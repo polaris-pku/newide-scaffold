@@ -39,3 +39,7 @@ src/memory/docs/
 .zcode/
 
 /.npmrc
+
+# AI 驱动测试生成残留 — 脚手架 / 报告 / 子项目
+DL_RESULT.md
+jwt-auth-system/

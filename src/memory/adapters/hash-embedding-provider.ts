@@ -18,17 +18,6 @@ export class HashEmbeddingProvider implements EmbeddingProvider {
   async embed(text: string): Promise<number[]> {
     return textToVector(text, this.dimensions);
   }
-
-  cosineSimilarity(a: number[], b: number[]): number {
-    const left = normalizeVector(padOrTruncate(a, this.dimensions));
-    const right = normalizeVector(padOrTruncate(b, this.dimensions));
-
-    let dot = 0;
-    for (let index = 0; index < this.dimensions; index += 1) {
-      dot += left[index]! * right[index]!;
-    }
-    return dot;
-  }
 }
 
 /** 模块默认实例，供 memory-retrieval 使用 */
@@ -49,16 +38,6 @@ function textToVector(text: string, dimensions: number): number[] {
   }
 
   return normalizeVector(values);
-}
-
-function padOrTruncate(vector: number[], dimensions: number): number[] {
-  if (vector.length === dimensions) {
-    return [...vector];
-  }
-  if (vector.length > dimensions) {
-    return vector.slice(0, dimensions);
-  }
-  return [...vector, ...new Array<number>(dimensions - vector.length).fill(0)];
 }
 
 function normalizeVector(vector: number[]): number[] {

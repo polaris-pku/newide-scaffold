@@ -16,6 +16,7 @@ import type {
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type { MemoryRepository, MemoryVectorSearchOptions } from '../ports/memory-repository';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
+import { cosineSimilarity } from '../utils/vector';
 import {
   createSeedHandle,
   createSeedMetrics,
@@ -175,7 +176,7 @@ async function rankByVectorSimilarity<T extends SkillRecord | ExperienceRecord>(
         : await embedding.embed(item.description);
     scored.push({
       item,
-      similarity: embedding.cosineSimilarity(options.query_embedding, itemEmbedding),
+      similarity: cosineSimilarity(options.query_embedding, itemEmbedding),
     });
   }
 

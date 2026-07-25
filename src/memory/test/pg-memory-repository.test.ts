@@ -4,6 +4,8 @@
  * 需要 PostgreSQL + pgvector。未设置 MEMORY_PG_TEST_URL 时自动跳过。
  * 示例：MEMORY_PG_TEST_URL=postgres://user:pass@localhost:5432/newide_test pnpm test
  */
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
@@ -12,6 +14,24 @@ import { HashEmbeddingProvider } from '../adapters/hash-embedding-provider';
 import { PgMemoryRepository } from '../adapters/pg-memory-repository';
 import { ensurePgMemorySchema } from '../adapters/pg-memory-schema';
 import type { ExperienceRecord, SkillRecord } from '../schemas';
+
+function loadEnv(): void {
+  const envPath = resolve(__dirname, '../.env');
+  if (!existsSync(envPath)) return;
+  const content = readFileSync(envPath, 'utf-8');
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex === -1) continue;
+    const key = trimmed.slice(0, eqIndex).trim();
+    const value = trimmed.slice(eqIndex + 1).trim();
+    if (!process.env[key]) {
+      process.env[key] = value;
+    }
+  }
+}
+loadEnv();
 
 const pgTestUrl = process.env.MEMORY_PG_TEST_URL;
 const describePg = pgTestUrl ? describe : describe.skip;

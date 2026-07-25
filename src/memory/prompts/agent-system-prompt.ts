@@ -32,9 +32,10 @@ export async function buildAgentSystemPrompt(
     ...toolDefinitions.map((def) => `- ${def.function.name}: ${def.function.description}`),
     '',
     '## Behavior Rules',
-    '- Use query_memory to retrieve relevant past experiences and skills. Skills are NOT pre-loaded — you must query them when needed.',
-    '- Pass retrieved skills and experiences as context when calling invoke_driver.',
-    '- Use invoke_driver to dispatch concrete sub-tasks to the Driver Agent.',
+    '- You MUST use the available tools for every task. Do NOT attempt to complete tasks without tools.',
+    '- Step 1: Use query_memory to retrieve relevant past experiences and skills. Skills are NOT pre-loaded — you must query them when needed.',
+    '- Step 2: Pass retrieved skills and experiences as context when calling invoke_driver to dispatch the concrete work.',
+    '- Use invoke_driver to dispatch ALL concrete sub-tasks to the Driver Agent. Never try to implement code or solve problems yourself.',
     '- Keep track of what the driver returns and use it to inform next steps.',
     '- When the task is complete, summarize the result clearly and include "[done]".',
   ];

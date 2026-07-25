@@ -190,6 +190,82 @@ if (selected) {
 
 `PgMemoryRepository` 使用 PostgreSQL 和 `pgvector`。默认 `autoMigrate: true`，首次访问时会调用 `ensurePgMemorySchema()` 创建扩展、表和索引；数据库用户需要具备相应权限。默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，不是语义嵌入模型。生产环境应通过 `PgMemoryRepository` 构造参数注入合适的 `EmbeddingProvider`。
 
+## Embedding Provider 接入
+
+嵌入向量化是经验/技能语义检索的基础。Memory 模块通过 `ports/embedding-provider.ts` 的 `EmbeddingProvider` 接口抽象，支持切换不同实现。
+
+### 接口
+
+```ts
+interface EmbeddingProvider {
+  readonly dimensions: number;
+  embed(text: string): Promise<number[]>;
+  cosineSimilarity(a: number[], b: number[]): number;
+}
+```
+
+### 实现
+
+| 实现     | 类名                       | 用途                                                       |
+| -------- | -------------------------- | ---------------------------------------------------------- |
+| 哈希嵌入 | `HashEmbeddingProvider`    | FNV-1a 确定性哈希，本地开发/测试用，**不具备语义检索能力** |
+| 真实嵌入 | `LiteLLMEmbeddingProvider` | 通过 Vercel AI SDK 调用 embedding API，生产环境使用        |
+
+### LiteLLMEmbeddingProvider 配置
+
+支持环境变量和构造参数两种方式：
+
+```bash
+# .env 或环境变量
+OPENAI_API_KEY=sk-xxx              # API key
+OPENAI_BASE_URL=https://api.deepseek.com/v1  # 兼容国内 API（可选）
+EMBEDDING_MODEL=text-embedding-3-small      # 模型名（可选）
+EMBEDDING_DIMENSIONS=1536                   # 向量维度（可选）
+```
+
+DeepSeek 用户：设置 `LLM_PROVIDER=deepseek` + `DEEPSEEK_API_KEY` 后自动映射为 `OPENAI_API_KEY` + `OPENAI_BASE_URL`。
+
+构造参数覆盖环境变量：
+
+```ts
+const embedding = new LiteLLMEmbeddingProvider({
+  apiKey: 'sk-xxx',
+  baseUrl: 'https://api.deepseek.com/v1',
+  model: 'text-embedding-3-small',
+  dimensions: 1536,
+});
+```
+
+### 注入到 PgMemoryRepository
+
+```ts
+import { LiteLLMEmbeddingProvider } from './memory';
+import { PgMemoryRepository } from './memory';
+
+const embedding = new LiteLLMEmbeddingProvider();
+const repository = new PgMemoryRepository({
+  pool,
+  embedding, // 注入真实嵌入实现
+});
+```
+
+`PgMemoryRepository` 使用注入的 `EmbeddingProvider` 进行 `searchExperiences()` / `searchSkills()` 的向量检索和余弦相似度计算。未注入时默认为 `HashEmbeddingProvider`。
+
+### 在测试中使用
+
+单元测试始终使用 `HashEmbeddingProvider`（确定性的 1024 维，不依赖外部 API）：
+
+```ts
+import { HashEmbeddingProvider } from './memory';
+const embedding = new HashEmbeddingProvider();
+```
+
+集成测试可见 `test/integration/embedding-smoke.test.ts`，它使用 `LiteLLMEmbeddingProvider` 验证：
+
+- `embed()` 返回正确维度的向量
+- 相同文本的 `cosineSimilarity` 等于 1
+- 相似文本的相似度高于不相关文本
+
 ### 文件 Buffer
 
 `FileBufferRepository({ agentStateRoot })` 使用以下布局：
@@ -250,6 +326,10 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 
 `src/memory/test/integration/agent-loop-with-real-driver.test.ts` 使用本地 `claude` CLI 作为真实 Driver，与 `LiteLLMToolCallingClient`（Agent LLM）组合运行完整的 tool-calling 循环，验证 `invoke_driver` 调用能返回结构化 `DriverReturn`。需要本地安装 `claude` 命令和有效的 `DEEPSEEK_API_KEY`，不满足条件时自动跳过。
 
+`src/memory/test/integration/agent-loop-via-bridge.test.ts` 和 `src/memory/test/integration/real-agent-e2e.test.ts` 使用 `CliDriverRuntime`（`test/drivers/cli-driver-runtime.ts`）包装本地 CLI（Claude/Kimi）为 A 侧 `DriverRuntimeHandle`，通过 `DriverBridge` 转换为 `DriverReturn`，走完整的 A→B 侧管线。这些测试依赖本地 CLI 命令和 API key，不满足条件时自动跳过。
+
+> **注意**：`test/drivers/` 下的 `cli-driver-runtime.ts` 和 `llm-driver.ts` 是 Memory 模块**内部集成测试专用**的辅助实现，只负责在单模块测试中模拟 Driver 调用链路。**其他模块（Coordinator、Council、Hook/Gate 等）使用 Driver 时无需 import 这些文件**，应通过 `src/driver/` 模块的正式接口（`DriverRuntimeHandle`、`DriverBridge`、`CommandDriverTransport` 等）接入。
+
 其余测试使用内存仓库和 Mock 客户端，不需要外部服务。
 
 ## 目录结构
@@ -287,14 +367,13 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 
 ### 2. EmbeddingProvider 的遗留问题
 
-当前的嵌入实现有以下不足：
+当前嵌入实现的已知问题：
 
 - 默认 `HashEmbeddingProvider` 使用 FNV-1a 确定性哈希生成向量，**不具备语义搜索能力**，仅适用于本地开发和测试；
 - 经验提取器（`llm-experience-extractor.ts`、`rule-based-experience-extractor.ts`）中 embedding 硬编码为 `[0.1, 0.2, 0.3]` 占位值；
-- `PgMemoryRepository` 需要注入真正的 `EmbeddingProvider` 才能在生产环境进行语义检索；
-- `LiteLLMClientAdapter` 未实现嵌入接口，无法使用 LiteLLM 统一管理嵌入模型。
+- `LiteLLMEmbeddingProvider` 已可用（基于 Vercel AI SDK），但未集成到 `LiteLLMClientAdapter` 的统一路由中，需独立配置 embedding API key 和模型。
 
-后续应通过 `LiteLLMClient` 的嵌入能力或独立嵌入服务实现真正的语义嵌入。
+后续目标是将 embedding 能力统一到 LiteLLM 配置体系，通过 YAML 路由和共享 API key 管理嵌入模型。
 
 ### 3. Driver 未真实接入
 

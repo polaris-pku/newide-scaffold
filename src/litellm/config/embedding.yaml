@@ -1,0 +1,9 @@
+tasks:
+  embed:
+    models:
+      - provider: openai
+        model: text-embedding-v3
+        order: 1
+    strategy: order
+    timeoutMs: 30000
+    maxRetries: 2

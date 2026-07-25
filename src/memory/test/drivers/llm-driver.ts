@@ -101,6 +101,11 @@ export interface LlmDriverOptions {
   model?: string;
   /** CLI 模式下的 claude 命令路径（默认 'claude'） */
   cliCommand?: string;
+  /**
+   * CLI 进程的工作目录。不设置时默认使用系统临时目录，避免 AI driver
+   * 生成的文件污染项目根目录。集成测试应传入临时目录并在测试后清理。
+   */
+  cwd?: string;
 }
 
 /**
@@ -172,12 +177,14 @@ function createApiDriver(options?: LlmDriverOptions): DriverHandler {
 
 function createCliDriver(options?: LlmDriverOptions): DriverHandler {
   const cliCommand = options?.cliCommand ?? 'claude';
+  const cwd = options?.cwd ?? process.cwd();
 
   return async (task: DriverTask): Promise<DriverReturn> => {
     const prompt = `${SYSTEM_PROMPT}\n\n${buildPrompt(task)}`;
 
     try {
       const stdout = execSync(cliCommand, {
+        cwd,
         input: prompt,
         encoding: 'utf-8',
         timeout: 60_000,

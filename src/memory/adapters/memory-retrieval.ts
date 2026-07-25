@@ -23,6 +23,7 @@ import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { ExperienceRecord, SkillRecord } from '../schemas';
 import type { MemoryRetrievalResult } from '../services/memory-query';
+import { cosineSimilarity } from '../utils/vector';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 
 /** ReMe 索引层默认 top-K（Spec §5.1） */
@@ -234,7 +235,7 @@ async function scoreSkill(
   return {
     kind: 'skill',
     skill,
-    embedding_similarity: embedding.cosineSimilarity(taskEmbedding, itemEmbedding),
+    embedding_similarity: cosineSimilarity(taskEmbedding, itemEmbedding),
     tag_overlap,
   };
 }
@@ -250,7 +251,7 @@ async function scoreExperience(
   return {
     kind: 'experience',
     experience,
-    embedding_similarity: embedding.cosineSimilarity(taskEmbedding, itemEmbedding),
+    embedding_similarity: cosineSimilarity(taskEmbedding, itemEmbedding),
     tag_overlap,
   };
 }
