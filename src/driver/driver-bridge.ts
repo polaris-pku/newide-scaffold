@@ -157,6 +157,8 @@ export class DriverBridge {
     const converterOptions: DriverReturnConverterOptions = {
       instruction: task.instruction,
       sourceDriver: this.driver.driver_id,
+      taskId: prompt.task_id,
+      workspace: process.env.ACP_WORKSPACE || process.cwd(),
     };
 
     if (this.loadTranscript) {
@@ -254,6 +256,19 @@ export class DriverBridge {
       2,
     );
     promptText += '\n<<<END_DRIVER_RETURN>>>';
+
+    if (process.env.ACP_WRITE_REPORT_FILE === '1' || process.env.ACP_WRITE_REPORT_FILE === 'true') {
+      promptText += '\n\n---\n';
+      promptText += 'FINAL STEP — After completing the task, you MUST write a report file:\n';
+      promptText += `- File name: exactly \`${taskId}_report.txt\` in the workspace root directory.\n`;
+      promptText +=
+        '- File content: a JSON object containing the six-field report. ' +
+        'The JSON MUST be the object inside the <<<DRIVER_RETURN>>> block above — ' +
+        'DO NOT include the <<<DRIVER_RETURN>>> or <<<END_DRIVER_RETURN>>> markers themselves. ' +
+        'The file MUST start with `{` and end with `}` and be valid JSON.\n';
+      promptText +=
+        '- Required fields: summary, artifacts, decisions, blockers, referenced_experiences, assumptions.';
+    }
 
     return {
       task_id: taskId,

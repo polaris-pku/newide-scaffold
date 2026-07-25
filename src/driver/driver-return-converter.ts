@@ -6,15 +6,19 @@
  * - 方向 B 需要 DriverReturn（artifacts + summary + decisions + blockers +
  *   referenced_experiences + assumptions）
  *
- * 提供三种转换策略，按优先级：
- * 1. parseDriverReturnFromTranscript — 从 transcript 中解析结构化 JSON 块
+ * 提供多级转换策略，按优先级降级：
+ * 1. tryReadReportFile — 从 workspace 下 {taskId}_report.txt 直接读取
+ *    （Agent 被 ACP_WRITE_REPORT_FILE=1 指令写入的报告文件）
+ * 2. parseDriverReturnFromTranscript — 从 transcript 中解析结构化 JSON 块
  *    （Driver 被 prompt 指示产出 <<<DRIVER_RETURN>>> 标记块）
- * 2. createLlmDriverReturnConverter — 调用 LLM 根据 DriverRunResult 生成六字段报告
- *    （智能路径：transcript 无结构化块时，由 LLM 推理生成完整报告）
- * 3. constructDriverReturnFromResult — 从 DriverRunResult 元数据构造
- *    （降级路径：无 transcript 或 LLM 失败时的基本报告）
+ * 3. LLM 解析 — 调用 LLM 根据 transcript + DriverRunResult 生成六字段报告
+ *    （可选：仅在提供 LlmClient 且 transcript 无结构化块时启用）
+ * 4. constructDriverReturnFromResult — 从 DriverRunResult 元数据构造
+ *    （最终降级：无 transcript 或前述策略全部失败时的基本报告）
  */
 
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import path from 'node:path';
 import { DriverReturnSchema, type DriverReturn } from '../memory/schemas';
 import type { LlmClient } from '../memory/ports/llm-client';
 import type { DriverRunResult } from './contract';
@@ -38,6 +42,111 @@ export interface DriverReturnConverterOptions {
   instruction?: string;
   /** 可选：标记来源 Driver */
   sourceDriver?: string;
+  /** 可选：任务 ID，用于定位 {taskId}_report.txt */
+  taskId?: string;
+  /** 可选：workspace 路径，Agent 写入 report.txt 的目录 */
+  workspace?: string;
+}
+
+// ──────────────────────────────────────────────
+// 策略0：从 Agent 写入的 report.txt 文件读取
+// ──────────────────────────────────────────────
+
+/**
+ * 尝试从 workspace 目录下读取 {taskId}_report.txt 并解析为 DriverReturn。
+ *
+ * 这是最高优先级的转换策略：当 Agent 按照 ACP_WRITE_REPORT_FILE 指令
+ * 将六字段报告写入了文件时，直接读取即可获得最准确的报告。
+ *
+ * @returns 解析出的 DriverReturn，文件不存在或解析失败则返回 null
+ */
+function tryReadReportFile(taskId: string, workspace: string): DriverReturn | null {
+  const filePath = path.join(workspace, `${taskId}_report.txt`);
+  if (!existsSync(filePath)) {
+    console.error(`[DriverReturnConverter] report file not found: ${filePath}`);
+    return null;
+  }
+
+  let content: string;
+  try {
+    content = readFileSync(filePath, 'utf8');
+  } catch (readError) {
+    const reason = readError instanceof Error ? readError.message : String(readError);
+    console.error(`[DriverReturnConverter] failed to read report file ${filePath}: ${reason}`);
+    return null;
+  }
+
+  if (!content.trim()) {
+    console.error(`[DriverReturnConverter] report file is empty: ${filePath}`);
+    return null;
+  }
+
+  // 跳过前导非法字符，定位第一个 JSON 对象的起始 '{'
+  const jsonStart = content.indexOf('{');
+  if (jsonStart === -1) {
+    console.error(
+      `[DriverReturnConverter] report file contains no JSON object (no '{' found): ${filePath}`,
+    );
+    return null;
+  }
+
+  // 丢弃第一个 '{' 之前的全部内容（如 <<<DRIVER_RETURN>>> 标记等）
+  const cleanedContent = jsonStart > 0 ? content.slice(jsonStart) : content;
+
+  const jsonText = extractJsonObject(cleanedContent, 0);
+  if (!jsonText) {
+    console.error(
+      `[DriverReturnConverter] report file contains unbalanced braces — could not extract a complete JSON object: ${filePath}`,
+    );
+    return null;
+  }
+
+  if (jsonText.length < cleanedContent.trimEnd().length) {
+    const skipped = cleanedContent.trimEnd().length - jsonText.length;
+    console.error(
+      `[DriverReturnConverter] report file had ${skipped} trailing character(s) after the JSON object — stripped before parsing`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (jsonError) {
+    const reason = jsonError instanceof Error ? jsonError.message : String(jsonError);
+    console.error(
+      `[DriverReturnConverter] report file extracted JSON is invalid (${filePath}): ${reason}`,
+    );
+    return null;
+  }
+
+  try {
+    const report = DriverReturnSchema.parse(parsed) as DriverReturn;
+
+    // 解析成功后，默认清理 report 文件（可通过 ACP_KEEP_REPORT_FILE=1 保留）
+    const keepFile =
+      process.env.ACP_KEEP_REPORT_FILE === '1' || process.env.ACP_KEEP_REPORT_FILE === 'true';
+    if (!keepFile) {
+      try {
+        unlinkSync(filePath);
+        console.error(
+          `[DriverReturnConverter] report file deleted after successful parse: ${filePath}`,
+        );
+      } catch (deleteError) {
+        const reason = deleteError instanceof Error ? deleteError.message : String(deleteError);
+        console.error(
+          `[DriverReturnConverter] failed to delete report file ${filePath}: ${reason}`,
+        );
+      }
+    }
+
+    return report;
+  } catch (schemaError) {
+    const reason = schemaError instanceof Error ? schemaError.message : String(schemaError);
+    console.error(
+      `[DriverReturnConverter] report file JSON failed schema validation (${filePath}): ${reason}`,
+    );
+    return null;
+  }
 }
 
 // ──────────────────────────────────────────────
@@ -265,67 +374,18 @@ function parseLlmDriverReturn(raw: string): DriverReturn {
 /**
  * 创建基于 LLM 的 DriverReturnConverter。
  *
- * 转换优先级：
- * 1. 如果提供了 transcriptText，先尝试 parseDriverReturnFromTranscript
- * 2. 否则调用 LLM 根据 DriverRunResult 生成六字段报告
- * 3. LLM 调用或解析失败时，降级到 constructDriverReturnFromResult
+ * 委托到 createDefaultDriverReturnConverter(llm)，
+ * 因此完整优先级为：report 文件 → transcript 直接解析 → LLM 解析 → 元数据构造。
  *
  * 使用示例：
  * ```ts
  * const llm = new LiteLLMClientAdapter('driver-return-generation');
  * const converter = createLlmDriverReturnConverter(llm);
- * const driverReturn = await converter(driverRunResult, { transcriptText, instruction });
+ * const driverReturn = await converter(driverRunResult, { transcriptText, instruction, taskId, workspace });
  * ```
  */
 export function createLlmDriverReturnConverter(llm: LlmClient): DriverReturnConverter {
-  return async (
-    result: DriverRunResult,
-    options?: DriverReturnConverterOptions,
-  ): Promise<DriverReturn> => {
-    // 优先尝试从 transcript 解析
-    if (options?.transcriptText) {
-      const parsed = parseDriverReturnFromTranscript(options.transcriptText);
-      if (parsed) {
-        console.error(
-          `[DriverReturnConverter] six-field report generated via JSON parsing (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
-        );
-        return parsed;
-      }
-    }
-
-    // 调用 LLM 生成
-    try {
-      const userPrompt = buildLlmPrompt(result, options);
-      const raw = await llm.complete({
-        messages: [
-          { role: 'system', content: LLM_DRIVER_RETURN_SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt },
-        ],
-        responseFormat: { type: 'json_object' },
-      });
-
-      try {
-        const driverReturn = parseLlmDriverReturn(raw);
-
-        console.error(
-          `[DriverReturnConverter] six-field report generated via LLM (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
-        );
-        return driverReturn;
-      } catch (parseError) {
-        const reason = parseError instanceof Error ? parseError.message : String(parseError);
-        console.error(
-          `[DriverReturnConverter] LLM extraction failed: LLM output was malformed or failed schema validation (${reason}); falling back to construction (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
-        );
-        return constructDriverReturnFromResult(result, options);
-      }
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      console.error(
-        `[DriverReturnConverter] LLM extraction failed: LLM call error (${reason}); falling back to construction (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
-      );
-      return constructDriverReturnFromResult(result, options);
-    }
-  };
+  return createDefaultDriverReturnConverter(llm);
 }
 
 // ──────────────────────────────────────────────
@@ -335,37 +395,99 @@ export function createLlmDriverReturnConverter(llm: LlmClient): DriverReturnConv
 /**
  * 创建默认的 DriverReturnConverter。
  *
- * 优先尝试从 transcript 解析结构化报告，解析失败则降级到元数据构造。
+ * @param llm 可选的 LlmClient。提供后，当 transcript 无结构化 JSON 块时，
+ *            会尝试用 LLM 从 transcript 推理生成六字段报告。
+ *
+ * 四级降级链（按优先级）：
+ * 1. 从 workspace 下 {taskId}_report.txt 读取并解析（最高优先）
+ * 2. 从 transcript 文本直接解析结构化 JSON 块
+ * 3. 调用 LLM 根据 transcript + metadata 推理生成（仅在提供 llm 时启用）
+ * 4. 从 DriverRunResult 元数据构造（最终降级）
  *
  * 使用示例：
  * ```ts
+ * // 无 LLM — 两条降级路径
  * const converter = createDefaultDriverReturnConverter();
- * const driverReturn = converter(driverRunResult, { transcriptText });
+ *
+ * // 有 LLM — 三条降级路径
+ * const llm = new LiteLLMClientAdapter('driver-return-generation');
+ * const converter = createDefaultDriverReturnConverter(llm);
+ *
+ * const driverReturn = await converter(driverRunResult, {
+ *   transcriptText,
+ *   instruction,
+ *   taskId,
+ *   workspace,
+ * });
  * ```
  */
-export function createDefaultDriverReturnConverter(): DriverReturnConverter {
-  return (result: DriverRunResult, options?: DriverReturnConverterOptions): DriverReturn => {
-    // 尝试从 transcript 解析
+export function createDefaultDriverReturnConverter(llm?: LlmClient): DriverReturnConverter {
+  return async (
+    result: DriverRunResult,
+    options?: DriverReturnConverterOptions,
+  ): Promise<DriverReturn> => {
+    const src = options?.sourceDriver ?? result.diagnostics.driver_id;
+
+    // ── 优先级1：从 Agent 写入的 report.txt 文件读取 ──
+    if (options?.taskId && options?.workspace) {
+      const fromFile = tryReadReportFile(options.taskId, options.workspace);
+      if (fromFile) {
+        console.error(
+          `[DriverReturnConverter] six-field report loaded from ${options.taskId}_report.txt (source: ${src})`,
+        );
+        return fromFile;
+      }
+    }
+
+    // ── 优先级2：从 transcript 直接解析结构化 JSON ──
     if (options?.transcriptText) {
       const parsed = parseDriverReturnFromTranscript(options.transcriptText);
       if (parsed) {
         console.error(
-          `[DriverReturnConverter] six-field report generated via JSON parsing (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
+          `[DriverReturnConverter] six-field report generated via JSON parsing (source: ${src})`,
         );
         return parsed;
       }
       console.error(
-        `[DriverReturnConverter] transcript extraction failed: no valid six-field report found in transcript; falling back to construction (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
-      );
-    } else {
-      console.error(
-        `[DriverReturnConverter] transcript extraction skipped: transcriptText not provided; falling back to construction (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
+        `[DriverReturnConverter] transcript extraction failed: no structured report found in transcript (source: ${src})`,
       );
     }
 
-    // 降级：元数据构造
+    // ── 优先级3：LLM 推理（从 transcript 或 metadata 生成，仅在提供 llm 时启用）──
+    if (llm) {
+      try {
+        const userPrompt = buildLlmPrompt(result, options);
+        const raw = await llm.complete({
+          messages: [
+            { role: 'system', content: LLM_DRIVER_RETURN_SYSTEM_PROMPT },
+            { role: 'user', content: userPrompt },
+          ],
+          responseFormat: { type: 'json_object' },
+        });
+
+        try {
+          const driverReturn = parseLlmDriverReturn(raw);
+          console.error(
+            `[DriverReturnConverter] six-field report generated via LLM (source: ${src})`,
+          );
+          return driverReturn;
+        } catch (parseError) {
+          const reason = parseError instanceof Error ? parseError.message : String(parseError);
+          console.error(
+            `[DriverReturnConverter] LLM output was malformed (${reason}); falling back to construction (source: ${src})`,
+          );
+        }
+      } catch (llmError) {
+        const reason = llmError instanceof Error ? llmError.message : String(llmError);
+        console.error(
+          `[DriverReturnConverter] LLM call error (${reason}); falling back to construction (source: ${src})`,
+        );
+      }
+    }
+
+    // ── 优先级4（最终降级）：元数据构造 ──
     console.error(
-      `[DriverReturnConverter] six-field report generated via construction (source: ${options?.sourceDriver ?? result.diagnostics.driver_id})`,
+      `[DriverReturnConverter] six-field report generated via construction (source: ${src})`,
     );
     return constructDriverReturnFromResult(result, options);
   };

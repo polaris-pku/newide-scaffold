@@ -22,6 +22,10 @@
     "backend:rpc": "node --import tsx src/app/backend-rpc-stdio.ts",
     "rpc:smoke": "node --import tsx scripts/rpc-smoke.ts",
     "acceptance:real": "node --import tsx scripts/real-acceptance.ts",
+    "eval:instance": "tsx eval/run-instance.ts",
+    "eval:smoke": "tsx eval/run-smoke.ts",
+    "eval:sweevo-harness": "tsx eval/run-sweevo-harness.ts",
+    "eval:record-harness": "tsx eval/record-harness-result.ts",
     "prepare": "husky"
   },
   "lint-staged": {

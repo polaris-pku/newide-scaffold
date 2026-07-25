@@ -290,7 +290,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       stdio: ['pipe', 'pipe', 'pipe'],
     };
 
-    if (process.platform !== 'win32') {
+    if (this.timeoutMs !== undefined && process.platform !== 'win32') {
       options.detached = true;
     }
 

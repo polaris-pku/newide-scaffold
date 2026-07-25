@@ -25,7 +25,11 @@ export class CommandRunner extends BaseGateRunner {
 
     try {
       // Execute the command string
-      const timeout = this.definition.timeout ?? request.timeout_ms ?? 30000;
+      // definition.timeout is seconds; execAsync expects ms
+      const timeout =
+        this.definition.timeout != null
+          ? this.definition.timeout * 1000
+          : (request.timeout_ms ?? 30000);
       await execAsync(cmd, {
         timeout,
       });

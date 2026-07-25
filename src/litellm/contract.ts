@@ -103,6 +103,26 @@ export interface JsonSchema {
 }
 
 // ──────────────────────────────────────────────────────────
+// Embedding Request / Response
+// ──────────────────────────────────────────────────────────
+
+export interface EmbeddingRequest {
+  /** LiteLLM task type — ModelPool resolves to model(s) */
+  task: LiteLLMTaskType;
+  /** Single string or batch of strings to embed */
+  input: string | string[];
+}
+
+export interface EmbeddingResponse {
+  /** The actual model that served this request */
+  model: ModelId;
+  /** Embedding vectors — one per input */
+  embeddings: number[][];
+  /** Token usage */
+  usage: TokenUsage;
+}
+
+// ──────────────────────────────────────────────────────────
 // Completion Request / Response
 // ──────────────────────────────────────────────────────────
 

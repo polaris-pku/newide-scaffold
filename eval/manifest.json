@@ -1,0 +1,12 @@
+{
+  "dataset_version": "hf_out-v1",
+  "dataset_jsonl": "../SWE-EVO/hf_out/hf_jsonl/test.jsonl",
+  "dataset_hf_dir": "../SWE-EVO/hf_out/hf_dataset",
+  "default_subset": "v0-smoke",
+  "subsets": {
+    "v0-smoke": "eval/datasets/v0-smoke.json",
+    "v0-dev": "eval/datasets/v0-dev.json",
+    "verified-30": "eval/datasets/verified-30.json"
+  },
+  "default_model_name": "unspecified"
+}

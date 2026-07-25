@@ -58,6 +58,7 @@ export interface GateDefinition {
   input?: string;
   gates?: SubGateRef[];
   outputConfig: GateOutputConfig;
+  /** Per-gate timeout in seconds. Runners convert to ms internally. */
   timeout?: number;
   retry_threshold: number;
 }

@@ -35,6 +35,7 @@ import { FileBufferRepository } from '../adapters/file-buffer-repository';
 import { InvokeDriverTool, type DriverHandler } from './tools/invoke-driver-tool';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { BufferRepository } from '../ports/buffer-repository';
+import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type { ToolCallingClient } from './tool';
 import type { Tool } from './tool';
 
@@ -60,6 +61,8 @@ export interface AgentRuntimeConfig {
     /** 提供则使用 FileBufferRepository（存储路径）；不提供则使用 InMemoryBufferRepository */
     agentStateRoot?: string;
   };
+  /** 自定义 EmbeddingProvider（默认使用 HashEmbeddingProvider） */
+  embedding?: EmbeddingProvider;
   /** 顶层 Agent 的 LLM（需支持 tool-calling） */
   llm: ToolCallingClient;
   /** 顶层 Agent 的系统提示词（可选覆盖） */
@@ -85,7 +88,7 @@ export interface AgentRuntimeConfig {
  */
 export async function createAgentRuntime(config: AgentRuntimeConfig): Promise<AgentManager> {
   // 1. 选择存储实现
-  const repository = createMemoryRepository(config.storage);
+  const repository = createMemoryRepository(config.storage, config.embedding);
   const bufferRepository = createBufferRepository(config.storage);
 
   // 2. 构建工具列表
@@ -116,6 +119,7 @@ export async function createAgentRuntime(config: AgentRuntimeConfig): Promise<Ag
       tools,
       ...(config.systemPrompt ? { systemPrompt: config.systemPrompt } : {}),
     },
+    ...(config.embedding ? { embedding: config.embedding } : {}),
   };
 
   // 4. 返回 AgentManager（async create 自动加载所有已注册 Agent）
@@ -126,7 +130,10 @@ export async function createAgentRuntime(config: AgentRuntimeConfig): Promise<Ag
 // 内部工厂
 // ──────────────────────────────────────────────
 
-function createMemoryRepository(storage?: AgentRuntimeConfig['storage']): MemoryRepository {
+function createMemoryRepository(
+  storage?: AgentRuntimeConfig['storage'],
+  embedding?: EmbeddingProvider,
+): MemoryRepository {
   if (storage?.pg) {
     const pool = new Pool({
       connectionString: storage.pg.connectionString,
@@ -137,9 +144,9 @@ function createMemoryRepository(storage?: AgentRuntimeConfig['storage']): Memory
       password: storage.pg.password,
       max: storage.pg.max ?? 10,
     });
-    return new PgMemoryRepository({ pool });
+    return new PgMemoryRepository({ pool, ...(embedding ? { embedding } : {}) });
   }
-  return new InMemoryRepository();
+  return new InMemoryRepository(embedding);
 }
 
 function createBufferRepository(storage?: AgentRuntimeConfig['storage']): BufferRepository {

@@ -1,0 +1,61 @@
+{
+  "bench": "SWE-bench Verified",
+  "source_parquet": "D:\\SWE-bench-Verified\\test.parquet",
+  "rfc_repo_quota": {
+    "django/django": 9,
+    "scikit-learn/scikit-learn": 9,
+    "psf/requests": 6,
+    "pallets/flask": 6
+  },
+  "rfc_tier_quota": {
+    "easy": 10,
+    "medium": 10,
+    "hard": 10
+  },
+  "pool_available_by_repo": {
+    "django/django": 227,
+    "pallets/flask": 1,
+    "psf/requests": 8,
+    "scikit-learn/scikit-learn": 31
+  },
+  "pool_available_by_repo_tier": {
+    "django/django|easy": 90,
+    "django/django|hard": 22,
+    "django/django|medium": 115,
+    "pallets/flask|easy": 1,
+    "psf/requests|easy": 6,
+    "psf/requests|medium": 2,
+    "scikit-learn/scikit-learn|easy": 12,
+    "scikit-learn/scikit-learn|hard": 1,
+    "scikit-learn/scikit-learn|medium": 18
+  },
+  "excluded_lt_30_words": 5,
+  "selected_count": 30,
+  "selected_by_repo": {
+    "django/django": 14,
+    "pallets/flask": 1,
+    "psf/requests": 6,
+    "scikit-learn/scikit-learn": 9
+  },
+  "selected_by_tier": {
+    "easy": 10,
+    "hard": 10,
+    "medium": 10
+  },
+  "gaps": {
+    "repo_quota_shortfall": {
+      "django/django": 0,
+      "scikit-learn/scikit-learn": 0,
+      "psf/requests": 0,
+      "pallets/flask": 5
+    },
+    "notes": [
+      "SWE-bench Verified 中 pallets/flask 仅 1 条，无法满足 RFC flask×6。",
+      "psf/requests 仅 8 条，可满足 requests×6。",
+      "solo Driver 冒烟剔除（地板效应）需跑 harness 后才能落地，本草案未执行。",
+      "python:3.10-slim 原生依赖剔除目前仅软标记 soft_flags，未强排除。"
+    ]
+  },
+  "list_status": "draft_provisional",
+  "blocker_for_formal_list": "flask Verified 库存不足（1 < 6）；正式清单需组长确认是否改配额或换数据源。"
+}
