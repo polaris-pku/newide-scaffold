@@ -4,7 +4,9 @@
 
 **边界**：F 只**观测**，不补 B/C 业务逻辑。EventStore 里该 emit 什么、ResumePackage 怎么构建、Buffer 门控策略等，仍由 B/C 方向负责；缺失部分见文末「依赖 B/C 的缺口」。
 
-依据文档：同目录 `埋点清单.md`（RFC §1 记忆纵向 + §2 长程协调 + §3 Council 互决策 + §4 端到端打榜）。
+依据文档：同目录 `埋点清单.md`（RFC §1–§4；文首 **§0 结果层 vs 归因层**）。
+
+**执行优先级**：若目标是「能跑出评测结果」，只保证 **L1 harness 判卷**经 `FHarnessTelemetryPort`（或 `eval/` 的 `summary.json`）可落盘即可；§2/§3 细事件与全量 adapter 接线属归因层，不阻塞出分。评测命令与产物见 `eval/README.md`。
 
 ---
 
@@ -181,6 +183,8 @@ class JsonlTelemetrySink implements TelemetrySink {
 | `adapters/c-council.ts`              | `observeCouncilRound` / `observeDecisionPacket` / `observeCoordinationTrace` / `observeTokenTracker`（单测验证 shape；运行时未接线）                                                                                 |
 
 ### 依赖 B/C、尚未接入（adapter 已备好或 catalog 已登记）
+
+> 下表为**归因层**缺口，**不阻塞**「eval 出 summary / L1 判卷」。结果层验收见同目录 `埋点清单.md` §0.2。
 
 | 缺口                                    | 说明                                                                                                  | F 侧准备                                                  |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |

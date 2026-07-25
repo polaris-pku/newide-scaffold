@@ -51,6 +51,87 @@ pnpm example:basic
 
 `pnpm example:basic` prints the v0 flow timeline and IDs.
 
+## F Eval Real Harness Setup
+
+The F-eval TypeScript pipeline is committed in this repository, but the real
+SWE-EVO/SWE-bench Docker harness depends on local data and tools that are not
+checked in. Stub smoke tests only need the JSONL data; real harness evaluation
+also needs a Linux Python environment and Docker access.
+
+### Windows + WSL + Docker Desktop
+
+On Windows, run the SWE-EVO harness from Ubuntu WSL. The harness imports Linux
+modules such as `resource`, so Windows Python is not enough even when Docker
+Desktop is installed.
+
+1. Enable Ubuntu WSL and make Docker Desktop available inside it:
+
+```powershell
+wsl --install -d Ubuntu-22.04
+wsl --set-default Ubuntu-22.04
+wsl -d Ubuntu-22.04 --user root --exec /bin/sh -lc "apt update && apt install -y python3 python3-pip python3-venv git"
+```
+
+In Docker Desktop, open `Settings -> Resources -> WSL Integration`, enable
+`Ubuntu-22.04`, then apply and restart Docker Desktop.
+
+Verify WSL can call Docker:
+
+```powershell
+wsl -d Ubuntu-22.04 --user root --exec /bin/sh -lc "docker --version && docker info"
+```
+
+2. Prepare SWE-EVO outside this repository. The default expected layout is:
+
+```text
+D:\SWE-EVO\SWE-bench\evaluate_instance.py
+D:\SWE-EVO\hf_out\hf_jsonl\test.jsonl
+```
+
+The JSONL can be downloaded from the public Hugging Face mirror:
+
+```powershell
+New-Item -ItemType Directory -Force -Path D:\SWE-EVO\hf_out\hf_jsonl | Out-Null
+curl.exe -L -o D:\SWE-EVO\hf_out\hf_jsonl\test.jsonl `
+  https://hf-mirror.com/datasets/Fsoft-AIC/SWE-EVO/resolve/main/SWE-EVO/hf_jsonl/test.jsonl
+```
+
+Clone or download `SWE-EVO/SWE-EVO` so that `D:\SWE-EVO\SWE-bench` exists.
+
+3. Install the SWE-bench harness in WSL:
+
+```powershell
+wsl -d Ubuntu-22.04 --user root --exec /bin/sh -lc "python3 -m pip install -U pip setuptools wheel"
+wsl -d Ubuntu-22.04 --user root --exec /bin/sh -lc "cd /mnt/d/SWE-EVO/SWE-bench && python3 -m pip install ."
+wsl -d Ubuntu-22.04 --user root --exec /bin/sh -lc "cd /mnt/d/SWE-EVO/SWE-bench && python3 evaluate_instance.py --help"
+```
+
+4. From this repository, generate a harness dry-run first:
+
+```powershell
+pnpm eval:instance -- `
+  --instance-id conan-io__conan_2.0.14_2.0.15 `
+  --mode oracle `
+  --skip-scaffold `
+  --run-harness `
+  --harness-dry-run
+```
+
+The command writes `.newide/eval/<run>/harness-command.json`. To run the real
+harness, execute the equivalent Linux command in WSL from the generated
+`sweevo-work` directory, using `/mnt/d/...` paths and `--max_workers 1` for the
+first case. A successful real harness run should pull or reuse a Docker image,
+run one instance, and print metrics such as `Applied rate` and `Resolved rate`.
+
+Notes:
+
+- `stub` validates the F-eval pipeline only; it does not run Docker.
+- `oracle` replays the dataset gold patch and is useful for harness validation.
+- `real` should use a patch from a case worktree or backend `summary.json`; do
+  not use this repository's `git diff` as a benchmark patch.
+- Local data, WSL setup, Docker images, and `.newide/` run outputs are not
+  committed to this repository.
+
 ## Module Responsibilities
 
 `src/core` owns shared contracts: IDs, timestamps, task/run state, events, artifacts, checkpoints, decisions, merge authorization, messages, role and memory refs, context pack refs, and file leases. It must not import `coordinator`, `driver`, `memory`, `hook`, `gate`, or `council`.

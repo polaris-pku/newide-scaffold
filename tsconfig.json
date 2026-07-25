@@ -14,5 +14,5 @@
     "outDir": "dist",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "eslint.config.js", "prettier.config.js"]
+  "include": ["src/**/*.ts", "eval/**/*.ts", "eslint.config.js", "prettier.config.js"]
 }
