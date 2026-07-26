@@ -24,24 +24,37 @@ describe('createDriverRuntimeInvoker', () => {
       session_id: 'session_existing',
       schema_version: SCHEMA_VERSION,
     });
-    expect(driver.prompts[0]?.prompt).toBe(
+    expect(driver.prompts[0]?.prompt).toContain(
       '{"experiences":[{"content":"Experience body","description":"Experience","id":"exp_1"}],"skills":[{"content":"Skill body","description":"Skill","id":"skill_1"}],"task_instruction":"Implement it"}',
     );
+    expect(driver.prompts[0]?.prompt).toContain('<<<DRIVER_RETURN>>>');
+    expect(driver.prompts[0]?.prompt).toContain('referenced_experiences');
     expect(output.execution).toEqual(successResult());
     expect(output.report).toEqual({
       artifacts: [{ type: 'patch', path: 'artifact://patch/1', summary: 'Changed one file' }],
-      summary: 'Driver succeeded (driver_result_1).',
-      decisions: [],
-      blockers: [],
-      referenced_experiences: [
+      summary:
+        'Task: "Implement it" Driver "driver_1" finished with status "succeeded" in 12ms. Produced 1 artifact(s): patch(artifact://patch/1). Notes: complete.',
+      decisions: [
         {
-          experience_id: 'exp_1',
-          applied: false,
-          effectiveness: 'not_applicable',
-          note: 'Driver result driver_result_1 did not evidence use of experience exp_1.',
+          point: 'Task execution approach',
+          options: ['delegate_to_driver', 'handle_directly'],
+          chosen: 'delegate_to_driver',
+          reason: 'Task "Implement it" delegated to driver "driver_1".',
         },
       ],
-      assumptions: [],
+      blockers: [],
+      referenced_experiences: [],
+      assumptions: [
+        {
+          assumption: 'Driver "driver_1" correctly executed the task',
+          risk_if_wrong:
+            'Output may be incomplete or incorrect; requires manual review of artifacts',
+        },
+        {
+          assumption: 'All 1 artifact(s) are valid and complete',
+          risk_if_wrong: 'Missing or corrupted artifacts could cause downstream failures',
+        },
+      ],
     });
   });
 
@@ -90,18 +103,17 @@ describe('createDriverRuntimeInvoker', () => {
       const output = await createDriverRuntimeInvoker(new TestDriver(result))(invocationInput());
 
       expect(output.execution).toBe(result);
-      expect(output.report.blockers).toEqual([
-        {
-          blocker: 'Driver stopped',
-          attempts: ['first attempt failed'],
-          resolution: 'DRIVER_ERROR (retryable)',
-          resolved: false,
-        },
-      ]);
-      expect(output.report.referenced_experiences[0]).toMatchObject({
-        applied: false,
-        effectiveness: 'not_applicable',
-      });
+      expect(output.report.blockers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            blocker: 'Driver stopped',
+            attempts: ['first attempt failed'],
+            resolution: 'Pending retry (error is retryable)',
+            resolved: false,
+          }),
+        ]),
+      );
+      expect(output.report.referenced_experiences).toEqual([]);
     },
   );
 
