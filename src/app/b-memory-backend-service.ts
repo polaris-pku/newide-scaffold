@@ -6,14 +6,17 @@ import {
 } from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BPublicCapabilities } from './b-public-capabilities';
+import { filterLegacyCouncilPseudoAgents } from './council-legacy-agent-filter';
 
 export class BMemoryBackendService {
   constructor(
     private readonly capabilities: Pick<BPublicCapabilities, 'boardQuery' | 'maintenance'>,
   ) {}
 
-  listAgents(): Promise<AgentBoardListItem[]> {
-    return this.capabilities.boardQuery.listAgents();
+  async listAgents(): Promise<AgentBoardListItem[]> {
+    return filterLegacyCouncilPseudoAgents(
+      await this.capabilities.boardQuery.listAgents(),
+    );
   }
 
   getAgent(roleId: string): Promise<AgentBoardAgentView> {
