@@ -13,7 +13,7 @@ import { IntegrationV0CoordinatorRunner } from '../../src/coordinator/coordinato
 import { runSnapshotSchema } from '../../src/protocol/run-snapshot';
 
 describe('NewideBackendService', () => {
-  it('publishes incremental driver events before the runner completes', async () => {
+  it('keeps raw driver chunks out of the state timeline and publishes lifecycle events', async () => {
     let finish: ((result: IntegrationV0Result) => void) | undefined;
     const runnerResult = new Promise<IntegrationV0Result>((resolve) => {
       finish = resolve;
@@ -31,6 +31,15 @@ describe('NewideBackendService', () => {
           created_at: '2026-07-20T00:00:01.000Z',
           payload: { text: 'working' },
         });
+        request.onDriverEvent?.({
+          schema_version: 'driver-event.v1',
+          event_type: 'driver.turn_started',
+          task_id: 'task_stream',
+          run_id: 'run_stream',
+          session_id: 'session_stream',
+          sequence: 2,
+          created_at: '2026-07-20T00:00:02.000Z',
+        });
         return runnerResult;
       },
     });
@@ -42,13 +51,11 @@ describe('NewideBackendService', () => {
       events: [
         { type: 'run.started' },
         {
-          type: 'driver.stream_event',
+          type: 'driver.turn_started',
           source: 'driver',
           payload: {
-            driver_event_type: 'agent_message_chunk',
             session_id: 'session_stream',
-            event_sequence: 1,
-            event_payload: { text: 'working' },
+            event_sequence: 2,
           },
         },
       ],
