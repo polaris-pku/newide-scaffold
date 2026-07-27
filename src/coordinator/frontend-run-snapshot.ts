@@ -10,6 +10,7 @@ import type { RunResultStatus, IntegrationRunOutputPaths } from './run-result';
 import type { SelectionMode } from './artifact-finalizer';
 import type { CouncilDecision, CouncilResult, CouncilRunResult } from '../council';
 import type { DriverToolEvent } from '../driver/contract';
+import type { RunOutcome } from './run-outcome';
 
 export type FrontendStage = 'executing' | 'council' | 'delivery';
 export type FrontendTimelineLevel = 'info' | 'success' | 'warning' | 'council';
@@ -29,6 +30,7 @@ export interface FrontendRunSnapshotSummary {
   mode: SelectionMode;
   status: RunResultStatus;
   outcome: 'completed_files' | 'completed_response' | 'failed';
+  run_outcome?: RunOutcome;
   session_id: string;
   response: string;
   tool_events: DriverToolEvent[];
@@ -90,6 +92,7 @@ export interface FrontendRunSnapshot {
   generated_at: Timestamp;
   run_id: string;
   task_id: string;
+  quality?: RunOutcome;
   task: Task;
   current: {
     stage: FrontendStage;
@@ -176,6 +179,20 @@ export function buildFrontendRunSnapshot(
     generated_at: input.summary.created_at,
     run_id: input.summary.run_id,
     task_id: input.summary.task_id,
+    ...(input.summary.run_outcome
+      ? {
+          quality: {
+            ...input.summary.run_outcome,
+            criteria: input.summary.run_outcome.criteria.map((criterion) => ({
+              ...criterion,
+              gate_result_refs: [...criterion.gate_result_refs],
+              audit_refs: [...criterion.audit_refs],
+            })),
+            gate_result_refs: [...input.summary.run_outcome.gate_result_refs],
+            artifact_refs: [...input.summary.run_outcome.artifact_refs],
+          },
+        }
+      : {}),
     task: { ...input.task },
     current: {
       stage: getFrontendStage(input.summary),

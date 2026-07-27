@@ -68,6 +68,11 @@ import {
 } from './run-result';
 import { buildFrontendRunSnapshot, type FrontendRunSnapshot } from './frontend-run-snapshot';
 import { diffWorkspaceFiles, snapshotWorkspaceFiles } from './workspace-change-detector';
+import {
+  evaluateCompletionCriteria,
+  type CompletionCriteriaEvaluation,
+} from './completion-criteria-evaluator';
+import { isCompletedRunOutcome, type RunOutcome } from './run-outcome';
 
 export interface IntegrationV0TimelineItem {
   name: string;
@@ -80,6 +85,8 @@ export interface IntegrationV0Summary {
   mode: SelectionMode;
   status: 'completed' | 'failed';
   outcome: 'completed_files' | 'completed_response' | 'failed';
+  run_outcome: RunOutcome;
+  completion_evaluation: CompletionCriteriaEvaluation;
   session_id: string;
   response: string;
   tool_events: DriverRunResult['tool_events'];
@@ -989,17 +996,29 @@ export async function runIntegrationV0Flow(
       ? workspaceChangedFiles
       : [...materializationResult.changed_files];
   const hasChangedFiles = workspaceChangedFiles.length > 0 || hasMaterializedChanges;
-  const responseOnlyCompleted = !hasChangedFiles && !hasMaterializableArtifact && hasResponse;
   const driverRecoveredByCouncil =
     !driverSucceeded &&
     selectionResult.council_result !== undefined &&
     councilDelivery !== undefined &&
     materializationResult.status === 'completed' &&
     hasChangedFiles;
-  const flowCompleted =
-    (driverSucceeded || driverRecoveredByCouncil) &&
-    gatesPassed &&
-    (hasChangedFiles || responseOnlyCompleted);
+  const artifactOutputs = buildArtifactOutputs({
+    artifacts: selectionResult.selected_artifacts,
+    materialized_record_paths: materializationResult.files_written,
+  });
+  const completionEvaluation = evaluateCompletionCriteria({
+    completion_criteria: task.completion_criteria,
+    gate_results: combinedGateResults,
+    artifact_manifest: {
+      artifact_refs: artifactOutputs.map((artifact) => artifact.artifact_id),
+      changed_files: deliveryChangedFiles,
+      response_available: hasResponse,
+      has_materializable_artifact: hasMaterializableArtifact,
+      materialization_status: materializationResult.status,
+    },
+    execution_succeeded: driverSucceeded || driverRecoveredByCouncil,
+  });
+  const flowCompleted = isCompletedRunOutcome(completionEvaluation.outcome.status);
   const outcome: IntegrationV0Summary['outcome'] = flowCompleted
     ? hasChangedFiles
       ? 'completed_files'
@@ -1111,6 +1130,7 @@ export async function runIntegrationV0Flow(
     payload: {
       status: finalTaskStatus,
       outcome,
+      run_outcome: completionEvaluation.outcome,
       artifact_refs: selectionResult.selected_artifacts.map((artifact) => artifact.artifact_id),
       ...(failure
         ? { code: failure.code, message: failure.message, details: failure.details }
@@ -1129,6 +1149,7 @@ export async function runIntegrationV0Flow(
     payload: {
       status: finalRunStatus,
       outcome,
+      run_outcome: completionEvaluation.outcome,
       ...(failure
         ? { code: failure.code, message: failure.message, details: failure.details }
         : {}),
@@ -1151,16 +1172,14 @@ export async function runIntegrationV0Flow(
     });
   }
 
-  const artifactOutputs = buildArtifactOutputs({
-    artifacts: selectionResult.selected_artifacts,
-    materialized_record_paths: materializationResult.files_written,
-  });
   const summary: IntegrationV0Summary = {
     run_id: run.run_id,
     task_id: task.task_id,
     mode: selectionResult.mode,
     status: finalRunStatus,
     outcome,
+    run_outcome: completionEvaluation.outcome,
+    completion_evaluation: completionEvaluation,
     session_id: driverResult.session_id,
     response: driverResult.response ?? '',
     tool_events: [...driverResult.tool_events],
@@ -1249,6 +1268,8 @@ export async function runIntegrationV0Flow(
     run_id: run.run_id,
     task_id: task.task_id,
     status: finalRunStatus,
+    run_outcome: completionEvaluation.outcome,
+    completion_evaluation: completionEvaluation,
     mode: selectionResult.mode,
     driver_id: driverResult.diagnostics.driver_id,
     artifact_outputs: artifactOutputs,

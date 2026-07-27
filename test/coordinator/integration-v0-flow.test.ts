@@ -26,6 +26,7 @@ import type {
 } from '../../src/coordinator/worktree-materializer';
 import { SelectAgentHandler } from '../../src/coordinator/handlers/select-agent-handler';
 import type { AgentProjection } from '../../src/market';
+import { completionCriterionId } from '../../src/coordinator/completion-criteria-evaluator';
 
 describe('runIntegrationV0Flow', () => {
   const createdRunDirs = new Set<string>();
@@ -98,6 +99,7 @@ describe('runIntegrationV0Flow', () => {
     expect(result.task_id).toBeDefined();
     expect(result.summary.mode).toBe('single_agent');
     expect(result.summary.status).toBe('completed');
+    expect(result.summary.run_outcome.status).toBe('best_effort');
 
     // Verify mailbox events in timeline
     const timelineNames = result.timeline.map((t) => t.name);
@@ -134,6 +136,54 @@ describe('runIntegrationV0Flow', () => {
     }
     expect(driverRequestedDelivery.status).toBe('acked');
     expect(driverRequestedDelivery.ack_at).toBeDefined();
+  });
+
+  it('marks output verified only with criterion-scoped audited Gate evidence', async () => {
+    const criterion = 'The configured acceptance command passes';
+    const result = await runFlow({
+      taskRequest: {
+        spec: 'Generate the requested output',
+        completion_criteria: [criterion],
+      },
+      hookEngine: {
+        handleEvent: async () => ({
+          hook_point: 'task.completed',
+          matched: true,
+          gate_requests: [],
+          gate_results: [
+            {
+              gate_result_id: createId('gate_result'),
+              gate_id: 'criterion-command',
+              gate_point: 'task.completed',
+              request_id: createId('gate_request'),
+              subject_id: completionCriterionId(criterion, 0),
+              subject_type: 'completion_criterion',
+              decision: 'allow',
+              reason: 'Acceptance command passed.',
+              required_actions: [],
+              audit_ref: 'file:///audit/criterion-command.json',
+              created_at: new Date().toISOString(),
+              schema_version: SCHEMA_VERSION,
+            },
+          ],
+          final_decision: 'allow',
+          created_at: new Date().toISOString(),
+          schema_version: SCHEMA_VERSION,
+        }),
+      },
+    });
+
+    expect(result.summary.run_outcome).toMatchObject({
+      status: 'verified',
+      criteria: [
+        {
+          description: criterion,
+          status: 'satisfied',
+          audit_refs: ['file:///audit/criterion-command.json'],
+        },
+      ],
+    });
+    expect(result.result_manifest.run_outcome.status).toBe('verified');
   });
 
   it('publishes task.completed only after the final delivery boundary', async () => {
