@@ -1,9 +1,12 @@
 import path from 'node:path';
 import { Pool } from 'pg';
+import { LiteLLMClient } from '../litellm';
 import {
   FileBufferRepository,
+  LiteLLMEmbeddingProvider,
   PgMemoryRepository,
   type BufferRepository,
+  type EmbeddingProvider,
   type MemoryRepository,
 } from '../memory';
 
@@ -31,7 +34,16 @@ const COUNCIL_AGENT_CATALOG = [
 
 export interface BMemoryStorage {
   readonly repository: MemoryRepository;
+  readonly embedding_info?: BEmbeddingRuntimeInfo;
   close(): Promise<void>;
+}
+
+export interface BEmbeddingRuntimeInfo {
+  readonly provider: string;
+  readonly task?: string;
+  readonly model?: string;
+  readonly dimensions?: number;
+  readonly readiness: 'verified' | 'host_managed';
 }
 
 export interface BackendBRuntime {
@@ -39,6 +51,7 @@ export interface BackendBRuntime {
   readonly bufferRepository: BufferRepository;
   readonly app_state_root: string;
   readonly market_agent_ids: readonly string[];
+  readonly embedding_info: BEmbeddingRuntimeInfo;
   close(): Promise<void>;
 }
 
@@ -46,6 +59,8 @@ export interface ProductionBRuntimeFactoryOptions {
   repoRoot?: string;
   appStateRoot?: string;
   createPool?: (databaseUrl: string) => Pool;
+  /** Host-owned semantic embedding injection. Production defaults to LiteLLM. */
+  embedding?: EmbeddingProvider;
   /** Test or host-owned storage injection. Production uses PostgreSQL by default. */
   storage?: BMemoryStorage;
 }
@@ -77,11 +92,15 @@ export async function createProductionBRuntime(
       bufferRepository,
       app_state_root: appStateRoot,
       market_agent_ids: MARKET_AGENT_CATALOG.map((agent) => agent.role_id),
+      embedding_info: storage.embedding_info ?? {
+        provider: 'host-managed repository',
+        readiness: 'host_managed',
+      },
       close: onceAsync(() => storage!.close()),
     };
-  } catch {
+  } catch (error) {
     await storage?.close().catch(() => undefined);
-    throw new Error('Production B runtime readiness check failed');
+    throw operationalError('Production B runtime readiness check failed', error);
   }
 }
 
@@ -99,13 +118,81 @@ async function createPostgresStorage(
     new Pool({ connectionString: databaseUrl, connectionTimeoutMillis: 10_000 });
   const close = onceAsync(() => pool.end());
   try {
-    const repository = new PgMemoryRepository({ pool });
+    const embedding = resolveProductionEmbedding(env, options);
+    await verifyEmbeddingReadiness(embedding.provider);
+    const repository = new PgMemoryRepository({ pool, embedding: embedding.provider });
     await repository.listAgentIds();
-    return { repository, close };
-  } catch {
+    return { repository, close, embedding_info: embedding.info };
+  } catch (error) {
     await close().catch(() => undefined);
-    throw new Error('PostgreSQL B memory storage readiness check failed');
+    throw operationalError(
+      'PostgreSQL B memory storage readiness check failed',
+      error,
+      databaseUrl,
+    );
   }
+}
+
+function resolveProductionEmbedding(
+  env: NodeJS.ProcessEnv,
+  options: ProductionBRuntimeFactoryOptions,
+): { provider: EmbeddingProvider; info: BEmbeddingRuntimeInfo } {
+  if (options.embedding) {
+    return {
+      provider: options.embedding,
+      info: {
+        provider: 'host-injected EmbeddingProvider',
+        dimensions: options.embedding.dimensions,
+        readiness: 'verified',
+      },
+    };
+  }
+
+  const configuredDir = env.NEWIDE_LITELLM_CONFIG_DIR?.trim();
+  const configDir = configuredDir
+    ? path.resolve(options.repoRoot ?? process.cwd(), configuredDir)
+    : undefined;
+  const client = new LiteLLMClient().loadConfig(configDir);
+  const route = client.modelPool.resolve('embed');
+  const dimensions = readEmbeddingDimensions(env, client.dimensions);
+  return {
+    provider: new LiteLLMEmbeddingProvider(client, dimensions),
+    info: {
+      provider: `LiteLLM:${route.provider}`,
+      task: 'embed',
+      model: route.model,
+      dimensions,
+      readiness: 'verified',
+    },
+  };
+}
+
+async function verifyEmbeddingReadiness(provider: EmbeddingProvider): Promise<void> {
+  const vector = await provider.embed('newIDE B memory readiness probe');
+  if (vector.length !== provider.dimensions) {
+    throw new Error(
+      `Embedding dimension mismatch: configured ${String(provider.dimensions)}, received ${String(vector.length)}`,
+    );
+  }
+  if (vector.length === 0 || vector.some((value) => !Number.isFinite(value))) {
+    throw new Error('Embedding readiness probe returned an invalid vector');
+  }
+}
+
+function readEmbeddingDimensions(env: NodeJS.ProcessEnv, fallback: number): number {
+  const raw = env.NEWIDE_B_EMBEDDING_DIMENSIONS?.trim() ?? env.EMBEDDING_DIMENSIONS?.trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error('NEWIDE_B_EMBEDDING_DIMENSIONS must be a positive integer');
+  }
+  return parsed;
+}
+
+function operationalError(prefix: string, error: unknown, secret?: string): Error {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const safeMessage = secret ? rawMessage.replaceAll(secret, '[REDACTED]') : rawMessage;
+  return new Error(`${prefix}: ${safeMessage}`, { cause: error });
 }
 
 async function seedCatalog(

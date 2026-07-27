@@ -2,6 +2,14 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+export interface AgentRuntimePromptEvidence {
+  policy_id: string;
+  persona_ref: string;
+  persona_version: number;
+  persona_generated_at: string;
+  system_prompt_sha256?: string;
+}
+
 export interface AgentContextPackEvidence {
   context_pack_id: string;
   task_id: string;
@@ -18,6 +26,7 @@ export interface AgentContextPackEvidence {
   driver_context: unknown;
   /** Exact merged context serialized into A's DriverPrompt. */
   driver_invocation_context?: unknown;
+  agent_runtime: AgentRuntimePromptEvidence;
   created_at: string;
   schema_version: string;
 }

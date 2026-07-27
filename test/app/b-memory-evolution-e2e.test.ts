@@ -3,9 +3,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import {
-  BMemoryBackendService,
-} from '../../src/app/b-memory-backend-service';
+import { BMemoryBackendService } from '../../src/app/b-memory-backend-service';
+import { createBPublicCapabilities } from '../../src/app/b-public-capabilities';
 import {
   BMemoryMaintenanceRunner,
   FileBMemoryMaintenanceEvidenceStore,
@@ -62,14 +61,16 @@ describe('B memory evolution end to end', () => {
       {
         kind: 'experience_extraction',
         status: 'completed',
-        experiences: [expect.objectContaining({ content: 'Keep B behind public application ports.' })],
+        experiences: [
+          expect.objectContaining({ content: 'Keep B behind public application ports.' }),
+        ],
       },
     ]);
 
     await facade.runAgent(request('task_002', 'Apply the architecture lesson to the next task.'));
     await maintenance.waitForIdle();
 
-    const secondContext = JSON.parse(driver.prompts[1]!.prompt) as {
+    const secondContext = parseDriverContext(driver.prompts[1]!.prompt) as {
       experiences: Array<{ content: string }>;
     };
     expect(secondContext.experiences).toEqual(
@@ -128,7 +129,23 @@ describe('B memory evolution end to end', () => {
     });
 
     const dispatcher = memoryDispatcher(
-      new BMemoryBackendService(repository, maintenance),
+      new BMemoryBackendService(
+        createBPublicCapabilities(
+          {
+            repository,
+            bufferRepository,
+            app_state_root: root,
+            market_agent_ids: ['role_ts_engineer'],
+            embedding_info: {
+              provider: 'test',
+              dimensions: 4,
+              readiness: 'host_managed',
+            },
+            close: async () => undefined,
+          },
+          maintenance,
+        ),
+      ),
     );
     await expect(
       dispatcher.dispatch({
@@ -154,7 +171,6 @@ describe('B memory evolution end to end', () => {
         skills: [{ id: storedSkill!.id, review_status: 'pending' }],
       },
     });
-
   });
 });
 
@@ -169,6 +185,10 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
   }).register(dispatcher);
   return dispatcher;
+}
+
+function parseDriverContext(prompt: string): unknown {
+  return JSON.parse(prompt.split('\n\n---\n', 1)[0]!);
 }
 
 function request(taskId: string, instruction: string) {
