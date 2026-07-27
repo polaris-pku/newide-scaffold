@@ -34,6 +34,8 @@ import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
 import { FileRunAuditWriter } from './run-audit-writer';
 import { FileDriverStreamAuditWriter } from './driver-stream-audit-writer';
+import { ProductionGateExecutor } from './production-gate-executor';
+import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
 import { TaskProcessor } from './task-processor';
@@ -63,6 +65,7 @@ export interface ProductionBackendServiceDependencies {
   memoryLlm?: LlmClient;
   memoryMaintenance?: BMemoryMaintenanceRunner;
   bRuntime?: BackendBRuntime;
+  gateExecutor?: IntegrationV0GateExecutor;
 }
 
 export async function createProductionBackendService(
@@ -70,6 +73,7 @@ export async function createProductionBackendService(
   dependencies: ProductionBackendServiceDependencies = {},
 ): Promise<NewideBackendService> {
   const repoRoot = process.cwd();
+  const runsRoot = path.join(repoRoot, '.newide', 'runs');
   const runnerDir = path.resolve(
     env.ACP_DRIVER_RUNNER_DIR ?? path.join(repoRoot, '..', 'acp-client-prototype'),
   );
@@ -186,6 +190,12 @@ export async function createProductionBackendService(
           ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
         }),
       }),
+      gateExecutor:
+        dependencies.gateExecutor ??
+        new ProductionGateExecutor({
+          runsRoot,
+          env,
+        }),
     });
     const bMemoryService = new BMemoryBackendService(
       bCapabilities,
@@ -198,7 +208,6 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
 
-    const runsRoot = path.join(repoRoot, '.newide', 'runs');
     const configuredDatabasePath =
       env.NEWIDE_COORDINATION_DB ?? path.join(repoRoot, '.newide', 'coordination.sqlite');
     const databasePath =
