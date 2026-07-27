@@ -5,7 +5,10 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type ArtifactRef } from '../../src/core';
 import { runIntegrationV0Flow } from '../../src/coordinator/integration-v0-flow';
-import { SynthesisAgentCouncilProvider } from '../../src/council';
+import {
+  SynthesisAgentCouncilProvider,
+  type CouncilParticipantResolver,
+} from '../../src/council';
 import type {
   AgentExecutionFacade,
   AgentExecutionRequest,
@@ -37,6 +40,7 @@ describe('Council end-to-end coordinator slice', () => {
       agentExecutionFacade: facade,
       councilProvider: new SynthesisAgentCouncilProvider({
         agentExecutionFacade: facade,
+        participantResolver: testParticipantResolver(),
         councilRoot,
       }),
       councilRoot,
@@ -47,10 +51,10 @@ describe('Council end-to-end coordinator slice', () => {
     expect(result.summary.status).toBe('completed');
     expect(requests.map((request) => request.role_id)).toEqual([
       'role_ts_engineer',
-      'proposer_a',
-      'proposer_b',
-      'reviewer',
-      'synthesizer',
+      'role_backend_proposer',
+      'role_frontend_proposer',
+      'role_security_reviewer',
+      'role_release_synthesizer',
     ]);
     expect(requests[0]?.workspace_path).toBe(
       path.join(councilRoot, result.run_id, 'primary'),
@@ -60,13 +64,25 @@ describe('Council end-to-end coordinator slice', () => {
     const deliveredSha = createHash('sha256').update(delivered).digest('hex');
     expect(result.selection_result.council_result).toMatchObject({
       quality: 'verified',
-      final_artifact_ref: 'artifact_synthesizer',
+      final_artifact_ref: 'artifact_role_release_synthesizer',
       final_artifact_sha256: deliveredSha,
       warnings: [],
       unmet_criteria: [],
     });
     expect(result.frontend_snapshot.council?.result).toEqual(
       result.selection_result.council_result,
+    );
+    expect(result.frontend_snapshot.council?.participants).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          seat: 'reviewer',
+          agent_id: 'role_security_reviewer',
+        }),
+        expect.objectContaining({
+          seat: 'synthesizer',
+          agent_id: 'role_release_synthesizer',
+        }),
+      ]),
     );
     await expect(
       fs.readFile(path.join(runsRoot, result.run_id, 'council', 'result.json'), 'utf-8'),
@@ -79,13 +95,15 @@ function createCouncilFacade(requests: AgentExecutionRequest[]): AgentExecutionF
     async runAgent(input) {
       requests.push(input);
       const artifacts =
-        input.role_id === 'reviewer'
+        input.context_policy === 'council_reviewer'
           ? []
           : [
               artifact(
                 `artifact_${input.role_id}`,
-                input.role_id === 'synthesizer' ? 'final.ts' : `${input.role_id}.ts`,
-                input.role_id === 'synthesizer'
+                input.context_policy === 'council_synthesizer'
+                  ? 'final.ts'
+                  : `${input.role_id}.ts`,
+                input.context_policy === 'council_synthesizer'
                   ? 'export const finalValue = 42;\n'
                   : `export const candidate = '${input.role_id}';\n`,
               ),
@@ -100,7 +118,7 @@ function createCouncilFacade(requests: AgentExecutionRequest[]): AgentExecutionF
         transcript_ref: transcript(input.role_id),
         session_id: `session_${input.role_id}`,
         response:
-          input.role_id === 'reviewer'
+          input.context_policy === 'council_reviewer'
             ? structuredReviews(input.instruction)
             : `${input.role_id} completed`,
         tool_events: [],
@@ -114,6 +132,39 @@ function createCouncilFacade(requests: AgentExecutionRequest[]): AgentExecutionF
         created_at: '2026-07-18T00:00:00.000Z',
         schema_version: SCHEMA_VERSION,
       };
+    },
+  };
+}
+
+function testParticipantResolver(): CouncilParticipantResolver {
+  return {
+    async resolve() {
+      return [
+        {
+          participant_id: 'participant_backend_proposer',
+          seat: 'proposer',
+          seat_index: 0,
+          agent_id: 'role_backend_proposer',
+        },
+        {
+          participant_id: 'participant_frontend_proposer',
+          seat: 'proposer',
+          seat_index: 1,
+          agent_id: 'role_frontend_proposer',
+        },
+        {
+          participant_id: 'participant_security_reviewer',
+          seat: 'reviewer',
+          seat_index: 0,
+          agent_id: 'role_security_reviewer',
+        },
+        {
+          participant_id: 'participant_release_synthesizer',
+          seat: 'synthesizer',
+          seat_index: 0,
+          agent_id: 'role_release_synthesizer',
+        },
+      ];
     },
   };
 }

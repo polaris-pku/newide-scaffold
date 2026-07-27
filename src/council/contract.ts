@@ -8,6 +8,7 @@ import type {
   Timestamp,
 } from '../core';
 import type { DriverStreamEventListener } from '../driver/contract';
+import type { CouncilParticipantBinding } from './council-participant';
 
 export type CouncilDecisionMode =
   | 'advisory'
@@ -136,6 +137,7 @@ export interface CouncilRunResult {
   council_run_id: string;
   run_id?: RunId;
   task_id: TaskId;
+  participants?: CouncilParticipantBinding[];
   proposals: Proposal[];
   reviews: Review[];
   synthesis?: CouncilSynthesis;
@@ -160,6 +162,7 @@ export interface CouncilRunRequest {
   candidate_artifacts?: ArtifactRef[];
   context_pack_ref?: string;
   participant_profile_refs?: string[];
+  participants?: CouncilParticipantBinding[];
   proposals: Proposal[];
   reviews?: Review[];
   evidence_pack?: EvidencePack;
