@@ -218,6 +218,10 @@ export class NewideBackendService {
     return this.requireBMemoryService().listAgents();
   }
 
+  getMemoryCapabilities() {
+    return this.requireBMemoryService().getCapabilities();
+  }
+
   getMemoryAgent(roleId: string): Promise<AgentBoardAgentView> {
     return this.requireBMemoryService().getAgent(roleId);
   }
