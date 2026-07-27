@@ -61,14 +61,13 @@ import type {
   PersistedMailboxEnvelope,
   SaveMailboxReplyResult,
 } from '../persistence';
-import type {
-  AgentBoardAgentView,
-  AgentBoardListItem,
-  ExperienceView,
-  SkillView,
-} from '../memory';
+import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
+import {
+  NoopDriverStreamAuditWriter,
+  type DriverStreamAuditWriter,
+} from './driver-stream-audit-writer';
 
 export interface RunCreateParams {
   prompt: string;
@@ -178,6 +177,7 @@ export class NewideBackendService {
     private readonly mailboxRecovery: Promise<unknown> = Promise.resolve(),
     private readonly closeRuntime: () => Promise<void> | void = () => undefined,
     private readonly bMemoryService?: BMemoryBackendService,
+    private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new NoopDriverStreamAuditWriter(),
   ) {}
 
   close(): Promise<void> {
@@ -234,10 +234,7 @@ export class NewideBackendService {
     return this.requireBMemoryService().listMaintenance(roleId);
   }
 
-  promoteMemorySkills(
-    roleId: string,
-    requestedBy: string,
-  ): Promise<BMemoryMaintenanceEvidence> {
+  promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
   }
 
@@ -458,6 +455,7 @@ export class NewideBackendService {
       let identity: { run_id: string; task_id: string } | undefined;
       const pendingTelemetry: TelemetryRecord[] = [];
       const pendingEvents: Event[] = [];
+      const pendingDriverEvents: DriverStreamEvent[] = [];
       const telemetry: TelemetrySink = {
         emit: (record) => {
           if (!identity) {
@@ -480,12 +478,11 @@ export class NewideBackendService {
           telemetry,
           signal: controller.signal,
           onDriverEvent: (event) => {
-            const driverEvent = toDriverStreamDomainEvent(event);
             if (!identity) {
-              pendingEvents.push(driverEvent);
+              pendingDriverEvents.push(event);
               return;
             }
-            this.appendDomainEvent(identity, driverEvent);
+            this.appendDriverStreamEvent(identity, event);
           },
           onEvent: (event) => {
             if (!identity) {
@@ -549,6 +546,7 @@ export class NewideBackendService {
               this.notifyTaskListeners(created.task_id, event);
             });
             for (const event of pendingEvents) this.appendDomainEvent(created, event);
+            for (const event of pendingDriverEvents) this.appendDriverStreamEvent(created, event);
             this.registry.appendEvent(
               created.run_id,
               'run.started',
@@ -816,8 +814,20 @@ export class NewideBackendService {
     });
   }
 
+  private appendDriverStreamEvent(
+    identity: { run_id: string; task_id: string },
+    event: DriverStreamEvent,
+  ): void {
+    void this.driverStreamAuditWriter
+      .append(identity.run_id, identity.task_id, event)
+      .catch(() => undefined);
+    const projected = projectDriverStreamLifecycleEvent(event);
+    if (projected) this.appendDomainEvent(identity, projected);
+  }
+
   private async persistTerminal(runId: string, staged: StagedTerminalTransition): Promise<void> {
     try {
+      await this.driverStreamAuditWriter.flush(runId);
       await this.auditWriter.flush(runId);
       const terminalEvidence = await this.terminalWriter.finalize(staged.snapshot);
       const projected = projectRunSnapshot(staged.snapshot);
@@ -977,19 +987,51 @@ function toDomainEvent(event: AppRunEvent): Event {
   };
 }
 
-function toDriverStreamDomainEvent(event: DriverStreamEvent): Event {
+function projectDriverStreamLifecycleEvent(event: DriverStreamEvent): Event | undefined {
   const payload: Record<string, unknown> = {
-    driver_event_type: event.event_type,
-    event_payload: event.payload ?? null,
     ...(event.session_id ? { session_id: event.session_id } : {}),
     ...(event.role_id ? { role_id: event.role_id } : {}),
     ...(event.sequence !== undefined ? { event_sequence: event.sequence } : {}),
-    ...(event.run_id ? { driver_run_id: event.run_id } : {}),
-    ...(event.task_id ? { driver_task_id: event.task_id } : {}),
   };
+  const rawPayload = recordValue(event.payload);
+  const update = recordValue(rawPayload?.update);
+  let eventType: string;
+  switch (event.event_type) {
+    case 'driver.turn_started':
+    case 'turn_started':
+      eventType = 'driver.turn_started';
+      break;
+    case 'driver.turn_completed':
+    case 'turn_completed':
+      eventType = 'driver.turn_completed';
+      addString(payload, 'stop_reason', update?.stopReason);
+      break;
+    case 'driver.turn_failed':
+    case 'turn_failed':
+      eventType = 'driver.turn_failed';
+      addString(payload, 'reason', update?.reason);
+      break;
+    case 'driver.interrupt_requested':
+      eventType = 'driver.interrupt_requested';
+      addString(payload, 'reason', rawPayload?.reason);
+      break;
+    case 'tool_call':
+      eventType = 'driver.tool_started';
+      addToolIdentity(payload, update);
+      break;
+    case 'tool_call_update': {
+      const status = update?.status;
+      if (status !== 'completed' && status !== 'failed') return undefined;
+      eventType = status === 'completed' ? 'driver.tool_completed' : 'driver.tool_failed';
+      addToolIdentity(payload, update);
+      break;
+    }
+    default:
+      return undefined;
+  }
   return {
     event_id: createId('run_event'),
-    event_type: 'driver.stream_event',
+    event_type: eventType,
     subject_id: event.run_id ?? event.session_id ?? event.event_type,
     ...(event.run_id ? { run_id: event.run_id } : {}),
     ...(event.task_id ? { task_id: event.task_id } : {}),
@@ -997,6 +1039,27 @@ function toDriverStreamDomainEvent(event: DriverStreamEvent): Event {
     created_at: event.created_at ?? new Date().toISOString(),
     schema_version: SCHEMA_VERSION,
   };
+}
+
+function addToolIdentity(
+  payload: Record<string, unknown>,
+  update: Record<string, unknown> | undefined,
+): void {
+  addString(payload, 'tool_call_id', update?.toolCallId);
+  addString(payload, 'title', update?.title);
+  const meta = recordValue(update?._meta);
+  const claudeCode = recordValue(meta?.claudeCode);
+  addString(payload, 'tool_name', claudeCode?.toolName);
+}
+
+function addString(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (typeof value === 'string' && value.length > 0) target[key] = value;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 function terminalStatus(status: AppRunSnapshot['status']): 'completed' | 'failed' | 'cancelled' {
