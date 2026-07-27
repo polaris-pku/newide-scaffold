@@ -16,6 +16,9 @@ export interface AgentContextPackEvidence {
   run_id: string;
   agent_id: string;
   role_id: string;
+  participant_id?: string;
+  council_seat?: 'proposer' | 'reviewer' | 'synthesizer';
+  council_seat_index?: number;
   context_policy: string;
   input_artifact_refs: string[];
   memory_buffer_ref: string;

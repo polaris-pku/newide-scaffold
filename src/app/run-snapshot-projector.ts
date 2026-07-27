@@ -121,6 +121,9 @@ function projectCouncil(
     required_next_actions: [...(council?.output?.required_next_actions ?? [])],
     blocked_by: [...(council?.output?.blocked_by ?? [])],
     can_create_merge_authorization: council?.can_create_merge_authorization ?? false,
+    ...(council?.participants
+      ? { participants: asRecords(council.participants) }
+      : {}),
     ...(council?.proposals ? { proposals: asRecords(council.proposals) } : {}),
     ...(council?.reviews ? { reviews: asRecords(council.reviews) } : {}),
     ...(council?.synthesis ? { synthesis: asRecord(council.synthesis) } : {}),

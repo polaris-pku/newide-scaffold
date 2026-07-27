@@ -273,6 +273,9 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           task_id: input.task_id,
           run_id: executionRunId,
           role_id: participant.agent_id,
+          participant_id: participant.participant_id,
+          council_seat: participant.seat,
+          council_seat_index: participant.seat_index,
           instruction,
           workspace_path: workspacePath,
           input_artifact_refs: inputArtifactRefs,
@@ -434,6 +437,7 @@ function participantAuditPayload(
 ): Record<string, unknown> {
   return {
     participant_id: participant.participant_id,
+    seat: participant.seat,
     council_seat: participant.seat,
     seat_index: participant.seat_index,
     agent_id: participant.agent_id,

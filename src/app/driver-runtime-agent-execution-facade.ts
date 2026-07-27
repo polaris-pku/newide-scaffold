@@ -526,6 +526,11 @@ export class DriverRuntimeAgentExecutionFacade
       run_id: input.run_id,
       agent_id: runtimeRoleId,
       role_id: input.role_id,
+      ...(input.participant_id ? { participant_id: input.participant_id } : {}),
+      ...(input.council_seat ? { council_seat: input.council_seat } : {}),
+      ...(input.council_seat_index !== undefined
+        ? { council_seat_index: input.council_seat_index }
+        : {}),
       context_policy: input.context_policy,
       input_artifact_refs: input.input_artifact_refs,
       memory_buffer_ref: memoryBufferRef,
@@ -541,6 +546,11 @@ export class DriverRuntimeAgentExecutionFacade
       run_id: input.run_id,
       agent_id: runtimeRoleId,
       role_id: input.role_id,
+      ...(input.participant_id ? { participant_id: input.participant_id } : {}),
+      ...(input.council_seat ? { council_seat: input.council_seat } : {}),
+      ...(input.council_seat_index !== undefined
+        ? { council_seat_index: input.council_seat_index }
+        : {}),
       context_policy: input.context_policy,
       input_artifact_refs: [...input.input_artifact_refs],
       memory_buffer_ref: memoryBufferRef,
