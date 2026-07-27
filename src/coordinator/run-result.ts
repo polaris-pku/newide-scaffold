@@ -14,6 +14,8 @@ import type { SelectionMode } from './artifact-finalizer';
 import type { ArtifactOutput } from './artifact-output';
 import type { CouncilDecision } from '../council';
 import type { MaterializationFailure, MaterializationResult } from './worktree-materializer';
+import type { CompletionCriteriaEvaluation } from './completion-criteria-evaluator';
+import type { RunOutcome } from './run-outcome';
 
 export type RunResultStatus = 'completed' | 'failed';
 
@@ -33,6 +35,8 @@ export interface IntegrationRunResultManifest {
   run_id: RunId;
   task_id: TaskId;
   status: RunResultStatus;
+  run_outcome: RunOutcome;
+  completion_evaluation: CompletionCriteriaEvaluation;
   mode: SelectionMode;
   driver_id: string;
   artifact_outputs: ArtifactOutput[];
@@ -92,6 +96,8 @@ export interface BuildRunResultManifestInput {
   run_id: RunId;
   task_id: TaskId;
   status: RunResultStatus;
+  run_outcome: RunOutcome;
+  completion_evaluation: CompletionCriteriaEvaluation;
   mode: SelectionMode;
   driver_id: string;
   artifact_outputs: readonly ArtifactOutput[];
@@ -125,6 +131,8 @@ export function buildRunResultManifest(
     run_id: input.run_id,
     task_id: input.task_id,
     status: input.status,
+    run_outcome: input.run_outcome,
+    completion_evaluation: input.completion_evaluation,
     mode: input.mode,
     driver_id: input.driver_id,
     artifact_outputs: [...input.artifact_outputs],
