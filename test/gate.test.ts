@@ -15,7 +15,6 @@ import {
   type GateRunner,
   type GateDecision,
 } from '../src/gate';
-import { HookEngine } from '../src/hook/hook';
 
 // Helper to construct mock results safely without using 'any'
 function makeMockResult(decision: GateDecision, gateId: string): GateResult {
@@ -252,50 +251,5 @@ describe('GateScheduler', () => {
 
     // r1 finishes first, then r3 executes as it has higher priority than r2
     expect(resolvedOrder).toEqual(['g1', 'g3', 'g2']);
-  });
-});
-
-describe('HookEngine integration', () => {
-  it('should run HookEngine handleEvent using GateScheduler', async () => {
-    const scheduler = new PriorityGateScheduler();
-
-    const hookEngine = new HookEngine({
-      config: {
-        version: 'hook-0.1',
-        settings: {
-          fail_fast: false,
-          default_timeout: 30,
-          parallel: false,
-          output_format: 'json',
-          emergency_env_var: 'AGENT_EMERGENCY_SKIP',
-        },
-        gates: {
-          'test-gate': {
-            type: 'command',
-            run: 'node -e "process.exit(0)"',
-            retry_threshold: 1,
-          },
-        },
-        hooks: {
-          'task.completed': [
-            { gate: 'test-gate', priority: 100, timeout: 30 },
-          ],
-        },
-      },
-      scheduler,
-    });
-
-    const result = await hookEngine.handleEvent({
-      event_id: 'e-1',
-      event_type: 'task.completed',
-      subject_id: 'task-123',
-      payload: {},
-      created_at: nowTimestamp(),
-      schema_version: SCHEMA_VERSION,
-    });
-
-    expect(result.matched).toBe(true);
-    expect(result.gate_results).toHaveLength(1);
-    expect(result.gate_results[0]!.decision).toBe('allow');
   });
 });

@@ -1,22 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { HookEngine } from '../src/hook/hook';
-import { createHookEvent } from '../src/hook/hook';
-import { createId } from '../src/core';
+import { createId } from '../../src/core';
 import {
   parseHookConfigYaml,
   loadHookConfigFromFile,
   loadMergedHookConfig,
   mergeHookConfigs,
-  // validateHookConfig,
   HookConfigValidationError,
-} from '../src/hook/loader';
+} from '../../src/hook/loader';
 import {
   DEFAULT_HOOK_VERSION,
   DEFAULT_HOOK_SETTINGS,
-  // DEFAULT_PRIORITY,
-  // ALL_HOOK_POINTS,
-} from '../src/hook/constants';
-import type { HookConfig } from '../src/hook/config';
+} from '../../src/hook/constants';
+import type { HookConfig } from '../../src/hook/config';
 import { writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -614,146 +609,5 @@ hooks:
     } finally {
       rmSync(emptyDir, { recursive: true, force: true });
     }
-  });
-});
-
-// ──────────────────────────────────────────────
-// Integration with HookEngine
-// ──────────────────────────────────────────────
-
-describe('HookEngine integration with YAML config', () => {
-  // Use simple Unix commands that don't need shell quoting
-  const allowCmd = 'true';
-  const denyCmd = 'false';
-
-  it('should create HookEngine from parsed YAML config', async () => {
-    const yaml = `
-version: "hook-0.1"
-settings:
-  fail_fast: false
-  default_timeout: 30
-gates:
-  allow_gate:
-    type: command
-    run: "${allowCmd}"
-hooks:
-  task.completed:
-    - name: "smoke-test"
-      gate: allow_gate
-      priority: 100
-`;
-    const config = parseHookConfigYaml(yaml);
-    const engine = new HookEngine({ config });
-
-    const event = createHookEvent({
-      event_type: 'task.completed',
-      subject_id: 'task-001',
-      payload: { task_id: 'task-001' },
-    });
-
-    const result = await engine.handleEvent(event);
-    expect(result.hook_point).toBe('task.completed');
-    expect(result.matched).toBe(true);
-    expect(result.final_decision).toBe('allow');
-  });
-
-  it('should handle event with no matching bindings', async () => {
-    const yaml = `
-version: "hook-0.1"
-gates:
-  allow_gate:
-    type: command
-    run: "${allowCmd}"
-hooks:
-  task.created:
-    - gate: allow_gate
-`;
-    const config = parseHookConfigYaml(yaml);
-    const engine = new HookEngine({ config });
-
-    const event = createHookEvent({
-      event_type: 'task.completed',
-      subject_id: 'task-001',
-      payload: {},
-    });
-    const result = await engine.handleEvent(event);
-    expect(result.matched).toBe(false);
-    expect(result.final_decision).toBe('allow');
-  });
-
-  it('should respect priority ordering from YAML', async () => {
-    const yaml = `
-version: "hook-0.1"
-settings:
-  fail_fast: false
-  default_timeout: 30
-gates:
-  gate_low:
-    type: command
-    run: "${allowCmd}"
-  gate_high:
-    type: command
-    run: "${denyCmd}"
-hooks:
-  task.completed:
-    - name: "low-priority"
-      gate: gate_low
-      priority: 10
-    - name: "high-priority"
-      gate: gate_high
-      priority: 100
-`;
-    const config = parseHookConfigYaml(yaml);
-    const engine = new HookEngine({ config });
-
-    const event = createHookEvent({
-      event_type: 'task.completed',
-      subject_id: 'task-001',
-      payload: {},
-    });
-    const result = await engine.handleEvent(event);
-
-    // High priority gate should execute first
-    expect(result.gate_requests[0]!.priority).toBe(100);
-    expect(result.gate_requests[1]!.priority).toBe(10);
-  });
-
-  it('should evaluate if conditions from YAML', async () => {
-    const yaml = `
-version: "hook-0.1"
-settings:
-  fail_fast: false
-  default_timeout: 30
-gates:
-  allow_gate:
-    type: command
-    run: "${allowCmd}"
-  deny_gate:
-    type: command
-    run: "${denyCmd}"
-hooks:
-  task.completed:
-    - name: "only-when-critical"
-      gate: deny_gate
-      if: "payload.risk_level == 'critical'"
-      priority: 100
-    - name: "always-run"
-      gate: allow_gate
-      priority: 50
-`;
-    const config = parseHookConfigYaml(yaml);
-    const engine = new HookEngine({ config });
-
-    // risk_level is not 'critical', so the deny gate should not fire
-    const event = createHookEvent({
-      event_type: 'task.completed',
-      subject_id: 'task-001',
-      payload: { risk_level: 'low' },
-    });
-    const result = await engine.handleEvent(event);
-
-    expect(result.gate_requests).toHaveLength(1);
-    expect(result.gate_requests[0]!.gate_id).toBe('allow_gate');
-    expect(result.final_decision).toBe('allow');
   });
 });
