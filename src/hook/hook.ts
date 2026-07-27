@@ -151,14 +151,25 @@ export class HookEngine {
       this.toGateRequest(event, entry),
     );
 
-    // Execute gates sequentially, respecting priority order and fail_fast
+    // Execute gates — parallel or sequential based on settings
     const gateResults: GateResult[] = [];
-    for (const request of gateRequests) {
-      const result = await this.scheduler.insert(request);
-      gateResults.push(result);
-      // Stop early when fail_fast is enabled and a gate denies
-      if (this.settings.fail_fast && result.decision === 'deny') {
-        break;
+    if (this.settings.parallel) {
+      // Send all gate requests concurrently via Promise.all.
+      // Note: fail_fast has no early-termination effect in parallel mode
+      // since all gates are already in-flight.
+      const results = await Promise.all(
+        gateRequests.map((request) => this.scheduler.insert(request)),
+      );
+      gateResults.push(...results);
+    } else {
+      // Execute gates sequentially, respecting priority order and fail_fast
+      for (const request of gateRequests) {
+        const result = await this.scheduler.insert(request);
+        gateResults.push(result);
+        // Stop early when fail_fast is enabled and a gate denies
+        if (this.settings.fail_fast && result.decision === 'deny') {
+          break;
+        }
       }
     }
 
