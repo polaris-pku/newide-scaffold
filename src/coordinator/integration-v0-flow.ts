@@ -27,8 +27,8 @@ import {
   DeliverArtifactHandler,
   type DeliverArtifactResult,
 } from './handlers/deliver-artifact-handler';
-import { HookEngine, type HookEvent, type HookResult } from '../hook';
-import { DecisionAggregator, type GateResult } from '../gate';
+import type { HookEvent, HookResult } from '../hook';
+import type { GateResult } from '../gate';
 import { MockMemoryProvider } from '../memory';
 import { RuntimeOrchestrator } from './orchestrator';
 import type { TelemetrySink } from '../telemetry/telemetry-sink';
@@ -73,6 +73,10 @@ import {
   type CompletionCriteriaEvaluation,
 } from './completion-criteria-evaluator';
 import { isCompletedRunOutcome, type RunOutcome } from './run-outcome';
+import {
+  BestEffortGateExecutor,
+  type IntegrationV0GateExecutor,
+} from './gate-executor';
 
 export interface IntegrationV0TimelineItem {
   name: string;
@@ -166,6 +170,7 @@ export interface IntegrationV0Options {
   selectAgentHandler?: Pick<SelectAgentHandler, 'execute'>;
   deliverArtifactHandler?: DeliverArtifactHandler;
   hookEngine?: IntegrationV0HookEngine;
+  gateExecutor?: IntegrationV0GateExecutor;
   materializer?: IntegrationV0Materializer;
   worktreePath?: string;
   runsRoot?: string;
@@ -618,37 +623,20 @@ export async function runIntegrationV0Flow(
   });
   timeline.push({ name: 'PrimaryAgentCompleted', id: primaryCompletedEvent.event_id });
 
-  const hookEngine =
-    options?.hookEngine ??
-    new HookEngine({
-      config: {
-        version: 'hook-0.1',
-        settings: {
-          fail_fast: false,
-          default_timeout: 30,
-          parallel: false,
-          output_format: 'json',
-          emergency_env_var: 'AGENT_EMERGENCY_SKIP',
-        },
-        gates: {
-          'allow-gate': {
-            type: 'command',
-            run: 'node -e "process.exit(0)"',
-            retry_threshold: 1,
-          },
-        },
-        hooks: {
-          'task.completed': [{ gate: 'allow-gate', priority: 100, timeout: 30 }],
-          'council.completed': [{ gate: 'allow-gate', priority: 100, timeout: 30 }],
-        },
-      },
-      aggregator: new DecisionAggregator(),
-    });
-
-  const hookResult = await hookEngine.handleEvent({
-    ...primaryCompletedEvent,
-    event_type: 'task.completed',
-  });
+  const gateExecutor = options?.gateExecutor ?? new BestEffortGateExecutor();
+  const hookResult = options?.hookEngine
+    ? await options.hookEngine.handleEvent({
+        ...primaryCompletedEvent,
+        event_type: 'task.completed',
+      })
+    : await gateExecutor.execute({
+        run_id: run.run_id,
+        task_id: task.task_id,
+        phase: options?.enableCouncil ? 'pre_council' : 'pre_selection',
+        workspace_path: options?.workspacePath ?? process.cwd(),
+        completion_criteria: task.completion_criteria,
+        artifact_refs: driverResult.artifacts.map((artifact) => artifact.artifact_id),
+      });
   options?.signal?.throwIfAborted();
 
   const hookEvent = orchestrator.appendEvent({
@@ -822,10 +810,21 @@ export async function runIntegrationV0Flow(
   const postCouncilGateResults: GateResult[] = [];
   const postCouncilGatesRequired = Boolean(councilCompletedEvent);
   if (councilCompletedEvent) {
-    const postCouncilHookResult = await hookEngine.handleEvent({
-      ...councilCompletedEvent,
-      event_type: 'council.completed',
-    });
+    const postCouncilHookResult = options?.hookEngine
+      ? await options.hookEngine.handleEvent({
+          ...councilCompletedEvent,
+          event_type: 'council.completed',
+        })
+      : await gateExecutor.execute({
+          run_id: run.run_id,
+          task_id: task.task_id,
+          phase: 'post_council',
+          workspace_path: options?.workspacePath ?? process.cwd(),
+          completion_criteria: task.completion_criteria,
+          artifact_refs: selectionResult.selected_artifacts.map(
+            (artifact) => artifact.artifact_id,
+          ),
+        });
     options?.signal?.throwIfAborted();
     const usedGateResultIds = new Set(preGateResults.map((gate) => gate.gate_result_id));
     for (const sourceGateResult of postCouncilHookResult.gate_results) {
