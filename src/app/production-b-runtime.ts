@@ -25,13 +25,6 @@ const MARKET_AGENT_CATALOG = [
   },
 ] as const;
 
-const COUNCIL_AGENT_CATALOG = [
-  { role_id: 'proposer_a', name: 'Council Proposer A' },
-  { role_id: 'proposer_b', name: 'Council Proposer B' },
-  { role_id: 'reviewer', name: 'Council Reviewer' },
-  { role_id: 'synthesizer', name: 'Council Synthesizer' },
-] as const;
-
 export interface BMemoryStorage {
   readonly repository: MemoryRepository;
   readonly embedding_info?: BEmbeddingRuntimeInfo;
@@ -211,18 +204,6 @@ async function seedCatalog(
       existing.add(agent.role_id);
     }
   }
-  for (const agent of COUNCIL_AGENT_CATALOG) {
-    if (!existing.has(agent.role_id)) {
-      await repository.initializeAgent({
-        role_id: agent.role_id,
-        name: agent.name,
-        tags: ['council_only'],
-        persona_seed: `${agent.name} participates only in isolated Council execution.`,
-      });
-      existing.add(agent.role_id);
-    }
-  }
-
   for (const roleId of [...existing].sort(compareCodeUnits)) {
     await bufferRepository.ensureAgent(roleId);
   }

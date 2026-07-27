@@ -42,7 +42,10 @@ import { ExternalDriverRuntime } from '../driver/external-driver-runtime';
 import { CommandDriverTransport } from '../driver/command-driver-transport';
 import { MockDriver, type DriverRuntimeHandle } from '../driver';
 import { DriverRuntimeAgentExecutionFacade } from '../app/driver-runtime-agent-execution-facade';
-import { SynthesisAgentCouncilProvider } from '../council';
+import {
+  SynthesisAgentCouncilProvider,
+  type CouncilParticipantResolver,
+} from '../council';
 import { InMemoryBufferRepository, InMemoryRepository, LiteLLMToolCallingClient } from '../memory';
 import { parseIntegrationV0CliArgs } from './integration-v0-options';
 
@@ -137,6 +140,7 @@ try {
         bufferRepository: new InMemoryBufferRepository(),
         llm: new LiteLLMToolCallingClient(),
       }),
+      participantResolver: exampleParticipantResolver(),
     });
   }
 
@@ -174,6 +178,39 @@ try {
   console.error('\n❌ Integration v0 failed:');
   console.error(error);
   process.exit(1);
+}
+
+function exampleParticipantResolver(): CouncilParticipantResolver {
+  return {
+    async resolve() {
+      return [
+        {
+          participant_id: 'example_backend_proposer',
+          seat: 'proposer',
+          seat_index: 0,
+          agent_id: 'role_backend_engineer',
+        },
+        {
+          participant_id: 'example_frontend_proposer',
+          seat: 'proposer',
+          seat_index: 1,
+          agent_id: 'role_frontend_engineer',
+        },
+        {
+          participant_id: 'example_security_reviewer',
+          seat: 'reviewer',
+          seat_index: 0,
+          agent_id: 'role_security_engineer',
+        },
+        {
+          participant_id: 'example_release_synthesizer',
+          seat: 'synthesizer',
+          seat_index: 0,
+          agent_id: 'role_release_engineer',
+        },
+      ];
+    },
+  };
 }
 
 function loadEnvFile(filePath: string): NodeJS.ProcessEnv {
