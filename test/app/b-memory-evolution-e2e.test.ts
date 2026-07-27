@@ -66,16 +66,23 @@ describe('B memory evolution end to end', () => {
         ],
       },
     ]);
+    const firstExperienceId = (
+      firstEvidence[0]?.experiences[0] as { id?: string } | undefined
+    )?.id;
+    expect(firstExperienceId).toEqual(expect.any(String));
 
     await facade.runAgent(request('task_002', 'Apply the architecture lesson to the next task.'));
     await maintenance.waitForIdle();
 
     const secondContext = parseDriverContext(driver.prompts[1]!.prompt) as {
-      experiences: Array<{ content: string }>;
+      experiences: Array<{ id: string; content: string }>;
     };
     expect(secondContext.experiences).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ content: 'Keep B behind public application ports.' }),
+        expect.objectContaining({
+          id: firstExperienceId,
+          content: 'Keep B behind public application ports.',
+        }),
       ]),
     );
   });
@@ -145,8 +152,37 @@ describe('B memory evolution end to end', () => {
           },
           maintenance,
         ),
+        {
+          provider: 'test',
+          model: 'test-embedding',
+          dimensions: 4,
+          readiness: 'verified',
+        },
       ),
     );
+    await expect(
+      dispatcher.dispatch({
+        jsonrpc: '2.0',
+        id: 0,
+        method: 'memory.getCapabilities',
+        params: {},
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        capabilities: {
+          embedding: {
+            provider: 'test',
+            model: 'test-embedding',
+            dimensions: 4,
+          },
+          operations: {
+            promote_skills: { status: 'available' },
+            approve_skill: { status: 'unavailable', reason: expect.any(String) },
+            update_persona: { status: 'unavailable', reason: expect.any(String) },
+          },
+        },
+      },
+    });
     await expect(
       dispatcher.dispatch({
         jsonrpc: '2.0',
@@ -177,6 +213,7 @@ describe('B memory evolution end to end', () => {
 function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
   const dispatcher = new JsonRpcDispatcher();
   new MemoryRpcMethods({
+    getMemoryCapabilities: () => service.getCapabilities(),
     listMemoryAgents: () => service.listAgents(),
     getMemoryAgent: (roleId) => service.getAgent(roleId),
     listMemorySkills: (roleId) => service.listSkills(roleId),
