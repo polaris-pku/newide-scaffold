@@ -1,6 +1,8 @@
-import { createId, type TaskCreateRequest } from '../core';
+import { createId, type Event, type TaskCreateRequest } from '../core';
+import type { DriverStreamEventListener } from '../driver/contract';
 import type {
   PersistedRunMode,
+  PersistedCoordinationEvent,
   PersistedTaskFinalOutput,
   RunEvidenceStore,
   RunStageEvidenceReference,
@@ -25,6 +27,9 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   task_request: TaskCreateRequest;
   workspace_path: string;
   cursor_input: CursorInput<TCursor>;
+  signal?: AbortSignal;
+  on_driver_event?: DriverStreamEventListener;
+  on_event?: (event: Event) => void;
 }
 
 export interface CouncilEscalationRequest {
@@ -62,7 +67,14 @@ export interface CouncilStageResult extends StageResult {
   expected_sha256: string;
 }
 
-export type GateStageResult = StageResult;
+export interface GateStageResult extends StageResult {
+  status?: 'allowed' | 'denied' | 'blocked';
+  error?: {
+    code: string;
+    message: string;
+    details?: Record<string, unknown>;
+  };
+}
 
 export interface DeliverStageResult extends StageResult {
   final_output: PersistedTaskFinalOutput;
@@ -108,6 +120,10 @@ export interface RunTaskExecutionInput {
   task_id: string;
   run_id: string;
   council_override?: boolean;
+  signal?: AbortSignal;
+  on_driver_event?: DriverStreamEventListener;
+  on_event?: (event: Event) => void;
+  on_committed_events?: (events: readonly PersistedCoordinationEvent[]) => void;
 }
 
 export class TaskExecutionLoop {
@@ -131,6 +147,7 @@ export class TaskExecutionLoop {
       this.processor.setCouncilOverride(input.run_id);
     }
     for (;;) {
+      input.signal?.throwIfAborted();
       const state = this.processor.getRunExecutionState(input.run_id);
       assertRunTaskIdentity(state, input.task_id);
       const cursorInput = requireCursorInput(state);
@@ -138,7 +155,7 @@ export class TaskExecutionLoop {
         return this.processor.getTaskSnapshot(input.task_id);
       }
 
-      const result = await this.executeStage(state, cursorInput);
+      const result = await this.executeStage(state, cursorInput, input);
       if (result.snapshot.task.status !== 'running') return result.snapshot;
     }
   }
@@ -146,28 +163,40 @@ export class TaskExecutionLoop {
   private async executeStage(
     state: TaskRunExecutionState,
     cursorInput: Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>,
+    controls: Pick<
+      RunTaskExecutionInput,
+      'signal' | 'on_driver_event' | 'on_event' | 'on_committed_events'
+    >,
   ): Promise<TaskStageCommitResult> {
     const invocationId = this.createInvocationId(cursorInput.cursor);
-    this.processor.startStage({
+    const started = this.processor.startStage({
       run_id: state.run_id,
       expected_cursor: cursorInput.cursor,
       invocation_id: invocationId,
     });
+    controls.on_committed_events?.(started.committed_events);
 
     try {
       switch (cursorInput.cursor) {
         case 'select_agent': {
           const result = await this.executors.select_agent.execute(
-            stageContext(state, cursorInput),
+            stageContext(state, cursorInput, controls),
           );
-          return await this.persistAndAdvance(state, cursorInput.cursor, invocationId, result, {
-            cursor: 'execute_agent',
-            winner_agent_id: result.winner_agent_id,
-          });
+          return await this.persistAndAdvance(
+            state,
+            cursorInput.cursor,
+            invocationId,
+            result,
+            {
+              cursor: 'execute_agent',
+              winner_agent_id: result.winner_agent_id,
+            },
+            controls,
+          );
         }
         case 'execute_agent': {
           const result = await this.executors.execute_agent.execute(
-            stageContext(state, cursorInput),
+            stageContext(state, cursorInput, controls),
           );
           assertChangesetResult(result, 'Primary Agent');
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
@@ -186,7 +215,7 @@ export class TaskExecutionLoop {
                 changeset_ref: result.changeset_ref,
                 expected_sha256: result.expected_sha256,
               };
-          return this.advanceWithEvidence(
+          const committed = this.advanceWithEvidence(
             state,
             cursorInput.cursor,
             invocationId,
@@ -208,31 +237,76 @@ export class TaskExecutionLoop {
                 : {}),
             },
           );
+          controls.on_committed_events?.(committed.committed_events);
+          return committed;
         }
         case 'council': {
-          const result = await this.executors.council.execute(stageContext(state, cursorInput));
+          const result = await this.executors.council.execute(
+            stageContext(state, cursorInput, controls),
+          );
           assertChangesetResult(result, 'Council');
-          return await this.persistAndAdvance(state, cursorInput.cursor, invocationId, result, {
-            cursor: 'gate',
-            subject_ref: result.changeset_ref,
-            phase: 'post_council',
-            changeset_ref: result.changeset_ref,
-            expected_sha256: result.expected_sha256,
-          });
+          return await this.persistAndAdvance(
+            state,
+            cursorInput.cursor,
+            invocationId,
+            result,
+            {
+              cursor: 'gate',
+              subject_ref: result.changeset_ref,
+              phase: 'post_council',
+              changeset_ref: result.changeset_ref,
+              expected_sha256: result.expected_sha256,
+            },
+            controls,
+          );
         }
         case 'gate': {
-          const result = await this.executors.gate.execute(stageContext(state, cursorInput));
+          const result = await this.executors.gate.execute(
+            stageContext(state, cursorInput, controls),
+          );
           assertGateResultIdentity(result, cursorInput);
-          return await this.persistAndAdvance(state, cursorInput.cursor, invocationId, result, {
-            cursor: 'deliver',
-            changeset_ref: cursorInput.changeset_ref,
-            expected_sha256: cursorInput.expected_sha256,
-          });
+          const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
+          if (result.status === 'denied' || result.status === 'blocked') {
+            const committed = this.processor.failStage({
+              run_id: state.run_id,
+              expected_cursor: cursorInput.cursor,
+              invocation_id: invocationId,
+              evidence_ref: evidence,
+              error:
+                result.error ??
+                {
+                  code: result.status === 'denied' ? 'gate_denied' : 'gate_blocked',
+                  message:
+                    result.status === 'denied'
+                      ? 'Production Gate denied the changeset'
+                      : 'Production Gate blocked the changeset',
+                },
+              ...(result.artifact_refs ? { artifact_refs: result.artifact_refs } : {}),
+            });
+            controls.on_committed_events?.(committed.committed_events);
+            return committed;
+          }
+          const committed = this.advanceWithEvidence(
+            state,
+            cursorInput.cursor,
+            invocationId,
+            evidence,
+            {
+              cursor: 'deliver',
+              changeset_ref: cursorInput.changeset_ref,
+              expected_sha256: cursorInput.expected_sha256,
+            },
+            result,
+          );
+          controls.on_committed_events?.(committed.committed_events);
+          return committed;
         }
         case 'deliver': {
-          const result = await this.executors.deliver.execute(stageContext(state, cursorInput));
+          const result = await this.executors.deliver.execute(
+            stageContext(state, cursorInput, controls),
+          );
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
-          return this.advanceWithEvidence(
+          const committed = this.advanceWithEvidence(
             state,
             cursorInput.cursor,
             invocationId,
@@ -244,6 +318,8 @@ export class TaskExecutionLoop {
               ...(result.warnings ? { warnings: result.warnings } : {}),
             },
           );
+          controls.on_committed_events?.(committed.committed_events);
+          return committed;
         }
       }
     } catch (error) {
@@ -260,7 +336,7 @@ export class TaskExecutionLoop {
               failure,
               resultEvidence,
             );
-      return this.processor.failStage({
+      const committed = this.processor.failStage({
         run_id: state.run_id,
         expected_cursor: cursorInput.cursor,
         invocation_id: invocationId,
@@ -268,6 +344,8 @@ export class TaskExecutionLoop {
         ...(failureEvidence ? { evidence_ref: failureEvidence } : {}),
         ...(resultEvidence ? { artifact_refs: [resultEvidence.uri] } : {}),
       });
+      controls.on_committed_events?.(committed.committed_events);
+      return committed;
     }
   }
 
@@ -277,9 +355,19 @@ export class TaskExecutionLoop {
     invocationId: string,
     result: StageResult,
     nextInput: TaskCursorInput,
+    controls: Pick<RunTaskExecutionInput, 'on_committed_events'>,
   ): Promise<TaskStageCommitResult> {
     const evidence = await this.writeEvidence(state.run_id, cursor, result);
-    return this.advanceWithEvidence(state, cursor, invocationId, evidence, nextInput, result);
+    const committed = this.advanceWithEvidence(
+      state,
+      cursor,
+      invocationId,
+      evidence,
+      nextInput,
+      result,
+    );
+    controls.on_committed_events?.(committed.committed_events);
+    return committed;
   }
 
   private advanceWithEvidence(
@@ -373,6 +461,7 @@ class StageAdvanceError extends Error {
 function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbox_wait'>>(
   state: TaskRunExecutionState,
   cursorInput: CursorInput<TCursor>,
+  controls: Pick<RunTaskExecutionInput, 'signal' | 'on_driver_event' | 'on_event'>,
 ): TaskStageExecutionContext<TCursor> {
   return {
     task_id: state.task_id,
@@ -381,6 +470,9 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     task_request: state.task_request,
     workspace_path: state.workspace_path,
     cursor_input: cursorInput,
+    ...(controls.signal ? { signal: controls.signal } : {}),
+    ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
+    ...(controls.on_event ? { on_event: controls.on_event } : {}),
   };
 }
 
