@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type ArtifactRef } from '../../src/core';
 import { DeliverArtifactHandler } from '../../src/coordinator/handlers/deliver-artifact-handler';
+import type { ChangesetManifest } from '../../src/coordinator/changeset-manifest';
 
 describe('DeliverArtifactHandler', () => {
   const created = new Set<string>();
@@ -21,20 +22,32 @@ describe('DeliverArtifactHandler', () => {
     const sha256 = createHash('sha256').update(body).digest('hex');
     const handler = new DeliverArtifactHandler();
 
-    const result = await handler.execute({
-      workspace_path: workspace,
-      final_artifact: artifact(body),
-      expected_sha256: sha256,
-    });
+    const changeset = manifest(workspace, artifact(body), sha256);
+    const result = await handler.execute({ manifest: changeset });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
+      manifest_id: 'changeset_final',
+      idempotency_key: 'deliver:changeset_final',
+      workspace_path: workspace,
       artifact_ref: 'artifact_final',
       relative_path: 'src/final.ts',
       file_path: path.join(workspace, 'src/final.ts'),
       sha256,
       bytes_written: body.byteLength,
+      files: [
+        {
+          artifact_ref: 'artifact_final',
+          relative_path: 'src/final.ts',
+          file_path: path.join(workspace, 'src/final.ts'),
+          sha256,
+          bytes_written: body.byteLength,
+        },
+      ],
     });
     await expect(fs.readFile(result.file_path)).resolves.toEqual(body);
+    await expect(fs.readFile(changeset.paths.delivery_receipt_path, 'utf-8')).resolves.toContain(
+      'changeset_final',
+    );
   });
 
   it('rejects a hash mismatch before completing delivery', async () => {
@@ -44,11 +57,9 @@ describe('DeliverArtifactHandler', () => {
 
     await expect(
       handler.execute({
-        workspace_path: workspace,
-        final_artifact: artifact(Buffer.from('actual')),
-        expected_sha256: '0'.repeat(64),
+        manifest: manifest(workspace, artifact(Buffer.from('actual')), '0'.repeat(64)),
       }),
-    ).rejects.toThrow('Council final artifact SHA256 mismatch');
+    ).rejects.toThrow('Changeset entry changeset_entry_final SHA256 mismatch');
     await expect(fs.stat(path.join(workspace, 'src/final.ts'))).rejects.toThrow();
   });
 
@@ -61,11 +72,30 @@ describe('DeliverArtifactHandler', () => {
 
     await expect(
       new DeliverArtifactHandler().execute({
-        workspace_path: workspace,
-        final_artifact: escaping,
-        expected_sha256: createHash('sha256').update(body).digest('hex'),
+        manifest: manifest(
+          workspace,
+          escaping,
+          createHash('sha256').update(body).digest('hex'),
+        ),
       }),
     ).rejects.toThrow('Artifact target escapes workspace');
+  });
+
+  it('returns the same durable receipt for the same manifest idempotency key', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-delivery-replay-'));
+    created.add(workspace);
+    const body = Buffer.from('stable delivery');
+    const changeset = manifest(
+      workspace,
+      artifact(body),
+      createHash('sha256').update(body).digest('hex'),
+    );
+    const handler = new DeliverArtifactHandler();
+
+    const first = await handler.execute({ manifest: changeset });
+    const second = await handler.execute({ manifest: changeset });
+
+    expect(second).toEqual(first);
   });
 });
 
@@ -82,6 +112,41 @@ function artifact(body: Buffer): ArtifactRef {
       target_path: 'src/final.ts',
       media_type: 'text/typescript',
     },
+    created_at: '2026-07-18T00:00:00.000Z',
+    schema_version: SCHEMA_VERSION,
+  };
+}
+
+function manifest(
+  workspacePath: string,
+  finalArtifact: ArtifactRef,
+  expectedSha256: string,
+): ChangesetManifest {
+  return {
+    manifest_id: 'changeset_final',
+    run_id: 'run_final',
+    task_id: 'task_final',
+    mode: 'council',
+    base: { kind: 'workspace_snapshot', ref: 'workspace-before-run:run_final' },
+    paths: {
+      task_worktree_path: path.join(workspacePath, '.newide', 'worktree'),
+      manifest_path: path.join(workspacePath, '.newide', 'changeset-manifest.json'),
+      delivery_receipt_path: path.join(workspacePath, '.newide', 'delivery.json'),
+      user_workspace_path: workspacePath,
+    },
+    entries: [
+      {
+        entry_id: 'changeset_entry_final',
+        artifact_id: finalArtifact.artifact_id,
+        artifact_ref: finalArtifact,
+        relative_paths: [finalArtifact.content!.target_path!],
+        sha256: expectedSha256,
+        producer_agent_id: finalArtifact.producer_id,
+        gate_result_refs: ['gate_result_final'],
+        delivery_strategy: 'copy_file',
+      },
+    ],
+    gate_result_refs: ['gate_result_final'],
     created_at: '2026-07-18T00:00:00.000Z',
     schema_version: SCHEMA_VERSION,
   };

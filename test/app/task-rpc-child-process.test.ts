@@ -72,30 +72,19 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         'memory.listAgents',
         {},
       );
-      expect(agents.agents.map((agent) => agent.role_id)).toEqual(
-        expect.arrayContaining([
-          'role_ts_engineer',
-          'proposer_a',
-          'proposer_b',
-          'reviewer',
-          'synthesizer',
-        ]),
+      const roleIds = agents.agents.map((agent) => agent.role_id);
+      expect(roleIds).toEqual(
+        expect.arrayContaining(['role_ts_engineer', 'role_fullstack_engineer']),
+      );
+      expect(roleIds).not.toEqual(
+        expect.arrayContaining(['proposer_a', 'proposer_b', 'reviewer', 'synthesizer']),
       );
       const maintenance = await waitForMaintenance(client, [
         'role_ts_engineer',
-        'proposer_a',
-        'proposer_b',
-        'reviewer',
-        'synthesizer',
+        'role_fullstack_engineer',
       ]);
       expect(maintenance.maintenance.map((item) => item.role_id)).toEqual(
-        expect.arrayContaining([
-          'role_ts_engineer',
-          'proposer_a',
-          'proposer_b',
-          'reviewer',
-          'synthesizer',
-        ]),
+        expect.arrayContaining(['role_ts_engineer', 'role_fullstack_engineer']),
       );
       expect(maintenance.maintenance).toEqual(
         expect.arrayContaining([
