@@ -41,9 +41,11 @@ describe('NewideBackendService SQLite lifecycle', () => {
 
       expect(overridden.current_run?.run_id).toBe('run_override_live');
       expect(runnerCalls).toBe(1);
-      expect(store.getTaskAggregate(created.task.task_id)?.runtime_state.diagnostics).toMatchObject({
-        council_override: true,
-      });
+      expect(store.getTaskAggregate(created.task.task_id)?.runtime_state.diagnostics).toMatchObject(
+        {
+          council_override: true,
+        },
+      );
       expect(
         store
           .listEvents(created.task.task_id)
@@ -225,9 +227,16 @@ describe('NewideBackendService SQLite lifecycle', () => {
           diagnostics: {
             resume_checkpoint_id: checkpoint?.checkpoint_id,
             requested_resume_cursor: 'gate',
+            resume_strategy: 'from_checkpoint',
           },
         },
       });
+      expect(checkpoint?.resume_cursor).toBe('gate');
+      expect(checkpoint?.cursor_input?.cursor).toBe('gate');
+      // Resume must not silently restart at select_agent lineage.
+      expect(
+        reopenedStore.getTaskAggregate('task_resume')?.runtime_state.diagnostics.resume_strategy,
+      ).toBe('from_checkpoint');
     } finally {
       reopenedStore.close();
       await rm(root, { recursive: true, force: true });

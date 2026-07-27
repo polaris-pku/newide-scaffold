@@ -604,9 +604,9 @@ describe('TaskProcessor', () => {
     );
 
     expect(() => processor.setCouncilOverride('run_override_late')).toThrow(/too late|gate/i);
-    expect(store.getTaskAggregate('task_override_late')?.runtime_state.diagnostics).not.toHaveProperty(
-      'council_override',
-    );
+    expect(
+      store.getTaskAggregate('task_override_late')?.runtime_state.diagnostics,
+    ).not.toHaveProperty('council_override');
     store.close();
   });
 
@@ -763,12 +763,15 @@ describe('TaskProcessor', () => {
       resume_cursor: 'gate',
       artifact_refs: ['artifact_partial'],
       validity_status: 'valid',
-      mechanical_snapshot: { worktree_path: '/workspace' },
+      mechanical_snapshot: {
+        worktree_path: expect.stringMatching(/workspace$/i),
+      },
       semantic_handoff: {
         in_progress: ['gate'],
         blocked_on: ['backend process interrupted'],
       },
     });
+    expect(checkpoint?.cursor_input?.cursor).toBe('gate');
     expect(checkpoint?.message_thread.map((message) => message.content)).toContain(
       'agent.execution_completed',
     );

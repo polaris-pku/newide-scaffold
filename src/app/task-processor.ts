@@ -9,9 +9,11 @@ import {
   assertTaskRunStartTransition,
   assertTaskStatusTransition,
 } from '../coordinator/task-state-machine';
+import { buildResumePackage, buildSafepointCheckpoint, type ResumePackage } from '../checkpoint';
 import {
   parseTaskCursorInput,
   type CoordinationStateStore,
+  type MailboxStateStore,
   type PersistedRunMode,
   type PersistedRunState,
   type PersistedTaskAggregate,
@@ -120,6 +122,7 @@ export interface TaskLaunchContext {
 export interface TaskResumeContext extends TaskLaunchContext {
   checkpoint_id: string;
   resume_cursor: TaskResumeCursor;
+  cursor_input: TaskCursorInput;
   mode: PersistedRunMode;
   interrupted_run_id: string;
 }
@@ -161,13 +164,19 @@ export class TaskProcessorStageCommitError extends Error {
 export class TaskProcessor {
   private readonly now: () => string;
   private readonly createEventId: () => string;
+  private readonly mailboxStore?:
+    | Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>
+    | undefined;
 
   constructor(
     private readonly store: CoordinationStateStore,
-    options: TaskProcessorOptions = {},
+    options: TaskProcessorOptions & {
+      mailboxStore?: Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>;
+    } = {},
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.createEventId = options.createEventId ?? (() => createId('event'));
+    this.mailboxStore = options.mailboxStore;
   }
 
   beginRun(input: BeginTaskRunInput): TaskSnapshot {
@@ -367,11 +376,7 @@ export class TaskProcessor {
     assertEvidenceReference(input.evidence_ref);
     const nextInput = parseTaskCursorInput(resolveStageNextInput(aggregate, input));
     assertCursorTransition(input.expected_cursor, nextInput.cursor);
-    assertChangesetIdentity(
-      aggregate.runtime_state.cursor_input,
-      nextInput,
-      input.final_output,
-    );
+    assertChangesetIdentity(aggregate.runtime_state.cursor_input, nextInput, input.final_output);
     const completing = nextInput.cursor === 'done';
     if (completing && !input.final_output) {
       throw new Error('Advancing deliver to done requires final_output');
@@ -463,6 +468,15 @@ export class TaskProcessor {
     } catch (error) {
       throw new TaskProcessorStageCommitError('handler.completed', error);
     }
+
+    if (!completing) {
+      const refreshed = this.store.getTaskAggregate(aggregate.task.task_id);
+      if (refreshed) {
+        const trigger = nextInput.cursor === 'mailbox_wait' ? 'blocked' : 'periodic';
+        this.persistSafepoint(refreshed, input.run_id, trigger);
+      }
+    }
+
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
@@ -665,16 +679,12 @@ export class TaskProcessor {
       },
       runtime_state: {
         ...(shouldProjectCursor ? runtimeWithoutCursorInput : aggregate.runtime_state),
-        resume_cursor: shouldProjectCursor
-          ? nextCursor
-          : aggregate.runtime_state.resume_cursor,
+        resume_cursor: shouldProjectCursor ? nextCursor : aggregate.runtime_state.resume_cursor,
         artifact_refs: artifactRefs,
         diagnostics: {
           ...aggregate.runtime_state.diagnostics,
           ...(shouldProjectCursor ? { legacy_cursor_projection: true } : {}),
-          ...(cursorMoved && hasActiveStage
-            ? { legacy_cursor_projection_suppressed: true }
-            : {}),
+          ...(cursorMoved && hasActiveStage ? { legacy_cursor_projection_suppressed: true } : {}),
           last_event_id: event.event_id,
           last_event_type: event.event_type,
         },
@@ -791,7 +801,9 @@ export class TaskProcessor {
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
     const events = afterEventId
       ? (() => {
-          const cursorIndex = aggregate.events.findIndex((event) => event.event_id === afterEventId);
+          const cursorIndex = aggregate.events.findIndex(
+            (event) => event.event_id === afterEventId,
+          );
           if (cursorIndex < 0) throw new TaskEventCursorNotFoundError(taskId, afterEventId);
           return aggregate.events.slice(cursorIndex + 1);
         })()
@@ -836,21 +848,117 @@ export class TaskProcessor {
   }
 
   getTaskResumeContext(taskId: string): TaskResumeContext {
+    const resumePackage = this.buildResumePackage(taskId);
+    return {
+      task_request: {
+        spec: resumePackage.task_request.spec,
+        ...(resumePackage.task_request.role_id
+          ? { role_id: resumePackage.task_request.role_id }
+          : {}),
+        ...(resumePackage.task_request.parent_task_id
+          ? { parent_task_id: resumePackage.task_request.parent_task_id }
+          : {}),
+        risk_level: resumePackage.task_request.risk_level,
+        affected_paths: [...resumePackage.task_request.affected_paths],
+        completion_criteria: [...resumePackage.task_request.completion_criteria],
+        ...(resumePackage.task_request.budget
+          ? { budget: { ...resumePackage.task_request.budget } }
+          : {}),
+      },
+      workspace_path: resumePackage.workspace_path,
+      ...(resumePackage.session_id ? { session_id: resumePackage.session_id } : {}),
+      checkpoint_id: resumePackage.checkpoint_id,
+      resume_cursor: resumePackage.resume_cursor,
+      cursor_input: resumePackage.cursor_input,
+      mode: resumePackage.mode,
+      interrupted_run_id: resumePackage.interrupted_run_id,
+    };
+  }
+
+  buildResumePackage(taskId: string): ResumePackage {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
     const checkpoint = this.store.getLatestCheckpoint(taskId);
     if (!checkpoint) throw new Error(`Task ${taskId} has no valid full checkpoint`);
-    const interruptedRun = requireRun(aggregate, checkpoint.run_id);
-    const launch = this.getTaskLaunchContext(taskId);
-    const sessionId = checkpoint.session_id ?? interruptedRun.session_id ?? launch.session_id;
-    return {
-      ...launch,
-      ...(sessionId ? { session_id: sessionId } : {}),
-      checkpoint_id: checkpoint.checkpoint_id,
-      resume_cursor: checkpoint.resume_cursor,
-      mode: interruptedRun.mode,
-      interrupted_run_id: interruptedRun.run_id,
-    };
+    return buildResumePackage({
+      aggregate,
+      checkpoint,
+      ...(this.mailboxStore ? { mailboxStore: this.mailboxStore } : {}),
+    });
+  }
+
+  /** Save shutdown safepoints for all active runs before process exit. */
+  saveShutdownSafepoints(): PersistedFullCheckpoint[] {
+    const saved: PersistedFullCheckpoint[] = [];
+    for (const aggregate of this.store.listTaskAggregates()) {
+      const run = aggregate.runs.find((candidate) => isActiveRun(candidate));
+      if (!run) continue;
+      const checkpoint = this.persistSafepoint(aggregate, run.run_id, 'shutdown');
+      if (checkpoint) saved.push(checkpoint);
+    }
+    return saved;
+  }
+
+  private persistSafepoint(
+    aggregate: PersistedTaskAggregate,
+    runId: string,
+    trigger: PersistedFullCheckpoint['trigger'],
+    interruptState?: Record<string, unknown>,
+  ): PersistedFullCheckpoint | undefined {
+    const latestCheckpoint = this.store.getLatestCheckpoint(aggregate.task.task_id);
+    const checkpoint = buildSafepointCheckpoint({
+      aggregate,
+      run_id: runId,
+      trigger,
+      ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
+      ...(interruptState ? { interrupt_state: interruptState } : {}),
+      now: this.now(),
+    });
+    const checkpointSaved = this.createEvent(
+      'checkpoint.saved',
+      checkpoint.checkpoint_id,
+      aggregate.task.task_id,
+      runId,
+      {
+        checkpoint_id: checkpoint.checkpoint_id,
+        resume_cursor: checkpoint.resume_cursor,
+        trigger,
+      },
+    );
+    const timestamp = this.now();
+    try {
+      this.store.commitState({
+        expected_task_revision: aggregate.task.revision,
+        task: {
+          ...aggregate.task,
+          revision: aggregate.task.revision + 1,
+          updated_at: timestamp,
+        },
+        run: (() => {
+          const run = requireRun(aggregate, runId);
+          return {
+            ...run,
+            revision: run.revision + 1,
+            updated_at: timestamp,
+          };
+        })(),
+        runtime_state: {
+          ...aggregate.runtime_state,
+          ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
+          diagnostics: {
+            ...aggregate.runtime_state.diagnostics,
+            last_safepoint_checkpoint_id: checkpoint.checkpoint_id,
+            last_safepoint_trigger: trigger,
+          },
+          updated_at: timestamp,
+        },
+        checkpoint,
+        events: [checkpointSaved],
+      });
+      return checkpoint;
+    } catch {
+      return undefined;
+    }
   }
 
   private requireAggregateForRun(runId: string): PersistedTaskAggregate {
@@ -873,55 +981,21 @@ export class TaskProcessor {
       reason,
       interrupted_run_id: run.run_id,
     };
-    const checkpointId = createId('checkpoint');
     const latestCheckpoint = this.store.getLatestCheckpoint(aggregate.task.task_id);
-    const checkpoint: PersistedFullCheckpoint = {
-      checkpoint_id: checkpointId,
-      ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
-      task_id: aggregate.task.task_id,
+    const checkpoint = buildSafepointCheckpoint({
+      aggregate,
       run_id: run.run_id,
-      agent_id:
-        readLatestEventString(aggregate, 'agent_id') ??
-        aggregate.task.owner_agent_id ??
-        aggregate.task.role_id ??
-        'coordinator',
-      ...(run.session_id ? { session_id: run.session_id } : {}),
       trigger: 'blocked',
-      resume_cursor: aggregate.runtime_state.resume_cursor,
-      message_thread: aggregate.events.map((event, index) => ({
-        message_id: event.event_id,
-        role: projectRunEventSource(event.event_type),
-        content: event.event_type,
-        turn: index + 1,
-        artifact_refs: readPayloadStringArray(event.payload, 'artifact_refs'),
-        created_at: event.created_at,
-      })),
-      mechanical_snapshot: {
-        base_commit: 'unknown',
-        worktree_path: aggregate.task.workspace_path,
-        branch: 'runtime-recovery',
-        modified_files: [],
-      },
-      semantic_handoff: {
-        done: aggregate.events.map((event) => event.event_type),
-        in_progress: [aggregate.runtime_state.resume_cursor],
-        blocked_on: ['backend process interrupted'],
-        assumptions: [],
-        next_steps: [`resume ${aggregate.runtime_state.resume_cursor}`],
-        known_risks: ['unfinished action will be re-executed'],
-      },
+      ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
       interrupt_state: interruptState,
-      artifact_refs: [...aggregate.runtime_state.artifact_refs],
-      validity_status: 'valid',
-      created_at: timestamp,
-      schema_version: SCHEMA_VERSION,
-    };
+      now: timestamp,
+    });
     const runInterrupted = this.createEvent(
       'run.interrupted',
       run.run_id,
       aggregate.task.task_id,
       run.run_id,
-      { reason, resume_cursor: aggregate.runtime_state.resume_cursor },
+      { reason, resume_cursor: checkpoint.resume_cursor },
     );
     const taskBlocked = this.createEvent(
       'task.blocked',
@@ -932,10 +1006,10 @@ export class TaskProcessor {
     );
     const checkpointSaved = this.createEvent(
       'checkpoint.saved',
-      checkpointId,
+      checkpoint.checkpoint_id,
       aggregate.task.task_id,
       run.run_id,
-      { checkpoint_id: checkpointId, resume_cursor: aggregate.runtime_state.resume_cursor },
+      { checkpoint_id: checkpoint.checkpoint_id, resume_cursor: checkpoint.resume_cursor },
     );
     const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
 
@@ -956,11 +1030,12 @@ export class TaskProcessor {
       },
       runtime_state: {
         ...runtimeWithoutCurrentRun,
+        ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
         interrupt_state: interruptState,
         diagnostics: {
           ...aggregate.runtime_state.diagnostics,
           interrupted_run_id: run.run_id,
-          recovery_checkpoint_id: checkpointId,
+          recovery_checkpoint_id: checkpoint.checkpoint_id,
         },
         updated_at: timestamp,
       },
@@ -1117,9 +1192,7 @@ function resolveStageNextInput(
       'Council override input is only valid for execute_agent -> gate with persistent_override',
     );
   }
-  return overrideRequested
-    ? input.council_override_input
-    : input.next_input;
+  return overrideRequested ? input.council_override_input : input.next_input;
 }
 
 function assertBeginRunIntent(
@@ -1145,9 +1218,7 @@ function assertBeginRunIntent(
     return;
   }
   if (!existing) {
-    throw new Error(
-      `Run intent ${intent.type} requires an existing Task ${input.task_id}`,
-    );
+    throw new Error(`Run intent ${intent.type} requires an existing Task ${input.task_id}`);
   }
 
   if (intent.type === 'council_refinement') {
@@ -1196,18 +1267,12 @@ function assertBeginRunIntent(
       cursorInput.cursor !== latestCheckpoint.resume_cursor) ||
     (intent.strategy === 'restart_from_beginning' && cursorInput.cursor !== 'select_agent')
   ) {
-    throw new Error(
-      `Checkpoint resume cursor does not match strategy ${intent.strategy}`,
-    );
+    throw new Error(`Checkpoint resume cursor does not match strategy ${intent.strategy}`);
   }
 }
 
 function assertFinalOutputEvidence(output: PersistedTaskFinalOutput): void {
-  if (
-    !output.artifact_ref ||
-    !output.workspace_path ||
-    !/^[a-f0-9]{64}$/.test(output.sha256)
-  ) {
+  if (!output.artifact_ref || !output.workspace_path || !/^[a-f0-9]{64}$/.test(output.sha256)) {
     throw new Error(
       'Final output requires a non-empty artifact, workspace path, and lowercase SHA256',
     );
@@ -1390,19 +1455,6 @@ function readPayloadStringArray(payload: Record<string, unknown>, key: string): 
 
 function appendUnique(current: readonly string[], additions: readonly string[]): string[] {
   return [...new Set([...current, ...additions])];
-}
-
-function readLatestEventString(
-  aggregate: PersistedTaskAggregate,
-  key: string,
-): string | undefined {
-  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
-    const event = aggregate.events[index];
-    if (!event) continue;
-    const value = readPayloadString(event.payload, key);
-    if (value) return value;
-  }
-  return undefined;
 }
 
 function councilWarnings(snapshot: RunSnapshot | undefined): string[] {

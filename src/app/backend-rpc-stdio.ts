@@ -25,7 +25,7 @@ import { RunRpcMethods } from '../rpc/run-methods';
 import { TaskRpcMethods } from '../rpc/task-methods';
 import { MailboxRpcMethods } from '../rpc/mailbox-methods';
 import { MemoryRpcMethods } from '../rpc/memory-methods';
-import { SqliteCoordinationStore } from '../persistence';
+import { SqliteCoordinationStore, FileRunEvidenceStore } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
 import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
 import { NewideBackendService } from './newide-backend-service';
@@ -41,6 +41,7 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
 } from './b-memory-maintenance-runner';
 import { BMemoryBackendService } from './b-memory-backend-service';
+import { createProductionStageExecutors } from './production-stage-executors';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -175,6 +176,11 @@ export async function createProductionBackendService(
       selectAgentHandler,
       councilProvider: new SynthesisAgentCouncilProvider({ agentExecutionFacade }),
     });
+    const durableExecutors = createProductionStageExecutors({
+      selectAgentHandler,
+      agentExecutionFacade,
+      bootstrapAgentIds: bRuntime.market_agent_ids,
+    });
     const bMemoryService = new BMemoryBackendService(bRuntime.repository, memoryMaintenance);
 
     try {
@@ -191,7 +197,9 @@ export async function createProductionBackendService(
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
-    const taskProcessor = new TaskProcessor(coordinationStore);
+    const taskProcessor = new TaskProcessor(coordinationStore, {
+      mailboxStore: coordinationStore,
+    });
     taskProcessor.recoverInterruptedTasks();
     const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
     const mailboxRecovery = mailboxService.replayPendingDeliveries();
@@ -211,6 +219,8 @@ export async function createProductionBackendService(
       mailboxRecovery,
       closeRuntime,
       bMemoryService,
+      durableExecutors,
+      new FileRunEvidenceStore({ root: runsRoot }),
     );
   } catch (error) {
     await closeRuntime().catch(() => undefined);
@@ -385,8 +395,7 @@ function assertValidMarketAgentIds(value: unknown): asserts value is readonly st
   const valid =
     agentIds.length > 0 &&
     agentIds.every(
-      (agentId) =>
-        typeof agentId === 'string' && agentId.length > 0 && agentId.trim() === agentId,
+      (agentId) => typeof agentId === 'string' && agentId.length > 0 && agentId.trim() === agentId,
     ) &&
     new Set(agentIds).size === agentIds.length;
   if (!valid) {

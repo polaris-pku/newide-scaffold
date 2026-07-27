@@ -169,9 +169,7 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
     if (cursor && !deliveryMatchesRecipient(cursor, recipient)) {
       throw new Error(`Mailbox delivery cursor ${afterDeliveryId} belongs to another recipient`);
     }
-    const where = recipient.agent_id
-      ? 'recipient_agent_id = ?'
-      : 'recipient_role_id = ?';
+    const where = recipient.agent_id ? 'recipient_agent_id = ?' : 'recipient_role_id = ?';
     const recipientId = recipient.agent_id ?? recipient.role_id;
     const cursorClause = cursor
       ? 'AND (created_at > ? OR (created_at = ? AND delivery_id > ?))'
@@ -279,7 +277,10 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
 
   recordMailboxWakeAttempt(
     deliveryId: string,
-    input: { attempted_at: string; error?: { code: string; message: string; details?: Record<string, unknown> } },
+    input: {
+      attempted_at: string;
+      error?: { code: string; message: string; details?: Record<string, unknown> };
+    },
   ): PersistedMailboxDelivery {
     const result = this.database
       .prepare(
@@ -591,6 +592,7 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
           run_id: checkpoint.run_id,
           ...(checkpoint.session_id ? { session_id: checkpoint.session_id } : {}),
           resume_cursor: checkpoint.resume_cursor,
+          ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
           message_thread: checkpoint.message_thread,
         }),
         checkpoint.interrupt_state ? toJson(checkpoint.interrupt_state) : null,
@@ -921,9 +923,20 @@ function readCheckpoint(row: SqlRow): PersistedFullCheckpoint {
     run_id: string;
     session_id?: string;
     resume_cursor: TaskResumeCursor;
+    cursor_input?: unknown;
     message_thread: PersistedFullCheckpoint['message_thread'];
   }>(row, 'runtime_state_json');
   const interruptState = readOptionalJson<Record<string, unknown>>(row, 'interrupt_state_json');
+  const cursorInput =
+    runtime.cursor_input !== undefined
+      ? (() => {
+          try {
+            return parseTaskCursorInput(runtime.cursor_input);
+          } catch {
+            return undefined;
+          }
+        })()
+      : undefined;
   return {
     checkpoint_id: readString(row, 'checkpoint_id'),
     ...(readOptionalString(row, 'parent_checkpoint_id')
@@ -945,6 +958,7 @@ function readCheckpoint(row: SqlRow): PersistedFullCheckpoint {
       'resume_cursor',
       RESUME_CURSORS,
     ),
+    ...(cursorInput ? { cursor_input: cursorInput } : {}),
     message_thread: runtime.message_thread,
     mechanical_snapshot: readJson<PersistedFullCheckpoint['mechanical_snapshot']>(
       row,

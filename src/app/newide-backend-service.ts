@@ -6,7 +6,7 @@
 import type { IntegrationV0Result } from '../coordinator/integration-v0-flow';
 import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { CouncilRoleExecutionError } from '../council';
+import { CouncilRoleExecutionError } from '../council/providers/synthesis-agent-provider';
 import {
   SCHEMA_VERSION,
   createId,
@@ -14,13 +14,13 @@ import {
   type MessageRecipient,
   type TaskCreateRequest,
 } from '../core';
-import {
-  IntegrationV0CoordinatorRunner,
-  type CoordinatorRunner,
-} from '../coordinator/coordinator-runner';
+import type { CoordinatorRunner } from '../coordinator/coordinator-runner';
 import { createDefaultTaskRequest } from '../coordinator/task-request';
-import type { TaskResumeCursor } from '../persistence';
+import type { TaskCursorInput, TaskResumeCursor, RunEvidenceStore } from '../persistence';
 import type { TelemetryRecord, TelemetrySink } from '../telemetry/telemetry-sink';
+import { observeResumePackage } from '../telemetry/adapters/c-coordination';
+import type { ResumePackage } from '../checkpoint';
+import { TaskExecutionLoop, type TaskExecutionLoopExecutors } from './task-execution-loop';
 import {
   InMemoryRunRegistry,
   type AppRunEvent,
@@ -40,6 +40,7 @@ import {
   type RunRequestStore,
 } from './run-request-store';
 import { projectRunSnapshot } from './run-snapshot-projector';
+import type { FrontendRunSnapshot } from '../coordinator/frontend-run-snapshot';
 import type { RunSnapshot } from '../protocol/run-snapshot';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
 import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task-snapshot';
@@ -61,14 +62,15 @@ import type {
   PersistedMailboxEnvelope,
   SaveMailboxReplyResult,
 } from '../persistence';
-import type {
-  AgentBoardAgentView,
-  AgentBoardListItem,
-  ExperienceView,
-  SkillView,
-} from '../memory';
+import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
+
+const unsetCoordinatorRunner: CoordinatorRunner = {
+  run: async () => {
+    throw new Error('CoordinatorRunner is required');
+  },
+};
 
 export interface RunCreateParams {
   prompt: string;
@@ -152,6 +154,7 @@ interface RunLineage {
   persist_restarted_from_run_id?: boolean;
   resume_checkpoint_id?: string;
   requested_resume_cursor?: TaskResumeCursor;
+  cursor_input?: TaskCursorInput;
 }
 
 interface PendingRunStart {
@@ -168,7 +171,7 @@ export class NewideBackendService {
   private closePromise?: Promise<void>;
 
   constructor(
-    private readonly runner: CoordinatorRunner = new IntegrationV0CoordinatorRunner(),
+    private readonly runner: CoordinatorRunner = unsetCoordinatorRunner,
     private readonly registry = new InMemoryRunRegistry(),
     private readonly auditWriter: RunAuditWriter = new FileRunAuditWriter(),
     private readonly terminalWriter: RunTerminalOutputWriter = new FileRunTerminalOutputWriter(),
@@ -178,6 +181,8 @@ export class NewideBackendService {
     private readonly mailboxRecovery: Promise<unknown> = Promise.resolve(),
     private readonly closeRuntime: () => Promise<void> | void = () => undefined,
     private readonly bMemoryService?: BMemoryBackendService,
+    private readonly durableExecutors?: TaskExecutionLoopExecutors,
+    private readonly evidenceStore?: RunEvidenceStore,
   ) {}
 
   close(): Promise<void> {
@@ -234,10 +239,7 @@ export class NewideBackendService {
     return this.requireBMemoryService().listMaintenance(roleId);
   }
 
-  promoteMemorySkills(
-    roleId: string,
-    requestedBy: string,
-  ): Promise<BMemoryMaintenanceEvidence> {
+  promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
   }
 
@@ -341,6 +343,8 @@ export class NewideBackendService {
     if (!this.taskProcessor) {
       throw new Error(`Task ${taskId} cannot resume without the persistent Task processor`);
     }
+    const resumePackage = this.taskProcessor.buildResumePackage(taskId);
+    this.emitResumePackageTelemetry(resumePackage);
     const resume = this.taskProcessor.getTaskResumeContext(taskId);
     await this.startRun(
       {
@@ -352,10 +356,11 @@ export class NewideBackendService {
         ...(resume.session_id ? { session_id: resume.session_id } : {}),
       },
       {
-        run_intent: { type: 'checkpoint_resume', strategy: 'restart_from_beginning' },
+        run_intent: { type: 'checkpoint_resume', strategy: 'from_checkpoint' },
         restarted_from_run_id: resume.interrupted_run_id,
         resume_checkpoint_id: resume.checkpoint_id,
         requested_resume_cursor: resume.resume_cursor,
+        cursor_input: resume.cursor_input,
       },
     );
     return this.getTask(taskId);
@@ -431,6 +436,174 @@ export class NewideBackendService {
     if (this.closing) {
       return Promise.reject(new Error('Backend service is closing'));
     }
+    if (this.canUseDurableLoop()) {
+      return this.startDurableLoopRun(params, lineage);
+    }
+    return this.startIntegrationRunner(params, lineage);
+  }
+
+  private canUseDurableLoop(): boolean {
+    return Boolean(this.taskProcessor && this.durableExecutors && this.evidenceStore);
+  }
+
+  private startDurableLoopRun(
+    params: RunCreateParams,
+    lineage?: RunLineage,
+  ): Promise<RunCreateResult> {
+    const mode = params.mode ?? 'single_agent';
+    const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
+    const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
+    const controller = new AbortController();
+    let resolvePendingStart!: () => void;
+    const pendingStart: PendingRunStart = {
+      controller,
+      settled: new Promise<void>((resolve) => {
+        resolvePendingStart = resolve;
+      }),
+    };
+    let pendingStartSettled = false;
+    const settlePendingStart = (): void => {
+      if (pendingStartSettled) return;
+      pendingStartSettled = true;
+      this.pendingRunStarts.delete(pendingStart);
+      resolvePendingStart();
+    };
+    this.pendingRunStarts.add(pendingStart);
+
+    return new Promise<RunCreateResult>((resolve, reject) => {
+      let resolveTerminal!: () => void;
+      const terminalRun = new Promise<void>((resolveRun) => {
+        resolveTerminal = resolveRun;
+      });
+
+      const taskId = params.task_id ?? createId('task');
+      const runId = createId('run');
+      const identity = { run_id: runId, task_id: taskId };
+
+      try {
+        if (this.closing) {
+          throw new Error('Backend service is closing');
+        }
+        this.terminalRuns.set(runId, terminalRun);
+        this.runWorkspaces.set(runId, workspacePath);
+        this.registry.create({ ...identity, mode, controller });
+        const runStartedEvent = createRunStartedEvent(identity, mode);
+        this.taskProcessor!.beginRun({
+          ...identity,
+          task_request: taskRequest,
+          workspace_path: workspacePath,
+          mode,
+          run_intent: lineage?.run_intent ?? { type: 'create' },
+          ...(params.session_id ? { session_id: params.session_id } : {}),
+          ...(lineage?.restarted_from_run_id && lineage.persist_restarted_from_run_id !== false
+            ? { restarted_from_run_id: lineage.restarted_from_run_id }
+            : {}),
+          ...(lineage?.resume_checkpoint_id
+            ? { resume_checkpoint_id: lineage.resume_checkpoint_id }
+            : {}),
+          ...(lineage?.requested_resume_cursor
+            ? { requested_resume_cursor: lineage.requested_resume_cursor }
+            : {}),
+          ...(lineage?.cursor_input ? { cursor_input: lineage.cursor_input } : {}),
+          run_started_event: runStartedEvent,
+        });
+        this.registry.subscribe(runId, (event) => {
+          if (this.taskProcessor && shouldPersistRuntimeEvent(event.type)) {
+            this.taskProcessor.recordRunEvent(runId, toDomainEvent(event));
+          }
+          void this.auditWriter.append(event).catch(() => undefined);
+          this.notifyTaskListeners(taskId, event);
+        });
+        this.registry.appendEvent(
+          runId,
+          'run.started',
+          { mode },
+          { event_id: runStartedEvent.event_id, created_at: runStartedEvent.created_at },
+        );
+        settlePendingStart();
+        void this.requestStore
+          .save({
+            run_id: runId,
+            task_id: taskId,
+            prompt: params.prompt,
+            workspace_path: workspacePath,
+            mode,
+            task_request: taskRequest,
+            ...(params.session_id ? { session_id: params.session_id } : {}),
+            ...(params.project_id ? { project_id: params.project_id } : {}),
+            ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
+            ...(params.title ? { title: params.title } : {}),
+            ...(lineage?.restarted_from_run_id
+              ? { restarted_from_run_id: lineage.restarted_from_run_id }
+              : {}),
+          })
+          .then(() => resolve({ ...identity, status: 'running' }))
+          .catch((error: unknown) => {
+            controller.abort(error);
+            reject(toError(error));
+          });
+      } catch (error) {
+        settlePendingStart();
+        reject(toError(error));
+        return;
+      }
+
+      const loop = new TaskExecutionLoop({
+        processor: this.taskProcessor!,
+        evidence_store: this.evidenceStore!,
+        executors: this.durableExecutors!,
+      });
+
+      void loop
+        .run({ task_id: taskId, run_id: runId })
+        .then(async (snapshot) => {
+          const status = snapshot.task.status;
+          if (status === 'completed') {
+            const staged = this.registry.stageTerminal(runId, {
+              status: 'completed',
+              snapshot: minimalFrontendSnapshot(identity, params.prompt, params.session_id),
+            });
+            if (staged) await this.persistTerminal(runId, staged);
+          } else if (status === 'cancelled') {
+            const staged = this.registry.stageTerminal(runId, { status: 'cancelled' });
+            if (staged) await this.persistTerminal(runId, staged);
+          } else if (status === 'failed' || status === 'blocked') {
+            const staged = this.registry.stageTerminal(runId, {
+              status: 'failed',
+              code: status === 'blocked' ? 'TASK_BLOCKED' : 'DURABLE_LOOP_FAILED',
+              message: `Durable loop stopped at task status ${status}`,
+            });
+            if (staged) await this.persistTerminal(runId, staged);
+          }
+        })
+        .catch(async (error: unknown) => {
+          const normalized = toError(error);
+          const staged = this.registry.stageTerminal(runId, {
+            status: 'failed',
+            code: 'DURABLE_LOOP_FAILED',
+            message: normalized.message,
+          });
+          if (staged) await this.persistTerminal(runId, staged);
+        })
+        .then(
+          () => {
+            settlePendingStart();
+            resolveTerminal();
+          },
+          () => {
+            settlePendingStart();
+            resolveTerminal();
+          },
+        );
+      void terminalRun.then(() => this.terminalRuns.delete(runId));
+      void terminalRun.then(() => this.runWorkspaces.delete(runId));
+    });
+  }
+
+  private startIntegrationRunner(
+    params: RunCreateParams,
+    lineage?: RunLineage,
+  ): Promise<RunCreateResult> {
     const mode = params.mode ?? 'single_agent';
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
     const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
@@ -532,6 +705,7 @@ export class NewideBackendService {
                 ...(lineage?.requested_resume_cursor
                   ? { requested_resume_cursor: lineage.requested_resume_cursor }
                   : {}),
+                ...(lineage?.cursor_input ? { cursor_input: lineage.cursor_input } : {}),
                 ...(taskCreatedEvent ? { task_created_event: taskCreatedEvent } : {}),
                 ...(runCreatedEvent ? { run_created_event: runCreatedEvent } : {}),
                 run_started_event: runStartedEvent,
@@ -638,7 +812,30 @@ export class NewideBackendService {
     });
   }
 
+  private emitResumePackageTelemetry(resumePackage: ResumePackage): void {
+    try {
+      // Validate ResumePackage against the C coordination telemetry catalog.
+      // The interrupted run is usually not live in the registry, so we do not append here.
+      void observeResumePackage({
+        task_id: resumePackage.task_id,
+        run_id: resumePackage.interrupted_run_id,
+        checkpoint_id: resumePackage.checkpoint_id,
+        restored_status: 'blocked',
+        next_action: 'continue',
+        resume_cursor: resumePackage.resume_cursor,
+        message_thread: resumePackage.message_thread,
+      });
+    } catch {
+      // Telemetry must not block resume.
+    }
+  }
+
   private async closeGracefully(): Promise<void> {
+    try {
+      this.taskProcessor?.saveShutdownSafepoints();
+    } catch {
+      // Best-effort safepoints must not block shutdown.
+    }
     const pendingStarts = [...this.pendingRunStarts];
     const closeReason = new Error('Backend service is closing');
     for (const pendingStart of pendingStarts) pendingStart.controller.abort(closeReason);
@@ -956,6 +1153,68 @@ function createRunStartedEvent(
     payload: { mode },
     created_at: new Date().toISOString(),
     schema_version: SCHEMA_VERSION,
+  };
+}
+
+function minimalFrontendSnapshot(
+  identity: { run_id: string; task_id: string },
+  spec: string,
+  sessionId?: string,
+): FrontendRunSnapshot {
+  const session = sessionId ?? `session_${identity.run_id}`;
+  return {
+    snapshot_type: 'coordinator.frontend_run_snapshot.v0',
+    schema_version: 'v0',
+    generated_at: new Date().toISOString(),
+    run_id: identity.run_id,
+    task_id: identity.task_id,
+    task: {
+      task_id: identity.task_id,
+      status: 'completed',
+      spec,
+      completion_criteria: [],
+      risk_level: 'low',
+      affected_paths: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      schema_version: 'v0',
+    },
+    current: { stage: 'delivery', task_status: 'completed', active_node_code: 'N18' },
+    run: {
+      run_id: identity.run_id,
+      task_id: identity.task_id,
+      status: 'completed',
+      mode: 'single_agent',
+      driver_id: 'durable-loop',
+      session_id: session,
+      created_at: new Date().toISOString(),
+    },
+    flow: { active_node_code: 'N18', node_statuses: [] },
+    timeline: [],
+    delivery_report: {
+      worktree_path: '',
+      files_written: [],
+      changed_files: [],
+      artifacts_materialized: 0,
+      outcome: 'completed_response',
+      response: '',
+      session_id: session,
+      tool_events: [],
+      driver_diagnostics: { driver_id: 'durable-loop', duration_ms: 0 },
+    },
+    artifacts: [],
+    checkpoint: {} as never,
+    mailbox: { thread_id: identity.run_id, message_refs: [], messages: [] },
+    links: {
+      result_path: '',
+      summary_path: '',
+      timeline_path: '',
+      checkpoint_path: '',
+      message_thread_path: '',
+      event_log_path: '',
+      audit_path: '',
+      frontend_snapshot_path: '',
+    },
   };
 }
 
