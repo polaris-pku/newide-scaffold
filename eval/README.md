@@ -1,6 +1,9 @@
 # F 方向评测
 
-这个目录放 NewIDE 的 F 方向初步评测管线。当前阶段不自建完整数据集，先直接使用 SWE-EVO 作为数据源；`newide-scaffold` 只记录固定子集和评测产物，不复制完整 SWE-EVO 数据。
+这个目录放 NewIDE 的 F 方向初步评测管线。当前阶段不自建完整数据集，先直接使用外部 benchmark 作为数据源；`newide-scaffold` 只记录固定子集和评测产物，不复制完整数据集。
+
+- **SWE-EVO**（本目录根下脚本）：§1 记忆纵向 / 通用出分
+- **CooperBench**（`eval/cooperbench/`）：§2 P1-A 协调主效应；详见 [cooperbench/README.md](./cooperbench/README.md)
 
 ## 埋点：结果层最低要求
 
@@ -173,3 +176,16 @@ pnpm eval:instance -- --instance-id <instance-id> --mode real --model <name> `
 3. F 方向评测层把数据集、答案、判卷结果和 telemetry 收到同一个 run 目录里，方便复现和解释。
 
 所以 `stub` 用来看管线，`oracle` 用来看判卷系统，`real` 才用于看 NewIDE 的真实能力。
+
+## CooperBench（§2 P1-A）速查
+
+```powershell
+# stub 冒烟（无需 Docker；需同级 ../CooperBench/dataset）
+pnpm eval:cooperbench-smoke -- --subset v0-smoke --mode stub --setting coop
+
+# oracle + harness dry-run
+pnpm eval:cooperbench-case -- --case-id dottxt_ai_outlines_task__1655__f1_f3 `
+  --mode oracle --setting coop --run-harness --harness-dry-run
+```
+
+完整说明见 `eval/cooperbench/README.md`。

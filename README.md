@@ -53,10 +53,13 @@ pnpm example:basic
 
 ## F Eval Real Harness Setup
 
-The F-eval TypeScript pipeline is committed in this repository, but the real
-SWE-EVO/SWE-bench Docker harness depends on local data and tools that are not
-checked in. Stub smoke tests only need the JSONL data; real harness evaluation
-also needs a Linux Python environment and Docker access.
+The F-eval TypeScript pipeline is committed in this repository. SWE-EVO lives
+under `eval/`; CooperBench (§2 P1-A) lives under `eval/cooperbench/` and
+defaults to the sibling `../CooperBench` checkout. Real Docker harnesses for
+either bench are not checked in.
+
+Stub smoke tests only need local dataset files; real harness evaluation also
+needs a Linux Python environment and Docker access.
 
 ### Windows + WSL + Docker Desktop
 
