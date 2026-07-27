@@ -15,7 +15,6 @@ import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
 import {
   LiteLLMClientAdapter,
   LiteLLMToolCallingClient,
-  RepositoryAgentBoardQuery,
   type LlmClient,
   type ToolCallingClient,
 } from '../memory';
@@ -42,6 +41,7 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
 } from './b-memory-maintenance-runner';
 import { BMemoryBackendService } from './b-memory-backend-service';
+import { createBPublicCapabilities } from './b-public-capabilities';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -149,12 +149,13 @@ export async function createProductionBackendService(
     } catch {
       throw new Error('Production B Agent manager readiness check failed');
     }
+    const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
-      repository: bRuntime.repository,
-      bufferRepository: bRuntime.bufferRepository,
+      repository: bCapabilities.repository,
+      bufferRepository: bCapabilities.bufferRepository,
       llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
-      memoryMaintenance,
+      memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(repoRoot, '.newide', 'b', 'context-packs'),
       }),
@@ -162,7 +163,7 @@ export async function createProductionBackendService(
     const selectAgentHandler = new SelectAgentHandler({
       projectionSource: new BAgentProjectionAdapter({
         competitionQuery: agentExecutionFacade,
-        boardQuery: new RepositoryAgentBoardQuery(bRuntime.repository),
+        boardQuery: bCapabilities.boardQuery,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
         allowedAgentIds: bRuntime.market_agent_ids,
       }),
@@ -176,7 +177,7 @@ export async function createProductionBackendService(
       selectAgentHandler,
       councilProvider: new SynthesisAgentCouncilProvider({ agentExecutionFacade }),
     });
-    const bMemoryService = new BMemoryBackendService(bRuntime.repository, memoryMaintenance);
+    const bMemoryService = new BMemoryBackendService(bCapabilities);
 
     try {
       await agentExecutionFacade.ready();
