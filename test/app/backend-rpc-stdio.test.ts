@@ -456,6 +456,18 @@ describe('backend RPC stdio entrypoint', () => {
       const councilSnapshot = await waitForTerminal(service, councilCreated.run_id);
       unsubscribe();
       expect(councilSnapshot.status).toBe('completed');
+      const externalCouncilSnapshot = service.getRunSnapshot(councilCreated.run_id);
+      expect(externalCouncilSnapshot.council?.participants).toHaveLength(4);
+      expect(
+        externalCouncilSnapshot.council?.participants?.map(
+          (participant) => participant.agent_id,
+        ),
+      ).toEqual([
+        'role_fullstack_engineer',
+        'role_ts_engineer',
+        'role_ts_engineer',
+        'role_fullstack_engineer',
+      ]);
       const councilEventTypes = councilSnapshot.events.map((event) => event.type);
       expect(councilEventTypes).not.toContain('market.selected');
       expect(

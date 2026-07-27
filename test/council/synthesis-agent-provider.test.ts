@@ -84,6 +84,12 @@ describe('SynthesisAgentCouncilProvider', () => {
       COUNCIL_AGENTS.reviewer,
       COUNCIL_AGENTS.synthesizer,
     ]);
+    expect(requests[0]).toMatchObject({
+      participant_id: 'participant_proposer_0',
+      council_seat: 'proposer',
+      council_seat_index: 0,
+      role_id: COUNCIL_AGENTS.proposerA,
+    });
     expect(signals).toEqual(Array(4).fill(controller.signal));
     expect(requests.map((request) => request.workspace_path)).toEqual([
       path.join(councilRoot, 'run_001', 'participant_proposer_0'),

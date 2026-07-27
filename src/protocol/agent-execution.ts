@@ -26,6 +26,9 @@ export interface AgentExecutionRequest {
   task_id: TaskId;
   run_id: RunId;
   role_id: RoleId;
+  participant_id?: string;
+  council_seat?: 'proposer' | 'reviewer' | 'synthesizer';
+  council_seat_index?: number;
   instruction: string;
   workspace_path?: string;
   session_id?: string;
