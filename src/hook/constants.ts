@@ -82,10 +82,15 @@ export const PHASE_1_HOOK_POINTS: HookPoint[] = [
   'task.started',
   'task.completed',
   'task.failed',
-  'agent.checkpoint',
+  'task.checkpoint_resume',
+  'task.before_merge',
   'agent.message_send',
+  'agent.message_recv',
+  'agent.checkpoint',
   'system.timeout',
+  'system.budget_exceeded',
   'lifecycle.human_gate',
+  'council.decision'
 ];
 
 /** Complete set of all RFC-defined hook points for runtime validation */
