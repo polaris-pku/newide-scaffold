@@ -27,6 +27,7 @@ import type { RunSnapshot } from '../protocol/run-snapshot';
 import { projectRunEventSource } from '../protocol/run-event';
 import { taskSnapshotSchema, type TaskSnapshot } from '../protocol/task-snapshot';
 import type { AppRunEvent } from './run-registry';
+import { projectPersistedRunSnapshot } from './task-run-snapshot-projector';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
 
 export interface TaskProcessorOptions {
@@ -813,7 +814,11 @@ export class TaskProcessor {
     const aggregate = this.store
       .listTaskAggregates()
       .find((candidate) => candidate.runs.some((run) => run.run_id === runId));
-    return aggregate?.runs.find((run) => run.run_id === runId)?.snapshot;
+    if (!aggregate) return undefined;
+    return (
+      aggregate.runs.find((run) => run.run_id === runId)?.snapshot ??
+      projectPersistedRunSnapshot(aggregate, runId)
+    );
   }
 
   getTaskLaunchContext(taskId: string): TaskLaunchContext {
@@ -1003,7 +1008,9 @@ function projectAggregate(aggregate: PersistedTaskAggregate): TaskSnapshot {
       ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
     },
     created_at: aggregate.task.created_at,
-    runs: aggregate.runs.map(toRunFact),
+    runs: aggregate.runs.map((run) =>
+      toRunFact(run, run.snapshot ?? projectPersistedRunSnapshot(aggregate, run.run_id)),
+    ),
   });
   const waitingReason = readWaitingReason(aggregate);
   return taskSnapshotSchema.parse({
@@ -1016,9 +1023,12 @@ function projectAggregate(aggregate: PersistedTaskAggregate): TaskSnapshot {
       updated_at: aggregate.task.updated_at,
     },
     ...(waitingReason ? { waiting_reason: waitingReason } : {}),
-    warnings: [...aggregate.task.warnings],
+    warnings: [...new Set([...projected.warnings, ...aggregate.task.warnings])],
     ...(aggregate.task.error ? { error: { ...aggregate.task.error } } : {}),
-    ...(!projected.final_output && aggregate.task.final_output
+    ...(aggregate.task.final_output &&
+    (!projected.final_output ||
+      (projected.final_output.artifact_refs.length === 0 &&
+        projected.final_output.files_written.length === 0))
       ? {
           final_output: {
             artifact_refs: [aggregate.task.final_output.artifact_ref],
@@ -1031,7 +1041,7 @@ function projectAggregate(aggregate: PersistedTaskAggregate): TaskSnapshot {
   });
 }
 
-function toRunFact(run: PersistedRunState): TaskRunFact {
+function toRunFact(run: PersistedRunState, snapshot = run.snapshot): TaskRunFact {
   return {
     run_id: run.run_id,
     task_id: run.task_id,
@@ -1043,7 +1053,7 @@ function toRunFact(run: PersistedRunState): TaskRunFact {
     ...(run.completed_at ? { completed_at: run.completed_at } : {}),
     ...(run.error ? { error: { ...run.error } } : {}),
     revision: run.revision,
-    ...(run.snapshot ? { snapshot: run.snapshot } : {}),
+    ...(snapshot ? { snapshot } : {}),
   };
 }
 

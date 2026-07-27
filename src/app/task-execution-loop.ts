@@ -26,6 +26,7 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   mode: PersistedRunMode;
   task_request: TaskCreateRequest;
   workspace_path: string;
+  session_id?: string;
   cursor_input: CursorInput<TCursor>;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
@@ -120,6 +121,7 @@ export interface RunTaskExecutionInput {
   task_id: string;
   run_id: string;
   council_override?: boolean;
+  session_id?: string;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
   on_event?: (event: Event) => void;
@@ -165,7 +167,7 @@ export class TaskExecutionLoop {
     cursorInput: Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>,
     controls: Pick<
       RunTaskExecutionInput,
-      'signal' | 'on_driver_event' | 'on_event' | 'on_committed_events'
+      'session_id' | 'signal' | 'on_driver_event' | 'on_event' | 'on_committed_events'
     >,
   ): Promise<TaskStageCommitResult> {
     const invocationId = this.createInvocationId(cursorInput.cursor);
@@ -461,7 +463,10 @@ class StageAdvanceError extends Error {
 function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbox_wait'>>(
   state: TaskRunExecutionState,
   cursorInput: CursorInput<TCursor>,
-  controls: Pick<RunTaskExecutionInput, 'signal' | 'on_driver_event' | 'on_event'>,
+  controls: Pick<
+    RunTaskExecutionInput,
+    'session_id' | 'signal' | 'on_driver_event' | 'on_event'
+  >,
 ): TaskStageExecutionContext<TCursor> {
   return {
     task_id: state.task_id,
@@ -469,6 +474,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     mode: state.mode,
     task_request: state.task_request,
     workspace_path: state.workspace_path,
+    ...(controls.session_id ? { session_id: controls.session_id } : {}),
     cursor_input: cursorInput,
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
