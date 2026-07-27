@@ -17,6 +17,14 @@ export async function readArtifactBytes(artifact: ArtifactRef): Promise<Buffer> 
   if (!content || (content.kind !== 'text' && content.kind !== 'file')) {
     throw new Error(`Artifact ${artifact.artifact_id} is not a materializable file artifact`);
   }
+  return readArtifactContentBytes(artifact);
+}
+
+export async function readArtifactContentBytes(artifact: ArtifactRef): Promise<Buffer> {
+  const content = artifact.content;
+  if (!content || content.kind === 'metadata') {
+    throw new Error(`Artifact ${artifact.artifact_id} has no readable content`);
+  }
   if (content.content_ref.startsWith('data:')) {
     const comma = content.content_ref.indexOf(',');
     if (comma < 0) throw new Error(`Artifact ${artifact.artifact_id} has an invalid data reference`);

@@ -29,6 +29,8 @@ export interface IntegrationRunOutputPaths {
   event_log_path: string;
   audit_path: string;
   frontend_snapshot_path: string;
+  changeset_manifest_path: string;
+  delivery_receipt_path: string;
 }
 
 export interface IntegrationRunResultManifest {
@@ -51,6 +53,9 @@ export interface IntegrationRunResultManifest {
   event_log_path: string;
   audit_path: string;
   frontend_snapshot_path: string;
+  changeset_manifest_path: string;
+  delivery_receipt_path: string;
+  changeset_manifest_ref: string;
   council_decision_path?: string;
   council_proposals_path?: string;
   council_reviews_path?: string;
@@ -89,6 +94,8 @@ export function buildRunOutputPaths(
     event_log_path: path.join(runDir, 'event-log.json'),
     audit_path: path.join(runDir, 'audit.jsonl'),
     frontend_snapshot_path: path.join(runDir, 'frontend-snapshot.json'),
+    changeset_manifest_path: path.join(runDir, 'changeset-manifest.json'),
+    delivery_receipt_path: path.join(runDir, 'delivery.json'),
   };
 }
 
@@ -112,6 +119,9 @@ export interface BuildRunResultManifestInput {
   event_log_path: string;
   audit_path: string;
   frontend_snapshot_path: string;
+  changeset_manifest_path: string;
+  delivery_receipt_path: string;
+  changeset_manifest_ref: string;
   council_decision_path?: string;
   council_proposals_path?: string;
   council_reviews_path?: string;
@@ -147,6 +157,9 @@ export function buildRunResultManifest(
     event_log_path: input.event_log_path,
     audit_path: input.audit_path,
     frontend_snapshot_path: input.frontend_snapshot_path,
+    changeset_manifest_path: input.changeset_manifest_path,
+    delivery_receipt_path: input.delivery_receipt_path,
+    changeset_manifest_ref: input.changeset_manifest_ref,
     ...(input.council_decision_path ? { council_decision_path: input.council_decision_path } : {}),
     ...(input.council_proposals_path
       ? { council_proposals_path: input.council_proposals_path }

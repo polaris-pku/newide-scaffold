@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef, type TaskId } from '../core';
+import type { ChangesetManifest, ChangesetManifestEntry } from './changeset-manifest';
 
 const execFileAsync = promisify(execFile);
 
@@ -21,14 +22,22 @@ export interface MaterializationResult {
   changed_files: string[];
   status: 'completed' | 'partial' | 'failed';
   failures: MaterializationFailure[];
+  changeset_manifest_ref?: string;
   created_at: string;
   schema_version: string;
 }
 
-export interface MaterializationInput {
-  task_id: TaskId;
-  artifacts: ArtifactRef[];
-}
+export type MaterializationInput =
+  | {
+      task_id: TaskId;
+      manifest: ChangesetManifest;
+      artifacts?: never;
+    }
+  | {
+      task_id: TaskId;
+      artifacts: ArtifactRef[];
+      manifest?: never;
+    };
 
 export interface WorktreeMaterializerOptions {
   baseWorktreePath: string;
@@ -65,10 +74,19 @@ export class WorktreeMaterializer {
     const materializedArtifacts: ArtifactRef[] = [];
     const failures: MaterializationFailure[] = [];
 
-    // Write each artifact to worktree
-    for (const artifact of input.artifacts) {
+    const entries = input.manifest
+      ? input.manifest.entries
+      : input.artifacts.map(legacyManifestEntry);
+    for (const entry of entries) {
       try {
-        if (artifact.content) {
+        const artifact = entry.artifact_ref;
+        if (entry.source_path && entry.relative_paths[0]) {
+          const target = safeTargetPath(worktreePath, entry.relative_paths[0]);
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          await fs.copyFile(entry.source_path, target);
+          filesWritten.push(target);
+          changedFiles.push(target);
+        } else if (artifact?.content) {
           const written = await materializeContent(worktreePath, artifact);
           filesWritten.push(...written);
           // changed_files describes files materialized from deliverable content.
@@ -76,22 +94,28 @@ export class WorktreeMaterializer {
           // user deliverables and therefore must not enter changed_files.
           if (artifact.content.kind !== 'metadata') changedFiles.push(...written);
         } else if (
-          artifact.type === 'patch' ||
-          artifact.type === 'diff' ||
-          artifact.type === 'driver_result'
+          artifact &&
+          (artifact.type === 'patch' ||
+            artifact.type === 'diff' ||
+            artifact.type === 'driver_result')
         ) {
           // Metadata blobs: register, but never as a changed file.
           const artifactFile = path.join(worktreePath, `${artifact.artifact_id}.json`);
           await fs.writeFile(artifactFile, JSON.stringify(artifact, null, 2), 'utf-8');
           filesWritten.push(artifactFile);
         }
-        materializedArtifacts.push(artifact);
+        if (artifact) materializedArtifacts.push(artifact);
       } catch (error) {
         failures.push({
-          artifact_id: artifact.artifact_id,
+          artifact_id: entry.artifact_id,
           reason: error instanceof Error ? error.message : String(error),
         });
       }
+    }
+    if (input.manifest) {
+      const manifestRecordPath = path.join(worktreePath, 'changeset-manifest.json');
+      await fs.writeFile(manifestRecordPath, JSON.stringify(input.manifest, null, 2), 'utf-8');
+      filesWritten.push(manifestRecordPath);
     }
 
     const uniqueFiles = [...new Set(filesWritten)];
@@ -108,6 +132,7 @@ export class WorktreeMaterializer {
       changed_files: uniqueChangedFiles,
       status,
       failures,
+      ...(input.manifest ? { changeset_manifest_ref: input.manifest.manifest_id } : {}),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
@@ -124,6 +149,24 @@ export class WorktreeMaterializer {
       // Ignore errors if directory doesn't exist
     }
   }
+}
+
+function legacyManifestEntry(artifact: ArtifactRef): ChangesetManifestEntry {
+  return {
+    entry_id: `legacy_${artifact.artifact_id}`,
+    artifact_id: artifact.artifact_id,
+    artifact_ref: artifact,
+    relative_paths: artifact.content?.target_path ? [artifact.content.target_path] : [],
+    sha256: artifact.sha256 ?? '',
+    producer_agent_id: artifact.producer_id,
+    gate_result_refs: [],
+    delivery_strategy:
+      artifact.content?.kind === 'patch'
+        ? 'apply_patch'
+        : artifact.content?.kind === 'text' || artifact.content?.kind === 'file'
+          ? 'copy_file'
+          : 'metadata_only',
+  };
 }
 
 async function materializeContent(worktreePath: string, artifact: ArtifactRef): Promise<string[]> {

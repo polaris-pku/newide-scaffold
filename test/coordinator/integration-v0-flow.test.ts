@@ -1184,7 +1184,7 @@ describe('runIntegrationV0Flow', () => {
       result.materialization_result.worktree_path,
     );
     expect(checkpoint.mechanical_snapshot.modified_files).toEqual(
-      result.materialization_result.files_written,
+      result.materialization_result.changed_files,
     );
     expect(checkpoint.artifact_refs).toContain(result.driver_result.transcript_ref.artifact_id);
     expect(checkpoint.semantic_handoff).toBeDefined();
@@ -1430,7 +1430,14 @@ function fakeMaterializer(
       materialization_id: createId('materialization'),
       task_id: input.task_id,
       worktree_path: '.newide/worktrees/fake',
-      materialized_artifacts: status === 'failed' ? [] : input.artifacts,
+      materialized_artifacts:
+        status === 'failed'
+          ? []
+          : input.manifest
+            ? input.manifest.entries.flatMap((entry) =>
+                entry.artifact_ref ? [entry.artifact_ref] : [],
+              )
+            : input.artifacts,
       files_written: status === 'failed' ? [] : ['partial.ts'],
       changed_files: status === 'failed' ? [] : ['partial.ts'],
       status,
