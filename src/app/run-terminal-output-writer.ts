@@ -26,25 +26,18 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
     const timelinePath = path.join(runDir, 'timeline.json');
     const frontendSnapshotPath = path.join(runDir, 'frontend-snapshot.json');
 
-    const fallbackWrites =
-      snapshot.status === 'completed'
-        ? []
-        : [
-            writeJsonIfMissing(resultPath, {
-              run_id: snapshot.run_id,
-              task_id: snapshot.task_id,
-              status: snapshot.status,
-              mode: snapshot.mode,
-              errors: snapshot.error ? [snapshot.error] : [],
-              result_path: resultPath,
-              timeline_path: timelinePath,
-              audit_path: path.join(runDir, 'audit.jsonl'),
-              frontend_snapshot_path: frontendSnapshotPath,
-              schema_version: snapshot.schema_version,
-            }),
-            writeJsonIfMissing(timelinePath, snapshot.events),
-          ];
-    const serializedSnapshot = JSON.stringify(projectRunSnapshot(snapshot), null, 2);
+    const projected = projectRunSnapshot(snapshot);
+    const fallbackWrites = [
+      writeJsonIfMissing(resultPath, {
+        ...projected,
+        result_path: resultPath,
+        timeline_path: timelinePath,
+        audit_path: path.join(runDir, 'audit.jsonl'),
+        frontend_snapshot_path: frontendSnapshotPath,
+      }),
+      writeJsonIfMissing(timelinePath, snapshot.events),
+    ];
+    const serializedSnapshot = JSON.stringify(projected, null, 2);
     await Promise.all([
       ...fallbackWrites,
       fs.writeFile(frontendSnapshotPath, serializedSnapshot, 'utf-8'),

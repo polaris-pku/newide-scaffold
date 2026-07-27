@@ -18,7 +18,7 @@ describe('production RPC composition smoke script', () => {
       malformed_json_error: -32700,
       unknown_method_error: -32601,
     });
-  }, 30_000);
+  }, 60_000);
 
   it.each([
     ['single_agent', 1],

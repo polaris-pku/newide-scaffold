@@ -121,6 +121,8 @@ export function createProductionStageExecutors(
       const candidateIds =
         context.cursor_input.candidate_ids.length > 0
           ? context.cursor_input.candidate_ids
+          : context.task_request.role_id
+            ? [context.task_request.role_id]
           : [...dependencies.bootstrapAgentIds];
       const result = await dependencies.selectAgentHandler.execute({
         task_id: context.task_id,
@@ -173,6 +175,7 @@ export function createProductionStageExecutors(
           input_artifact_refs: [],
           context_policy: 'production_task_loop',
           schema_version: SCHEMA_VERSION,
+          ...(context.session_id ? { session_id: context.session_id } : {}),
         },
         {
           ...(context.signal ? { signal: context.signal } : {}),
@@ -208,11 +211,20 @@ export function createProductionStageExecutors(
         role_id: result.role_id,
         status: result.status,
         session_id: result.session_id,
+        response: result.response,
         artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
+        transcript_ref: result.transcript_ref.artifact_id,
         context_pack_ref: result.context_pack_ref,
         memory_buffer_ref: result.memory_buffer_ref,
         driver_run_result_id: result.driver_run_result_id,
+        diagnostics: result.diagnostics,
       });
+      if (context.mode === 'single_agent') {
+        emit(context, 'artifact.selected', selection.manifest_ref, {
+          mode: 'single_agent',
+          selected_artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
+        });
+      }
       return {
         changeset_ref: selection.manifest_ref,
         expected_sha256: selection.expected_sha256,
@@ -323,6 +335,13 @@ export function createProductionStageExecutors(
         reviews: councilRunResult.reviews,
         synthesis: councilRunResult.synthesis,
         output: councilRunResult.output,
+        result: councilRunResult.result,
+      });
+      emit(context, 'artifact.selected', selection.manifest_ref, {
+        mode: 'council',
+        selected_artifact_refs: selected.selected_artifacts.map(
+          (artifact) => artifact.artifact_id,
+        ),
       });
       return {
         changeset_ref: selection.manifest_ref,
@@ -425,10 +444,19 @@ export function createProductionStageExecutors(
           },
         },
       });
+      emit(context, 'worktree.materialized', manifest.manifest_id, {
+        changeset_manifest_ref: selection.manifest_ref,
+        worktree_path: materialization.worktree_path,
+        files_written: materialization.files_written,
+        changed_files: materialization.changed_files,
+        status: materialization.status,
+        failures: materialization.failures,
+      });
       emit(context, 'completion.evaluated', context.run_id, {
         outcome: completionEvaluation.outcome,
         changeset_manifest_ref: selection.manifest_ref,
         changeset_manifest_id: manifest.manifest_id,
+        worktree_path: materialization.worktree_path,
       });
       const status =
         denied || completionEvaluation.outcome.status === 'failed'
@@ -503,6 +531,7 @@ export function createProductionStageExecutors(
         changeset_manifest_ref: selection.manifest_ref,
         idempotency_key: delivery.idempotency_key,
         workspace_path: delivery.workspace_path,
+        delivery_receipt_path: gateState.manifest.paths.delivery_receipt_path,
         files: delivery.files,
         quality: gateState.completion_evaluation.outcome,
       });
