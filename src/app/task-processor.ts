@@ -910,6 +910,43 @@ export class TaskProcessor {
     return saved;
   }
 
+  /**
+   * Record the outcome of a workspace anchor restore attempt against a resume
+   * checkpoint. Auditing this matters because a skipped restore silently changes what
+   * the resumed stage sees, and "resumed" must not imply "workspace was restored".
+   */
+  recordWorkspaceRestore(
+    taskId: string,
+    checkpointId: string,
+    runId: string,
+    outcome: Record<string, unknown>,
+  ): void {
+    const aggregate = this.store.getTaskAggregate(taskId);
+    if (!aggregate) return;
+    const event = this.createEvent(
+      'checkpoint.workspace_restored',
+      checkpointId,
+      taskId,
+      runId,
+      { checkpoint_id: checkpointId, ...outcome },
+    );
+    const timestamp = this.now();
+    try {
+      this.store.commitState({
+        expected_task_revision: aggregate.task.revision,
+        task: {
+          ...aggregate.task,
+          revision: aggregate.task.revision + 1,
+          updated_at: timestamp,
+        },
+        runtime_state: { ...aggregate.runtime_state, updated_at: timestamp },
+        events: [event],
+      });
+    } catch {
+      // audit only; a lost restore note must not block resume
+    }
+  }
+
   private persistSafepoint(
     aggregate: PersistedTaskAggregate,
     runId: string,
@@ -992,49 +1029,19 @@ export class TaskProcessor {
       reason,
       interrupted_run_id: run.run_id,
     };
-    const checkpointId = createId('checkpoint');
     const latestCheckpoint = this.store.getLatestCheckpoint(aggregate.task.task_id);
-    const checkpoint: PersistedFullCheckpoint = {
-      checkpoint_id: checkpointId,
-      ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
-      task_id: aggregate.task.task_id,
+    // Built through buildSafepointCheckpoint so the interrupt captures a real workspace
+    // anchor. This path used to hardcode base_commit 'unknown' with no snapshot, which
+    // made every recovery checkpoint undeployable for content restore.
+    const checkpoint = buildSafepointCheckpoint({
+      aggregate,
       run_id: run.run_id,
-      agent_id:
-        readLatestEventString(aggregate, 'agent_id') ??
-        aggregate.task.owner_agent_id ??
-        aggregate.task.role_id ??
-        'coordinator',
-      ...(run.session_id ? { session_id: run.session_id } : {}),
       trigger: 'blocked',
-      resume_cursor: aggregate.runtime_state.resume_cursor,
-      message_thread: aggregate.events.map((event, index) => ({
-        message_id: event.event_id,
-        role: projectRunEventSource(event.event_type),
-        content: event.event_type,
-        turn: index + 1,
-        artifact_refs: readPayloadStringArray(event.payload, 'artifact_refs'),
-        created_at: event.created_at,
-      })),
-      mechanical_snapshot: {
-        base_commit: 'unknown',
-        worktree_path: aggregate.task.workspace_path,
-        branch: 'runtime-recovery',
-        modified_files: [],
-      },
-      semantic_handoff: {
-        done: aggregate.events.map((event) => event.event_type),
-        in_progress: [aggregate.runtime_state.resume_cursor],
-        blocked_on: ['backend process interrupted'],
-        assumptions: [],
-        next_steps: [`resume ${aggregate.runtime_state.resume_cursor}`],
-        known_risks: ['unfinished action will be re-executed'],
-      },
+      ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
       interrupt_state: interruptState,
-      artifact_refs: [...aggregate.runtime_state.artifact_refs],
-      validity_status: 'valid',
-      created_at: timestamp,
-      schema_version: SCHEMA_VERSION,
-    };
+      now: timestamp,
+    });
+    const checkpointId = checkpoint.checkpoint_id;
     const runInterrupted = this.createEvent(
       'run.interrupted',
       run.run_id,
@@ -1517,18 +1524,6 @@ function appendUnique(current: readonly string[], additions: readonly string[]):
   return [...new Set([...current, ...additions])];
 }
 
-function readLatestEventString(
-  aggregate: PersistedTaskAggregate,
-  key: string,
-): string | undefined {
-  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
-    const event = aggregate.events[index];
-    if (!event) continue;
-    const value = readPayloadString(event.payload, key);
-    if (value) return value;
-  }
-  return undefined;
-}
 
 function councilWarnings(snapshot: RunSnapshot | undefined): string[] {
   const result = snapshot?.council?.result;
