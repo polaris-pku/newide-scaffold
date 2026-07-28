@@ -29,6 +29,8 @@
     "eval:cooperbench-smoke": "tsx eval/cooperbench/run-smoke.ts",
     "eval:cooperbench-harness": "tsx eval/cooperbench/run-harness.ts",
     "eval:cooperbench-record": "tsx eval/cooperbench/record-harness-result.ts",
+    "eval:verify-backend-contract": "tsx eval/scripts/verify-backend-contract.ts",
+    "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
     "prepare": "husky"
   },
   "lint-staged": {

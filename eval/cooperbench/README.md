@@ -13,10 +13,21 @@
 1. 同级有 CooperBench 仓库且已 `cooperbench prepare`（或已有 `dataset/`）
 2. 真判卷需要 Docker（`--backend docker`，默认）以及可调用的 `python -m cooperbench.cli`
 
+推荐在 WSL 安装独立 venv（勿用系统 Python）：
+
+```bash
+bash eval/scripts/setup-cooperbench-venv.sh
+bash eval/scripts/check-harness-env.sh
+```
+
 环境变量（可选）：
 
 - `NEWIDE_COOPERBENCH_ROOT`
 - `NEWIDE_COOPERBENCH_DATASET_DIR`
+- `NEWIDE_COOPERBENCH_VENV`（默认 `../CooperBench/.venv`）
+- `NEWIDE_COOPERBENCH_PYTHON`（覆盖 harness 使用的解释器）
+
+Harness adapter 会优先使用 `CooperBench/.venv/bin/python`。
 
 ## 子集
 
@@ -31,8 +42,6 @@
 ## 常用命令
 
 ```powershell
-cd D:\Code\NewIDE\newide-scaffold
-
 # stub 冒烟（无需 Docker）
 pnpm eval:cooperbench-smoke -- --subset v0-smoke --mode stub --setting coop
 

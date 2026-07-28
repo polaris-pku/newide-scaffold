@@ -124,6 +124,8 @@ try {
   const flowOptions: IntegrationV0Options = {
     enableCouncil: cliOptions.enableCouncil,
     driverPrompt: cliOptions.driverPrompt,
+    ...(cliOptions.memoryAblation ? { memoryAblation: cliOptions.memoryAblation } : {}),
+    ...(cliOptions.worktreePath ? { worktreePath: cliOptions.worktreePath } : {}),
   };
 
   if (driver) {
@@ -155,6 +157,9 @@ try {
   console.log(`  Task ID: ${result.task_id}`);
   console.log(`  Mode: ${result.summary.mode}`);
   console.log(`  Status: ${result.summary.status}`);
+  if (result.summary.memory_ablation) {
+    console.log(`  Memory ablation: ${result.summary.memory_ablation}`);
+  }
   console.log(`  Driver: ${result.summary.driver_diagnostics.driver_id}`);
   console.log(`  Duration: ${result.summary.driver_diagnostics.duration_ms}ms`);
   console.log(`  Artifacts: ${result.summary.artifacts_materialized}`);

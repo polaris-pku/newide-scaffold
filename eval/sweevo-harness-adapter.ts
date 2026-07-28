@@ -11,6 +11,8 @@ export interface SweEvoHarnessAdapterOptions {
   runId: string;
   outRoot?: string;
   sweEvoRoot?: string;
+  /** Override dataset JSONL (e.g. verified-30 slice); defaults to manifest.dataset_jsonl. */
+  datasetPath?: string;
   maxWorkers?: number;
   dryRun?: boolean;
   reportSource?: string;
@@ -131,9 +133,10 @@ export function buildSweEvoHarnessCommand(input: {
 export async function writeOutputFinalInstances(
   path: string,
   predictions: SweBenchPrediction[],
+  datasetPathOverride?: string,
 ): Promise<void> {
   const manifest = loadManifest();
-  const datasetPath = resolveDatasetJsonl(manifest);
+  const datasetPath = resolveDatasetJsonl(manifest, datasetPathOverride);
   const instances = indexDatasetById(await loadDataset(datasetPath));
   mkdirSync(path, { recursive: true });
 
@@ -167,7 +170,7 @@ export async function runSweEvoHarnessAdapter(
     copyFileSync(options.predictionsPath, storedPredictionsPath);
   }
   writeOpenHandsTrajectory(trajectoryPath, predictions);
-  await writeOutputFinalInstances(outputFinalDir, predictions);
+  await writeOutputFinalInstances(outputFinalDir, predictions, options.datasetPath);
 
   const command = buildSweEvoHarnessCommand({
     sweEvoRoot,

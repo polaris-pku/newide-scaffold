@@ -32,6 +32,10 @@ export interface RunCreateParams {
   project_id?: string;
   client_task_id?: string;
   title?: string;
+  /** F-eval memory ablation B0–B3; recorded on summary for --backend-summary. */
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  /** Optional override for materializer base / eval worktree root. */
+  worktree_path?: string;
 }
 
 export interface RunCreateResult {
@@ -76,6 +80,8 @@ export class NewideBackendService {
         runnerPromise = this.runner.run({
           prompt: params.prompt,
           mode,
+          ...(params.memory_ablation ? { memoryAblation: params.memory_ablation } : {}),
+          ...(params.worktree_path ? { worktreePath: params.worktree_path } : {}),
           telemetry,
           signal: controller.signal,
           onEvent: (event) => {

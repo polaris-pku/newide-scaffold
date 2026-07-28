@@ -34,6 +34,22 @@ describe('parseIntegrationV0CliArgs', () => {
     });
   });
 
+  it('parses memory ablation and worktree path for eval contract', () => {
+    expect(
+      parseIntegrationV0CliArgs([
+        '--ablation',
+        'B1',
+        '--worktree-path',
+        '../tmp/swe-worktree',
+        'Fix memory',
+      ]),
+    ).toMatchObject({
+      memoryAblation: 'B1',
+      worktreePath: '../tmp/swe-worktree',
+      driverPrompt: 'Fix memory',
+    });
+  });
+
   it('keeps mock council as the default provider mode', () => {
     expect(parseIntegrationV0CliArgs(['Refactor task runner'])).toEqual({
       enableCouncil: false,

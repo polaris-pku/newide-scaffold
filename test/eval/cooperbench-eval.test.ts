@@ -112,10 +112,10 @@ describe('CooperBench F-eval utilities', () => {
 
   it('builds cooperbench eval command', () => {
     const command = buildCooperBenchEvalCommand({
-      cooperbenchRoot: 'D:/Code/NewIDE/CooperBench',
+      cooperbenchRoot: '../CooperBench',
       cooperbenchRunName: 'newide',
-      logsRoot: 'D:/logs',
-      datasetDir: 'D:/dataset',
+      logsRoot: '../logs',
+      datasetDir: '../dataset',
       backend: 'docker',
       concurrency: 2,
       force: true,
@@ -123,7 +123,7 @@ describe('CooperBench F-eval utilities', () => {
     expect(command.command).toBe('python');
     expect(command.args).toContain('eval');
     expect(command.args).toContain('--force');
-    expect(command.cwd).toBe('D:/Code/NewIDE/CooperBench');
+    expect(command.cwd).toBe('../CooperBench');
   });
 
   it('runs stub case end-to-end without docker', async () => {

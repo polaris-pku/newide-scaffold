@@ -15,6 +15,8 @@ import type { Event } from '../core';
 export interface CoordinatorRunRequest {
   prompt: string;
   mode: 'single_agent' | 'council';
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+  worktreePath?: string;
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
   onEvent?: (event: Event) => void;
@@ -43,6 +45,8 @@ export class IntegrationV0CoordinatorRunner implements CoordinatorRunner {
       ...this.defaults,
       driverPrompt: request.prompt,
       enableCouncil: request.mode === 'council',
+      ...(request.memoryAblation ? { memoryAblation: request.memoryAblation } : {}),
+      ...(request.worktreePath ? { worktreePath: request.worktreePath } : {}),
       ...(request.telemetry ? { telemetry: request.telemetry } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(request.onEvent ? { onEvent: request.onEvent } : {}),

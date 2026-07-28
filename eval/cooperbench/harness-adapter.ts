@@ -31,6 +31,27 @@ export interface CooperBenchHarnessAdapterResult {
   report?: CooperBenchHarnessReport;
 }
 
+export function resolveCooperBenchPython(cooperbenchRoot: string): string {
+  const fromEnv = process.env.NEWIDE_COOPERBENCH_PYTHON?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  const homeVenv = process.env.HOME
+    ? join(process.env.HOME, '.venvs', 'cooperbench', 'bin', 'python')
+    : undefined;
+  const candidates = [
+    ...(homeVenv ? [homeVenv] : []),
+    join(cooperbenchRoot, '.venv', 'bin', 'python'),
+    join(cooperbenchRoot, '.venv', 'Scripts', 'python.exe'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return 'python';
+}
+
 export function buildCooperBenchEvalCommand(input: {
   cooperbenchRoot: string;
   cooperbenchRunName: string;
@@ -60,7 +81,7 @@ export function buildCooperBenchEvalCommand(input: {
   }
   return {
     cwd: input.cooperbenchRoot,
-    command: 'python',
+    command: resolveCooperBenchPython(input.cooperbenchRoot),
     args,
   };
 }

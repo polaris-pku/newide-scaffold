@@ -69,6 +69,8 @@ export interface IntegrationV0Summary {
   status: 'completed' | 'failed';
   failure?: IntegrationV0Failure;
   worktree_path: string;
+  /** F-eval ablation tag (B0–B3); echoed for --backend-summary alignment. */
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   artifacts_materialized: number;
   files_written: string[];
   changed_files: string[];
@@ -127,6 +129,8 @@ export interface IntegrationV0Options {
   materializer?: IntegrationV0Materializer;
   worktreePath?: string;
   runsRoot?: string;
+  /** F Harness memory ablation; recorded on summary + context_pack events. */
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
   onEvent?: (event: Event) => void;
@@ -253,6 +257,7 @@ export async function runIntegrationV0Flow(
     artifact_refs: [],
   });
   options?.signal?.throwIfAborted();
+  const memoryAblation = options?.memoryAblation;
   const contextEvent = orchestrator.appendEvent({
     event_type: 'memory.context_pack_built',
     subject_id: contextPack.context_pack_id,
@@ -261,6 +266,7 @@ export async function runIntegrationV0Flow(
     payload: {
       role_id: contextPack.role_profile_ref.role_id,
       memory_refs: contextPack.memory_refs.map((memoryRef) => memoryRef.memory_id),
+      ...(memoryAblation ? { ablation: memoryAblation } : {}),
     },
   });
   timeline.push({ name: 'ContextPackBuilt', id: contextEvent.event_id });
@@ -908,6 +914,7 @@ export async function runIntegrationV0Flow(
     status: finalRunStatus,
     ...(failure ? { failure } : {}),
     worktree_path: materializationResult.worktree_path,
+    ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     artifacts_materialized: materializationResult.materialized_artifacts.length,
     files_written: materializationResult.files_written,
     changed_files: materializationResult.changed_files,
