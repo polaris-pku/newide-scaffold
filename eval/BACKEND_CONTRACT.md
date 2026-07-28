@@ -19,10 +19,12 @@
 2. 已 checkout 到该 instance 的 `base_commit`（或能 `git rev-parse` 到该 commit）；
 3. Agent 改完后的树通常是脏的 → eval 侧加 `--allow-dirty-worktree`。
 
-Integration v0 默认 `WorktreeMaterializer` 只写 artifact JSON，**不是** SWE checkout。接 eval 时应：
+**能力向标准跑法**：`run.create` 的 `workspace_path` 就是已检出的 SWE worktree；agent **直接在该树写文件**。后端若传入 `workspacePath`，`summary.worktree_path` 会绑定到该路径（不再用 materializer 产物目录冒充源码树）。评测收 patch：对 `base_commit` 做 `git diff`（`collectWorktreePatch` / `--backend-summary` + `--allow-dirty-worktree`）。
 
-- 把 `options.worktreePath` / runner defaults 指到已准备好的 instance git 树；或
-- 跳过 `--backend-summary`，改用 `--ephemeral-from` + `--patch-file`。
+Integration v0 默认 `WorktreeMaterializer` 仍只写 artifact JSON，**不是** SWE checkout。未传 `workspacePath` 的 demo 路径下 `summary.worktree_path` 仍指向 materializer 目录。接 eval 时也可：
+
+- 跳过 `--backend-summary`，改用 `--worktree-path <agent-tree> --allow-dirty-worktree`；或
+- `--ephemeral-from` + `--patch-file`（seed 已知 patch，不经 agent）。
 
 ## Ablation
 

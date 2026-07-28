@@ -32,6 +32,8 @@
     "eval:cooperbench-record": "tsx eval/cooperbench/record-harness-result.ts",
     "eval:verify-backend-contract": "tsx eval/scripts/verify-backend-contract.ts",
     "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
+    "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
+    "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
     "prepare": "husky"
   },
   "lint-staged": {

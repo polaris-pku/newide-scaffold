@@ -1031,10 +1031,16 @@ export async function runIntegrationV0Flow(
       ? selectionResult.selected_artifacts[0]!.artifact_id
       : undefined;
 
+  // Capability-facing eval reads summary.worktree_path as the agent git workspace.
+  // Prefer workspacePath (ACP write root) over the materializer artifact directory.
+  const evalWorktreePath = options?.workspacePath
+    ? path.resolve(options.workspacePath)
+    : materializationResult.worktree_path;
+
   const mechanicalSnapshot: Checkpoint['mechanical_snapshot'] = {
     base_commit: 'demo-head',
     snapshot_commit: 'demo-head',
-    worktree_path: materializationResult.worktree_path,
+    worktree_path: evalWorktreePath,
     branch: 'integration-v0-demo',
     modified_files: deliveryChangedFiles,
   };
@@ -1173,7 +1179,7 @@ export async function runIntegrationV0Flow(
     response: driverResult.response ?? '',
     tool_events: [...driverResult.tool_events],
     ...(failure ? { failure } : {}),
-    worktree_path: materializationResult.worktree_path,
+    worktree_path: evalWorktreePath,
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     artifacts_materialized: materializationResult.materialized_artifacts.length,
     files_written: materializationResult.files_written,
