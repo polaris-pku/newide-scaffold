@@ -38,6 +38,20 @@ interface BackendClient {
   close(): Promise<void>;
 }
 
+interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  /** input + cache_creation + cache_read (Claude billed input-ish total). */
+  total_input_tokens: number;
+  total_tokens: number;
+  assistant_messages: number;
+  source: 'claude_session_jsonl' | 'unavailable';
+  session_path?: string;
+  session_id?: string;
+}
+
 interface InstanceRow {
   ablation: MemoryAblation;
   instance_id: string;
@@ -50,6 +64,13 @@ interface InstanceRow {
   snapshot_status?: string;
   summary_path?: string;
   summary_worktree_path?: string;
+  session_id?: string;
+  wall_started_at?: string;
+  wall_finished_at?: string;
+  wall_ms?: number;
+  driver_duration_ms?: number;
+  maintenance_wait_ms?: number;
+  token_usage?: TokenUsage;
   eval_run_dir?: string;
   eval_predictions_path?: string;
   eval_error?: string;
@@ -151,10 +172,21 @@ for (const ablation of ablations) {
   await fs.writeFile(path.join(armDir, 'arm-summary.json'), JSON.stringify(armSummary, null, 2));
 }
 
+const finishedAt = new Date();
+const metricsRows = armReports.flatMap((arm) => arm.instances);
+const metricsPath = path.join(experimentRoot, 'metrics.jsonl');
+await fs.writeFile(
+  metricsPath,
+  `${metricsRows.map((row) => JSON.stringify(row)).join('\n')}${metricsRows.length > 0 ? '\n' : ''}`,
+  'utf-8',
+);
+const timingTotals = summarizeTiming(metricsRows);
+const tokenTotals = summarizeTokens(metricsRows);
 const summary = {
   schema_version: 'sweevo-memory-ablation.v0',
   started_at: startedAt.toISOString(),
-  finished_at: new Date().toISOString(),
+  finished_at: finishedAt.toISOString(),
+  wall_ms: finishedAt.getTime() - startedAt.getTime(),
   experiment_root: experimentRoot,
   mirrors_root: mirrorsRoot,
   subset_id: subsetId,
@@ -164,12 +196,19 @@ const summary = {
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
   skip_eval: skipEval,
+  metrics_path: metricsPath,
+  timing_totals: timingTotals,
+  token_totals: tokenTotals,
   arms: armReports,
 };
 const summaryPath = path.join(experimentRoot, 'summary.json');
 await fs.writeFile(summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
 log('');
 log(`summary: ${summaryPath}`);
+log(`metrics: ${metricsPath}`);
+log(
+  `totals wall_ms=${String(timingTotals.wall_ms)} driver_ms=${String(timingTotals.driver_duration_ms)} tokens=${String(tokenTotals.total_tokens)} (in=${String(tokenTotals.total_input_tokens)} out=${String(tokenTotals.output_tokens)})`,
+);
 
 const failed = armReports.some((arm) => arm.instances.some((row) => row.status === 'failed'));
 if (failed) process.exitCode = 1;
@@ -194,6 +233,8 @@ async function runOneInstance(input: {
   let prepared:
     | Awaited<ReturnType<typeof prepareEphemeralWorktree>>
     | undefined;
+  const wallStartedAt = Date.now();
+  row.wall_started_at = new Date(wallStartedAt).toISOString();
 
   try {
     const mirror = await ensureRepoMirror({
@@ -230,17 +271,35 @@ async function runOneInstance(input: {
     row.snapshot_status = String(snapshot.status ?? '');
 
     if (ablation !== 'B0') {
+      row.maintenance_wait_ms = maintenanceWaitMs;
       await sleep(maintenanceWaitMs);
     }
 
     const summaryPath = path.join(repoRoot, '.newide', 'runs', created.run_id, 'summary.json');
     row.summary_path = summaryPath;
     const summary = await readJsonIfExists(summaryPath);
-    if (summary && typeof summary === 'object' && 'worktree_path' in summary) {
-      row.summary_worktree_path = String(
-        (summary as { worktree_path?: unknown }).worktree_path ?? '',
-      );
+    if (summary && typeof summary === 'object') {
+      const summaryObj = summary as {
+        worktree_path?: unknown;
+        session_id?: unknown;
+        driver_diagnostics?: { duration_ms?: unknown };
+      };
+      if ('worktree_path' in summaryObj) {
+        row.summary_worktree_path = String(summaryObj.worktree_path ?? '');
+      }
+      if (typeof summaryObj.session_id === 'string' && summaryObj.session_id.length > 0) {
+        row.session_id = summaryObj.session_id;
+      }
+      const driverMs = summaryObj.driver_diagnostics?.duration_ms;
+      if (typeof driverMs === 'number' && Number.isFinite(driverMs)) {
+        row.driver_duration_ms = Math.max(0, Math.floor(driverMs));
+      }
     }
+
+    row.token_usage = await collectClaudeTokenUsage({
+      sessionId: row.session_id,
+      worktreePath: prepared.worktreePath,
+    });
 
     if (skipEval) {
       row.status = 'skipped_eval';
@@ -280,6 +339,12 @@ async function runOneInstance(input: {
     row.status = 'failed';
     return row;
   } finally {
+    const wallFinishedAt = Date.now();
+    row.wall_finished_at = new Date(wallFinishedAt).toISOString();
+    row.wall_ms = Math.max(0, wallFinishedAt - wallStartedAt);
+    log(
+      `  metrics wall_ms=${String(row.wall_ms)} driver_ms=${String(row.driver_duration_ms ?? '-')} tokens=${String(row.token_usage?.total_tokens ?? '-')} source=${row.token_usage?.source ?? 'unavailable'}`,
+    );
     if (prepared && !keepWorktree) {
       try {
         await removeEphemeralWorktree(prepared.sourceRepo, prepared.worktreePath);
@@ -307,6 +372,191 @@ function buildPrompt(instance: SweEvoInstance): string {
     'Problem statement:',
     instance.problem_statement,
   ].join('\n');
+}
+
+function emptyTokenUsage(
+  source: TokenUsage['source'] = 'unavailable',
+  extras: Partial<TokenUsage> = {},
+): TokenUsage {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    total_input_tokens: 0,
+    total_tokens: 0,
+    assistant_messages: 0,
+    source,
+    ...extras,
+  };
+}
+
+function encodeClaudeProjectDir(worktreePath: string): string {
+  return path
+    .resolve(worktreePath)
+    .replaceAll(':', '')
+    .replaceAll('\\', '-')
+    .replaceAll('/', '-');
+}
+
+async function collectClaudeTokenUsage(input: {
+  sessionId?: string;
+  worktreePath: string;
+}): Promise<TokenUsage> {
+  const claudeRoot = path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.claude');
+  if (!claudeRoot || !existsSync(claudeRoot)) return emptyTokenUsage();
+
+  const candidates: string[] = [];
+  if (input.sessionId) {
+    const projectDir = path.join(
+      claudeRoot,
+      'projects',
+      encodeClaudeProjectDir(input.worktreePath),
+    );
+    candidates.push(path.join(projectDir, `${input.sessionId}.jsonl`));
+    candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
+  }
+
+  // Fallback: newest jsonl under the encoded project dir (useful if session_id mapping drifts).
+  const projectDir = path.join(claudeRoot, 'projects', encodeClaudeProjectDir(input.worktreePath));
+  if (existsSync(projectDir)) {
+    try {
+      const files = (await fs.readdir(projectDir))
+        .filter((name) => name.endsWith('.jsonl'))
+        .map((name) => path.join(projectDir, name));
+      const ranked = await Promise.all(
+        files.map(async (filePath) => ({
+          filePath,
+          mtimeMs: (await fs.stat(filePath)).mtimeMs,
+        })),
+      );
+      ranked.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      for (const entry of ranked.slice(0, 3)) {
+        if (!candidates.includes(entry.filePath)) candidates.push(entry.filePath);
+      }
+    } catch {
+      // ignore listing failures
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (!existsSync(candidate) || !candidate.endsWith('.jsonl')) continue;
+    try {
+      const usage = await sumUsageFromClaudeJsonl(candidate, input.sessionId);
+      if (usage.assistant_messages > 0) return usage;
+    } catch {
+      // try next candidate
+    }
+  }
+  return emptyTokenUsage('unavailable', {
+    session_id: input.sessionId,
+  });
+}
+
+async function sumUsageFromClaudeJsonl(
+  filePath: string,
+  expectedSessionId?: string,
+): Promise<TokenUsage> {
+  const text = await fs.readFile(filePath, 'utf-8');
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheCreation = 0;
+  let cacheRead = 0;
+  let assistantMessages = 0;
+  let matchedSessionId = expectedSessionId;
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let obj: {
+      type?: string;
+      sessionId?: string;
+      message?: { usage?: Record<string, unknown> };
+      usage?: Record<string, unknown>;
+    };
+    try {
+      obj = JSON.parse(line) as typeof obj;
+    } catch {
+      continue;
+    }
+    if (expectedSessionId && obj.sessionId && obj.sessionId !== expectedSessionId) continue;
+    if (obj.sessionId) matchedSessionId = obj.sessionId;
+    const usage = obj.message?.usage ?? obj.usage;
+    if (!usage || typeof usage !== 'object') continue;
+    if (obj.type !== 'assistant' && !obj.message?.usage) continue;
+
+    const nextInput = Number(usage.input_tokens ?? 0);
+    const nextOutput = Number(usage.output_tokens ?? 0);
+    const nextCacheCreation = Number(usage.cache_creation_input_tokens ?? 0);
+    const nextCacheRead = Number(usage.cache_read_input_tokens ?? 0);
+    if (![nextInput, nextOutput, nextCacheCreation, nextCacheRead].every(Number.isFinite)) {
+      continue;
+    }
+    inputTokens += nextInput;
+    outputTokens += nextOutput;
+    cacheCreation += nextCacheCreation;
+    cacheRead += nextCacheRead;
+    assistantMessages += 1;
+  }
+
+  const totalInput = inputTokens + cacheCreation + cacheRead;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+    total_input_tokens: totalInput,
+    total_tokens: totalInput + outputTokens,
+    assistant_messages: assistantMessages,
+    source: assistantMessages > 0 ? 'claude_session_jsonl' : 'unavailable',
+    session_path: filePath,
+    session_id: matchedSessionId,
+  };
+}
+
+function summarizeTiming(rows: InstanceRow[]): {
+  wall_ms: number;
+  driver_duration_ms: number;
+  maintenance_wait_ms: number;
+  instances: number;
+} {
+  return {
+    wall_ms: rows.reduce((sum, row) => sum + (row.wall_ms ?? 0), 0),
+    driver_duration_ms: rows.reduce((sum, row) => sum + (row.driver_duration_ms ?? 0), 0),
+    maintenance_wait_ms: rows.reduce((sum, row) => sum + (row.maintenance_wait_ms ?? 0), 0),
+    instances: rows.length,
+  };
+}
+
+function summarizeTokens(rows: InstanceRow[]): {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  total_input_tokens: number;
+  total_tokens: number;
+  instances_with_tokens: number;
+  instances: number;
+} {
+  const withTokens = rows.filter((row) => row.token_usage?.source === 'claude_session_jsonl');
+  return {
+    input_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.input_tokens ?? 0), 0),
+    output_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.output_tokens ?? 0), 0),
+    cache_creation_input_tokens: withTokens.reduce(
+      (sum, row) => sum + (row.token_usage?.cache_creation_input_tokens ?? 0),
+      0,
+    ),
+    cache_read_input_tokens: withTokens.reduce(
+      (sum, row) => sum + (row.token_usage?.cache_read_input_tokens ?? 0),
+      0,
+    ),
+    total_input_tokens: withTokens.reduce(
+      (sum, row) => sum + (row.token_usage?.total_input_tokens ?? 0),
+      0,
+    ),
+    total_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.total_tokens ?? 0), 0),
+    instances_with_tokens: withTokens.length,
+    instances: rows.length,
+  };
 }
 
 async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<BackendClient> {
