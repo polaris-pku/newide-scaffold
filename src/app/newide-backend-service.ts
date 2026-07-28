@@ -19,7 +19,7 @@ import {
   type CoordinatorRunner,
 } from '../coordinator/coordinator-runner';
 import { createDefaultTaskRequest } from '../coordinator/task-request';
-import type { TaskResumeCursor } from '../persistence';
+import type { TaskCursorInput, TaskResumeCursor } from '../persistence';
 import type { TelemetryRecord, TelemetrySink } from '../telemetry/telemetry-sink';
 import {
   InMemoryRunRegistry,
@@ -152,6 +152,11 @@ interface RunLineage {
   persist_restarted_from_run_id?: boolean;
   resume_checkpoint_id?: string;
   requested_resume_cursor?: TaskResumeCursor;
+  /**
+   * Stage input the resumed run must start from. Without this a checkpoint_resume
+   * falls back to the default select_agent cursor and silently restarts.
+   */
+  cursor_input?: TaskCursorInput;
 }
 
 interface PendingRunStart {
@@ -355,10 +360,11 @@ export class NewideBackendService {
         ...(resume.session_id ? { session_id: resume.session_id } : {}),
       },
       {
-        run_intent: { type: 'checkpoint_resume', strategy: 'restart_from_beginning' },
+        run_intent: { type: 'checkpoint_resume', strategy: 'from_checkpoint' },
         restarted_from_run_id: resume.interrupted_run_id,
         resume_checkpoint_id: resume.checkpoint_id,
         requested_resume_cursor: resume.resume_cursor,
+        cursor_input: resume.cursor_input,
       },
     );
     return this.getTask(taskId);
@@ -476,6 +482,7 @@ export class NewideBackendService {
         ...(lineage?.requested_resume_cursor
           ? { requested_resume_cursor: lineage.requested_resume_cursor }
           : {}),
+        ...(lineage?.cursor_input ? { cursor_input: lineage.cursor_input } : {}),
       });
       for (const event of processor.listTaskEvents(identity.task_id)) {
         if (event.run_id === identity.run_id) this.mirrorTaskAuthorityEvent(event);
@@ -741,6 +748,7 @@ export class NewideBackendService {
                 ...(lineage?.requested_resume_cursor
                   ? { requested_resume_cursor: lineage.requested_resume_cursor }
                   : {}),
+                ...(lineage?.cursor_input ? { cursor_input: lineage.cursor_input } : {}),
                 ...(taskCreatedEvent ? { task_created_event: taskCreatedEvent } : {}),
                 ...(runCreatedEvent ? { run_created_event: runCreatedEvent } : {}),
                 run_started_event: runStartedEvent,
