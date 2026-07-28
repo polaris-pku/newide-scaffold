@@ -8,7 +8,11 @@ import { indexDatasetById, loadDataset } from '../../eval/load-dataset';
 import { buildPrediction, writePredictionsJsonl } from '../../eval/prediction-writer';
 import { assertWorktreeClean } from '../../eval/prepare-worktree';
 import { runEvalInstance, runEvalSmoke } from '../../eval/run-instance-core';
-import { runSweEvoHarnessAdapter } from '../../eval/sweevo-harness-adapter';
+import {
+  runSweEvoHarnessAdapter,
+  buildSweEvoHarnessCommand,
+  toWslPath,
+} from '../../eval/sweevo-harness-adapter';
 import type { SweEvoInstance } from '../../eval/types';
 import { parsePredictionMode } from '../../eval/validation';
 
@@ -27,9 +31,63 @@ describe('F eval utilities', () => {
 
   afterEach(() => {
     delete process.env.NEWIDE_SCAFFOLD_ROOT;
+    delete process.env.NEWIDE_SWE_EVO_PYTHON;
+    delete process.env.NEWIDE_SWE_EVO_WSL_DISTRO;
+    delete process.env.NEWIDE_SWE_EVO_WSL_PYTHON;
     for (const dir of tempDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('converts Windows paths for WSL and builds a wsl harness command', () => {
+    expect(toWslPath('/mnt/d/already/posix')).toBe('/mnt/d/already/posix');
+    if (process.platform === 'win32') {
+      expect(toWslPath('D:\\SWE-EVO\\SWE-bench')).toBe('/mnt/d/SWE-EVO/SWE-bench');
+    }
+
+    process.env.NEWIDE_SWE_EVO_PYTHON = 'wsl';
+    process.env.NEWIDE_SWE_EVO_WSL_DISTRO = 'Ubuntu-22.04';
+    process.env.NEWIDE_SWE_EVO_WSL_PYTHON = 'python3';
+
+    const sweEvoRoot = process.platform === 'win32' ? 'D:\\SWE-EVO' : '/mnt/d/SWE-EVO';
+    const workDir =
+      process.platform === 'win32'
+        ? 'D:\\newide-scaffold-f-eval\\.newide\\eval\\run\\sweevo-work'
+        : '/mnt/d/newide-scaffold-f-eval/.newide/eval/run/sweevo-work';
+    const trajectoryDir =
+      process.platform === 'win32'
+        ? 'D:\\newide-scaffold-f-eval\\.newide\\eval\\run\\sweevo-openhands'
+        : '/mnt/d/newide-scaffold-f-eval/.newide/eval/run/sweevo-openhands';
+
+    const command = buildSweEvoHarnessCommand({
+      sweEvoRoot,
+      workDir,
+      trajectoryDir,
+      maxWorkers: 2,
+    });
+
+    expect(command.command).toBe('wsl');
+    expect(command.args[0]).toBe('-d');
+    expect(command.args[1]).toBe('Ubuntu-22.04');
+    expect(command.args).toContain('--cd');
+    expect(command.args).toContain(toWslPath(workDir));
+    expect(command.args).toContain('python3');
+    expect(command.args).toContain(
+      toWslPath(join(sweEvoRoot, 'SWE-bench', 'evaluate_instance.py')),
+    );
+    expect(command.args).toContain(toWslPath(trajectoryDir));
+  });
+
+  it('honors NEWIDE_SWE_EVO_PYTHON as a direct interpreter path', () => {
+    process.env.NEWIDE_SWE_EVO_PYTHON = 'C:\\Python310\\python.exe';
+    const command = buildSweEvoHarnessCommand({
+      sweEvoRoot: process.platform === 'win32' ? 'D:\\SWE-EVO' : '/tmp/SWE-EVO',
+      workDir: process.platform === 'win32' ? 'D:\\work' : '/tmp/work',
+      trajectoryDir: process.platform === 'win32' ? 'D:\\traj' : '/tmp/traj',
+      maxWorkers: 4,
+    });
+    expect(command.command).toBe('C:\\Python310\\python.exe');
+    expect(command.args[0]).toContain('evaluate_instance.py');
   });
 
   it('loads dataset jsonl and builds oracle SWE-bench predictions', async () => {

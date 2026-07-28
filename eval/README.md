@@ -146,6 +146,17 @@ pnpm eval:sweevo-harness -- --predictions .newide/eval/<run>/predictions.jsonl -
 
 去掉 `--dry-run` 后会真正调用 SWE-EVO harness。真实执行需要本机 SWE-EVO 环境和 Docker 可用。
 
+**Windows 注意**：SWE-bench harness 依赖 Linux（`resource` 模块等）。在 PowerShell 里请走 WSL：
+
+```powershell
+$env:NEWIDE_SWE_EVO_PYTHON = "wsl"
+# 可选：$env:NEWIDE_SWE_EVO_WSL_DISTRO = "Ubuntu-22.04"
+# 可选：$env:NEWIDE_SWE_EVO_WSL_PYTHON = "python3"
+pnpm eval:instance -- --instance-id <id> --mode oracle --run-harness
+```
+
+也可把 `NEWIDE_SWE_EVO_PYTHON` 设成任意本机 Python 可执行文件路径（例如 conda `py310`）。
+
 从后端运行结果自动收集 patch，并直接交给 SWE-EVO（后端 worktree 必须干净，或加 `--allow-dirty-worktree`）：
 
 ```powershell

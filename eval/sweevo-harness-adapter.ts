@@ -54,24 +54,77 @@ export function writeOpenHandsTrajectory(path: string, predictions: SweBenchPred
   writeFileSync(path, body.length > 0 ? `${body}\n` : '', 'utf-8');
 }
 
+/** Convert a Windows path to a WSL `/mnt/<drive>/...` path. No-op for already-POSIX paths. */
+export function toWslPath(pathLike: string): string {
+  const forward = pathLike.replace(/\\/g, '/');
+  if (forward.startsWith('/mnt/') || (forward.startsWith('/') && !/^[A-Za-z]:/.test(pathLike))) {
+    // Already a WSL/POSIX absolute path — do not resolve on Windows (would become D:\mnt\...).
+    return forward;
+  }
+  const absolute = resolve(pathLike);
+  const match = /^([A-Za-z]):[\\/]?(.*)$/.exec(absolute);
+  if (!match) {
+    return absolute.replace(/\\/g, '/');
+  }
+  const drive = match[1]!.toLowerCase();
+  const rest = (match[2] ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
+  return rest ? `/mnt/${drive}/${rest}` : `/mnt/${drive}`;
+}
+
+function resolveSweEvoPython(): string {
+  return process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python';
+}
+
+function resolveSweEvoWslDistro(): string {
+  return process.env.NEWIDE_SWE_EVO_WSL_DISTRO?.trim() || 'Ubuntu-22.04';
+}
+
+function resolveSweEvoWslPython(): string {
+  return process.env.NEWIDE_SWE_EVO_WSL_PYTHON?.trim() || 'python3';
+}
+
 export function buildSweEvoHarnessCommand(input: {
   sweEvoRoot: string;
   workDir: string;
   trajectoryDir: string;
   maxWorkers: number;
 }): SweEvoHarnessAdapterResult['command'] {
+  const python = resolveSweEvoPython();
+  const scriptPath = join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py');
+  const viaWsl = python.toLowerCase() === 'wsl';
+  const trajectoriesPath = viaWsl
+    ? toWslPath(input.trajectoryDir)
+    : input.trajectoryDir.replace(/\\/g, '/');
+  const scriptArgs = [
+    '--scaffold',
+    'OpenHands',
+    '--trajectories_path',
+    trajectoriesPath,
+    '--max_workers',
+    String(input.maxWorkers),
+  ];
+
+  if (viaWsl) {
+    return {
+      cwd: input.workDir,
+      command: 'wsl',
+      args: [
+        '-d',
+        resolveSweEvoWslDistro(),
+        '--cd',
+        toWslPath(input.workDir),
+        '--',
+        resolveSweEvoWslPython(),
+        toWslPath(scriptPath),
+        ...scriptArgs,
+      ],
+    };
+  }
+
   return {
     cwd: input.workDir,
-    command: 'python',
-    args: [
-      join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py'),
-      '--scaffold',
-      'OpenHands',
-      '--trajectories_path',
-      input.trajectoryDir.replace(/\\/g, '/'),
-      '--max_workers',
-      String(input.maxWorkers),
-    ],
+    command: python,
+    args: [scriptPath, ...scriptArgs],
   };
 }
 
@@ -128,7 +181,8 @@ export async function runSweEvoHarnessAdapter(
     predictions_path: options.predictionsPath,
     trajectory_path: trajectoryPath,
     output_final_dir: outputFinalDir,
-    note: 'Run this command in the SWE-EVO environment. Pass --report-source when a harness report is available to normalize it into harness-report.json.',
+    swe_evo_python: resolveSweEvoPython(),
+    note: 'Run this command in the SWE-EVO environment. On Windows, set NEWIDE_SWE_EVO_PYTHON=wsl to invoke via WSL. Pass --report-source when a harness report is available to normalize it into harness-report.json.',
   });
 
   if (options.reportSource) {
@@ -139,10 +193,13 @@ export async function runSweEvoHarnessAdapter(
   }
 
   if (!options.dryRun) {
+    const viaWsl = command.command === 'wsl';
     const completed = spawnSync(command.command, command.args, {
-      cwd: command.cwd,
+      // WSL uses `--cd`; Node cwd is only for native python.
+      ...(viaWsl ? {} : { cwd: command.cwd }),
       stdio: 'inherit',
-      shell: process.platform === 'win32',
+      // Avoid cmd.exe mangling `wsl -d ... -- python3 ...` arg boundaries.
+      shell: process.platform === 'win32' && !viaWsl,
     });
     if (completed.status !== 0) {
       throw new Error(`SWE-EVO harness exited with status ${completed.status ?? 'unknown'}`);
