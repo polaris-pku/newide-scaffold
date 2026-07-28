@@ -11,7 +11,7 @@ export interface HookSettings {
   fail_fast: boolean;
   /** Default gate timeout in seconds */
   default_timeout: number;
-  /** Reserved for future use; HookEngine currently executes gates sequentially */
+  /** When true, gate requests are sent in parallel via Promise.all; when false, executed sequentially in priority order */
   parallel: boolean;
   /** Default output format for gate results */
   output_format: string;

@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
   runIntegrationV0Flow,
@@ -23,19 +24,23 @@ import type {
   MaterializationInput,
   MaterializationResult,
 } from '../../src/coordinator/worktree-materializer';
+import { SelectAgentHandler } from '../../src/coordinator/handlers/select-agent-handler';
+import type { AgentProjection } from '../../src/market';
 
 describe('runIntegrationV0Flow', () => {
   const createdRunDirs = new Set<string>();
   const createdWorktreeDirs = new Set<string>();
+  const createdWorkspaceDirs = new Set<string>();
 
   afterEach(async () => {
     await Promise.all(
-      [...createdRunDirs, ...createdWorktreeDirs].map((dir) =>
+      [...createdRunDirs, ...createdWorktreeDirs, ...createdWorkspaceDirs].map((dir) =>
         fs.rm(dir, { recursive: true, force: true }),
       ),
     );
     createdRunDirs.clear();
     createdWorktreeDirs.clear();
+    createdWorkspaceDirs.clear();
   });
 
   it('reports real task and run ids before driver completion', async () => {
@@ -67,6 +72,23 @@ describe('runIntegrationV0Flow', () => {
     createdRunDirs.add(`.newide/runs/${result.run_id}`);
     createdWorktreeDirs.add(result.materialization_result.worktree_path);
     expect(identity).toEqual({ run_id: result.run_id, task_id: result.task_id });
+  });
+
+  it('creates a new run under an existing durable task identity', async () => {
+    const eventTypes: string[] = [];
+    const result = await runFlow({
+      taskId: 'task_existing',
+      taskRequest: {
+        spec: 'Run Council for the existing task',
+        completion_criteria: ['Council produces a final artifact'],
+      },
+      onEvent: (event) => eventTypes.push(event.event_type),
+    });
+
+    expect(result.task_id).toBe('task_existing');
+    expect(result.frontend_snapshot.task.task_id).toBe('task_existing');
+    expect(result.timeline[0]?.name).toBe('TaskAttached');
+    expect(eventTypes).not.toContain('task.created');
   });
 
   it('should run complete flow with MockDriver and single_agent mode', async () => {
@@ -112,6 +134,41 @@ describe('runIntegrationV0Flow', () => {
     }
     expect(driverRequestedDelivery.status).toBe('acked');
     expect(driverRequestedDelivery.ack_at).toBeDefined();
+  });
+
+  it('publishes task.completed only after the final delivery boundary', async () => {
+    const events: string[] = [];
+    const result = await runFlow({ onEvent: (event) => events.push(event.event_type) });
+
+    expect(events.filter((event) => event === 'task.completed')).toHaveLength(1);
+    expect(events).toContain('agent.primary_completed');
+    expect(events.indexOf('agent.primary_completed')).toBeLessThan(
+      events.indexOf('task.completed'),
+    );
+    expect(events.indexOf('task.completed')).toBeLessThan(events.indexOf('run.completed'));
+    expect(result.summary.status).toBe('completed');
+  });
+
+  it('creates the runtime task from the supplied task definition', async () => {
+    const result = await runFlow({
+      taskRequest: {
+        spec: 'Implement the task-first RPC surface',
+        role_id: 'role_backend_engineer',
+        risk_level: 'medium',
+        affected_paths: ['src/app/**', 'src/protocol/**'],
+        completion_criteria: ['TaskSnapshot is queryable through JSON-RPC'],
+        budget: { max_tool_calls: 20 },
+      },
+    });
+
+    expect(result.frontend_snapshot.task).toMatchObject({
+      spec: 'Implement the task-first RPC surface',
+      role_id: 'role_backend_engineer',
+      risk_level: 'medium',
+      affected_paths: ['src/app/**', 'src/protocol/**'],
+      completion_criteria: ['TaskSnapshot is queryable through JSON-RPC'],
+      budget: { max_tool_calls: 20 },
+    });
   });
 
   it('reports a structured GATE_DENIED failure', async () => {
@@ -667,23 +724,41 @@ describe('runIntegrationV0Flow', () => {
         requests.push(input);
         return {
           agent_run_id: 'agent_run_001',
+          agent_id: input.role_id,
           role_id: input.role_id,
           context_pack_ref: 'context_pack_001',
           driver_run_result_id: 'driver_result_from_agent_001',
           artifact_refs: [createArtifact('artifact_from_agent_001')],
           transcript_ref: createArtifact('artifact_transcript_from_agent_001', 'transcript'),
+          session_id: 'session_existing',
+          response: 'Implemented through the real Agent session.',
+          tool_events: [
+            {
+              tool_event_id: 'tool_event_from_agent_001',
+              tool_name: 'edit',
+              status: 'completed',
+              summary: 'Edited the target file.',
+              created_at: new Date().toISOString(),
+              schema_version: SCHEMA_VERSION,
+            },
+          ],
           diagnostics: {
             driver_id: 'agent-driver',
             duration_ms: 42,
           },
           status: 'completed',
+          memory_buffer_ref: 'memory_buffer_001',
           created_at: new Date().toISOString(),
           schema_version: SCHEMA_VERSION,
         };
       },
     };
 
-    const result = await runFlow({ agentExecutionFacade });
+    const result = await runFlow({
+      agentExecutionFacade,
+      workspacePath: process.cwd(),
+      sessionId: 'session_existing',
+    });
 
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({
@@ -692,6 +767,8 @@ describe('runIntegrationV0Flow', () => {
       role_id: 'role_ts_engineer',
       instruction: 'Run the integration v0 flow',
       context_policy: 'integration_v0_default',
+      workspace_path: process.cwd(),
+      session_id: 'session_existing',
     });
     expect(result.agent_execution_result).toMatchObject({
       agent_run_id: 'agent_run_001',
@@ -699,6 +776,9 @@ describe('runIntegrationV0Flow', () => {
     });
     expect(result.driver_result).toMatchObject({
       driver_run_result_id: 'driver_result_from_agent_001',
+      session_id: 'session_existing',
+      response: 'Implemented through the real Agent session.',
+      tool_events: [expect.objectContaining({ tool_event_id: 'tool_event_from_agent_001' })],
       status: 'succeeded',
       artifacts: [expect.objectContaining({ artifact_id: 'artifact_from_agent_001' })],
       transcript_ref: expect.objectContaining({
@@ -737,6 +817,170 @@ describe('runIntegrationV0Flow', () => {
         }),
       ]),
     );
+  });
+
+  it('dispatches an ordinary task to the persisted AgentMarket winner', async () => {
+    const requests: AgentExecutionRequest[] = [];
+    const agentExecutionFacade = successfulAgentFacade(requests);
+    const selectAgentHandler = new SelectAgentHandler({
+      projectionSource: {
+        async projectCandidates() {
+          return [marketCandidate('role_market_winner')];
+        },
+      },
+      evidenceStore: {
+        async persist() {
+          return {
+            ledger_ref: 'file:///market/ledger.json',
+            audit_ref: 'file:///market/audit.json',
+          };
+        },
+      },
+      now: () => '2026-07-18T00:00:00.000Z',
+    });
+
+    const result = await runFlow({ agentExecutionFacade, selectAgentHandler });
+
+    expect(requests[0]?.role_id).toBe('role_market_winner');
+    expect(result.market_selection).toMatchObject({
+      winner_agent_id: 'role_market_winner',
+      ledger_ref: 'file:///market/ledger.json',
+      audit_ref: 'file:///market/audit.json',
+    });
+    expect(result.summary.market).toMatchObject({
+      winner_agent_id: 'role_market_winner',
+      ledger_ref: 'file:///market/ledger.json',
+      audit_ref: 'file:///market/audit.json',
+      seed: result.run_id,
+      policy_version: 'market-v0',
+    });
+    expect(result.timeline.map((item) => item.name)).toContain('MarketSelected');
+    const eventLog = (await readJson(`.newide/runs/${result.run_id}/event-log.json`)) as Array<{
+      event_type: string;
+      payload: Record<string, unknown>;
+    }>;
+    expect(eventLog).toContainEqual(
+      expect.objectContaining({
+        event_type: 'market.selected',
+        payload: expect.objectContaining({
+          winner_agent_id: 'role_market_winner',
+          ledger_ref: 'file:///market/ledger.json',
+          audit_ref: 'file:///market/audit.json',
+        }),
+      }),
+    );
+  });
+
+  it.each([
+    ['scheduled', 'memory.maintenance_scheduled'],
+    ['running', 'memory.maintenance_running'],
+    ['completed', 'memory.maintenance_completed'],
+    ['skipped', 'memory.maintenance_skipped'],
+    ['failed', 'memory.maintenance_failed'],
+  ] as const)('publishes %s B maintenance evidence as %s', async (status, eventType) => {
+    const delegate = successfulAgentFacade([]);
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input, options) {
+        const result = await delegate.runAgent(input, options);
+        return {
+          ...result,
+          diagnostics: {
+            ...result.diagnostics,
+            memory_maintenance: {
+              maintenance_ref: 'b_maintenance_event_001',
+              kind: 'experience_extraction',
+              status,
+              role_id: input.role_id,
+              buffer_seq: 1,
+              experiences: [],
+              skills: [],
+              warnings: [],
+            },
+          },
+        };
+      },
+    };
+
+    const result = await runFlow({ agentExecutionFacade });
+    const eventLog = (await readJson(`.newide/runs/${result.run_id}/event-log.json`)) as Array<{
+      event_type?: string;
+      subject_id?: string;
+    }>;
+
+    expect(eventLog).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: eventType,
+          subject_id: 'b_maintenance_event_001',
+        }),
+      ]),
+    );
+  });
+
+  it('completes a successful response-only Agent execution without changed files', async () => {
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        return {
+          agent_run_id: 'agent_run_response_only',
+          agent_id: input.role_id,
+          role_id: input.role_id,
+          context_pack_ref: 'context_pack_response_only',
+          driver_run_result_id: 'driver_result_response_only',
+          artifact_refs: [],
+          transcript_ref: createArtifact('transcript_response_only', 'transcript'),
+          session_id: 'session_response_only',
+          response: 'The requested behavior is already implemented.',
+          tool_events: [],
+          diagnostics: { driver_id: 'agent-driver', duration_ms: 12 },
+          status: 'completed',
+          memory_buffer_ref: 'memory_buffer_response_only',
+          created_at: new Date().toISOString(),
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+
+    const result = await runFlow({ agentExecutionFacade });
+
+    expect(result.summary).toMatchObject({
+      status: 'completed',
+      outcome: 'completed_response',
+      changed_files: [],
+    });
+    expect(result.driver_result.response).toBe('The requested behavior is already implemented.');
+  });
+
+  it('does not count a metadata-only artifact as a successful file delivery', async () => {
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        return {
+          agent_run_id: 'agent_run_metadata_only',
+          agent_id: input.role_id,
+          role_id: input.role_id,
+          context_pack_ref: 'context_pack_metadata_only',
+          driver_run_result_id: 'driver_result_metadata_only',
+          artifact_refs: [createArtifact('artifact_metadata_only', 'driver_result')],
+          transcript_ref: createArtifact('transcript_metadata_only', 'transcript'),
+          session_id: 'session_metadata_only',
+          response: '',
+          tool_events: [],
+          diagnostics: { driver_id: 'agent-driver', duration_ms: 12 },
+          status: 'completed',
+          memory_buffer_ref: 'memory_buffer_metadata_only',
+          created_at: new Date().toISOString(),
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+
+    const result = await runFlow({ agentExecutionFacade });
+
+    expect(result.summary).toMatchObject({
+      status: 'failed',
+      outcome: 'failed',
+      changed_files: [],
+      failure: { code: 'ARTIFACT_NOT_SELECTED' },
+    });
   });
 
   it('should include all key timeline events', async () => {
@@ -781,9 +1025,12 @@ describe('runIntegrationV0Flow', () => {
     expect(result.frontend_snapshot).toMatchObject({
       run_id: result.run_id,
       task_id: result.task_id,
+      task: {
+        status: 'completed',
+      },
       current: {
         stage: 'delivery',
-        task_status: result.summary.status,
+        task_status: 'completed',
       },
       mailbox: {
         thread_id: result.summary.mailbox_thread_id,
@@ -965,6 +1212,8 @@ describe('runIntegrationV0Flow', () => {
 
     // Verify run failed
     expect(result.summary.status).toBe('failed');
+    expect(result.frontend_snapshot.task.status).toBe('failed');
+    expect(result.frontend_snapshot.current.task_status).toBe('failed');
 
     // Verify timeline has RunFailed instead of RunCompleted
     const timelineNames = result.timeline.map((t) => t.name);
@@ -984,6 +1233,53 @@ describe('runIntegrationV0Flow', () => {
     const manifest = JSON.parse(await fs.readFile(resultPath, 'utf-8'));
     expect(manifest.status).toBe('failed');
     expect(result.result_manifest.status).toBe('failed');
+  });
+
+  it('preserves real workspace changes when Agent execution fails after writing files', async () => {
+    const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-workspace-'));
+    createdWorkspaceDirs.add(workspacePath);
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        await fs.writeFile(path.join(workspacePath, 'index.html'), '<main>Tetris</main>');
+        await fs.writeFile(path.join(workspacePath, 'style.css'), 'main { display: grid; }');
+        return {
+          agent_run_id: 'agent_run_transport_failed_after_write',
+          agent_id: input.role_id,
+          role_id: input.role_id,
+          context_pack_ref: 'context_pack_transport_failed_after_write',
+          driver_run_result_id: 'driver_result_transport_failed_after_write',
+          artifact_refs: [],
+          transcript_ref: createArtifact('transcript_transport_failed_after_write', 'transcript'),
+          session_id: 'session_transport_failed_after_write',
+          response: '',
+          tool_events: [],
+          diagnostics: {
+            driver_id: 'external-driver',
+            duration_ms: 222_000,
+            driver_error_code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR',
+          },
+          status: 'failed',
+          memory_buffer_ref: 'memory_buffer_transport_failed_after_write',
+          created_at: new Date().toISOString(),
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+
+    const result = await runFlow({ agentExecutionFacade, workspacePath });
+
+    expect(result.summary).toMatchObject({
+      status: 'failed',
+      outcome: 'failed',
+      changed_files: ['index.html', 'style.css'],
+      failure: { code: 'DRIVER_FAILED' },
+    });
+    expect(result.materialization_result.changed_files).toEqual([]);
+    expect(result.frontend_snapshot.delivery_report.changed_files).toEqual([
+      'index.html',
+      'style.css',
+    ]);
+    expect(result.result_manifest.changed_files).toEqual(['index.html', 'style.css']);
   });
 
   it('should use real mailbox send/ack mechanism', async () => {
@@ -1108,5 +1404,56 @@ function createArtifact(artifactId: string, type: ArtifactRef['type'] = 'patch')
     task_id: 'task_001',
     created_at: '2026-07-07T00:00:00.000Z',
     schema_version: SCHEMA_VERSION,
+  };
+}
+
+function successfulAgentFacade(requests: AgentExecutionRequest[]): AgentExecutionFacade {
+  return {
+    async runAgent(input) {
+      requests.push(input);
+      return {
+        agent_run_id: 'agent_run_market_winner',
+        agent_id: input.role_id,
+        role_id: input.role_id,
+        context_pack_ref: 'context_pack_market_winner',
+        driver_run_result_id: 'driver_result_market_winner',
+        artifact_refs: [createArtifact('artifact_market_winner')],
+        transcript_ref: createArtifact('transcript_market_winner', 'transcript'),
+        session_id: 'session_market_winner',
+        response: 'Market winner completed the task.',
+        tool_events: [],
+        diagnostics: { driver_id: 'agent-driver', duration_ms: 10 },
+        status: 'completed',
+        memory_buffer_ref: 'buffer_market_winner',
+        created_at: '2026-07-18T00:00:00.000Z',
+        schema_version: SCHEMA_VERSION,
+      };
+    },
+  };
+}
+
+function marketCandidate(agentId: string): AgentProjection {
+  return {
+    agent_id: agentId,
+    persona_ref: `persona://${agentId}/v1`,
+    persona_keywords: ['backend', 'typescript'],
+    skills: [{ name: 'Backend delivery', tags: ['backend', 'typescript'] }],
+    experiences: [
+      {
+        name: 'Backend delivery',
+        type: 'positive',
+        confidence: 0.9,
+        tags: ['backend'],
+      },
+    ],
+    metrics_ref: {
+      total_tasks: 10,
+      tasks_completed: 10,
+      tasks_succeeded: 9,
+      skill_count: 1,
+      experience_count: 1,
+      avg_confidence: 0.9,
+    },
+    load_state: { active_task_count: 0, days_since_last_task: 1 },
   };
 }

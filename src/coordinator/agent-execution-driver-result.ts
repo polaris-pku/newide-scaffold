@@ -19,11 +19,12 @@ export function buildDriverRunResultFromAgentExecution(
 ): DriverRunResult {
   return {
     driver_run_result_id: input.result.driver_run_result_id,
-    session_id: input.session_id ?? `agent:${input.result.agent_run_id}`,
+    session_id: input.result.session_id || input.session_id || `agent:${input.result.agent_run_id}`,
     status: mapAgentExecutionStatus(input.result.status),
+    response: input.result.response,
     artifacts: [...input.result.artifact_refs],
     transcript_ref: input.result.transcript_ref,
-    tool_events: [],
+    tool_events: [...input.result.tool_events],
     diagnostics: {
       driver_id: String(input.result.diagnostics.driver_id ?? input.result.role_id),
       duration_ms: readDurationMs(input.result.diagnostics.duration_ms),

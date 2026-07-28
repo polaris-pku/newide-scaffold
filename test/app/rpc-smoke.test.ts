@@ -1,5 +1,8 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 describe('production RPC composition smoke script', () => {
@@ -37,18 +40,24 @@ describe('production RPC composition smoke script', () => {
 });
 
 async function runSmoke(args: string[] = []): Promise<Record<string, unknown>> {
-  const child = spawn('pnpm', ['rpc:smoke', ...args], {
-    cwd: process.cwd(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk) => (stdout += String(chunk)));
-  child.stderr.on('data', (chunk) => (stderr += String(chunk)));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-rpc-smoke-'));
+  try {
+    const child = spawn('pnpm', ['rpc:smoke', ...args], {
+      cwd: process.cwd(),
+      env: { ...process.env, RPC_SMOKE_WORKSPACE: workspace },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => (stdout += String(chunk)));
+    child.stderr.on('data', (chunk) => (stderr += String(chunk)));
 
-  const [code] = await once(child, 'exit');
-  expect(code, stderr).toBe(0);
-  const summaryLine = stdout.split('\n').find((line) => line.startsWith('{"status"'));
-  expect(summaryLine).toBeDefined();
-  return JSON.parse(summaryLine!) as Record<string, unknown>;
+    const [code] = await once(child, 'exit');
+    expect(code, stderr).toBe(0);
+    const summaryLine = stdout.split('\n').find((line) => line.startsWith('{"status"'));
+    expect(summaryLine).toBeDefined();
+    return JSON.parse(summaryLine!) as Record<string, unknown>;
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
 }

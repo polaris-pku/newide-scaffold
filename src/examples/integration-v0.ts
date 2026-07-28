@@ -34,7 +34,6 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import {
   runIntegrationV0Flow,
   type IntegrationV0Options,
@@ -42,6 +41,7 @@ import {
 import { ExternalDriverRuntime } from '../driver/external-driver-runtime';
 import { CommandDriverTransport } from '../driver/command-driver-transport';
 import { MockDriver, type DriverRuntimeHandle } from '../driver';
+import { DriverRuntimeAgentExecutionFacade } from '../app/driver-runtime-agent-execution-facade';
 import { SynthesisAgentCouncilProvider } from '../council';
 import { InMemoryBufferRepository, InMemoryRepository, LiteLLMToolCallingClient } from '../memory';
 import { parseIntegrationV0CliArgs } from './integration-v0-options';
@@ -95,15 +95,12 @@ if (cliOptions.useExternalDriver) {
   }
   console.log('');
 
-  // Same as `pnpm driver:run` (= tsc && node contract-runner), but without spawning pnpm:
-  // Windows Node 24 cannot reliably spawn pnpm.ps1/pnpm.cmd (ENOENT/EINVAL / engine checks).
-  const runnerJs = ensureAcpDriverRunnerBuilt(driverRunnerDir);
   driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     transport: new CommandDriverTransport({
-      command: process.execPath,
-      args: [runnerJs],
-      cwd: driverRunnerDir,
+      command: 'pnpm',
+      args: ['--dir', driverRunnerDir, 'driver:run'],
+      cwd: process.cwd(),
       env: {
         ...driverEnv,
         COREPACK_ENABLE_PROJECT_SPEC: process.env.COREPACK_ENABLE_PROJECT_SPEC || '0',
@@ -133,9 +130,6 @@ try {
   }
 
   if (cliOptions.enableCouncil && cliOptions.councilProviderMode === 'synthesis-agent') {
-    // Lazy-load: facade still imports removed memory exports; not needed for --external-driver.
-    const { DriverRuntimeAgentExecutionFacade } =
-      await import('../app/driver-runtime-agent-execution-facade');
     const councilDriver = driver ?? new MockDriver();
     flowOptions.driver = councilDriver;
     flowOptions.councilProvider = new SynthesisAgentCouncilProvider({
@@ -185,35 +179,6 @@ try {
   console.error('\n❌ Integration v0 failed:');
   console.error(error);
   process.exit(1);
-}
-
-function ensureAcpDriverRunnerBuilt(driverRunnerDir: string): string {
-  const runnerJs = path.join(driverRunnerDir, 'dist', 'src', 'driver', 'contract-runner.js');
-  const tscJs = path.join(driverRunnerDir, 'node_modules', 'typescript', 'lib', 'tsc.js');
-  if (!existsSync(tscJs)) {
-    console.error(`❌ TypeScript is not installed in ACP runner: ${tscJs}\n`);
-    console.error(`Run: pnpm --dir "${driverRunnerDir}" install\n`);
-    process.exit(1);
-  }
-
-  // Mirror `pnpm driver:run`'s leading `tsc` step without invoking pnpm.
-  console.log('Compiling ACP driver runner (tsc)...');
-  const build = spawnSync(process.execPath, [tscJs, '-p', driverRunnerDir], {
-    cwd: driverRunnerDir,
-    encoding: 'utf8',
-  });
-  if (build.status !== 0) {
-    console.error('❌ Failed to compile ACP driver runner (tsc).\n');
-    if (build.stdout) console.error(build.stdout);
-    if (build.stderr) console.error(build.stderr);
-    process.exit(1);
-  }
-  if (!existsSync(runnerJs)) {
-    console.error(`❌ ACP driver runner missing after build: ${runnerJs}\n`);
-    process.exit(1);
-  }
-  console.log('ACP driver runner ready. Starting flow (Claude may take a while)...\n');
-  return runnerJs;
 }
 
 function loadEnvFile(filePath: string): NodeJS.ProcessEnv {

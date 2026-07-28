@@ -1,6 +1,14 @@
-import { spawn, type SpawnOptionsWithoutStdio } from 'node:child_process';
-import type { DriverPrompt, DriverRunResult } from './contract';
+import { spawn, type ChildProcess, type SpawnOptionsWithoutStdio } from 'node:child_process';
+import { nowTimestamp } from '../core';
+import type {
+  DriverPrompt,
+  DriverRunResult,
+  DriverStreamEvent,
+  DriverStreamEventListener,
+} from './contract';
 import { assertDriverRunResult, type ExternalDriverTransport } from './external-driver-runtime';
+
+export const DRIVER_EVENT_PREFIX = 'NEWIDE_DRIVER_EVENT ';
 
 export interface CommandDriverTransportOptions {
   command: string;
@@ -9,6 +17,7 @@ export interface CommandDriverTransportOptions {
   env?: NodeJS.ProcessEnv;
   unsetEnv?: readonly string[];
   timeoutMs?: number;
+  onEvent?: DriverStreamEventListener;
 }
 
 export class CommandDriverTransport implements ExternalDriverTransport {
@@ -18,6 +27,9 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   private readonly env: NodeJS.ProcessEnv | undefined;
   private readonly unsetEnv: readonly string[];
   private readonly timeoutMs: number | undefined;
+  private readonly activeChildren = new Map<string, ChildProcess>();
+  private readonly eventListeners = new Set<DriverStreamEventListener>();
+  private readonly requestedInterrupts = new Set<string>();
   private stderr = '';
 
   constructor(options: CommandDriverTransportOptions) {
@@ -34,6 +46,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
     this.env = options.env;
     this.unsetEnv = options.unsetEnv ?? [];
     this.timeoutMs = options.timeoutMs;
+    if (options.onEvent) this.eventListeners.add(options.onEvent);
   }
 
   get lastStderr(): string {
@@ -49,10 +62,48 @@ export class CommandDriverTransport implements ExternalDriverTransport {
     return parseDriverRunResult(stdout);
   }
 
+  async interrupt(reason: string, runId?: string): Promise<void> {
+    const children = runId
+      ? [...(this.activeChildren.get(runId) ? [this.activeChildren.get(runId)!] : [])]
+      : [...this.activeChildren.values()];
+    const ids = runId ? [runId] : [...this.activeChildren.keys()];
+    for (const id of ids) this.requestedInterrupts.add(id);
+    for (const id of ids) {
+      this.emitEvent({
+        schema_version: 'driver-event.v1',
+        event_type: 'driver.interrupt_requested',
+        payload: { reason },
+        run_id: id,
+        sequence: 0,
+        created_at: nowTimestamp(),
+      });
+    }
+    try {
+      await Promise.all(children.map((child) => terminateAndWait(child)));
+    } finally {
+      for (const id of ids) this.requestedInterrupts.delete(id);
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    await this.interrupt('Command driver transport shutdown');
+  }
+
+  subscribeToEvents(listener: DriverStreamEventListener): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
   private execute(input: DriverPrompt): Promise<string> {
     return new Promise((resolve, reject) => {
+      if (this.activeChildren.has(input.run_id)) {
+        reject(new Error(`Command driver run ${input.run_id} is already active`));
+        return;
+      }
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
+      let stderrPending = '';
+      let eventSequence = 0;
       let stdinError: Error | undefined;
       let timedOut = false;
       let settled = false;
@@ -60,6 +111,13 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       let forceKillTimeout: NodeJS.Timeout | undefined;
 
       const child = spawn(this.command, this.args, this.spawnOptions());
+      this.activeChildren.set(input.run_id, child);
+
+      const releaseChild = (): void => {
+        if (this.activeChildren.get(input.run_id) === child) {
+          this.activeChildren.delete(input.run_id);
+        }
+      };
 
       const clearTimers = (): void => {
         if (timeout) {
@@ -76,6 +134,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         }
         settled = true;
         clearTimers();
+        releaseChild();
         reject(error);
       };
 
@@ -94,7 +153,14 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       });
 
       child.stderr.on('data', (chunk: Buffer) => {
-        stderrChunks.push(chunk);
+        stderrPending += chunk.toString('utf8');
+        for (;;) {
+          const newline = stderrPending.indexOf('\n');
+          if (newline < 0) break;
+          const line = stderrPending.slice(0, newline);
+          stderrPending = stderrPending.slice(newline + 1);
+          this.consumeStderrLine(line, true, input, () => ++eventSequence, stderrChunks);
+        }
       });
 
       child.stdin.on('error', (error: Error) => {
@@ -108,17 +174,21 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       });
 
       child.once('close', (code, signal) => {
+        releaseChild();
         if (settled) {
           return;
         }
 
         settled = true;
         clearTimers();
+        if (stderrPending) {
+          this.consumeStderrLine(stderrPending, false, input, () => ++eventSequence, stderrChunks);
+        }
         this.stderr = Buffer.concat(stderrChunks).toString('utf8');
         const stdout = Buffer.concat(stdoutChunks).toString('utf8');
         const stderrSummary = summarizeText(this.stderr);
 
-        if (timedOut) {
+        if (timedOut && !this.requestedInterrupts.has(input.run_id)) {
           reject(
             new Error(
               `Command driver timed out after ${String(this.timeoutMs)}ms: ${this.commandLabel()}. stderr: ${stderrSummary}`,
@@ -132,19 +202,19 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           return;
         }
 
-        if (code !== 0) {
+        if (signal) {
           reject(
             new Error(
-              `Command driver failed: ${this.commandLabel()} exited with code ${String(code)}. stderr: ${stderrSummary}`,
+              `Command driver failed: ${this.commandLabel()} exited with signal ${signal}. stderr: ${stderrSummary}`,
             ),
           );
           return;
         }
 
-        if (signal) {
+        if (code !== 0) {
           reject(
             new Error(
-              `Command driver failed: ${this.commandLabel()} exited with signal ${signal}. stderr: ${stderrSummary}`,
+              `Command driver failed: ${this.commandLabel()} exited with code ${String(code)}. stderr: ${stderrSummary}`,
             ),
           );
           return;
@@ -164,6 +234,55 @@ export class CommandDriverTransport implements ExternalDriverTransport {
 
       child.stdin.end(JSON.stringify(input));
     });
+  }
+
+  private consumeStderrLine(
+    line: string,
+    terminatedByNewline: boolean,
+    input: DriverPrompt,
+    nextSequence: () => number,
+    diagnostics: Buffer[],
+  ): void {
+    const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
+    if (!normalized.startsWith(DRIVER_EVENT_PREFIX)) {
+      diagnostics.push(Buffer.from(terminatedByNewline ? `${line}\n` : line, 'utf8'));
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(normalized.slice(DRIVER_EVENT_PREFIX.length)) as Record<
+        string,
+        unknown
+      >;
+      if (!parsed || typeof parsed.event_type !== 'string') {
+        throw new Error('event_type is required');
+      }
+      this.emitEvent({
+        schema_version:
+          typeof parsed.schema_version === 'string' ? parsed.schema_version : 'driver-event.v1',
+        event_type: parsed.event_type,
+        ...(parsed.payload !== undefined ? { payload: parsed.payload } : {}),
+        task_id: typeof parsed.task_id === 'string' ? parsed.task_id : input.task_id,
+        run_id: typeof parsed.run_id === 'string' ? parsed.run_id : input.run_id,
+        ...(typeof parsed.role_id === 'string' ? { role_id: parsed.role_id } : {}),
+        ...(typeof parsed.session_id === 'string' ? { session_id: parsed.session_id } : {}),
+        sequence: typeof parsed.sequence === 'number' ? parsed.sequence : nextSequence(),
+        created_at: typeof parsed.created_at === 'string' ? parsed.created_at : nowTimestamp(),
+      });
+    } catch {
+      // A malformed reserved line stays diagnostic output and cannot break the run.
+      diagnostics.push(Buffer.from(terminatedByNewline ? `${line}\n` : line, 'utf8'));
+    }
+  }
+
+  private emitEvent(event: DriverStreamEvent): void {
+    for (const listener of this.eventListeners) {
+      try {
+        listener(event);
+      } catch {
+        // Observability must never fail the driver invocation.
+      }
+    }
   }
 
   private spawnOptions(): SpawnOptionsWithoutStdio {
@@ -199,6 +318,30 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       ...this.args.map((arg) => summarizeText(arg.replace(/\s+/g, ' '), 80)),
     ].join(' ');
   }
+}
+
+function terminateAndWait(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const forceKill = setTimeout(() => terminateChild(child.pid, 'SIGKILL'), 1_000);
+    const giveUp = setTimeout(finish, 2_000);
+    forceKill.unref();
+    giveUp.unref();
+
+    function finish(): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceKill);
+      clearTimeout(giveUp);
+      child.removeListener('close', finish);
+      resolve();
+    }
+
+    child.once('close', finish);
+    terminateChild(child.pid, 'SIGTERM');
+  });
 }
 
 function summarizeText(input: string, maxLength = 500): string {

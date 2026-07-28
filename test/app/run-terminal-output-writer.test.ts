@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,7 +19,7 @@ describe('FileRunTerminalOutputWriter', () => {
     const writer = new FileRunTerminalOutputWriter(runsRoot);
     const snapshot = failedSnapshot();
 
-    await writer.finalize(snapshot);
+    const evidence = await writer.finalize(snapshot);
 
     const runDir = path.join(runsRoot, 'run_failed');
     await expect(readJson(path.join(runDir, 'result.json'))).resolves.toMatchObject({
@@ -44,6 +45,11 @@ describe('FileRunTerminalOutputWriter', () => {
     await expect(readJson(path.join(runDir, 'frontend-snapshot.json'))).resolves.not.toHaveProperty(
       'revision',
     );
+    const snapshotBytes = await readFile(path.join(runDir, 'frontend-snapshot.json'));
+    expect(evidence).toEqual({
+      artifact_ref: expect.stringMatching(/^file:/),
+      sha256: createHash('sha256').update(snapshotBytes).digest('hex'),
+    });
   });
 
   it('does not overwrite richer integration outputs', async () => {

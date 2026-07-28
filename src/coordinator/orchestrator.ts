@@ -62,22 +62,7 @@ export class RuntimeOrchestrator {
   }
 
   createTask(request: TaskCreateRequest): Task {
-    const timestamp = nowTimestamp();
-    const task: Task = {
-      task_id: createId('task'),
-      ...(request.parent_task_id ? { parent_id: request.parent_task_id } : {}),
-      status: 'created',
-      ...(request.role_id ? { role_id: request.role_id } : {}),
-      risk_level: request.risk_level ?? 'low',
-      spec: request.spec,
-      completion_criteria: request.completion_criteria,
-      ...(request.affected_paths ? { affected_paths: request.affected_paths } : {}),
-      ...(request.budget ? { budget: request.budget } : {}),
-      created_at: timestamp,
-      updated_at: timestamp,
-      schema_version: SCHEMA_VERSION,
-    };
-
+    const task = this.buildTask(createId('task'), request);
     this.tasks.set(task.task_id, task);
     this.appendEvent({
       event_type: 'task.created',
@@ -85,6 +70,13 @@ export class RuntimeOrchestrator {
       task_id: task.task_id,
       payload: { spec: task.spec, risk_level: task.risk_level },
     });
+    return task;
+  }
+
+  attachTaskForRun(taskId: TaskId, request: TaskCreateRequest): Task {
+    if (this.tasks.has(taskId)) throw new Error(`Task ${taskId} is already attached`);
+    const task = this.buildTask(taskId, request);
+    this.tasks.set(task.task_id, task);
     return task;
   }
 
@@ -196,7 +188,26 @@ export class RuntimeOrchestrator {
     this.tasks.set(taskId, updated);
     return updated;
   }
+
+  private buildTask(taskId: TaskId, request: TaskCreateRequest): Task {
+    const timestamp = nowTimestamp();
+    return {
+      task_id: taskId,
+      ...(request.parent_task_id ? { parent_id: request.parent_task_id } : {}),
+      status: 'created',
+      ...(request.role_id ? { role_id: request.role_id } : {}),
+      risk_level: request.risk_level ?? 'low',
+      spec: request.spec,
+      completion_criteria: [...(request.completion_criteria ?? [])],
+      ...(request.affected_paths ? { affected_paths: [...request.affected_paths] } : {}),
+      ...(request.budget ? { budget: { ...request.budget } } : {}),
+      created_at: timestamp,
+      updated_at: timestamp,
+      schema_version: SCHEMA_VERSION,
+    };
+  }
 }
+
 
 function normalizeOrchestratorConfig(
   config?: Partial<RuntimeStores> | RuntimeOrchestratorConfig,

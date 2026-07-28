@@ -22,9 +22,23 @@ describe('buildFrontendRunSnapshot', () => {
         task_id: 'task_001',
         mode: 'single_agent',
         status: 'completed',
+        outcome: 'completed_files',
+        session_id: 'session_001',
+        response: 'Implemented the requested result.',
         worktree_path: '.newide/worktrees/task_001',
         artifacts_materialized: 1,
         files_written: ['.newide/worktrees/task_001/artifact_001.json'],
+        changed_files: ['src/result.ts'],
+        tool_events: [
+          {
+            tool_event_id: 'tool_event_001',
+            tool_name: 'edit',
+            status: 'completed',
+            summary: 'Edited src/result.ts',
+            created_at: '2026-07-07T00:00:00.000Z',
+            schema_version: SCHEMA_VERSION,
+          },
+        ],
         artifact_outputs: [
           {
             artifact_id: 'artifact_001',
@@ -41,6 +55,14 @@ describe('buildFrontendRunSnapshot', () => {
         checkpoint_path: '.newide/runs/run_001/checkpoint.json',
         mailbox_message_refs: ['message_001', 'message_002'],
         mailbox_thread_id: 'run_001',
+        market: {
+          winner_agent_id: 'role_ts_engineer',
+          winner_bid_id: 'bid_001',
+          ledger_ref: 'file:///market/ledger.json',
+          audit_ref: 'file:///market/audit.json',
+          policy_version: 'market-v0',
+          seed: 'run_001',
+        },
         created_at: '2026-07-07T00:00:00.000Z',
         schema_version: SCHEMA_VERSION,
       },
@@ -114,10 +136,16 @@ describe('buildFrontendRunSnapshot', () => {
       run: {
         mode: 'single_agent',
         driver_id: 'mock-driver',
+        session_id: 'session_001',
       },
       delivery_report: {
         worktree_path: '.newide/worktrees/task_001',
         artifacts_materialized: 1,
+        outcome: 'completed_files',
+        response: 'Implemented the requested result.',
+        session_id: 'session_001',
+        changed_files: ['src/result.ts'],
+        tool_events: [expect.objectContaining({ tool_event_id: 'tool_event_001' })],
       },
       artifacts: [
         {
@@ -135,6 +163,14 @@ describe('buildFrontendRunSnapshot', () => {
       mailbox: {
         thread_id: 'run_001',
         message_refs: ['message_001', 'message_002'],
+      },
+      market: {
+        winner_agent_id: 'role_ts_engineer',
+        winner_bid_id: 'bid_001',
+        ledger_ref: 'file:///market/ledger.json',
+        audit_ref: 'file:///market/audit.json',
+        policy_version: 'market-v0',
+        seed: 'run_001',
       },
       links: {
         event_log_path: '.newide/runs/run_001/event-log.json',

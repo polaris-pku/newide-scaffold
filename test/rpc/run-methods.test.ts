@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { RunNotFoundError, type AppRunEvent } from '../../src/app/run-registry';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../../src/rpc/json-rpc-dispatcher';
 import { RunRpcMethods, type RunMethodsService } from '../../src/rpc/run-methods';
@@ -32,7 +32,13 @@ describe('RunRpcMethods', () => {
   it('creates runs and forwards subscribed events as notifications', async () => {
     const output: string[] = [];
     let listener: ((event: AppRunEvent) => void) | undefined;
+    const createRun = vi.fn(async () => ({
+      run_id: 'run_1',
+      task_id: 'task_1',
+      status: 'running' as const,
+    }));
     const service = fakeService({
+      createRun,
       subscribe: (_runId, next) => {
         listener = next;
         return () => {
@@ -48,7 +54,16 @@ describe('RunRpcMethods', () => {
     methods.register(dispatcher);
 
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":1,"method":"run.create","params":{"prompt":"Build RPC"}}',
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'run.create',
+        params: {
+          prompt: 'Build RPC',
+          workspace_path: process.cwd(),
+          session_id: 'session_existing',
+        },
+      })}`,
     );
     await session.handleLine(
       '{"jsonrpc":"2.0","id":2,"method":"run.subscribe","params":{"run_id":"run_1"}}',
@@ -100,6 +115,11 @@ describe('RunRpcMethods', () => {
       { jsonrpc: '2.0', id: 3, result: { unsubscribed: true } },
     ]);
     expect(listener).toBeUndefined();
+    expect(createRun).toHaveBeenCalledWith({
+      prompt: 'Build RPC',
+      workspace_path: process.cwd(),
+      session_id: 'session_existing',
+    });
   });
 
   it('forwards run.cancel to the application service', async () => {

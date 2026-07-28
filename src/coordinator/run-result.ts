@@ -52,6 +52,7 @@ export interface IntegrationRunResultManifest {
   council_reviews_path?: string;
   council_synthesis_path?: string;
   council_output_path?: string;
+  council_result_path?: string;
   council_verdict?: CouncilDecision['verdict'];
   council_decision_mode?: CouncilDecision['decision_mode'];
   created_at: Timestamp;
@@ -110,6 +111,7 @@ export interface BuildRunResultManifestInput {
   council_reviews_path?: string;
   council_synthesis_path?: string;
   council_output_path?: string;
+  council_result_path?: string;
   council_verdict?: CouncilDecision['verdict'];
   council_decision_mode?: CouncilDecision['decision_mode'];
   created_at: Timestamp;
@@ -146,6 +148,7 @@ export function buildRunResultManifest(
       ? { council_synthesis_path: input.council_synthesis_path }
       : {}),
     ...(input.council_output_path ? { council_output_path: input.council_output_path } : {}),
+    ...(input.council_result_path ? { council_result_path: input.council_result_path } : {}),
     ...(input.council_verdict ? { council_verdict: input.council_verdict } : {}),
     ...(input.council_decision_mode ? { council_decision_mode: input.council_decision_mode } : {}),
     created_at: input.created_at,

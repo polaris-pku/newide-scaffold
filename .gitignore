@@ -25,6 +25,9 @@ my-session.json
 # memory 本地设计文档（Spec + 代码导读 + 模块导读），不入仓
 src/memory/docs/
 
+# 本地架构、设计与执行计划文档，不入仓
+docs/
+
 # editor & OS
 .DS_Store
 .idea/
@@ -39,3 +42,11 @@ src/memory/docs/
 .zcode/
 
 /.npmrc
+
+# AI 驱动测试生成残留 — 脚手架 / 报告 / 子项目
+DL_RESULT.md
+jwt-auth-system/
+
+
+*[^ -~]*
+docs/

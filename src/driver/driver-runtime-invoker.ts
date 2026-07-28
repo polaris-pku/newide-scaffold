@@ -1,6 +1,6 @@
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../core';
 import { runDriverPromptWithSignal } from './abortable-driver-run';
-import type { DriverRunResult, DriverRuntimeHandle } from './contract';
+import type { DriverRunResult, DriverRuntimeHandle, DriverStreamEventListener } from './contract';
 
 export interface DriverRuntimeInvokerMemoryItem {
   id: string;
@@ -11,6 +11,8 @@ export interface DriverRuntimeInvokerMemoryItem {
 export interface DriverRuntimeInvokerInput {
   task_id: string;
   run_id?: string;
+  workspace_path?: string;
+  session_id?: string;
   call_id: string;
   source_driver: string;
   driver_context: {
@@ -22,6 +24,7 @@ export interface DriverRuntimeInvokerInput {
 
 export interface DriverRuntimeInvokerOptions {
   signal?: AbortSignal;
+  onDriverEvent?: DriverStreamEventListener;
 }
 
 export interface DriverRuntimeReport {
@@ -59,13 +62,16 @@ export function createDriverRuntimeInvoker(driver: DriverRuntimeHandle) {
       );
     }
 
+    const runId = input.run_id ?? input.call_id;
     let execution: DriverRunResult;
     try {
       execution = await runDriverPromptWithSignal(
         driver,
         {
           task_id: input.task_id,
-          run_id: input.run_id ?? input.call_id,
+          run_id: runId,
+          ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+          ...(input.session_id ? { session_id: input.session_id } : {}),
           prompt: deterministicJson({
             task_instruction: input.driver_context.task_instruction,
             skills: input.driver_context.skills,
@@ -75,6 +81,7 @@ export function createDriverRuntimeInvoker(driver: DriverRuntimeHandle) {
           schema_version: SCHEMA_VERSION,
         },
         options?.signal,
+        options?.onDriverEvent,
       );
     } catch (error) {
       if (isAbort(error, options?.signal)) throw error;
@@ -137,6 +144,7 @@ function failedExecution(
     driver_run_result_id: createId('driver_result'),
     session_id: driver.session_id,
     status: 'failed',
+    response: '',
     artifacts: [],
     transcript_ref: syntheticTranscript(driver, input, message, created_at),
     tool_events: [],

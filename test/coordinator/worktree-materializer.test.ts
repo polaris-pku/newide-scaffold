@@ -80,6 +80,24 @@ describe('WorktreeMaterializer', () => {
       expect(result.changed_files).toEqual([target]);
     });
 
+    it('does not report metadata records as user file changes', async () => {
+      const artifact: ArtifactRef = {
+        ...createMockArtifact('patch'),
+        content: {
+          kind: 'metadata',
+          content_ref: 'metadata://inline',
+          target_path: 'records/result.json',
+          media_type: 'application/json',
+        },
+      };
+
+      const result = await materializer.materialize({ task_id: 'task-1', artifacts: [artifact] });
+
+      expect(result.status).toBe('completed');
+      expect(result.files_written).toHaveLength(1);
+      expect(result.changed_files).toEqual([]);
+    });
+
     it('applies a patch artifact inside the task worktree', async () => {
       const patch = [
         'diff --git a/hello.txt b/hello.txt',

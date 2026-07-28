@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION, type ArtifactRef } from '../core';
-import type { DriverPrompt, DriverRunResult, DriverRuntimeHandle } from './contract';
+import type {
+  DriverPrompt,
+  DriverRunResult,
+  DriverRuntimeHandle,
+  DriverStreamEvent,
+  DriverStreamEventListener,
+} from './contract';
 import { createDriverRuntimeInvoker } from './driver-runtime-invoker';
 
 describe('createDriverRuntimeInvoker', () => {
@@ -14,6 +20,8 @@ describe('createDriverRuntimeInvoker', () => {
     expect(driver.prompts[0]).toMatchObject({
       task_id: 'task_1',
       run_id: 'run_1',
+      workspace_path: '/tmp/newide-project',
+      session_id: 'session_existing',
       schema_version: SCHEMA_VERSION,
     });
     expect(driver.prompts[0]?.prompt).toBe(
@@ -127,7 +135,25 @@ describe('createDriverRuntimeInvoker', () => {
     controller.abort(new DOMException('cancelled by caller', 'AbortError'));
 
     await expect(running).rejects.toMatchObject({ name: 'AbortError' });
-    expect(driver.interrupt).toHaveBeenCalledWith('cancelled by caller');
+    expect(driver.interrupt).toHaveBeenCalledWith('cancelled by caller', 'run_1');
+  });
+
+  it('forwards incremental driver events while the invocation is active', async () => {
+    const driver = new TestDriver(successResult());
+    const events: DriverStreamEvent[] = [];
+
+    await createDriverRuntimeInvoker(driver)(invocationInput(), {
+      onDriverEvent: (event) => events.push(event),
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        event_type: 'agent_message_chunk',
+        task_id: 'task_1',
+        run_id: 'run_1',
+      }),
+    ]);
+    expect(driver.eventListeners.size).toBe(0);
   });
 
   it('is structurally assignable to the expected B-facing shape', () => {
@@ -151,7 +177,7 @@ describe('createDriverRuntimeInvoker', () => {
     };
     type Expected = (
       input: ReturnType<typeof invocationInput>,
-      options?: { signal?: AbortSignal },
+      options?: { signal?: AbortSignal; onDriverEvent?: DriverStreamEventListener },
     ) => Promise<{ report: BReport; execution: DriverRunResult }>;
     const expected: Expected = createDriverRuntimeInvoker(new TestDriver(successResult()));
 
@@ -181,14 +207,29 @@ class TestDriver implements DriverRuntimeHandle {
     supports_permission_events: false,
   };
   readonly prompts: DriverPrompt[] = [];
+  readonly eventListeners = new Set<DriverStreamEventListener>();
   readonly interrupt = vi.fn(async (_reason: string) => undefined);
 
   constructor(private readonly result: DriverRunResult | Error | Promise<DriverRunResult>) {}
 
   async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
     this.prompts.push(input);
+    for (const listener of this.eventListeners) {
+      listener({
+        schema_version: 'driver-event.v1',
+        event_type: 'agent_message_chunk',
+        task_id: input.task_id,
+        run_id: input.run_id,
+        payload: { text: 'live output' },
+      });
+    }
     if (this.result instanceof Error) throw this.result;
     return this.result;
+  }
+
+  subscribeToEvents(listener: DriverStreamEventListener): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
   }
 
   async collectTranscript(): Promise<ArtifactRef> {
@@ -200,6 +241,8 @@ function invocationInput() {
   return {
     task_id: 'task_1',
     run_id: 'run_1',
+    workspace_path: '/tmp/newide-project',
+    session_id: 'session_existing',
     call_id: 'call_1',
     source_driver: 'driver_1',
     driver_context: {

@@ -666,7 +666,7 @@ End of report.
   });
 
   describe('createDefaultDriverReturnConverter', () => {
-    it('should use transcript when available', async () => {
+    it('should use transcript when available', () => {
       const converter = createDefaultDriverReturnConverter();
       const result: DriverRunResult = {
         driver_run_result_id: 'test',
@@ -701,11 +701,11 @@ End of report.
 <<<END_DRIVER_RETURN>>>
 `;
 
-      const report = await converter(result, { transcriptText });
+      const report = converter(result, { transcriptText });
       expect(report.summary).toBe('From transcript');
     });
 
-    it('should fall back to metadata when no transcript', async () => {
+    it('should fall back to metadata when no transcript', () => {
       const converter = createDefaultDriverReturnConverter();
       const result: DriverRunResult = {
         driver_run_result_id: 'test',
@@ -727,11 +727,11 @@ End of report.
         schema_version: SCHEMA_VERSION,
       };
 
-      const report = await converter(result);
+      const report = converter(result);
       expect(report.summary).toContain('test-driver-fallback');
     });
 
-    it('should fall back when transcript is invalid', async () => {
+    it('should fall back when transcript is invalid', () => {
       const converter = createDefaultDriverReturnConverter();
       const result: DriverRunResult = {
         driver_run_result_id: 'test',
@@ -753,7 +753,7 @@ End of report.
         schema_version: SCHEMA_VERSION,
       };
 
-      const report = await converter(result, {
+      const report = converter(result, {
         transcriptText: 'No valid report here.',
       });
       expect(report.summary).toContain('test-meta');

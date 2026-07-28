@@ -16,6 +16,7 @@ export interface CouncilRunOutputPaths {
   synthesis_path: string;
   decision_path: string;
   output_path: string;
+  result_path: string;
 }
 
 export interface WriteCouncilRunOutputsInput {
@@ -35,6 +36,7 @@ export function buildCouncilRunOutputPaths(
     synthesis_path: path.join(councilDir, 'synthesis.json'),
     decision_path: path.join(councilDir, 'decision.json'),
     output_path: path.join(councilDir, 'output.json'),
+    result_path: path.join(councilDir, 'result.json'),
   };
 }
 
@@ -68,6 +70,13 @@ export async function writeCouncilRunOutputs(
     await fs.writeFile(
       input.paths.output_path,
       JSON.stringify(input.result.output, null, 2),
+      'utf-8',
+    );
+  }
+  if (input.result.result) {
+    await fs.writeFile(
+      input.paths.result_path,
+      JSON.stringify(input.result.result, null, 2),
       'utf-8',
     );
   }

@@ -71,12 +71,16 @@ export class WorktreeMaterializer {
         if (artifact.content) {
           const written = await materializeContent(worktreePath, artifact);
           filesWritten.push(...written);
-          changedFiles.push(...written);
+          // changed_files describes files materialized from deliverable content.
+          // Metadata records remain auditable through files_written but are not
+          // user deliverables and therefore must not enter changed_files.
+          if (artifact.content.kind !== 'metadata') changedFiles.push(...written);
         } else if (
           artifact.type === 'patch' ||
           artifact.type === 'diff' ||
           artifact.type === 'driver_result'
         ) {
+          // Metadata blobs: register, but never as a changed file.
           const artifactFile = path.join(worktreePath, `${artifact.artifact_id}.json`);
           await fs.writeFile(artifactFile, JSON.stringify(artifact, null, 2), 'utf-8');
           filesWritten.push(artifactFile);

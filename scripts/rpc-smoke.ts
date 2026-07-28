@@ -9,7 +9,12 @@ import {
   startBackendRpcServer,
   type BackendRpcServer,
 } from '../src/app/backend-rpc-stdio';
-import type { ToolCallingClient } from '../src/memory';
+import {
+  InMemoryBufferRepository,
+  InMemoryRepository,
+  type LlmClient,
+  type ToolCallingClient,
+} from '../src/memory';
 import type { RunSnapshot } from '../src/protocol/run-snapshot';
 
 interface JsonRpcMessage {
@@ -24,6 +29,7 @@ interface JsonRpcMessage {
 type SmokeMode = 'single_agent' | 'council' | 'all';
 
 const smokeMode = readSmokeMode(process.argv.slice(2));
+const workspacePath = path.resolve(process.env.RPC_SMOKE_WORKSPACE ?? process.cwd());
 
 const configuredRunnerDir = process.env.RPC_SMOKE_ACP_RUNNER_DIR;
 const usesTemporaryRunner = configuredRunnerDir === undefined;
@@ -49,9 +55,19 @@ if (usesTemporaryRunner) {
   localServer = startBackendRpcServer({
     input,
     writeLine: (line) => localOutput!.write(`${line}\n`),
-    service: createProductionBackendService(
+    service: await createProductionBackendService(
       { ...process.env, ACP_DRIVER_RUNNER_DIR: runnerDir },
-      { agentLlm: invokeDriverLlm() },
+      {
+        agentLlm: invokeDriverLlm(),
+        memoryLlm: deterministicMaintenanceLlm(),
+        bRuntime: {
+          repository: new InMemoryRepository(),
+          bufferRepository: new InMemoryBufferRepository(),
+          app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(process.cwd(), '.newide'),
+          market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
+          close: async () => undefined,
+        },
+      },
     ),
   });
   backendInput = input;
@@ -156,7 +172,7 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
       : '编写一个网页贪吃蛇游戏。请以 snake-council.html 为最终候选文件，要求可直接在浏览器打开运行，包含键盘控制、计分和重新开始功能。';
   const created = await request<{ run_id: string; task_id: string; status: 'running' }>(
     'run.create',
-    { prompt, mode },
+    { prompt, mode, workspace_path: workspacePath },
   );
   runIds.push(created.run_id);
   taskIds.push(created.task_id);
@@ -244,7 +260,7 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
 async function createAndCancel(): Promise<Record<string, unknown>> {
   const created = await request<{ run_id: string; task_id: string; status: 'running' }>(
     'run.create',
-    { prompt: 'RPC smoke cancellation', mode: 'single_agent' },
+    { prompt: 'RPC smoke cancellation', mode: 'single_agent', workspace_path: workspacePath },
   );
   runIds.push(created.run_id);
   taskIds.push(created.task_id);
@@ -359,7 +375,7 @@ async function waitForCancellationEffects(): Promise<void> {
 
 async function waitForBackendClose(): Promise<number | null> {
   if (!child || !childClosed) {
-    localServer?.close();
+    await localServer?.close();
     localOutput?.end();
     return 0;
   }
@@ -403,6 +419,24 @@ function invokeDriverLlm(): ToolCallingClient {
           },
         ],
       };
+    },
+  };
+}
+
+function deterministicMaintenanceLlm(): LlmClient {
+  return {
+    async complete() {
+      return JSON.stringify({
+        experiences: [
+          {
+            description: 'RPC smoke execution lesson',
+            content: 'Keep production RPC composition behind explicit ports.',
+            type: 'positive',
+            confidence: 0.9,
+            tags: ['rpc'],
+          },
+        ],
+      });
     },
   };
 }

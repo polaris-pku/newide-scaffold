@@ -12,6 +12,7 @@ import type { AgentTaskRequest } from '../agent-types';
 import type { MemoryCycleResult } from '../types';
 import type { AgentToolConfig } from './agent';
 import type { CompetitionClaimBatch, CollectCompetitionClaimsOptions } from '../competition-types';
+import type { EmbeddingProvider } from '../ports/embedding-provider';
 import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import { QueryMemoryTool } from './tools/query-memory-tool';
 import { Agent } from './agent';
@@ -21,9 +22,11 @@ import { createId, nowTimestamp } from '../../core';
  * AgentManager 构造选项
  *
  * - `tools`: LLM tool-calling 配置（必选）
+ * - `embedding`: 透传给 QueryMemoryTool，确保查询向量与写入向量维度一致
  */
 export interface AgentManagerOptions {
   tools: AgentToolConfig;
+  embedding?: EmbeddingProvider;
 }
 
 /**
@@ -133,7 +136,7 @@ export class AgentManager {
         const memory = createAgentMemoryScope(this.repository, this.bufferRepository, role_id);
         const tools = {
           ...this.options.tools,
-          tools: [new QueryMemoryTool(memory), ...this.options.tools.tools],
+          tools: [new QueryMemoryTool(memory, this.options.embedding), ...this.options.tools.tools],
         };
         const agent = new Agent(memory, tools);
         this.agents.set(role_id, agent);
@@ -149,7 +152,7 @@ export class AgentManager {
     // 自动注入 QueryMemoryTool（需要 AgentMemoryScope，只能在这里创建）
     const tools = {
       ...this.options.tools,
-      tools: [new QueryMemoryTool(memory), ...this.options.tools.tools],
+      tools: [new QueryMemoryTool(memory, this.options.embedding), ...this.options.tools.tools],
     };
 
     const agent = new Agent(memory, tools);

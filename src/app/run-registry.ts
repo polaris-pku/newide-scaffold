@@ -226,6 +226,10 @@ export class InMemoryRunRegistry {
     return this.clone(this.require(runId));
   }
 
+  listSnapshots(): AppRunSnapshot[] {
+    return [...this.records.values()].map((record) => this.clone(record));
+  }
+
   cancel(runId: string): AppRunSnapshot {
     const record = this.require(runId);
     if (record.status !== 'running') return this.clone(record);

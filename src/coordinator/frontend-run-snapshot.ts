@@ -8,19 +8,34 @@ import type { Checkpoint, Message, MessageId, SchemaVersion, Task, Timestamp } f
 import type { ArtifactOutput } from './artifact-output';
 import type { RunResultStatus, IntegrationRunOutputPaths } from './run-result';
 import type { SelectionMode } from './artifact-finalizer';
-import type { CouncilDecision, CouncilRunResult } from '../council';
+import type { CouncilDecision, CouncilResult, CouncilRunResult } from '../council';
+import type { DriverToolEvent } from '../driver/contract';
 
 export type FrontendStage = 'executing' | 'council' | 'delivery';
 export type FrontendTimelineLevel = 'info' | 'success' | 'warning' | 'council';
+
+export interface FrontendMarketSelection {
+  winner_agent_id: string;
+  winner_bid_id: string;
+  ledger_ref: string;
+  audit_ref: string;
+  policy_version: string;
+  seed: string;
+}
 
 export interface FrontendRunSnapshotSummary {
   run_id: string;
   task_id: string;
   mode: SelectionMode;
   status: RunResultStatus;
+  outcome: 'completed_files' | 'completed_response' | 'failed';
+  session_id: string;
+  response: string;
+  tool_events: DriverToolEvent[];
   worktree_path: string;
   artifacts_materialized: number;
   files_written: string[];
+  changed_files: string[];
   artifact_outputs: ArtifactOutput[];
   driver_diagnostics: {
     driver_id: string;
@@ -30,11 +45,14 @@ export interface FrontendRunSnapshotSummary {
   checkpoint_path: string;
   mailbox_message_refs: MessageId[];
   mailbox_thread_id: string;
+  market?: FrontendMarketSelection;
   council_decision_path?: string;
   council_proposals_path?: string;
   council_reviews_path?: string;
   council_synthesis_path?: string;
   council_output_path?: string;
+  council_result_path?: string;
+  council_result?: CouncilResult;
   council_decision_id?: string;
   council_decision_mode?: CouncilDecision['decision_mode'];
   council_verdict?: CouncilDecision['verdict'];
@@ -84,6 +102,7 @@ export interface FrontendRunSnapshot {
     status: RunResultStatus;
     mode: SelectionMode;
     driver_id: string;
+    session_id: string;
     created_at: Timestamp;
   };
   flow: {
@@ -100,7 +119,12 @@ export interface FrontendRunSnapshot {
   delivery_report: {
     worktree_path: string;
     files_written: string[];
+    changed_files: string[];
     artifacts_materialized: number;
+    outcome: FrontendRunSnapshotSummary['outcome'];
+    response: string;
+    session_id: string;
+    tool_events: DriverToolEvent[];
     driver_diagnostics: FrontendRunSnapshotSummary['driver_diagnostics'];
   };
   artifacts: ArtifactOutput[];
@@ -116,12 +140,14 @@ export interface FrontendRunSnapshot {
     message_refs: MessageId[];
     messages: Message[];
   };
+  market?: FrontendMarketSelection;
   council?: {
     decision_path: string;
     proposals_path?: string;
     reviews_path?: string;
     synthesis_path?: string;
     output_path?: string;
+    result_path?: string;
     decision_id: string;
     decision_mode: CouncilDecision['decision_mode'];
     verdict: CouncilDecision['verdict'];
@@ -134,6 +160,7 @@ export interface FrontendRunSnapshot {
     reviews: CouncilRunResult['reviews'];
     synthesis?: CouncilRunResult['synthesis'];
     output?: CouncilRunResult['output'];
+    result?: CouncilResult;
   };
   links: Omit<IntegrationRunOutputPaths, 'run_dir'>;
 }
@@ -160,6 +187,7 @@ export function buildFrontendRunSnapshot(
       status: input.summary.status,
       mode: input.summary.mode,
       driver_id: input.summary.driver_diagnostics.driver_id,
+      session_id: input.summary.session_id,
       created_at: input.summary.created_at,
     },
     flow: {
@@ -176,7 +204,12 @@ export function buildFrontendRunSnapshot(
     delivery_report: {
       worktree_path: input.summary.worktree_path,
       files_written: [...input.summary.files_written],
+      changed_files: [...input.summary.changed_files],
       artifacts_materialized: input.summary.artifacts_materialized,
+      outcome: input.summary.outcome,
+      response: input.summary.response,
+      session_id: input.summary.session_id,
+      tool_events: input.summary.tool_events.map((event) => ({ ...event })),
       driver_diagnostics: input.summary.driver_diagnostics,
     },
     artifacts: [...input.summary.artifact_outputs],
@@ -192,6 +225,7 @@ export function buildFrontendRunSnapshot(
       message_refs: [...input.summary.mailbox_message_refs],
       messages: [...input.message_thread],
     },
+    ...(input.summary.market ? { market: { ...input.summary.market } } : {}),
     ...(input.summary.council_decision_path &&
     input.summary.council_decision_id &&
     input.summary.council_decision_mode &&
@@ -210,6 +244,9 @@ export function buildFrontendRunSnapshot(
               : {}),
             ...(input.summary.council_output_path
               ? { output_path: input.summary.council_output_path }
+              : {}),
+            ...(input.summary.council_result_path
+              ? { result_path: input.summary.council_result_path }
               : {}),
             decision_id: input.summary.council_decision_id,
             decision_mode: input.summary.council_decision_mode,
@@ -233,6 +270,7 @@ export function buildFrontendRunSnapshot(
             ...(input.council_run_result?.output
               ? { output: input.council_run_result.output }
               : {}),
+            ...(input.summary.council_result ? { result: input.summary.council_result } : {}),
           },
         }
       : {}),

@@ -1,17 +1,24 @@
 /** Writes fallback terminal artifacts when the integration flow cannot finalize itself. */
 import { promises as fs } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import type { AppRunSnapshot } from './run-registry';
 import { projectRunSnapshot } from './run-snapshot-projector';
 
 export interface RunTerminalOutputWriter {
-  finalize(snapshot: AppRunSnapshot): Promise<void>;
+  finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | void>;
+}
+
+export interface RunTerminalOutputEvidence {
+  artifact_ref: string;
+  sha256: string;
 }
 
 export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
   constructor(private readonly runsRoot = '.newide/runs') {}
 
-  async finalize(snapshot: AppRunSnapshot): Promise<void> {
+  async finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | undefined> {
     if (snapshot.status === 'running') return;
     const runDir = path.join(this.runsRoot, snapshot.run_id);
     await fs.mkdir(runDir, { recursive: true });
@@ -37,14 +44,15 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
             }),
             writeJsonIfMissing(timelinePath, snapshot.events),
           ];
+    const serializedSnapshot = JSON.stringify(projectRunSnapshot(snapshot), null, 2);
     await Promise.all([
       ...fallbackWrites,
-      fs.writeFile(
-        frontendSnapshotPath,
-        JSON.stringify(projectRunSnapshot(snapshot), null, 2),
-        'utf-8',
-      ),
+      fs.writeFile(frontendSnapshotPath, serializedSnapshot, 'utf-8'),
     ]);
+    return {
+      artifact_ref: pathToFileURL(path.resolve(frontendSnapshotPath)).href,
+      sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),
+    };
   }
 }
 

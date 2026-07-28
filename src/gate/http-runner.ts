@@ -25,7 +25,6 @@ export class HttpRunner extends BaseGateRunner {
       );
     }
 
-    // definition.timeout is seconds; setTimeout/AbortController expect ms
     const timeout =
       this.definition.timeout != null
         ? this.definition.timeout * 1000

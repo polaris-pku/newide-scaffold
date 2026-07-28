@@ -11,12 +11,15 @@ import type { GateResult } from '../gate';
 import {
   MockCouncil,
   type CouncilDecision,
+  type CouncilResult,
   type CouncilLifecycleEvent,
   type CouncilProvider,
   type CouncilRunResult,
   type EvidencePack,
 } from '../council';
 import { buildCouncilProposalFromDriverResult } from '../council/proposal-adapter';
+import type { AutonomousCouncilHandler } from './handlers/autonomous-council-handler';
+import type { DriverStreamEventListener } from '../driver/contract';
 
 export type SelectionMode = 'single_agent' | 'council';
 
@@ -30,6 +33,7 @@ export interface ArtifactSelectionResult {
   metadata: Record<string, unknown>;
   council_decision?: CouncilDecision;
   council_run_result?: CouncilRunResult;
+  council_result?: CouncilResult;
   created_at: string;
   schema_version: string;
 }
@@ -41,16 +45,19 @@ export interface ArtifactSelectionInput {
   gate_results: GateResult[];
   evidence_pack?: EvidencePack;
   question?: string;
+  workspace_path?: string;
 }
 
 export interface ArtifactSelectionExecutionOptions {
   signal?: AbortSignal;
+  onDriverEvent?: DriverStreamEventListener;
   onCouncilLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
 }
 
 export interface ArtifactSelectorOptions {
   mode: SelectionMode;
   councilProvider?: CouncilProvider;
+  councilHandler?: AutonomousCouncilHandler;
 }
 
 /**
@@ -126,36 +133,47 @@ export class ArtifactSelector {
       gate_results: input.gate_results,
     });
 
-    const councilRunResult = await this.options.councilProvider.runCouncilRound(
-      {
+    const councilRequest = {
         run_id: input.run_id,
         task_id: input.task_id,
-        trigger: 'manual',
-        decision_mode: 'advisory',
+        trigger: 'user_choice' as const,
+        decision_mode: 'advisory' as const,
         question: input.question ?? 'Select the best driver output artifact for v0 integration.',
+        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+        candidate_artifacts: [...input.driver_result.artifacts],
         proposals: [proposal],
         evidence_pack: input.evidence_pack,
         schema_version: SCHEMA_VERSION,
-      },
-      execution
+      };
+    const councilOptions = execution
         ? {
             ...(execution.signal ? { signal: execution.signal } : {}),
+            ...(execution.onDriverEvent ? { onDriverEvent: execution.onDriverEvent } : {}),
             ...(execution.onCouncilLifecycleEvent
               ? { onLifecycleEvent: execution.onCouncilLifecycleEvent }
               : {}),
           }
-        : undefined,
-    );
+        : undefined;
+    const autonomousExecution = this.options.councilHandler
+      ? await this.options.councilHandler.execute(councilRequest, councilOptions)
+      : undefined;
+    const councilRunResult = autonomousExecution
+      ? autonomousExecution.council_run_result
+      : await this.options.councilProvider.runCouncilRound(councilRequest, councilOptions);
     const councilDecision = councilRunResult.decision;
 
     // Convert council verdict to selection
-    const selectedArtifactIds = new Set(councilDecision.selected_artifact_refs);
+    const selectedArtifactIds = new Set(
+      autonomousExecution
+        ? [autonomousExecution.final_artifact.artifact_id]
+        : councilDecision.selected_artifact_refs,
+    );
     const selectableArtifacts = [
       ...input.driver_result.artifacts,
       ...councilRunResult.generated_artifact_refs,
     ];
     const selected =
-      councilDecision.verdict === 'select'
+      autonomousExecution || councilDecision.verdict === 'select'
         ? selectableArtifacts.filter((artifact) => selectedArtifactIds.has(artifact.artifact_id))
         : [];
 
@@ -181,6 +199,7 @@ export class ArtifactSelector {
       },
       council_decision: councilDecision,
       council_run_result: councilRunResult,
+      ...(autonomousExecution ? { council_result: autonomousExecution.council_result } : {}),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };

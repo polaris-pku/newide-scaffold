@@ -1,39 +1,125 @@
 import { describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { DriverRuntimeAgentExecutionFacade } from '../../src/app/driver-runtime-agent-execution-facade';
-import { SCHEMA_VERSION, type ArtifactRef } from '../../src/core';
+import { FileAgentExecutionEvidenceStore } from '../../src/app/agent-execution-evidence-store';
+import type { BMemoryMaintenancePort } from '../../src/app/b-memory-maintenance-runner';
+import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
 import {
   MockDriver,
   type DriverCapabilities,
   type DriverPrompt,
   type DriverRunResult,
   type DriverRuntimeHandle,
+  type DriverStreamEventListener,
 } from '../../src/driver';
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
   type ToolCallingClient,
 } from '../../src/memory';
+import type { ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
+  it('projects app-owned B maintenance evidence into execution diagnostics', async () => {
+    const requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
+    const memoryMaintenance: BMemoryMaintenancePort = {
+      async scheduleBuffer(input) {
+        requests.push(input);
+        return {
+          maintenance_ref: 'b_maintenance_test',
+          kind: 'experience_extraction',
+          status: 'scheduled',
+          ...input,
+          experiences: [],
+          skills: [],
+          warnings: [],
+          created_at: '2026-07-21T00:00:00.000Z',
+          completed_at: '2026-07-21T00:00:01.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    const { facade } = createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+      new InMemoryRepository(),
+      memoryMaintenance,
+    );
+
+    const result = await facade.runAgent(request('task_maintenance', 'proposer_a'));
+
+    expect(requests).toEqual([
+      {
+        task_id: 'task_maintenance',
+        run_id: 'run_task_maintenance',
+        role_id: 'proposer_a',
+        buffer_seq: 1,
+      },
+    ]);
+    expect(result.diagnostics.memory_maintenance).toMatchObject({
+      maintenance_ref: 'b_maintenance_test',
+      status: 'scheduled',
+    });
+  });
+
+  it('preserves a completed Agent execution when B maintenance scheduling fails', async () => {
+    const memoryMaintenance: BMemoryMaintenancePort = {
+      async scheduleBuffer() {
+        throw new Error('maintenance evidence store unavailable');
+      },
+    };
+    const { facade } = createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+      new InMemoryRepository(),
+      memoryMaintenance,
+    );
+
+    const result = await facade.runAgent(request('task_maintenance_failure', 'proposer_a'));
+
+    expect(result.status).toBe('completed');
+    expect(result.diagnostics.memory_maintenance).toMatchObject({
+      maintenance_ref: expect.stringMatching(/^b_maintenance_/),
+      kind: 'experience_extraction',
+      status: 'failed',
+      task_id: 'task_maintenance_failure',
+      run_id: 'run_task_maintenance_failure',
+      role_id: 'proposer_a',
+      buffer_seq: 1,
+      error: 'maintenance evidence store unavailable',
+    });
+  });
+
   it('runs the real driver through the public B runtime and preserves the execution result', async () => {
     const driver = new CapturingDriver('succeeded');
     const { facade, buffer } = createFacade(driver);
 
-    const result = await facade.runAgent(request('task_001', 'proposer_a'));
+    const result = await facade.runAgent(request('task_001', 'proposer_a', process.cwd()));
 
     expect(driver.prompts).toHaveLength(1);
     expect(driver.prompts[0]).toMatchObject({
       task_id: 'task_001',
       run_id: 'run_task_001',
+      workspace_path: process.cwd(),
+      session_id: 'session_existing',
       schema_version: SCHEMA_VERSION,
     });
     expect(result).toMatchObject({
       agent_run_id: expect.stringMatching(/^agent_run_/),
+      agent_id: 'proposer_a',
       role_id: 'proposer_a',
-      context_pack_ref: expect.stringMatching(/^context_pack_/),
+      context_pack_ref: expect.stringMatching(/^context_pack_[a-f0-9]{24}$/),
       driver_run_result_id: 'driver_result_001',
       artifact_refs: [createArtifact('artifact_output_001')],
       transcript_ref: createArtifact('artifact_transcript_001', 'transcript'),
+      session_id: 'session_existing',
+      response: 'Agent completed the requested change.',
+      tool_events: [expect.objectContaining({ tool_event_id: 'tool_event_001' })],
       diagnostics: {
         driver_id: 'driver_001',
         driver_status: 'succeeded',
@@ -49,6 +135,298 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       pending_count: 1,
       total_processed: 0,
     });
+  });
+
+  it('preserves B-owned query_memory alongside the app-owned driver tool', async () => {
+    const exposedTools: string[][] = [];
+    const delegate = invokeDriverLlm();
+    const llm: ToolCallingClient = {
+      async completeWithTools(input) {
+        exposedTools.push(input.tools.map((tool) => tool.function.name));
+        return delegate.completeWithTools(input);
+      },
+    };
+    const { facade } = createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      llm,
+    );
+
+    await facade.runAgent(request('task_tool_surface', 'tool_surface_role'));
+
+    expect(exposedTools[0]).toEqual(['query_memory', 'invoke_driver']);
+  });
+
+  it('registers and projects a market candidate without executing A', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const { facade } = createFacade(driver);
+
+    await facade.ensureAgent('role_market_candidate');
+    const batch = await facade.collectCompetitionClaims({
+      task_id: 'task_market_claim',
+      spec: 'Implement a backend service.',
+    });
+
+    expect(batch.claims).toEqual([
+      expect.objectContaining({
+        role_id: 'role_market_candidate',
+        decision: 'participate',
+      }),
+    ]);
+    expect(driver.prompts).toHaveLength(0);
+  });
+
+  it('tags streamed A events with the executing Council role', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const { facade } = createFacade(driver);
+    const events: Array<{ role_id?: string; event_type: string }> = [];
+
+    await facade.runAgent(request('task_stream_role', 'reviewer'), {
+      onDriverEvent: (event) => events.push(event),
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({ event_type: 'agent_message_chunk', role_id: 'reviewer' }),
+    ]);
+  });
+
+  it('wakes a sleeping mailbox recipient without dispatching a Driver task', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const { facade } = createFacade(driver);
+
+    await facade.wakeAgent({
+      contract_version: 'agent-mailbox-wake.v1',
+      message_id: 'message_wake',
+      delivery_id: 'delivery_wake',
+      thread_id: 'thread_wake',
+      recipient_role_id: 'role_mailbox_recipient',
+      schema_version: SCHEMA_VERSION,
+    });
+
+    const batch = await facade.collectCompetitionClaims({
+      task_id: 'task_after_wake',
+      spec: 'Confirm the recipient is loaded into the B runtime.',
+    });
+    expect(batch.claims).toEqual([expect.objectContaining({ role_id: 'role_mailbox_recipient' })]);
+    expect(driver.prompts).toHaveLength(0);
+  });
+
+  it('resolves a relative workspace before crossing the B to A process boundary', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const { facade } = createFacade(driver);
+    const relativeWorkspace = '.newide/council/run_relative/proposer_a';
+
+    await facade.runAgent(request('task_relative_workspace', 'proposer_a', relativeWorkspace));
+
+    expect(driver.prompts[0]?.workspace_path).toBe(path.resolve(relativeWorkspace));
+  });
+
+  it('persists a content-addressed context pack with real retrieval and buffer evidence', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-b-evidence-'));
+    try {
+      const driver = new CapturingDriver('succeeded');
+      const facade = new DriverRuntimeAgentExecutionFacade({
+        driver,
+        repository: new InMemoryRepository(),
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+        evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+      });
+
+      const result = await facade.runAgent(request('task_evidence', 'implementer'));
+
+      expect(result).toMatchObject({
+        agent_id: 'implementer',
+        context_pack_ref: expect.stringMatching(/^context_pack_[a-f0-9]{24}$/),
+        memory_buffer_ref: 'implementer:1',
+        diagnostics: {
+          context_pack_persisted: true,
+          context_pack_uri: expect.stringMatching(/^file:/),
+          retrieval: { experiences: 0, skills: 0 },
+        },
+      });
+      const files = await fs.readdir(root);
+      expect(files).toEqual([`${result.context_pack_ref}.json`]);
+      const persisted = JSON.parse(await fs.readFile(path.join(root, files[0]!), 'utf-8'));
+      expect(persisted).toMatchObject({
+        context_pack_id: result.context_pack_ref,
+        task_id: 'task_evidence',
+        agent_id: 'implementer',
+        memory_buffer_ref: 'implementer:1',
+        retrieval: { experiences: [], skills: [] },
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retrieves eligible memory before planning and injects it into A and ContextPack evidence', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-b-retrieval-'));
+    try {
+      const roleId = 'implementer';
+      const repository = new InMemoryRepository();
+      await repository.initializeAgent({ role_id: roleId, name: roleId });
+      const approvedSkill = createMemorySkill(roleId, {
+        description: 'Runtime contract implementation skill',
+        content: 'Keep runtime role identity stable across workspace paths.',
+        tags: ['runtime'],
+      });
+      const pendingSkill = createMemorySkill(roleId, {
+        description: 'Pending runtime skill',
+        content: 'This pending skill must not reach A.',
+        review_status: 'pending',
+        tags: ['runtime'],
+      });
+      const eligibleExperience = createMemoryExperience(roleId, {
+        description: 'Runtime retrieval experience',
+        content: 'Retrieve approved memory before invoking the driver.',
+        tags: ['runtime'],
+      });
+      const negativeExperience = createMemoryExperience(roleId, {
+        description: 'Negative runtime experience',
+        content: 'This negative experience must not reach A.',
+        confidence: 0.9,
+        type: 'negative',
+        tags: ['runtime'],
+      });
+      const lowConfidenceExperience = createMemoryExperience(roleId, {
+        description: 'Low confidence runtime experience',
+        content: 'This low-confidence experience must not reach A.',
+        confidence: 0.1,
+        tags: ['runtime'],
+      });
+      await repository.saveSkill(roleId, approvedSkill);
+      await repository.saveSkill(roleId, pendingSkill);
+      await repository.saveExperience(roleId, eligibleExperience);
+      await repository.saveExperience(roleId, negativeExperience);
+      await repository.saveExperience(roleId, lowConfidenceExperience);
+
+      const storedApprovedSkill = (await repository.listSkills(roleId)).find(
+        (skill) => skill.id === approvedSkill.id,
+      )!;
+      const storedEligibleExperience = (await repository.listExperiences(roleId)).find(
+        (experience) => experience.id === eligibleExperience.id,
+      )!;
+      const initialMessages: string[] = [];
+      const llmSkillContext = 'Preserve this LLM-provided skill context.';
+      const llmExperienceContext = 'Preserve this LLM-provided experience context.';
+      const driver = new CapturingDriver('succeeded');
+      const facade = new DriverRuntimeAgentExecutionFacade({
+        driver,
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverWithContextLlm(
+          {
+            skills: [approvedSkill.content, llmSkillContext, llmSkillContext],
+            experiences: [eligibleExperience.content, llmExperienceContext, llmExperienceContext],
+          },
+          initialMessages,
+        ),
+        evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+      });
+
+      const result = await facade.runAgent(request('task_retrieval', roleId));
+
+      expect(initialMessages[0]).toContain(approvedSkill.description);
+      expect(initialMessages[0]).toContain(approvedSkill.content);
+      expect(initialMessages[0]).toContain(eligibleExperience.description);
+      expect(initialMessages[0]).toContain(eligibleExperience.content);
+      expect(initialMessages[0]).not.toContain(pendingSkill.content);
+      expect(initialMessages[0]).not.toContain(negativeExperience.content);
+      expect(initialMessages[0]).not.toContain(lowConfidenceExperience.content);
+
+      const prompt = JSON.parse(driver.prompts[0]!.prompt) as {
+        task_instruction: string;
+        skills: Array<{ id: string; description: string; content: string }>;
+        experiences: Array<{ id: string; description: string; content: string }>;
+      };
+      expect(prompt.skills.map((item) => item.content)).toEqual([
+        approvedSkill.content,
+        llmSkillContext,
+      ]);
+      expect(prompt.experiences.map((item) => item.content)).toEqual([
+        eligibleExperience.content,
+        llmExperienceContext,
+      ]);
+      expect(prompt.skills[0]).toEqual({
+        id: approvedSkill.id,
+        description: approvedSkill.description,
+        content: approvedSkill.content,
+      });
+      expect(prompt.experiences[0]).toEqual({
+        id: eligibleExperience.id,
+        description: eligibleExperience.description,
+        content: eligibleExperience.content,
+      });
+
+      expect(result.diagnostics).toMatchObject({ retrieval: { experiences: 1, skills: 1 } });
+      const persisted = JSON.parse(
+        await fs.readFile(path.join(root, `${result.context_pack_ref}.json`), 'utf-8'),
+      );
+      expect(persisted).toMatchObject({
+        agent_id: roleId,
+        memory_buffer_ref: `${roleId}:1`,
+      });
+      expect(persisted.retrieval).toEqual({
+        skills: [storedApprovedSkill],
+        experiences: [storedEligibleExperience],
+      });
+      expect(persisted.driver_context).toEqual({
+        task_instruction: 'Execute through B runtime.',
+        skills: [storedApprovedSkill],
+        experiences: [storedEligibleExperience],
+      });
+      expect(persisted.driver_invocation_context).toEqual(prompt);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('releases role and workspace queues when cancellation wins against retrieval', async () => {
+    const roleId = 'retrieval_cancel_role';
+    const repository = new BlockingOnceRetrievalRepository();
+    await repository.initializeAgent({ role_id: roleId, name: roleId });
+    const driver = new CapturingDriver('succeeded');
+    const { facade } = createFacade(
+      driver,
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+      repository,
+    );
+    const controller = new AbortController();
+
+    const cancelled = facade.runAgent(
+      request('task_cancel_retrieval', roleId, '/tmp/newide-cancel-retrieval'),
+      { signal: controller.signal },
+    );
+    await repository.firstSearchStarted;
+    let cancellationState: 'pending' | 'resolved' | 'rejected' = 'pending';
+    let cancellationError: unknown;
+    const cancellationObserved = cancelled.then(
+      () => {
+        cancellationState = 'resolved';
+      },
+      (error: unknown) => {
+        cancellationState = 'rejected';
+        cancellationError = error;
+      },
+    );
+    controller.abort(new Error('Cancel blocked retrieval'));
+    const followUp = facade.runAgent(
+      request('task_after_retrieval_cancel', roleId, '/tmp/newide-cancel-retrieval'),
+    );
+    try {
+      await vi.waitFor(() => expect(cancellationState).toBe('rejected'), { timeout: 1_000 });
+      expect(cancellationError).toMatchObject({ message: 'Cancel blocked retrieval' });
+      await vi.waitFor(() => expect(driver.prompts).toHaveLength(1), { timeout: 1_000 });
+      await expect(followUp).resolves.toMatchObject({
+        status: 'completed',
+        memory_buffer_ref: `${roleId}:1`,
+      });
+    } finally {
+      repository.continueFirstSearch();
+      await Promise.allSettled([cancellationObserved, followUp]);
+    }
   });
 
   it('preserves the original C instruction when B delegates a narrower subtask', async () => {
@@ -137,6 +515,29 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(driver.maxActive).toBe(1);
   });
 
+  it('cleans settled role and workspace queues without deleting a newer queued entry', async () => {
+    const driver = new ControlledDriver();
+    const { facade } = createFacade(driver);
+    const workspace = '/tmp/newide-queue-cleanup';
+    const queues = Reflect.get(facade, 'executionQueues') as Map<string, Promise<void>>;
+
+    const first = facade.runAgent(request('task_queue_cleanup_1', 'proposer', workspace));
+    const second = facade.runAgent(request('task_queue_cleanup_2', 'proposer', workspace));
+    try {
+      await vi.waitFor(() => expect(driver.prompts).toHaveLength(1));
+      expect(queues.size).toBe(2);
+      driver.releaseNext();
+      await vi.waitFor(() => expect(driver.prompts).toHaveLength(2));
+      expect(queues.size).toBe(2);
+      driver.releaseNext();
+      await Promise.all([first, second]);
+      await vi.waitFor(() => expect(queues.size).toBe(0));
+    } finally {
+      driver.finishAll();
+      await Promise.allSettled([first, second]);
+    }
+  });
+
   it('keeps concurrent role invocations associated with their own task and run', async () => {
     const driver = new ConcurrentDriver();
     const { facade } = createFacade(driver);
@@ -154,6 +555,44 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     ).toEqual([
       { task_id: 'task_parallel_a', run_id: 'run_task_parallel_a' },
       { task_id: 'task_parallel_b', run_id: 'run_task_parallel_b' },
+    ]);
+  });
+
+  it('serializes different roles that target the same workspace', async () => {
+    const driver = new ConcurrentDriver();
+    const { facade } = createFacade(driver);
+    const workspace = '/tmp/newide-shared-workspace';
+
+    await Promise.all([
+      facade.runAgent(request('task_shared_a', 'proposer', workspace)),
+      facade.runAgent(request('task_shared_b', 'reviewer', workspace)),
+    ]);
+
+    expect(driver.maxActive).toBe(1);
+  });
+
+  it('reuses one logical role and buffer sequence across different workspaces', async () => {
+    const driver = new ConcurrentDriver();
+    const repository = new InMemoryRepository();
+    const { facade } = createFacade(
+      driver,
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+      repository,
+    );
+
+    const [first, second] = await Promise.all([
+      facade.runAgent(request('task_workspace_a', 'proposer', '/tmp/newide-workspace-a')),
+      facade.runAgent(request('task_workspace_b', 'proposer', '/tmp/newide-workspace-b')),
+    ]);
+
+    expect(driver.maxActive).toBe(1);
+    expect(first).toMatchObject({ agent_id: 'proposer', memory_buffer_ref: 'proposer:1' });
+    expect(second).toMatchObject({ agent_id: 'proposer', memory_buffer_ref: 'proposer:2' });
+    expect(await repository.listAgentIds()).toEqual(['proposer']);
+    expect(driver.prompts.map((prompt) => prompt.workspace_path).sort()).toEqual([
+      '/tmp/newide-workspace-a',
+      '/tmp/newide-workspace-b',
     ]);
   });
 
@@ -202,8 +641,42 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     controller.abort(new Error('Cancel B runtime execution'));
 
     await expect(running).rejects.toThrow('Cancel B runtime execution');
-    expect(interrupt).toHaveBeenCalledWith('Cancel B runtime execution');
+    expect(interrupt).toHaveBeenCalledWith('Cancel B runtime execution', 'run_task_cancel');
     expect((await buffer.getBufferMeta('proposer_a')).total_processed).toBe(0);
+  });
+
+  it('recovers a cancelled role by rebuilding the app-owned manager instance', async () => {
+    const roleId = 'canonical_recovery_role';
+    const repository = new CountingManagerLoadRepository();
+    const driver = new AbortOnceDriver();
+    const { facade } = createFacade(
+      driver,
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+      repository,
+    );
+    const controller = new AbortController();
+
+    const cancelled = facade.runAgent(request('task_cancel_canonical', roleId), {
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(driver.prompts).toHaveLength(1));
+    controller.abort(new Error('Cancel canonical role'));
+    await expect(cancelled).rejects.toThrow('Cancel canonical role');
+
+    const claims = await facade.collectCompetitionClaims({
+      task_id: 'task_claim_after_cancel',
+      spec: 'Confirm the recovered role can participate.',
+    });
+    expect(claims.claims).toEqual([
+      expect.objectContaining({ role_id: roleId, decision: 'participate' }),
+    ]);
+    await expect(facade.runAgent(request('task_run_after_cancel', roleId))).resolves.toMatchObject({
+      status: 'completed',
+      agent_id: roleId,
+      memory_buffer_ref: `${roleId}:1`,
+    });
+    expect(repository.managerLoadCount).toBe(2);
   });
 
   it('continues a queued role execution after the active execution is aborted', async () => {
@@ -304,6 +777,7 @@ function createFacade(
   buffer: InMemoryBufferRepository = new InMemoryBufferRepository(),
   llm: ToolCallingClient = invokeDriverLlm(),
   repository: InMemoryRepository = new InMemoryRepository(),
+  memoryMaintenance?: BMemoryMaintenancePort,
 ) {
   return {
     facade: new DriverRuntimeAgentExecutionFacade({
@@ -311,18 +785,55 @@ function createFacade(
       repository,
       bufferRepository: buffer,
       llm,
+      ...(memoryMaintenance ? { memoryMaintenance } : {}),
     }),
     buffer,
   };
 }
 
 class FailOnceOnReloadRepository extends InMemoryRepository {
-  private listCalls = 0;
+  private reloadCalls = 0;
+
+  override async ensureAgent(role_id: string): Promise<void> {
+    this.reloadCalls += 1;
+    if (this.reloadCalls === 1) throw new Error('Transient repository reload failure');
+    return super.ensureAgent(role_id);
+  }
+}
+
+class CountingManagerLoadRepository extends InMemoryRepository {
+  managerLoadCount = 0;
 
   override async listAgentIds(): Promise<string[]> {
-    this.listCalls += 1;
-    if (this.listCalls === 2) throw new Error('Transient repository reload failure');
+    this.managerLoadCount += 1;
     return super.listAgentIds();
+  }
+}
+
+class BlockingOnceRetrievalRepository extends InMemoryRepository {
+  private searchCalls = 0;
+  private firstSearchStartedResolve!: () => void;
+  private continueFirstSearchResolve!: () => void;
+  readonly firstSearchStarted = new Promise<void>((resolve) => {
+    this.firstSearchStartedResolve = resolve;
+  });
+  private readonly firstSearchContinues = new Promise<void>((resolve) => {
+    this.continueFirstSearchResolve = resolve;
+  });
+
+  continueFirstSearch(): void {
+    this.continueFirstSearchResolve();
+  }
+
+  override async searchSkills(
+    ...args: Parameters<InMemoryRepository['searchSkills']>
+  ): ReturnType<InMemoryRepository['searchSkills']> {
+    this.searchCalls += 1;
+    if (this.searchCalls === 1) {
+      this.firstSearchStartedResolve();
+      await this.firstSearchContinues;
+    }
+    return super.searchSkills(...args);
   }
 }
 
@@ -346,6 +857,38 @@ function invokeDriverLlm(): ToolCallingClient {
               name: 'invoke_driver',
               arguments: JSON.stringify({
                 instruction: userMessage?.content?.replace(/^Task:\s*/, '') ?? 'Execute task.',
+              }),
+            },
+          },
+        ],
+      };
+    },
+  };
+}
+
+function invokeDriverWithContextLlm(
+  context: { skills: string[]; experiences: string[] },
+  initialMessages: string[],
+): ToolCallingClient {
+  let calls = 0;
+  return {
+    async completeWithTools(input) {
+      calls += 1;
+      if (calls > 1) return { content: 'Task completed. [done]', tool_calls: undefined };
+      initialMessages.push(
+        input.messages.find((message) => message.role === 'user')?.content ?? '',
+      );
+      return {
+        content: null,
+        tool_calls: [
+          {
+            id: 'tool_call_with_context',
+            type: 'function',
+            function: {
+              name: 'invoke_driver',
+              arguments: JSON.stringify({
+                instruction: 'Execute through B runtime.',
+                context,
               }),
             },
           },
@@ -451,7 +994,7 @@ class DelayedBufferRepository extends InMemoryBufferRepository {
   }
 }
 
-function request(taskId: string, roleId: string) {
+function request(taskId: string, roleId: string, workspacePath?: string) {
   return {
     task_id: taskId,
     run_id: `run_${taskId}`,
@@ -459,6 +1002,8 @@ function request(taskId: string, roleId: string) {
     instruction: 'Execute through B runtime.',
     input_artifact_refs: [],
     context_policy: 'default',
+    ...(workspacePath ? { workspace_path: workspacePath } : {}),
+    session_id: 'session_existing',
     schema_version: SCHEMA_VERSION,
   };
 }
@@ -474,12 +1019,27 @@ class CapturingDriver implements DriverRuntimeHandle {
     supports_permission_events: false,
   };
   readonly prompts: DriverPrompt[] = [];
+  private readonly eventListeners = new Set<DriverStreamEventListener>();
 
   constructor(private readonly status: DriverRunResult['status']) {}
 
   async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
     this.prompts.push(input);
-    return driverResult(this, this.status);
+    for (const listener of this.eventListeners) {
+      listener({
+        schema_version: 'driver-event.v1',
+        event_type: 'agent_message_chunk',
+        task_id: input.task_id,
+        run_id: input.run_id,
+        payload: { text: 'working' },
+      });
+    }
+    return driverResult(this, this.status, input.session_id);
+  }
+
+  subscribeToEvents(listener: DriverStreamEventListener): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
   }
 
   async interrupt(_reason: string): Promise<void> {}
@@ -499,7 +1059,7 @@ class AbortOnceDriver extends CapturingDriver {
     if (this.prompts.length === 1) {
       return new Promise<DriverRunResult>(() => undefined);
     }
-    return driverResult(this, 'succeeded');
+    return driverResult(this, 'succeeded', input.session_id);
   }
 }
 
@@ -517,7 +1077,33 @@ class ConcurrentDriver extends CapturingDriver {
     this.maxActive = Math.max(this.maxActive, this.active);
     await new Promise((resolve) => setTimeout(resolve, 10));
     this.active -= 1;
-    return driverResult(this, 'succeeded');
+    return driverResult(this, 'succeeded', input.session_id);
+  }
+}
+
+class ControlledDriver extends CapturingDriver {
+  private readonly releases: Array<() => void> = [];
+  private releaseImmediately = false;
+
+  constructor() {
+    super('succeeded');
+  }
+
+  override async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
+    this.prompts.push(input);
+    if (!this.releaseImmediately) {
+      await new Promise<void>((resolve) => this.releases.push(resolve));
+    }
+    return driverResult(this, 'succeeded', input.session_id);
+  }
+
+  releaseNext(): void {
+    this.releases.shift()?.();
+  }
+
+  finishAll(): void {
+    this.releaseImmediately = true;
+    for (const release of this.releases.splice(0)) release();
   }
 }
 
@@ -528,9 +1114,9 @@ class RetryableOnceDriver extends CapturingDriver {
 
   override async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
     this.prompts.push(input);
-    if (this.prompts.length > 1) return driverResult(this, 'succeeded');
+    if (this.prompts.length > 1) return driverResult(this, 'succeeded', input.session_id);
     return {
-      ...driverResult(this, 'failed'),
+      ...driverResult(this, 'failed', input.session_id),
       error: {
         code: this.errorCode,
         message: 'Transient transport failure.',
@@ -543,14 +1129,25 @@ class RetryableOnceDriver extends CapturingDriver {
 function driverResult(
   driver: DriverRuntimeHandle,
   status: DriverRunResult['status'],
+  sessionId?: string,
 ): DriverRunResult {
   return {
     driver_run_result_id: 'driver_result_001',
-    session_id: driver.session_id,
+    session_id: sessionId ?? driver.session_id,
     status,
+    response: status === 'succeeded' ? 'Agent completed the requested change.' : '',
     artifacts: status === 'succeeded' ? [createArtifact('artifact_output_001')] : [],
     transcript_ref: createArtifact('artifact_transcript_001', 'transcript'),
-    tool_events: [],
+    tool_events: [
+      {
+        tool_event_id: 'tool_event_001',
+        tool_name: 'edit',
+        status: 'completed',
+        summary: 'Updated the requested file.',
+        created_at: '2026-07-07T00:00:00.000Z',
+        schema_version: SCHEMA_VERSION,
+      },
+    ],
     diagnostics: {
       driver_id: driver.driver_id,
       duration_ms: 25,
@@ -579,5 +1176,47 @@ function createArtifact(artifactId: string, type: ArtifactRef['type'] = 'patch')
     task_id: 'task_001',
     created_at: '2026-07-07T00:00:00.000Z',
     schema_version: SCHEMA_VERSION,
+  };
+}
+
+function createMemorySkill(roleId: string, overrides: Partial<SkillRecord> = {}): SkillRecord {
+  const now = nowTimestamp();
+  return {
+    id: randomUUID(),
+    description: 'Runtime skill',
+    description_embedding: [],
+    content: 'Use the runtime skill.',
+    version: '1.0.0',
+    review_status: 'approved',
+    tags: ['runtime'],
+    promoted_at: now,
+    agent_id: roleId,
+    created_at: now,
+    updated_at: now,
+    ...overrides,
+  };
+}
+
+function createMemoryExperience(
+  roleId: string,
+  overrides: Partial<ExperienceRecord> = {},
+): ExperienceRecord {
+  const now = nowTimestamp();
+  return {
+    id: randomUUID(),
+    description: 'Runtime experience',
+    description_embedding: [],
+    content: 'Use the runtime experience.',
+    confidence: 0.8,
+    tags: ['runtime'],
+    agent_id: roleId,
+    confidence_history: [{ value: 0.8, updated_at: now, reason: 'seed' }],
+    referenced_count: 0,
+    source_task_id: 'task_seed',
+    source_driver: 'seed',
+    type: 'positive',
+    created_at: now,
+    updated_at: now,
+    ...overrides,
   };
 }

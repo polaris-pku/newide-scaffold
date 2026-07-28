@@ -1,11 +1,38 @@
 import { describe, expect, it } from 'vitest';
+import { TASK_STATUSES } from '../../src/core';
 import {
+  assertTaskRunStartTransition,
   assertTaskStatusTransition,
   isTerminalTaskStatus,
+  listNonTerminalTaskStatuses,
   transitionTaskStatus,
 } from '../../src/coordinator/task-state-machine';
 
 describe('coordinator task state machine', () => {
+  it('uses the single core TaskStatus contract', () => {
+    expect(TASK_STATUSES).toEqual([
+      'created',
+      'triaged',
+      'ready',
+      'claimed',
+      'running',
+      'waiting_help',
+      'waiting_input',
+      'pending_gate',
+      'pending_council',
+      'reviewing',
+      'blocked',
+      'escalated',
+      'merging',
+      'completed',
+      'failed',
+      'cancelled',
+    ]);
+    expect([...listNonTerminalTaskStatuses(), 'completed', 'failed', 'cancelled']).toEqual(
+      TASK_STATUSES,
+    );
+  });
+
   it('allows the spec-c v0 happy path', () => {
     expect(transitionTaskStatus('created', 'claimed')).toMatchObject({
       previous_status: 'created',
@@ -15,6 +42,7 @@ describe('coordinator task state machine', () => {
     expect(transitionTaskStatus('running', 'reviewing').next_status).toBe('reviewing');
     expect(transitionTaskStatus('reviewing', 'merging').next_status).toBe('merging');
     expect(transitionTaskStatus('merging', 'completed').next_status).toBe('completed');
+    expect(transitionTaskStatus('running', 'completed').next_status).toBe('completed');
   });
 
   it('allows the v0 waiting and blocked paths', () => {
@@ -74,5 +102,12 @@ describe('coordinator task state machine', () => {
   it('allows an active run to fail during review or merge', () => {
     expect(transitionTaskStatus('reviewing', 'failed').next_status).toBe('failed');
     expect(transitionTaskStatus('merging', 'failed').next_status).toBe('failed');
+  });
+
+  it('allows completed -> running only for an explicit Council refinement Run', () => {
+    expect(() => assertTaskStatusTransition('completed', 'running')).toThrow();
+    expect(() => assertTaskRunStartTransition('completed', 'council_refinement')).not.toThrow();
+    expect(() => assertTaskRunStartTransition('failed', 'council_refinement')).toThrow();
+    expect(() => assertTaskRunStartTransition('blocked', 'checkpoint_resume')).not.toThrow();
   });
 });

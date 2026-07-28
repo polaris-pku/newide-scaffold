@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION } from '../core';
 import { CommandDriverTransport } from './command-driver-transport';
 import type { DriverPrompt } from './contract';
@@ -59,6 +59,31 @@ describe('CommandDriverTransport', () => {
     });
 
     await expect(transport.run(PROMPT)).rejects.toThrow(/Command driver timed out after 50ms/);
+  });
+
+  it('interrupts only the command child owned by the requested run', async () => {
+    const transport = new CommandDriverTransport(
+      nodeCommand(`
+        readInput(() => {
+          setInterval(() => {}, 60000);
+        });
+      `),
+    );
+    const first = transport.run({ ...PROMPT, run_id: 'run_cancel_first' });
+    const second = transport.run({ ...PROMPT, run_id: 'run_cancel_second' });
+    const activeChildren = () =>
+      (transport as unknown as { activeChildren: Map<string, unknown> }).activeChildren;
+    await vi.waitFor(() => expect(activeChildren().size).toBe(2));
+
+    await transport.interrupt('cancel first', 'run_cancel_first');
+
+    await expect(first).rejects.toThrow(/exited with signal/);
+    expect(activeChildren().has('run_cancel_first')).toBe(false);
+    expect(activeChildren().has('run_cancel_second')).toBe(true);
+
+    await transport.interrupt('test cleanup', 'run_cancel_second');
+    await expect(second).rejects.toThrow(/exited with signal/);
+    expect(activeChildren().size).toBe(0);
   });
 
   it('throws a clear error with stderr context when the command exits non-zero', async () => {

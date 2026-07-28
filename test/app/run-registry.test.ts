@@ -86,6 +86,18 @@ describe('InMemoryRunRegistry', () => {
     expect(() => registry.subscribe('missing', () => undefined)).toThrow(RunNotFoundError);
   });
 
+  it('lists cloned snapshots without exposing mutable registry records', () => {
+    const registry = new InMemoryRunRegistry();
+    registry.create({ run_id: 'run_1', task_id: 'task_1', mode: 'single_agent' });
+    registry.create({ run_id: 'run_2', task_id: 'task_2', mode: 'council' });
+
+    const listed = registry.listSnapshots();
+    expect(listed.map((snapshot) => snapshot.run_id)).toEqual(['run_1', 'run_2']);
+    listed[0]!.current.active_node_code = 'mutated';
+
+    expect(registry.getSnapshot('run_1').current.active_node_code).toBe('N3');
+  });
+
   it('replays existing events before streaming new subscription events', () => {
     const registry = new InMemoryRunRegistry();
     registry.create({ run_id: 'run_replay', task_id: 'task_replay', mode: 'single_agent' });

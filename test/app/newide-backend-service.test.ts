@@ -7,17 +7,66 @@ import { NewideBackendService } from '../../src/app/newide-backend-service';
 import { InMemoryRunRegistry, type AppRunEvent } from '../../src/app/run-registry';
 import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
+import { FileRunRequestStore } from '../../src/app/run-request-store';
+import type { TaskProcessor } from '../../src/app/task-processor';
 import { IntegrationV0CoordinatorRunner } from '../../src/coordinator/coordinator-runner';
 import { runSnapshotSchema } from '../../src/protocol/run-snapshot';
 
 describe('NewideBackendService', () => {
-  it('returns real ids before the runner completes and records telemetry', async () => {
+  it('publishes incremental driver events before the runner completes', async () => {
     let finish: ((result: IntegrationV0Result) => void) | undefined;
     const runnerResult = new Promise<IntegrationV0Result>((resolve) => {
       finish = resolve;
     });
     const service = new NewideBackendService({
       run: async (request) => {
+        request.onRunCreated?.({ run_id: 'run_stream', task_id: 'task_stream' });
+        request.onDriverEvent?.({
+          schema_version: 'driver-event.v1',
+          event_type: 'agent_message_chunk',
+          task_id: 'task_stream',
+          run_id: 'run_stream',
+          session_id: 'session_stream',
+          sequence: 1,
+          created_at: '2026-07-20T00:00:01.000Z',
+          payload: { text: 'working' },
+        });
+        return runnerResult;
+      },
+    });
+
+    await service.createRun({ prompt: 'Stream progress', workspace_path: process.cwd() });
+
+    expect(service.getSnapshot('run_stream')).toMatchObject({
+      status: 'running',
+      events: [
+        { type: 'run.started' },
+        {
+          type: 'driver.stream_event',
+          source: 'driver',
+          payload: {
+            driver_event_type: 'agent_message_chunk',
+            session_id: 'session_stream',
+            event_sequence: 1,
+            event_payload: { text: 'working' },
+          },
+        },
+      ],
+    });
+
+    finish?.(completedResult('run_stream', 'task_stream'));
+    await viWaitFor(() => service.getSnapshot('run_stream').status === 'completed');
+  });
+
+  it('returns real ids before the runner completes and records telemetry', async () => {
+    let receivedRequest: Parameters<IntegrationV0CoordinatorRunner['run']>[0] | undefined;
+    let finish: ((result: IntegrationV0Result) => void) | undefined;
+    const runnerResult = new Promise<IntegrationV0Result>((resolve) => {
+      finish = resolve;
+    });
+    const service = new NewideBackendService({
+      run: async (request) => {
+        receivedRequest = request;
         request.onRunCreated?.({ run_id: 'run_1', task_id: 'task_1' });
         await request.telemetry?.emit({
           telemetry_id: 'telemetry_1',
@@ -34,10 +83,20 @@ describe('NewideBackendService', () => {
       },
     });
 
-    await expect(service.createRun({ prompt: 'Build RPC' })).resolves.toEqual({
+    await expect(
+      service.createRun({
+        prompt: 'Build RPC',
+        workspace_path: process.cwd(),
+        session_id: 'session_existing',
+      }),
+    ).resolves.toEqual({
       run_id: 'run_1',
       task_id: 'task_1',
       status: 'running',
+    });
+    expect(receivedRequest).toMatchObject({
+      workspace_path: process.cwd(),
+      session_id: 'session_existing',
     });
     expect(service.getSnapshot('run_1')).toMatchObject({
       status: 'running',
@@ -53,6 +112,14 @@ describe('NewideBackendService', () => {
       status: 'completed',
       snapshot: { run_id: 'run_1', task_id: 'task_1' },
       events: [{ sequence: 1 }, { sequence: 2 }, { sequence: 3, type: 'run.completed' }],
+    });
+    expect(service.getRunSnapshot('run_1').market).toEqual({
+      winner_agent_id: 'role_ts_engineer',
+      winner_bid_id: 'bid_1',
+      ledger_ref: 'file:///market/ledger.json',
+      audit_ref: 'file:///market/audit.json',
+      policy_version: 'market-v0',
+      seed: 'run_1',
     });
   });
 
@@ -391,6 +458,163 @@ describe('NewideBackendService', () => {
     }
   });
 
+  it('waits for active runners before closing runtime resources', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'backend-service-close-'));
+    let runnerStopped = false;
+    let runtimeCloseCount = 0;
+    const service = new NewideBackendService(
+      {
+        run: async (request) => {
+          request.onRunCreated?.({ run_id: 'run_close', task_id: 'task_close' });
+          await new Promise((_, reject) => {
+            request.signal?.addEventListener(
+              'abort',
+              () => {
+                runnerStopped = true;
+                reject(request.signal?.reason);
+              },
+              { once: true },
+            );
+          });
+          throw new Error('unreachable');
+        },
+      },
+      new InMemoryRunRegistry(),
+      new FileRunAuditWriter(runsRoot),
+      new FileRunTerminalOutputWriter(runsRoot),
+      new FileRunRequestStore(runsRoot),
+      undefined,
+      undefined,
+      Promise.resolve(),
+      async () => {
+        expect(runnerStopped).toBe(true);
+        runtimeCloseCount += 1;
+      },
+    );
+
+    try {
+      await service.createRun({ prompt: 'Close safely' });
+      await Promise.all([service.close(), service.close()]);
+
+      expect(service.getSnapshot('run_close')).toMatchObject({ status: 'cancelled' });
+      expect(runtimeCloseCount).toBe(1);
+      await expect(service.createRun({ prompt: 'Too late' })).rejects.toThrow(
+        'Backend service is closing',
+      );
+    } finally {
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts a pending start and rejects delayed identity after close begins', async () => {
+    const registry = new InMemoryRunRegistry();
+    let reportIdentity!: () => void;
+    let runnerSignal: AbortSignal | undefined;
+    let runtimeClosed = false;
+    let beginRunCalls = 0;
+    const taskProcessor = {
+      beginRun: () => {
+        beginRunCalls += 1;
+      },
+    } as unknown as TaskProcessor;
+    const service = new NewideBackendService(
+      {
+        run: (request) => {
+          runnerSignal = request.signal;
+          return new Promise<IntegrationV0Result>((resolve, reject) => {
+            reportIdentity = () => {
+              try {
+                request.onRunCreated?.({
+                  run_id: 'run_delayed_identity',
+                  task_id: 'task_delayed_identity',
+                });
+                resolve(completedResult('run_delayed_identity', 'task_delayed_identity'));
+              } catch (error) {
+                reject(error);
+              }
+            };
+          });
+        },
+      },
+      registry,
+      undefined,
+      undefined,
+      undefined,
+      taskProcessor,
+      undefined,
+      Promise.resolve(),
+      async () => {
+        runtimeClosed = true;
+      },
+    );
+
+    const creating = service.createRun({ prompt: 'Delay identity until shutdown' });
+    const closing = service.close();
+    let closeSettled = false;
+    void closing.then(() => {
+      closeSettled = true;
+    });
+    await Promise.resolve();
+
+    expect(runnerSignal?.aborted).toBe(true);
+    expect(closeSettled).toBe(false);
+    expect(runtimeClosed).toBe(false);
+
+    reportIdentity();
+
+    await expect(creating).rejects.toThrow('Backend service is closing');
+    await closing;
+    expect(runtimeClosed).toBe(true);
+    expect(registry.listSnapshots()).toEqual([]);
+    expect(beginRunCalls).toBe(0);
+  });
+
+  it('waits for mailbox recovery before runtime close and aggregates both failures', async () => {
+    const order: string[] = [];
+    const recoveryFailure = new Error('mailbox recovery failed');
+    const runtimeFailure = new Error('runtime close failed');
+    let rejectRecovery!: (error: Error) => void;
+    const mailboxRecovery = new Promise<void>((_resolve, reject) => {
+      rejectRecovery = reject;
+    }).then(
+      () => order.push('mailbox recovery settled'),
+      (error: unknown) => {
+        order.push('mailbox recovery settled');
+        throw error;
+      },
+    );
+    const service = new NewideBackendService(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      mailboxRecovery,
+      async () => {
+        order.push('runtime closed');
+        throw runtimeFailure;
+      },
+    );
+
+    const closing = service.close();
+    await Promise.resolve();
+    expect(order).toEqual([]);
+
+    rejectRecovery(recoveryFailure);
+
+    let failure: unknown;
+    try {
+      await closing;
+    } catch (error) {
+      failure = error;
+    }
+    expect(order).toEqual(['mailbox recovery settled', 'runtime closed']);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([recoveryFailure, runtimeFailure]);
+  });
+
   it('projects a real council run into snapshot and append-only audit events', async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'backend-integration-events-'));
     const auditWriter = new FileRunAuditWriter(path.join(tempRoot, 'runs'));
@@ -570,6 +794,7 @@ function completedResult(runId: string, taskId: string): IntegrationV0Result {
         status: 'completed',
         mode: 'single_agent',
         driver_id: 'mock-driver',
+        session_id: 'session_1',
         created_at: '2026-07-11T08:00:00.000Z',
       },
       flow: { active_node_code: 'N18', node_statuses: [] },
@@ -577,12 +802,25 @@ function completedResult(runId: string, taskId: string): IntegrationV0Result {
       delivery_report: {
         worktree_path: '.newide/worktrees/task_1',
         files_written: [],
+        changed_files: [],
         artifacts_materialized: 0,
+        outcome: 'completed_response',
+        response: 'Completed.',
+        session_id: 'session_1',
+        tool_events: [],
         driver_diagnostics: { driver_id: 'mock-driver', duration_ms: 1 },
       },
       artifacts: [],
       checkpoint: {} as never,
       mailbox: { thread_id: runId, message_refs: [], messages: [] },
+      market: {
+        winner_agent_id: 'role_ts_engineer',
+        winner_bid_id: 'bid_1',
+        ledger_ref: 'file:///market/ledger.json',
+        audit_ref: 'file:///market/audit.json',
+        policy_version: 'market-v0',
+        seed: runId,
+      },
       links: {} as never,
     },
   } as IntegrationV0Result;

@@ -21,6 +21,8 @@ export interface DriverPrompt {
   task_id: TaskId;
   run_id: RunId;
   prompt: string;
+  workspace_path?: string;
+  session_id?: DriverSessionId;
   context_pack_ref?: ContextPackRef;
   created_at: Timestamp;
   schema_version: SchemaVersion;
@@ -35,6 +37,21 @@ export interface DriverToolEvent {
   schema_version: SchemaVersion;
 }
 
+/** Incremental event emitted by a driver while a prompt is running. */
+export interface DriverStreamEvent {
+  schema_version: string;
+  event_type: string;
+  payload?: unknown;
+  task_id?: TaskId;
+  run_id?: RunId;
+  role_id?: string;
+  session_id?: DriverSessionId;
+  sequence?: number;
+  created_at?: Timestamp;
+}
+
+export type DriverStreamEventListener = (event: DriverStreamEvent) => void;
+
 export interface DriverError {
   code: string;
   message: string;
@@ -47,6 +64,7 @@ export interface DriverRunResult {
   driver_run_result_id: string;
   session_id: DriverSessionId;
   status: DriverRunStatus;
+  response?: string;
   artifacts: ArtifactRef[];
   transcript_ref: ArtifactRef;
   tool_events: DriverToolEvent[];
@@ -65,6 +83,7 @@ export interface DriverRuntimeHandle {
   session_id: DriverSessionId;
   capabilities: DriverCapabilities;
   sendPrompt(input: DriverPrompt): Promise<DriverRunResult>;
-  interrupt(reason: string): Promise<void>;
+  interrupt(reason: string, runId?: RunId): Promise<void>;
   collectTranscript(): Promise<ArtifactRef>;
+  subscribeToEvents?(listener: DriverStreamEventListener): () => void;
 }

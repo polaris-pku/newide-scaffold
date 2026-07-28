@@ -7,6 +7,7 @@ import type {
   TaskId,
   Timestamp,
 } from '../core';
+import type { DriverStreamEventListener } from '../driver/contract';
 
 export type CouncilDecisionMode =
   | 'advisory'
@@ -46,8 +47,20 @@ export interface Review {
   reviewer_id: string;
   verdict: 'approve' | 'reject' | 'needs_revision';
   reason: string;
+  unmet_criteria?: string[];
+  evidence_refs?: string[];
   created_at: Timestamp;
   schema_version: SchemaVersion;
+}
+
+export interface CouncilResult {
+  quality: 'verified' | 'best_effort';
+  final_artifact_ref: ArtifactId;
+  final_artifact_sha256: string;
+  warnings: string[];
+  unmet_criteria: string[];
+  verification_refs: string[];
+  decision_record_ref: string;
 }
 
 export interface EvidencePack {
@@ -130,6 +143,7 @@ export interface CouncilRunResult {
   output?: CouncilOutput;
   generated_artifact_refs: ArtifactRef[];
   selected_artifact_refs: ArtifactId[];
+  result?: CouncilResult;
   diagnostic_refs?: string[];
   comparison_refs?: string[];
   created_at: Timestamp;
@@ -142,6 +156,8 @@ export interface CouncilRunRequest {
   trigger: CouncilTrigger;
   decision_mode: CouncilDecisionMode;
   question: string;
+  workspace_path?: string;
+  candidate_artifacts?: ArtifactRef[];
   context_pack_ref?: string;
   participant_profile_refs?: string[];
   proposals: Proposal[];
@@ -172,6 +188,7 @@ export interface CouncilLifecycleEvent {
 
 export interface CouncilExecutionOptions {
   signal?: AbortSignal;
+  onDriverEvent?: DriverStreamEventListener;
   onLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
 }
 

@@ -40,6 +40,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
             task_id: input.task_id,
             status: input.status,
             mode: input.mode,
+            session_id: rich.run.session_id,
             event_ids: input.events.map((event) => event.event_id),
             ...(runStarted ? { started_at: runStarted.created_at } : {}),
             ...(terminalEvent ? { completed_at: terminalEvent.created_at } : {}),
@@ -52,7 +53,12 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
           delivery_report: {
             worktree_path: rich.delivery_report.worktree_path,
             files_written: [...rich.delivery_report.files_written],
+            changed_files: [...rich.delivery_report.changed_files],
             artifacts_materialized: rich.delivery_report.artifacts_materialized,
+            outcome: rich.delivery_report.outcome,
+            response: rich.delivery_report.response,
+            session_id: rich.delivery_report.session_id,
+            tool_events: asRecords(rich.delivery_report.tool_events),
           },
           links: asRecord(rich.links),
         }
@@ -75,6 +81,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
         created_at: event.created_at,
         ...event.payload,
       })),
+    ...(rich?.market ? { market: { ...rich.market } } : {}),
     ...(input.mode === 'council' ? { council: projectCouncil(input, rich) } : {}),
     ...(rich?.checkpoint ? { checkpoint: asRecord(rich.checkpoint) } : {}),
     errors: input.error ? [{ ...input.error }] : [],
@@ -84,6 +91,15 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
             status: finalStatus,
             artifact_refs: artifactIds(artifacts),
             files_written: [...(rich?.delivery_report.files_written ?? [])],
+            ...(rich?.delivery_report
+              ? {
+                  changed_files: [...rich.delivery_report.changed_files],
+                  outcome: rich.delivery_report.outcome,
+                  response: rich.delivery_report.response,
+                  session_id: rich.delivery_report.session_id,
+                  tool_events: asRecords(rich.delivery_report.tool_events),
+                }
+              : {}),
           },
         }
       : {}),
@@ -109,6 +125,7 @@ function projectCouncil(
     ...(council?.reviews ? { reviews: asRecords(council.reviews) } : {}),
     ...(council?.synthesis ? { synthesis: asRecord(council.synthesis) } : {}),
     ...(council?.output ? { output: asRecord(council.output) } : {}),
+    ...(council?.result ? { result: asRecord(council.result) } : {}),
   };
 }
 

@@ -10,15 +10,21 @@ import {
   type IntegrationV0Result,
 } from './integration-v0-flow';
 import type { TelemetrySink } from '../telemetry/telemetry-sink';
-import type { Event } from '../core';
+import type { Event, TaskCreateRequest } from '../core';
+import type { DriverStreamEventListener } from '../driver/contract';
 
 export interface CoordinatorRunRequest {
   prompt: string;
   mode: 'single_agent' | 'council';
+  workspace_path: string;
+  session_id?: string;
+  task_id?: string;
+  task_request?: TaskCreateRequest;
   memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
   worktreePath?: string;
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
+  onDriverEvent?: DriverStreamEventListener;
   onEvent?: (event: Event) => void;
   onRunCreated?: (identity: { run_id: string; task_id: string }) => void;
 }
@@ -31,7 +37,15 @@ export type IntegrationFlow = (options: IntegrationV0Options) => Promise<Integra
 
 type RunnerDefaults = Omit<
   IntegrationV0Options,
-  'driverPrompt' | 'enableCouncil' | 'telemetry' | 'signal' | 'onEvent' | 'onRunCreated'
+  | 'driverPrompt'
+  | 'enableCouncil'
+  | 'taskId'
+  | 'taskRequest'
+  | 'telemetry'
+  | 'signal'
+  | 'onDriverEvent'
+  | 'onEvent'
+  | 'onRunCreated'
 >;
 
 export class IntegrationV0CoordinatorRunner implements CoordinatorRunner {
@@ -45,10 +59,15 @@ export class IntegrationV0CoordinatorRunner implements CoordinatorRunner {
       ...this.defaults,
       driverPrompt: request.prompt,
       enableCouncil: request.mode === 'council',
+      workspacePath: request.workspace_path,
+      ...(request.session_id ? { sessionId: request.session_id } : {}),
+      ...(request.task_id ? { taskId: request.task_id } : {}),
+      ...(request.task_request ? { taskRequest: request.task_request } : {}),
       ...(request.memoryAblation ? { memoryAblation: request.memoryAblation } : {}),
       ...(request.worktreePath ? { worktreePath: request.worktreePath } : {}),
       ...(request.telemetry ? { telemetry: request.telemetry } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
+      ...(request.onDriverEvent ? { onDriverEvent: request.onDriverEvent } : {}),
       ...(request.onEvent ? { onEvent: request.onEvent } : {}),
       ...(request.onRunCreated ? { onRunCreated: request.onRunCreated } : {}),
     });

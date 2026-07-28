@@ -257,7 +257,6 @@ export class DriverBridge {
     );
     promptText += '\n<<<END_DRIVER_RETURN>>>';
 
-    // 可选的报告文件写入指令（通过 ACP_WRITE_REPORT_FILE=1 启用）
     if (process.env.ACP_WRITE_REPORT_FILE === '1' || process.env.ACP_WRITE_REPORT_FILE === 'true') {
       promptText += '\n\n---\n';
       promptText += 'FINAL STEP — After completing the task, you MUST write a report file:\n';

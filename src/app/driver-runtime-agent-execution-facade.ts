@@ -1,11 +1,17 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
+import path from 'node:path';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../core';
 import {
   AgentManager,
   InvokeDriverTool,
+  createAgentMemoryScope,
+  repositoryRetrieveMemoryForTask,
   type BufferRepository,
   type DispatchTaskResult,
+  type DriverContext,
   type DriverTask,
+  type MemoryRetrievalResult,
   type MemoryRepository,
   type ToolCallingClient,
 } from '../memory';
@@ -16,22 +22,55 @@ import type {
   AgentExecutionResult,
   AgentExecutionStatus,
 } from '../protocol/agent-execution';
-import type { DriverRunResult, DriverRunStatus, DriverRuntimeHandle } from '../driver/contract';
-import { createDriverRuntimeInvoker } from '../driver/driver-runtime-invoker';
+import type { AgentTaskRequest } from '../memory/agent-types';
+import type {
+  CollectCompetitionClaimsOptions,
+  CompetitionClaimBatch,
+} from '../memory/competition-types';
+import type { AgentCompetitionQuery } from '../memory/ports/agent-competition-query';
+import type {
+  AgentMailboxWakePort,
+  AgentMailboxWakeRequestV1,
+} from '../protocol/agent-mailbox-wake';
+import type {
+  DriverRunResult,
+  DriverRunStatus,
+  DriverRuntimeHandle,
+  DriverStreamEvent,
+} from '../driver/contract';
+import {
+  createDriverRuntimeInvoker,
+  type DriverRuntimeInvokerInput,
+} from '../driver/driver-runtime-invoker';
+import type {
+  AgentContextPackEvidence,
+  AgentExecutionEvidenceStore,
+} from './agent-execution-evidence-store';
+import type {
+  BMemoryMaintenanceEvidence,
+  BMemoryMaintenancePort,
+} from './b-memory-maintenance-runner';
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
   driver: DriverRuntimeHandle;
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
+  evidenceStore?: AgentExecutionEvidenceStore;
+  memoryMaintenance?: BMemoryMaintenancePort;
 }
 
 interface InvocationContext {
   task_id: string;
   run_id: string;
   instruction: string;
+  workspace_path?: string;
+  session_id?: string;
   signal?: AbortSignal;
+  onDriverEvent?: AgentExecutionOptions['onDriverEvent'];
   execution?: DriverRunResult;
+  retrieval: MemoryRetrievalResult;
+  driver_invocation_context?: DriverRuntimeInvokerInput['driver_context'];
   driver_attempts: number;
   abortObserved: boolean;
 }
@@ -43,17 +82,28 @@ const AGENT_SYSTEM_PROMPT = [
   'After invoke_driver returns, do not call more tools. Summarize the result and include "[done]".',
 ].join('\n');
 
-export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
+const TOP_LEVEL_MEMORY_ITEM_LIMIT = 5;
+const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
+const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
+const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
+
+export class DriverRuntimeAgentExecutionFacade
+  implements AgentExecutionFacade, AgentCompetitionQuery, AgentMailboxWakePort
+{
   private readonly manager: Promise<AgentManager>;
   private readonly roleReady = new Map<string, Promise<AgentManager>>();
   private readonly invalidatedRoles = new Set<string>();
-  private readonly roleQueues = new Map<string, Promise<void>>();
+  private readonly executionQueues = new Map<string, Promise<void>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
   private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
 
   constructor(private readonly options: DriverRuntimeAgentExecutionFacadeOptions) {
     this.invokeDriverRuntime = createDriverRuntimeInvoker(options.driver);
     this.manager = this.createManager();
+  }
+
+  async ready(): Promise<void> {
+    await this.manager;
   }
 
   private createManager(): Promise<AgentManager> {
@@ -69,17 +119,42 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     });
   }
 
+  async ensureAgent(agentId: string): Promise<void> {
+    await this.ensureRole(agentId);
+  }
+
+  async wakeAgent(request: AgentMailboxWakeRequestV1): Promise<void> {
+    const agentId = request.recipient_agent_id ?? request.recipient_role_id;
+    if (!agentId) throw new Error('Mailbox wake requires an Agent or role recipient');
+    await this.ensureAgent(agentId);
+  }
+
+  async collectCompetitionClaims(
+    task: AgentTaskRequest,
+    options?: CollectCompetitionClaimsOptions,
+  ): Promise<CompetitionClaimBatch> {
+    return (await this.manager).collectCompetitionClaims(task, options);
+  }
+
   async runAgent(
     input: AgentExecutionRequest,
     options?: AgentExecutionOptions,
   ): Promise<AgentExecutionResult> {
     throwIfAborted(options?.signal);
+    const normalizedInput = input.workspace_path
+      ? { ...input, workspace_path: path.resolve(input.workspace_path) }
+      : input;
+    const runtimeRoleId = normalizedInput.role_id;
+    const queueKeys = [
+      `role:${runtimeRoleId}`,
+      ...(normalizedInput.workspace_path ? [`workspace:${normalizedInput.workspace_path}`] : []),
+    ];
     return this.enqueue(
-      input.role_id,
+      queueKeys,
       async () => {
         throwIfAborted(options?.signal);
-        const manager = await this.ensureRole(input.role_id);
-        return this.execute(manager, input, options);
+        const manager = await this.ensureRole(runtimeRoleId);
+        return this.execute(manager, normalizedInput, runtimeRoleId, options);
       },
       options?.signal,
     );
@@ -88,30 +163,63 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private async execute(
     manager: AgentManager,
     input: AgentExecutionRequest,
+    runtimeRoleId: string,
     options?: AgentExecutionOptions,
   ): Promise<AgentExecutionResult> {
+    throwIfAborted(options?.signal);
+    const task: AgentTaskRequest = {
+      spec: input.instruction,
+      task_id: input.task_id,
+      call_id: createId('call'),
+      source_driver: this.options.driver.driver_id,
+    };
+    const retrieval = await withAbort(
+      repositoryRetrieveMemoryForTask(
+        createAgentMemoryScope(
+          this.options.repository,
+          this.options.bufferRepository,
+          runtimeRoleId,
+        ),
+        task,
+        input.task_id,
+      ),
+      options?.signal,
+    );
+    throwIfAborted(options?.signal);
     const invocation: InvocationContext = {
       task_id: input.task_id,
       run_id: input.run_id,
       instruction: input.instruction,
+      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+      ...(input.session_id ? { session_id: input.session_id } : {}),
+      retrieval,
       driver_attempts: 0,
       abortObserved: false,
       ...(options?.signal ? { signal: options.signal } : {}),
+      ...(options?.onDriverEvent
+        ? {
+            onDriverEvent: (event: DriverStreamEvent) =>
+              options.onDriverEvent?.({ ...event, role_id: input.role_id }),
+          }
+        : {}),
     };
-    const dispatched = await this.invocationContext.run(invocation, () =>
-      manager.dispatchTask(input.role_id, {
-        spec: input.instruction,
-        task_id: input.task_id,
-        call_id: createId('call'),
-        source_driver: this.options.driver.driver_id,
-      }),
+    const rawDispatch = await this.invocationContext.run(invocation, () =>
+      manager.dispatchTask(runtimeRoleId, task),
     );
+    const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
 
     if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
-      await this.recoverRole(input.role_id);
+      await this.recoverRole(runtimeRoleId);
       throwIfAborted(invocation.signal);
     }
-    return this.buildResult(input, dispatched, invocation.execution, invocation.driver_attempts);
+    return this.buildResult(
+      input,
+      dispatched,
+      runtimeRoleId,
+      invocation.execution,
+      invocation.driver_attempts,
+      invocation.driver_invocation_context,
+    );
   }
 
   private async ensureRole(role_id: string): Promise<AgentManager> {
@@ -150,7 +258,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     }
     try {
       throwIfAborted(invocation.signal);
-      return await withAbort(this.options.llm.completeWithTools(input), invocation.signal);
+      return await withAbort(
+        this.options.llm.completeWithTools(withTopLevelMemoryContext(input, invocation.retrieval)),
+        invocation.signal,
+      );
     } catch (error) {
       if (invocation.signal?.aborted) invocation.abortObserved = true;
       throw error;
@@ -167,24 +278,37 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     }
     throwIfAborted(invocation.signal);
     try {
+      const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
+        task_instruction: invocation.instruction,
+        skills: deduplicateMemoryItems([
+          ...toDriverMemoryItems(invocation.retrieval.skills),
+          ...toMemoryItems('skill', task.context?.skills),
+        ]),
+        experiences: deduplicateMemoryItems([
+          ...toDriverMemoryItems(invocation.retrieval.experiences),
+          ...toMemoryItems('experience', task.context?.experiences),
+          ...delegationContext(invocation.instruction, task.instruction),
+        ]),
+      };
+      invocation.driver_invocation_context = driverInvocationContext;
       const invoke = () => {
         invocation.driver_attempts += 1;
         return this.invokeDriverRuntime(
           {
             task_id: invocation.task_id,
             run_id: invocation.run_id,
+            ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
+            ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
             call_id: createId('call'),
             source_driver: this.options.driver.driver_id,
-            driver_context: {
-              task_instruction: invocation.instruction,
-              skills: toMemoryItems('skill', task.context?.skills),
-              experiences: [
-                ...toMemoryItems('experience', task.context?.experiences),
-                ...delegationContext(invocation.instruction, task.instruction),
-              ],
-            },
+            driver_context: driverInvocationContext,
           },
-          invocation.signal ? { signal: invocation.signal } : undefined,
+          invocation.signal || invocation.onDriverEvent
+            ? {
+                ...(invocation.signal ? { signal: invocation.signal } : {}),
+                ...(invocation.onDriverEvent ? { onDriverEvent: invocation.onDriverEvent } : {}),
+              }
+            : undefined,
         );
       };
       let result = await invoke();
@@ -200,15 +324,35 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     }
   }
 
-  private buildResult(
+  private async buildResult(
     input: AgentExecutionRequest,
     dispatched: DispatchTaskResult,
+    runtimeRoleId: string,
     execution: DriverRunResult | undefined,
     driverAttempts: number,
-  ): AgentExecutionResult {
+    driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
+  ): Promise<AgentExecutionResult> {
+    const memoryMaintenance = await this.processMemoryMaintenance(
+      input,
+      runtimeRoleId,
+      dispatched.cycle.buffer_seq,
+    );
     if (!execution) {
-      return this.buildNoExecutionResult(input, dispatched);
+      return this.buildNoExecutionResult(
+        input,
+        dispatched,
+        runtimeRoleId,
+        driverInvocationContext,
+        memoryMaintenance,
+      );
     }
+
+    const contextEvidence = await this.persistContextEvidence(
+      input,
+      dispatched,
+      runtimeRoleId,
+      driverInvocationContext,
+    );
 
     const dispatchFailed = dispatched.status !== 'completed';
     const dispatchError = dispatchFailed
@@ -221,11 +365,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
 
     return {
       agent_run_id: createId('agent_run'),
+      agent_id: runtimeRoleId,
       role_id: input.role_id,
-      context_pack_ref: createId('context_pack'),
+      context_pack_ref: contextEvidence.context_pack_ref,
       driver_run_result_id: execution.driver_run_result_id,
       artifact_refs: [...execution.artifacts],
       transcript_ref: execution.transcript_ref,
+      session_id: execution.session_id,
+      response: execution.response ?? '',
+      tool_events: [...execution.tool_events],
       diagnostics: {
         ...execution.diagnostics,
         driver_status: execution.status,
@@ -239,7 +387,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           skills: dispatched.cycle.retrieval.skills.length,
         },
         promotion: dispatched.cycle.promotion.check,
-        context_pack_persisted: false,
+        ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
+        context_pack_persisted: contextEvidence.persisted,
+        ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
         ...(execution.error
           ? { driver_error: { ...execution.error }, driver_error_code: execution.error.code }
           : dispatchError
@@ -247,16 +397,19 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             : {}),
       },
       status: mapStatus(dispatched.status, execution.status),
-      memory_buffer_ref: `${input.role_id}:${dispatched.cycle.buffer_seq}`,
+      memory_buffer_ref: contextEvidence.memory_buffer_ref,
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
   }
 
-  private buildNoExecutionResult(
+  private async buildNoExecutionResult(
     input: AgentExecutionRequest,
     dispatched: DispatchTaskResult,
-  ): AgentExecutionResult {
+    runtimeRoleId: string,
+    driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
+    memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
+  ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     const errorCode = `B_${dispatched.status.toUpperCase()}`;
     const errorMessage = dispatched.cycle.buffer_snapshot.driver_return.summary;
@@ -270,14 +423,24 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       created_at,
       schema_version: SCHEMA_VERSION,
     };
+    const contextEvidence = await this.persistContextEvidence(
+      input,
+      dispatched,
+      runtimeRoleId,
+      driverInvocationContext,
+    );
 
     return {
       agent_run_id: createId('agent_run'),
+      agent_id: runtimeRoleId,
       role_id: input.role_id,
-      context_pack_ref: createId('context_pack'),
+      context_pack_ref: contextEvidence.context_pack_ref,
       driver_run_result_id: createId('driver_result'),
       artifact_refs: [],
       transcript_ref: transcript,
+      session_id: this.options.driver.session_id,
+      response: '',
+      tool_events: [],
       diagnostics: {
         driver_id: this.options.driver.driver_id,
         driver_status: 'failed',
@@ -291,33 +454,141 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],
         buffer_seq: dispatched.cycle.buffer_seq,
-        context_pack_persisted: false,
+        retrieval: {
+          experiences: dispatched.cycle.retrieval.experiences.length,
+          skills: dispatched.cycle.retrieval.skills.length,
+        },
+        ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
+        context_pack_persisted: contextEvidence.persisted,
+        ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
       },
       status: dispatched.status === 'cancelled' ? 'cancelled' : 'failed',
-      memory_buffer_ref: `${input.role_id}:${dispatched.cycle.buffer_seq}`,
+      memory_buffer_ref: contextEvidence.memory_buffer_ref,
       created_at,
       schema_version: SCHEMA_VERSION,
     };
   }
 
+  private async processMemoryMaintenance(
+    input: AgentExecutionRequest,
+    runtimeRoleId: string,
+    bufferSeq: number,
+  ): Promise<BMemoryMaintenanceEvidence | undefined> {
+    if (!this.options.memoryMaintenance) return undefined;
+    try {
+      return await this.options.memoryMaintenance.scheduleBuffer({
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: runtimeRoleId,
+        buffer_seq: bufferSeq,
+      });
+    } catch (error) {
+      const completedAt = nowTimestamp();
+      return {
+        maintenance_ref: createId('b_maintenance'),
+        kind: 'experience_extraction',
+        status: 'failed',
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: runtimeRoleId,
+        buffer_seq: bufferSeq,
+        experiences: [],
+        skills: [],
+        warnings: ['Memory maintenance could not be scheduled; Agent execution was preserved.'],
+        error: error instanceof Error ? error.message : String(error),
+        created_at: completedAt,
+        completed_at: completedAt,
+        schema_version: SCHEMA_VERSION,
+      };
+    }
+  }
+
+  private async persistContextEvidence(
+    input: AgentExecutionRequest,
+    dispatched: DispatchTaskResult,
+    runtimeRoleId: string,
+    driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
+  ): Promise<{
+    context_pack_ref: string;
+    memory_buffer_ref: string;
+    persisted: boolean;
+    uri?: string;
+  }> {
+    const memoryBufferRef = `${runtimeRoleId}:${dispatched.cycle.buffer_seq}`;
+    const identity = JSON.stringify({
+      task_id: input.task_id,
+      run_id: input.run_id,
+      agent_id: runtimeRoleId,
+      role_id: input.role_id,
+      context_policy: input.context_policy,
+      input_artifact_refs: input.input_artifact_refs,
+      memory_buffer_ref: memoryBufferRef,
+      retrieval: dispatched.cycle.retrieval,
+      driver_context: dispatched.cycle.driver_context,
+      ...(driverInvocationContext ? { driver_invocation_context: driverInvocationContext } : {}),
+    });
+    const contextPackRef = `context_pack_${createHash('sha256').update(identity).digest('hex').slice(0, 24)}`;
+    const evidence: AgentContextPackEvidence = {
+      context_pack_id: contextPackRef,
+      task_id: input.task_id,
+      run_id: input.run_id,
+      agent_id: runtimeRoleId,
+      role_id: input.role_id,
+      context_policy: input.context_policy,
+      input_artifact_refs: [...input.input_artifact_refs],
+      memory_buffer_ref: memoryBufferRef,
+      retrieval: {
+        experiences: [...dispatched.cycle.retrieval.experiences],
+        skills: [...dispatched.cycle.retrieval.skills],
+      },
+      driver_context: dispatched.cycle.driver_context,
+      ...(driverInvocationContext ? { driver_invocation_context: driverInvocationContext } : {}),
+      created_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    };
+    if (!this.options.evidenceStore) {
+      return {
+        context_pack_ref: contextPackRef,
+        memory_buffer_ref: memoryBufferRef,
+        persisted: false,
+      };
+    }
+    const saved = await this.options.evidenceStore.saveContextPack(evidence);
+    return {
+      context_pack_ref: contextPackRef,
+      memory_buffer_ref: memoryBufferRef,
+      persisted: true,
+      uri: saved.uri,
+    };
+  }
+
   private enqueue<T>(
-    role_id: string,
+    queueKeys: string[],
     operation: () => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
-    const previous = this.roleQueues.get(role_id) ?? Promise.resolve();
+    const previous = queueKeys.map(
+      (queueKey) => this.executionQueues.get(queueKey) ?? Promise.resolve(),
+    );
     let started = false;
-    const running = previous.then(() => {
+    const running = Promise.all(previous).then(() => {
       started = true;
       return operation();
     });
-    this.roleQueues.set(
-      role_id,
-      running.then(
-        () => undefined,
-        () => undefined,
-      ),
+    const completed = running.then(
+      () => undefined,
+      () => undefined,
     );
+    for (const queueKey of queueKeys) {
+      this.executionQueues.set(queueKey, completed);
+    }
+    void completed.then(() => {
+      for (const queueKey of queueKeys) {
+        if (this.executionQueues.get(queueKey) === completed) {
+          this.executionQueues.delete(queueKey);
+        }
+      }
+    });
     return rejectWhileQueued(running, signal, () => started);
   }
 }
@@ -346,6 +617,103 @@ function toMemoryItems(prefix: string, values: string[] | undefined) {
   }));
 }
 
+function toDriverMemoryItems(values: Array<{ id: string; description: string; content: string }>) {
+  return values.map(({ id, description, content }) => ({ id, description, content }));
+}
+
+function deduplicateMemoryItems<T extends { content: string }>(values: T[]): T[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    if (seen.has(value.content)) return false;
+    seen.add(value.content);
+    return true;
+  });
+}
+
+function withRetrievedMemory(
+  dispatched: DispatchTaskResult,
+  retrieval: MemoryRetrievalResult,
+  taskInstruction: string,
+): DispatchTaskResult {
+  const driverContext: DriverContext = {
+    task_instruction: taskInstruction,
+    skills: [...retrieval.skills],
+    experiences: [...retrieval.experiences],
+  };
+  return {
+    ...dispatched,
+    cycle: {
+      ...dispatched.cycle,
+      retrieval: {
+        skills: [...retrieval.skills],
+        experiences: [...retrieval.experiences],
+      },
+      driver_context: driverContext,
+    },
+  };
+}
+
+function withTopLevelMemoryContext(
+  input: Parameters<ToolCallingClient['completeWithTools']>[0],
+  retrieval: MemoryRetrievalResult,
+): Parameters<ToolCallingClient['completeWithTools']>[0] {
+  const memoryContext = renderTopLevelMemoryContext(retrieval);
+  if (!memoryContext) return input;
+
+  let injected = false;
+  return {
+    ...input,
+    messages: input.messages.map((message) => {
+      if (injected || message.role !== 'user' || message.content === null) return message;
+      injected = true;
+      return { ...message, content: `${message.content}\n\n${memoryContext}` };
+    }),
+  };
+}
+
+function renderTopLevelMemoryContext(retrieval: MemoryRetrievalResult): string {
+  if (retrieval.skills.length === 0 && retrieval.experiences.length === 0) return '';
+
+  const visibleSkills = retrieval.skills.slice(0, TOP_LEVEL_MEMORY_ITEM_LIMIT);
+  const visibleExperiences = retrieval.experiences.slice(
+    0,
+    TOP_LEVEL_MEMORY_ITEM_LIMIT - visibleSkills.length,
+  );
+  const visibleCount = visibleSkills.length + visibleExperiences.length;
+  const totalCount = retrieval.skills.length + retrieval.experiences.length;
+  const sections = [
+    renderMemorySection('Approved skills', visibleSkills, retrieval.skills.length),
+    renderMemorySection('Eligible experiences', visibleExperiences, retrieval.experiences.length),
+  ].filter((section) => section.length > 0);
+  return [
+    'Retrieved memory selected by B before execution:',
+    ...sections,
+    ...(visibleCount < totalCount
+      ? [`Omitted memory records: ${String(totalCount - visibleCount)}.`]
+      : []),
+  ].join('\n');
+}
+
+function renderMemorySection(
+  heading: string,
+  records: Array<{ id: string; description: string; content: string }>,
+  totalCount: number,
+): string {
+  if (records.length === 0) return '';
+  return [
+    `${heading} (shown ${String(records.length)} of ${String(totalCount)}):`,
+    ...records.map(
+      (record) =>
+        `- ${truncate(record.id, TOP_LEVEL_MEMORY_ID_LIMIT)}: ${truncate(record.description, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}\n  ${truncate(record.content, TOP_LEVEL_MEMORY_CONTENT_LIMIT)}`,
+    ),
+  ].join('\n');
+}
+
+function truncate(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  return `${value.slice(0, Math.max(0, limit - 3))}...`;
+}
+
 function delegationContext(original: string, delegated: string) {
   if (delegated.trim() === original.trim()) return [];
   return [{ id: 'b_delegation', description: 'B runtime delegation guidance', content: delegated }];
@@ -362,6 +730,7 @@ function isArtifactFreeRetryableFailure(execution: DriverRunResult): boolean {
 
 function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
   return new Promise<T>((resolve, reject) => {
     const abort = () => reject(abortReason(signal));
     signal.addEventListener('abort', abort, { once: true });
