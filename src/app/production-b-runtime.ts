@@ -3,12 +3,16 @@ import { Pool } from 'pg';
 import { LiteLLMClient } from '../litellm';
 import {
   FileBufferRepository,
+  HashEmbeddingProvider,
   LiteLLMEmbeddingProvider,
   PgMemoryRepository,
   type BufferRepository,
   type EmbeddingProvider,
   type MemoryRepository,
 } from '../memory';
+
+/** HashEmbeddingProvider 的原生维度，与库中既有 vector(32) 一致。 */
+const HASH_EMBEDDING_DIMENSIONS = 32;
 
 const MARKET_AGENT_CATALOG = [
   {
@@ -143,6 +147,21 @@ function resolveProductionEmbedding(
       info: {
         provider: 'host-injected EmbeddingProvider',
         dimensions: options.embedding.dimensions,
+        readiness: 'verified',
+      },
+    };
+  }
+
+  // NEWIDE_B_EMBEDDING_PROVIDER=hash：确定性哈希向量，不调用任何外部 embedding 服务。
+  // 用途是本地跑通协调链路（checkpoint / resume / 多 agent），此时语义检索质量无关紧要。
+  // 注意维度必须与库中 description_embedding vector(N) 一致，否则写入会被 pgvector 拒绝。
+  if (env.NEWIDE_B_EMBEDDING_PROVIDER?.trim() === 'hash') {
+    const dimensions = readEmbeddingDimensions(env, HASH_EMBEDDING_DIMENSIONS);
+    return {
+      provider: new HashEmbeddingProvider(dimensions),
+      info: {
+        provider: 'HashEmbeddingProvider',
+        dimensions,
         readiness: 'verified',
       },
     };
