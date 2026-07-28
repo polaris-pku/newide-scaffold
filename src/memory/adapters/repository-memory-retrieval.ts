@@ -17,7 +17,7 @@
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { AgentTaskRequest } from '../agent-types';
 import type { MemoryRetrievalResult } from '../services/memory-query';
-import { retrieveMemoriesForTask } from './memory-retrieval';
+import { retrieveMemoriesForTask, type MemoryRetrievalOptions } from './memory-retrieval';
 
 /**
  * 任务执行前的记忆检索策略（MemoryQueryStrategy）。
@@ -27,12 +27,14 @@ import { retrieveMemoriesForTask } from './memory-retrieval';
  * @param memory  - 当前 Agent 的记忆作用域
  * @param task    - 含 spec（作检索 query），不含 Driver 指令
  * @param _task_id - 任务 ID（检索逻辑暂不使用，保留接口一致性）
+ * @param options - 可选检索策略（含消融 selection）
  */
 export async function repositoryRetrieveMemoryForTask(
   memory: AgentMemoryScope,
   task: AgentTaskRequest,
   _task_id: string,
+  options?: MemoryRetrievalOptions,
 ): Promise<MemoryRetrievalResult> {
   void _task_id;
-  return retrieveMemoriesForTask(memory, { task_query: task.spec });
+  return retrieveMemoriesForTask(memory, { task_query: task.spec }, options);
 }

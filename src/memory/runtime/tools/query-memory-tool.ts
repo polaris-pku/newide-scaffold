@@ -9,6 +9,7 @@
 import type { Tool } from '../tool';
 import type { AgentMemoryScope } from '../../ports/agent-memory-scope';
 import type { EmbeddingProvider } from '../../ports/embedding-provider';
+import { getActiveMemoryAblationPolicy } from '../../ablation-policy';
 import { retrieveMemoriesForTask } from '../../adapters/memory-retrieval';
 
 export interface QueryMemoryInput {
@@ -55,6 +56,7 @@ export class QueryMemoryTool implements Tool<QueryMemoryInput, QueryMemoryOutput
   ) {}
 
   async execute(input: QueryMemoryInput): Promise<QueryMemoryOutput> {
+    const ablation = getActiveMemoryAblationPolicy();
     const result = await retrieveMemoriesForTask(
       this.memory,
       { task_query: input.query },
@@ -62,6 +64,12 @@ export class QueryMemoryTool implements Tool<QueryMemoryInput, QueryMemoryOutput
         selection: {
           max_memory_items: input.top_k ?? 5,
           min_embedding_similarity: input.min_similarity ?? 0.5,
+          ...(ablation
+            ? {
+                include_skills: ablation.include_skills,
+                include_recent_experience: ablation.include_recent_experience,
+              }
+            : {}),
         },
         ...(this.embedding ? { embedding: this.embedding } : {}),
       },

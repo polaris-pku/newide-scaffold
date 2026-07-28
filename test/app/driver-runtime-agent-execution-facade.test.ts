@@ -66,6 +66,119 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
   });
 
+  it('applies memory_ablation B0/B1/B2 to retrieval and maintenance scheduling', async () => {
+    const roleId = 'implementer';
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: roleId, name: roleId });
+    await repository.saveSkill(
+      roleId,
+      createMemorySkill(roleId, {
+        description: 'Runtime contract implementation skill',
+        content: 'Keep runtime role identity stable across workspace paths.',
+        tags: ['runtime'],
+      }),
+    );
+    await repository.saveExperience(
+      roleId,
+      createMemoryExperience(roleId, {
+        description: 'Runtime retrieval experience',
+        content: 'Retrieve approved memory before invoking the driver.',
+        tags: ['runtime'],
+      }),
+    );
+
+    const b0Requests: unknown[] = [];
+    const b0Maintenance: BMemoryMaintenancePort = {
+      async scheduleBuffer(input) {
+        b0Requests.push(input);
+        return {
+          maintenance_ref: 'should_not_run',
+          kind: 'experience_extraction',
+          status: 'scheduled',
+          task_id: input.task_id,
+          run_id: input.run_id,
+          role_id: input.role_id,
+          buffer_seq: input.buffer_seq,
+          experiences: [],
+          skills: [],
+          warnings: [],
+          created_at: '2026-07-21T00:00:00.000Z',
+          completed_at: '2026-07-21T00:00:01.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    const b0 = await new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository,
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      memoryMaintenance: b0Maintenance,
+    }).runAgent({ ...request('task_b0', roleId), memory_ablation: 'B0' });
+    expect(b0.diagnostics.retrieval).toEqual({ experiences: 0, skills: 0 });
+    expect(b0Requests).toHaveLength(0);
+    expect(b0.diagnostics.memory_maintenance).toBeUndefined();
+
+    const b1Requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
+    const b1 = await new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository,
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      memoryMaintenance: {
+        async scheduleBuffer(input) {
+          b1Requests.push(input);
+          return {
+            maintenance_ref: 'b1_maint',
+            kind: 'experience_extraction',
+            status: 'scheduled',
+            task_id: input.task_id,
+            run_id: input.run_id,
+            role_id: input.role_id,
+            buffer_seq: input.buffer_seq,
+            experiences: [],
+            skills: [],
+            warnings: [],
+            created_at: '2026-07-21T00:00:00.000Z',
+            completed_at: '2026-07-21T00:00:01.000Z',
+            schema_version: SCHEMA_VERSION,
+          };
+        },
+      },
+    }).runAgent({ ...request('task_b1', roleId), memory_ablation: 'B1' });
+    expect(b1.diagnostics.retrieval).toMatchObject({ skills: 0 });
+    expect((b1.diagnostics.retrieval as { experiences: number }).experiences).toBeGreaterThan(0);
+    expect(b1Requests[0]?.memory_ablation).toBe('B1');
+
+    const b2 = await new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository,
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      memoryMaintenance: {
+        async scheduleBuffer(input) {
+          return {
+            maintenance_ref: 'b2_maint',
+            kind: 'experience_extraction',
+            status: 'scheduled',
+            task_id: input.task_id,
+            run_id: input.run_id,
+            role_id: input.role_id,
+            buffer_seq: input.buffer_seq,
+            experiences: [],
+            skills: [],
+            warnings: [],
+            created_at: '2026-07-21T00:00:00.000Z',
+            completed_at: '2026-07-21T00:00:01.000Z',
+            schema_version: SCHEMA_VERSION,
+          };
+        },
+      },
+    }).runAgent({ ...request('task_b2', roleId), memory_ablation: 'B2' });
+    expect((b2.diagnostics.retrieval as { skills: number }).skills).toBeGreaterThan(0);
+    expect((b2.diagnostics.retrieval as { experiences: number }).experiences).toBeGreaterThan(0);
+  });
+
   it('preserves a completed Agent execution when B maintenance scheduling fails', async () => {
     const memoryMaintenance: BMemoryMaintenancePort = {
       async scheduleBuffer() {

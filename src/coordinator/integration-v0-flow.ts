@@ -429,6 +429,7 @@ export async function runIntegrationV0Flow(
       ...(options.sessionId ? { session_id: options.sessionId } : {}),
       input_artifact_refs: contextArtifactRefs,
       context_policy: 'integration_v0_default',
+      ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
       schema_version: SCHEMA_VERSION,
     };
     const agentExecutionRequestedEvent = orchestrator.appendEvent({
@@ -465,6 +466,7 @@ export async function runIntegrationV0Flow(
         memory_buffer_ref: agentExecutionResult.memory_buffer_ref,
         context_pack_persisted: agentExecutionResult.diagnostics.context_pack_persisted,
         retrieval: agentExecutionResult.diagnostics.retrieval,
+        ...(memoryAblation ? { ablation: memoryAblation } : {}),
       },
     });
     timeline.push({ name: 'ContextPackBuilt', id: contextEvent.event_id });
