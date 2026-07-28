@@ -15,6 +15,12 @@ export type EventType =
   | 'merge.authorization'
   | 'checkpoint.saved'
   | 'run.completed'
+  | 'mailbox.sent'
+  | 'mailbox.delivery_read'
+  | 'mailbox.delivery_acked'
+  | 'mailbox.delivery_replied'
+  | 'mailbox.delivery_timeout'
+  | 'mailbox.delivery_failed'
   | (string & {});
 
 export interface Event {
