@@ -254,6 +254,8 @@ export interface PersistedFullCheckpoint {
   session_id?: string;
   trigger: 'manual' | 'periodic' | 'shutdown' | 'blocked' | 'escalated';
   resume_cursor: TaskResumeCursor;
+  /** Optional: persisted for from_checkpoint resume; older rows may omit it. */
+  cursor_input?: TaskCursorInput;
   message_thread: PersistedCheckpointMessage[];
   mechanical_snapshot: {
     base_commit: string;
