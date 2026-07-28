@@ -9,9 +9,11 @@ import {
   assertTaskRunStartTransition,
   assertTaskStatusTransition,
 } from '../coordinator/task-state-machine';
+import { buildResumePackage, buildSafepointCheckpoint, type ResumePackage } from '../checkpoint';
 import {
   parseTaskCursorInput,
   type CoordinationStateStore,
+  type MailboxStateStore,
   type PersistedRunMode,
   type PersistedRunState,
   type PersistedTaskAggregate,
@@ -121,6 +123,7 @@ export interface TaskLaunchContext {
 export interface TaskResumeContext extends TaskLaunchContext {
   checkpoint_id: string;
   resume_cursor: TaskResumeCursor;
+  cursor_input: TaskCursorInput;
   mode: PersistedRunMode;
   interrupted_run_id: string;
 }
@@ -162,13 +165,19 @@ export class TaskProcessorStageCommitError extends Error {
 export class TaskProcessor {
   private readonly now: () => string;
   private readonly createEventId: () => string;
+  private readonly mailboxStore?:
+    | Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>
+    | undefined;
 
   constructor(
     private readonly store: CoordinationStateStore,
-    options: TaskProcessorOptions = {},
+    options: TaskProcessorOptions & {
+      mailboxStore?: Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>;
+    } = {},
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.createEventId = options.createEventId ?? (() => createId('event'));
+    this.mailboxStore = options.mailboxStore;
   }
 
   beginRun(input: BeginTaskRunInput): TaskSnapshot {
@@ -464,6 +473,15 @@ export class TaskProcessor {
     } catch (error) {
       throw new TaskProcessorStageCommitError('handler.completed', error);
     }
+
+    if (!completing) {
+      const refreshed = this.store.getTaskAggregate(aggregate.task.task_id);
+      if (refreshed) {
+        const trigger = nextInput.cursor === 'mailbox_wait' ? 'blocked' : 'periodic';
+        this.persistSafepoint(refreshed, input.run_id, trigger);
+      }
+    }
+
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
@@ -841,21 +859,117 @@ export class TaskProcessor {
   }
 
   getTaskResumeContext(taskId: string): TaskResumeContext {
+    const resumePackage = this.buildResumePackage(taskId);
+    return {
+      task_request: {
+        spec: resumePackage.task_request.spec,
+        ...(resumePackage.task_request.role_id
+          ? { role_id: resumePackage.task_request.role_id }
+          : {}),
+        ...(resumePackage.task_request.parent_task_id
+          ? { parent_task_id: resumePackage.task_request.parent_task_id }
+          : {}),
+        risk_level: resumePackage.task_request.risk_level,
+        affected_paths: [...resumePackage.task_request.affected_paths],
+        completion_criteria: [...resumePackage.task_request.completion_criteria],
+        ...(resumePackage.task_request.budget
+          ? { budget: { ...resumePackage.task_request.budget } }
+          : {}),
+      },
+      workspace_path: resumePackage.workspace_path,
+      ...(resumePackage.session_id ? { session_id: resumePackage.session_id } : {}),
+      checkpoint_id: resumePackage.checkpoint_id,
+      resume_cursor: resumePackage.resume_cursor,
+      cursor_input: resumePackage.cursor_input,
+      mode: resumePackage.mode,
+      interrupted_run_id: resumePackage.interrupted_run_id,
+    };
+  }
+
+  buildResumePackage(taskId: string): ResumePackage {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
     const checkpoint = this.store.getLatestCheckpoint(taskId);
     if (!checkpoint) throw new Error(`Task ${taskId} has no valid full checkpoint`);
-    const interruptedRun = requireRun(aggregate, checkpoint.run_id);
-    const launch = this.getTaskLaunchContext(taskId);
-    const sessionId = checkpoint.session_id ?? interruptedRun.session_id ?? launch.session_id;
-    return {
-      ...launch,
-      ...(sessionId ? { session_id: sessionId } : {}),
-      checkpoint_id: checkpoint.checkpoint_id,
-      resume_cursor: checkpoint.resume_cursor,
-      mode: interruptedRun.mode,
-      interrupted_run_id: interruptedRun.run_id,
-    };
+    return buildResumePackage({
+      aggregate,
+      checkpoint,
+      ...(this.mailboxStore ? { mailboxStore: this.mailboxStore } : {}),
+    });
+  }
+
+  /** Save shutdown safepoints for all active runs before process exit. */
+  saveShutdownSafepoints(): PersistedFullCheckpoint[] {
+    const saved: PersistedFullCheckpoint[] = [];
+    for (const aggregate of this.store.listTaskAggregates()) {
+      const run = aggregate.runs.find((candidate) => isActiveRun(candidate));
+      if (!run) continue;
+      const checkpoint = this.persistSafepoint(aggregate, run.run_id, 'shutdown');
+      if (checkpoint) saved.push(checkpoint);
+    }
+    return saved;
+  }
+
+  private persistSafepoint(
+    aggregate: PersistedTaskAggregate,
+    runId: string,
+    trigger: PersistedFullCheckpoint['trigger'],
+    interruptState?: Record<string, unknown>,
+  ): PersistedFullCheckpoint | undefined {
+    const latestCheckpoint = this.store.getLatestCheckpoint(aggregate.task.task_id);
+    const checkpoint = buildSafepointCheckpoint({
+      aggregate,
+      run_id: runId,
+      trigger,
+      ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
+      ...(interruptState ? { interrupt_state: interruptState } : {}),
+      now: this.now(),
+    });
+    const checkpointSaved = this.createEvent(
+      'checkpoint.saved',
+      checkpoint.checkpoint_id,
+      aggregate.task.task_id,
+      runId,
+      {
+        checkpoint_id: checkpoint.checkpoint_id,
+        resume_cursor: checkpoint.resume_cursor,
+        trigger,
+      },
+    );
+    const timestamp = this.now();
+    try {
+      this.store.commitState({
+        expected_task_revision: aggregate.task.revision,
+        task: {
+          ...aggregate.task,
+          revision: aggregate.task.revision + 1,
+          updated_at: timestamp,
+        },
+        run: (() => {
+          const run = requireRun(aggregate, runId);
+          return {
+            ...run,
+            revision: run.revision + 1,
+            updated_at: timestamp,
+          };
+        })(),
+        runtime_state: {
+          ...aggregate.runtime_state,
+          ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
+          diagnostics: {
+            ...aggregate.runtime_state.diagnostics,
+            last_safepoint_checkpoint_id: checkpoint.checkpoint_id,
+            last_safepoint_trigger: trigger,
+          },
+          updated_at: timestamp,
+        },
+        checkpoint,
+        events: [checkpointSaved],
+      });
+      return checkpoint;
+    } catch {
+      return undefined;
+    }
   }
 
   private requireAggregateForRun(runId: string): PersistedTaskAggregate {
@@ -961,6 +1075,7 @@ export class TaskProcessor {
       },
       runtime_state: {
         ...runtimeWithoutCurrentRun,
+        ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
         interrupt_state: interruptState,
         diagnostics: {
           ...aggregate.runtime_state.diagnostics,
