@@ -5,7 +5,18 @@ import prettier from 'eslint-config-prettier';
 
 export default tseslint.config(
   {
-    ignores: ['dist/', 'node_modules/', 'coverage/', '.newide/', '.claude/worktrees/'],
+    ignores: [
+      'dist/',
+      'node_modules/',
+      'coverage/',
+      '.newide/',
+      '.claude/worktrees/',
+      // Merged from feat/mailbox-collaboration, not yet integrated and not yet
+      // adapted to current mainline APIs. Kept byte-identical to the original
+      // commit so the port stays reviewable. See src/mailbox-collab/INTEGRATION.md.
+      'src/mailbox-collab/**',
+      'test/mailbox-collab/**',
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
