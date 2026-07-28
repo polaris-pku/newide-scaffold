@@ -7,7 +7,8 @@ export default defineConfig({
       '**/.claude/worktrees/**',
       // Merged from feat/mailbox-collaboration, not yet integrated. These tests
       // exercise a parallel mailbox stack that does not compile against current
-      // mainline APIs. See src/mailbox-collab/INTEGRATION.md.
+      // mainline APIs. Integration plan is tracked outside the repo:
+      // 工程化报告留底/2026-07-28-checkpoint与Mailbox分支整合留底.md
       'test/mailbox-collab/**',
     ],
   },

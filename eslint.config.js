@@ -13,7 +13,8 @@ export default tseslint.config(
       '.claude/worktrees/',
       // Merged from feat/mailbox-collaboration, not yet integrated and not yet
       // adapted to current mainline APIs. Kept byte-identical to the original
-      // commit so the port stays reviewable. See src/mailbox-collab/INTEGRATION.md.
+      // commit so the port stays reviewable. Integration plan is tracked outside
+      // the repo: 工程化报告留底/2026-07-28-checkpoint与Mailbox分支整合留底.md
       'src/mailbox-collab/**',
       'test/mailbox-collab/**',
     ],
