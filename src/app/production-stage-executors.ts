@@ -2,17 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import {
-  SCHEMA_VERSION,
-  createId,
-  nowTimestamp,
-  type ArtifactRef,
-  type Event,
-} from '../core';
-import {
-  ArtifactSelector,
-  WorktreeMaterializer,
-} from '../coordinator';
+import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef, type Event } from '../core';
+import { ArtifactSelector, WorktreeMaterializer } from '../coordinator';
 import {
   buildChangesetManifest,
   writeChangesetManifest,
@@ -123,7 +114,7 @@ export function createProductionStageExecutors(
           ? context.cursor_input.candidate_ids
           : context.task_request.role_id
             ? [context.task_request.role_id]
-          : [...dependencies.bootstrapAgentIds];
+            : [...dependencies.bootstrapAgentIds];
       const result = await dependencies.selectAgentHandler.execute({
         task_id: context.task_id,
         task_description: context.task_request.spec,
@@ -253,10 +244,12 @@ export function createProductionStageExecutors(
         driverId: String(result.diagnostics.driver_id ?? result.role_id),
         runsRoot: dependencies.runsRoot,
       });
-      await stateStore.update(context.run_id, context.task_id, {
-        primary: { result },
-        selection,
-      });
+      await stateStore.update(
+        context.run_id,
+        context.task_id,
+        { primary: { result }, selection },
+        context.restarted_from_run_id,
+      );
       emit(context, 'memory.context_pack_built', result.context_pack_ref, {
         agent_id: result.agent_id ?? result.role_id,
         role_id: result.role_id,
@@ -311,7 +304,7 @@ export function createProductionStageExecutors(
   const council: CouncilStageExecutor = {
     async execute(context) {
       context.signal?.throwIfAborted();
-      const state = await stateStore.require(context.run_id);
+      const state = await stateStore.require(context.run_id, context.restarted_from_run_id);
       const primary = state.primary?.result;
       if (!primary) throw new Error('Council stage has no persisted Primary Agent result');
       const driverResult = buildDriverRunResultFromAgentExecution({
@@ -367,9 +360,8 @@ export function createProductionStageExecutors(
         mode: 'council',
         artifacts: selected.selected_artifacts,
         producerAgentId:
-          councilRunResult.participants?.find(
-            (participant) => participant.seat === 'synthesizer',
-          )?.agent_id ??
+          councilRunResult.participants?.find((participant) => participant.seat === 'synthesizer')
+            ?.agent_id ??
           primary.agent_id ??
           primary.role_id,
         response: councilRunResult.decision.reason || primary.response,
@@ -378,7 +370,12 @@ export function createProductionStageExecutors(
         runsRoot: dependencies.runsRoot,
         councilRunResult,
       });
-      await stateStore.update(context.run_id, context.task_id, { selection });
+      await stateStore.update(
+        context.run_id,
+        context.task_id,
+        { selection },
+        context.restarted_from_run_id,
+      );
       emit(context, 'council.decision', councilRunResult.decision.decision_id, {
         ...councilRunResult.decision,
         participants: councilRunResult.participants ?? [],
@@ -397,9 +394,7 @@ export function createProductionStageExecutors(
       });
       emit(context, 'artifact.selected', selection.manifest_ref, {
         mode: 'council',
-        selected_artifact_refs: selected.selected_artifacts.map(
-          (artifact) => artifact.artifact_id,
-        ),
+        selected_artifact_refs: selected.selected_artifacts.map((artifact) => artifact.artifact_id),
       });
       return {
         changeset_ref: selection.manifest_ref,
@@ -420,7 +415,7 @@ export function createProductionStageExecutors(
   const gate: GateStageExecutor = {
     async execute(context) {
       context.signal?.throwIfAborted();
-      const state = await stateStore.require(context.run_id);
+      const state = await stateStore.require(context.run_id, context.restarted_from_run_id);
       const selection = state.selection;
       if (!selection) throw new Error('Gate stage has no persisted artifact selection');
       if (
@@ -457,10 +452,8 @@ export function createProductionStageExecutors(
         producer_agent_id: selection.producer_agent_id,
         task_worktree_path: path.join(dependencies.worktreesRoot, context.task_id),
         manifest_path: pathFromFileRef(selection.manifest_ref),
-        delivery_receipt_path: buildRunOutputPaths(
-          context.run_id,
-          dependencies.runsRoot,
-        ).delivery_receipt_path,
+        delivery_receipt_path: buildRunOutputPaths(context.run_id, dependencies.runsRoot)
+          .delivery_receipt_path,
         user_workspace_path: context.workspace_path,
         ...(context.mode === 'council'
           ? {
@@ -488,20 +481,25 @@ export function createProductionStageExecutors(
         },
         execution_succeeded: true,
       });
-      await stateStore.update(context.run_id, context.task_id, {
-        gate: {
-          gate_results: gateResult.gate_results,
-          completion_evaluation: completionEvaluation,
-          manifest,
-          materialization: {
-            worktree_path: materialization.worktree_path,
-            files_written: materialization.files_written,
-            changed_files: materialization.changed_files,
-            status: materialization.status,
-            failures: materialization.failures,
+      await stateStore.update(
+        context.run_id,
+        context.task_id,
+        {
+          gate: {
+            gate_results: gateResult.gate_results,
+            completion_evaluation: completionEvaluation,
+            manifest,
+            materialization: {
+              worktree_path: materialization.worktree_path,
+              files_written: materialization.files_written,
+              changed_files: materialization.changed_files,
+              status: materialization.status,
+              failures: materialization.failures,
+            },
           },
         },
-      });
+        context.restarted_from_run_id,
+      );
       emit(context, 'worktree.materialized', manifest.manifest_id, {
         changeset_manifest_ref: selection.manifest_ref,
         worktree_path: materialization.worktree_path,
@@ -529,14 +527,9 @@ export function createProductionStageExecutors(
           : {
               error: {
                 code: denied ? 'gate_denied' : 'gate_blocked',
-                message:
-                  denied?.reason ??
-                  blocked?.reason ??
-                  completionEvaluation.outcome.reason,
+                message: denied?.reason ?? blocked?.reason ?? completionEvaluation.outcome.reason,
                 details: {
-                  gate_result_refs: gateResult.gate_results.map(
-                    (result) => result.gate_result_id,
-                  ),
+                  gate_result_refs: gateResult.gate_results.map((result) => result.gate_result_id),
                   run_outcome: completionEvaluation.outcome,
                 },
               },
@@ -564,7 +557,7 @@ export function createProductionStageExecutors(
   const deliver: DeliverStageExecutor = {
     async execute(context) {
       context.signal?.throwIfAborted();
-      const state = await stateStore.require(context.run_id);
+      const state = await stateStore.require(context.run_id, context.restarted_from_run_id);
       const gateState = state.gate;
       const selection = state.selection;
       if (!gateState || !selection) {
@@ -577,13 +570,18 @@ export function createProductionStageExecutors(
         throw new Error('Deliver stage changeset identity does not match the Gate-approved state');
       }
       const delivery = await deliverArtifactHandler.execute({ manifest: gateState.manifest });
-      await stateStore.update(context.run_id, context.task_id, {
-        delivery: {
-          manifest_id: delivery.manifest_id,
-          idempotency_key: delivery.idempotency_key,
-          files: delivery.files,
+      await stateStore.update(
+        context.run_id,
+        context.task_id,
+        {
+          delivery: {
+            manifest_id: delivery.manifest_id,
+            idempotency_key: delivery.idempotency_key,
+            files: delivery.files,
+          },
         },
-      });
+        context.restarted_from_run_id,
+      );
       emit(context, 'artifact.delivered', gateState.manifest.manifest_id, {
         manifest_id: delivery.manifest_id,
         changeset_manifest_ref: selection.manifest_ref,
@@ -654,7 +652,10 @@ async function selectionState(input: {
   };
 }
 
-async function artifactSetHash(artifacts: readonly ArtifactRef[], response: string): Promise<string> {
+async function artifactSetHash(
+  artifacts: readonly ArtifactRef[],
+  response: string,
+): Promise<string> {
   const entries = await Promise.all(
     artifacts.map(async (artifact) => {
       let artifactHash = artifact.sha256;
@@ -695,20 +696,35 @@ function emit<TCursor extends TaskResumeCursor>(
 class ProductionStageStateStore {
   constructor(private readonly runsRoot: string) {}
 
-  async require(runId: string): Promise<ProductionStageState> {
+  /**
+   * 读取 stage 中间产物。resume 会新建 run_id，已完成 stage 的产物落在被中断 run 的
+   * 目录下，所以允许沿 restarted_from_run_id 回溯一层，否则续跑的 deliver 会因为
+   * "no production stage state" 直接失败。
+   *
+   * 只回溯读、不回溯写：update 始终写当前 run 的文件，保持每个 run 的证据自洽。
+   */
+  async require(runId: string, inheritedFromRunId?: string): Promise<ProductionStageState> {
     const state = await this.read(runId);
-    if (!state) throw new Error(`Run ${runId} has no production stage state`);
-    return state;
+    if (state) return state;
+    if (inheritedFromRunId) {
+      const inherited = await this.read(inheritedFromRunId);
+      if (inherited) return inherited;
+    }
+    throw new Error(`Run ${runId} has no production stage state`);
   }
 
   async update(
     runId: string,
     taskId: string,
     patch: Partial<Omit<ProductionStageState, 'schema_version' | 'run_id' | 'task_id'>>,
+    inheritedFromRunId?: string,
   ): Promise<void> {
+    // 续跑 run 的首次写入必须以被中断 run 的状态为底，否则会把前序 stage 的产物写没。
+    const inherited = inheritedFromRunId ? await this.read(inheritedFromRunId) : undefined;
     const current =
       (await this.read(runId)) ??
       ({
+        ...inherited,
         schema_version: SCHEMA_VERSION,
         run_id: runId,
         task_id: taskId,
@@ -717,11 +733,7 @@ class ProductionStageStateStore {
     const target = this.path(runId);
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(
-      temporary,
-      JSON.stringify({ ...current, ...patch }, null, 2),
-      'utf8',
-    );
+    await fs.writeFile(temporary, JSON.stringify({ ...current, ...patch }, null, 2), 'utf8');
     await fs.rename(temporary, target);
   }
 
@@ -744,6 +756,7 @@ class ProductionStageStateStore {
 
 function pathFromFileRef(reference: string): string {
   const url = new URL(reference);
-  if (url.protocol !== 'file:') throw new Error(`Expected file ChangesetManifest ref: ${reference}`);
+  if (url.protocol !== 'file:')
+    throw new Error(`Expected file ChangesetManifest ref: ${reference}`);
   return decodeURIComponent(url.pathname);
 }

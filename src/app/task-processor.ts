@@ -102,6 +102,12 @@ export interface TaskRunExecutionState {
   resume_cursor: TaskResumeCursor;
   cursor_input?: TaskCursorInput;
   council_override: boolean;
+  /**
+   * 本 run 续跑自哪个 run。resume 会新建 run_id，而 stage 之间传递的中间产物是按
+   * run_id 落盘的，所以续跑的 stage 必须能回溯到被中断 run 的状态，否则 deliver
+   * 拿不到 gate/execute 阶段的产物。
+   */
+  restarted_from_run_id?: string;
 }
 
 export interface FinishTaskRunInput {
@@ -583,6 +589,9 @@ export class TaskProcessor {
         ? { cursor_input: aggregate.runtime_state.cursor_input }
         : {}),
       council_override: aggregate.runtime_state.diagnostics.council_override === true,
+      ...(run.restarted_from_run_id
+        ? { restarted_from_run_id: run.restarted_from_run_id }
+        : {}),
     };
   }
 
@@ -1037,7 +1046,15 @@ export class TaskProcessor {
       aggregate,
       run_id: run.run_id,
       trigger: 'blocked',
-      ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
+      ...(latestCheckpoint
+        ? {
+            parent_checkpoint_id: latestCheckpoint.checkpoint_id,
+            // Recovery happens after the crash, so the disk is no longer authoritative.
+            // Carry the last safepoint's snapshot forward instead of pinning this
+            // checkpoint to whatever the crash (or anything since) left behind.
+            inherit_mechanical_snapshot: latestCheckpoint.mechanical_snapshot,
+          }
+        : {}),
       interrupt_state: interruptState,
       now: timestamp,
     });
