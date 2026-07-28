@@ -1,4 +1,14 @@
-export { captureFileAnchor, type FileAnchor } from './file-anchor';
+export {
+  captureFileAnchor,
+  releaseFileAnchor,
+  restoreFileAnchor,
+  verifyFileAnchor,
+  type CaptureFileAnchorOptions,
+  type FileAnchor,
+  type FileAnchorVerification,
+  type RestoreFileAnchorOptions,
+  type RestoreFileAnchorResult,
+} from './file-anchor';
 export {
   buildResumePackage,
   resolveResumeCursorInput,

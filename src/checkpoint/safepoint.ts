@@ -44,7 +44,9 @@ export function buildSafepointCheckpoint(
     synthesizeCursorInput(resumeCursor, aggregate, runId);
 
   const timestamp = input.now ?? new Date().toISOString();
-  const anchor = captureFileAnchor(aggregate.task.workspace_path);
+  const checkpointId = input.checkpoint_id ?? createId('checkpoint');
+  // Label the snapshot with the checkpoint id so its ref survives gc until resume.
+  const anchor = captureFileAnchor(aggregate.task.workspace_path, { label: checkpointId });
   const agentId =
     readLatestAgentId(aggregate) ??
     aggregate.task.owner_agent_id ??
@@ -52,7 +54,7 @@ export function buildSafepointCheckpoint(
     'coordinator';
 
   return {
-    checkpoint_id: input.checkpoint_id ?? createId('checkpoint'),
+    checkpoint_id: checkpointId,
     ...(input.parent_checkpoint_id ? { parent_checkpoint_id: input.parent_checkpoint_id } : {}),
     task_id: aggregate.task.task_id,
     run_id: runId,

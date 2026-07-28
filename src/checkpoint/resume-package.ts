@@ -79,7 +79,10 @@ export function buildResumePackage(input: BuildResumePackageInput): ResumePackag
       .filter((delivery) => delivery.status === 'pending' || delivery.status === 'delivered') ?? [];
 
   const mechanical = checkpoint.mechanical_snapshot;
-  const recoverable = !mechanical.base_commit.startsWith('unavailable:');
+  // recoverable means workspace content can actually be restored, so a usable
+  // snapshot commit is required — Git metadata alone only describes the state.
+  const recoverable =
+    !mechanical.base_commit.startsWith('unavailable:') && Boolean(mechanical.snapshot_commit);
 
   return {
     task_id: aggregate.task.task_id,

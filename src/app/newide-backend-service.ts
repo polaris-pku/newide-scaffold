@@ -20,6 +20,11 @@ import {
 } from '../coordinator/coordinator-runner';
 import { createDefaultTaskRequest } from '../coordinator/task-request';
 import type { TaskCursorInput, TaskResumeCursor } from '../persistence';
+import {
+  restoreFileAnchor,
+  type ResumePackage,
+  type RestoreFileAnchorResult,
+} from '../checkpoint';
 import type { TelemetryRecord, TelemetrySink } from '../telemetry/telemetry-sink';
 import {
   InMemoryRunRegistry,
@@ -350,6 +355,7 @@ export class NewideBackendService {
       throw new Error(`Task ${taskId} cannot resume without the persistent Task processor`);
     }
     const resume = this.taskProcessor.getTaskResumeContext(taskId);
+    this.restoreResumeWorkspace(taskId);
     await this.startRun(
       {
         prompt: resume.task_request.spec,
@@ -368,6 +374,52 @@ export class NewideBackendService {
       },
     );
     return this.getTask(taskId);
+  }
+
+  /**
+   * Restore workspace content from the resume checkpoint's file anchor before the
+   * resumed run starts, so the resumed stage sees the files the interrupted run left
+   * behind rather than whatever is on disk now.
+   *
+   * Never blocks resume: an unrecoverable anchor (no snapshot, non-Git workspace,
+   * pruned object) means stages re-execute against the current workspace, which is
+   * the pre-existing behaviour. The outcome is recorded either way.
+   */
+  private restoreResumeWorkspace(taskId: string): void {
+    if (!this.taskProcessor) return;
+    let resumePackage: ResumePackage;
+    try {
+      resumePackage = this.taskProcessor.buildResumePackage(taskId);
+    } catch {
+      return;
+    }
+
+    const anchor = resumePackage.file_anchor;
+    const result: RestoreFileAnchorResult = anchor.recoverable
+      ? restoreFileAnchor(anchor)
+      : {
+          status: 'skipped',
+          reason: 'anchor_not_recoverable',
+          restored_files: [],
+          extra_files: [],
+          pruned_files: [],
+        };
+
+    this.taskProcessor.recordWorkspaceRestore(
+      taskId,
+      resumePackage.checkpoint_id,
+      // The interrupted run is the only real run this event can hang off: the resumed
+      // run does not exist yet, and current_run_id was cleared by the interrupt.
+      resumePackage.interrupted_run_id,
+      {
+        status: result.status,
+        ...(result.reason ? { reason: result.reason } : {}),
+        workspace_path: anchor.worktree_path,
+        ...(anchor.snapshot_commit ? { snapshot_commit: anchor.snapshot_commit } : {}),
+        restored_file_count: result.restored_files.length,
+        extra_files: result.extra_files,
+      },
+    );
   }
 
   async subscribeTask(
