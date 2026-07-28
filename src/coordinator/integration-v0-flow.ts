@@ -1043,12 +1043,16 @@ export async function runIntegrationV0Flow(
       ? workspaceChangedFiles
       : [...materializationResult.changed_files];
   const hasChangedFiles = workspaceChangedFiles.length > 0 || hasMaterializedChanges;
+  // Council rescue: primary driver failed, but council ran and produced usable
+  // output (files, response, or a materializable artifact). Don't require
+  // hasChangedFiles — a response-only or response-plus-metadata delivery is
+  // still a valid rescue outcome.
   const driverRecoveredByCouncil =
     !driverSucceeded &&
     selectionResult.council_result !== undefined &&
     deliveryResult !== undefined &&
     materializationResult.status === 'completed' &&
-    hasChangedFiles;
+    (hasChangedFiles || hasResponse || hasMaterializableArtifact);
   const artifactOutputs = buildArtifactOutputs({
     artifacts: selectionResult.selected_artifacts,
     materialized_record_paths: materializationResult.changed_files,

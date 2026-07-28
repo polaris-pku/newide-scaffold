@@ -183,7 +183,65 @@ export function createProductionStageExecutors(
         },
       );
       if (result.status !== 'completed') {
-        throw new Error(`Primary Agent ended with status ${result.status}`);
+        if (context.mode !== 'council') {
+          throw new Error(`Primary Agent ended with status ${result.status}`);
+        }
+        // council mode: primary failed; persist partial evidence so the council
+        // stage can still read state.primary, then escalate to council for rescue.
+        const selection = await selectionState({
+          context,
+          mode: 'single_agent',
+          artifacts: result.artifact_refs,
+          producerAgentId: result.agent_id ?? result.role_id,
+          response: result.response,
+          sessionId: result.session_id,
+          driverId: String(result.diagnostics.driver_id ?? result.role_id),
+          runsRoot: dependencies.runsRoot,
+        });
+        await stateStore.update(
+          context.run_id,
+          context.task_id,
+          { primary: { result }, selection },
+          context.restarted_from_run_id,
+        );
+        emit(context, 'agent.execution_completed', result.agent_run_id, {
+          agent_id: result.agent_id ?? result.role_id,
+          role_id: result.role_id,
+          status: result.status,
+          session_id: result.session_id,
+          response: result.response,
+          artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
+          transcript_ref: result.transcript_ref.artifact_id,
+          context_pack_ref: result.context_pack_ref,
+          memory_buffer_ref: result.memory_buffer_ref,
+          driver_run_result_id: result.driver_run_result_id,
+          diagnostics: result.diagnostics,
+        });
+        return {
+          changeset_ref: selection.manifest_ref,
+          expected_sha256: selection.expected_sha256,
+          agent_id: result.agent_id ?? result.role_id,
+          session_id: result.session_id,
+          // escalation_request is redundant in council mode (councilTrigger always
+          // returns 'explicit_mode'), but included for audit clarity.
+          escalation_request: { type: 'request_council' as const, reason: `primary_agent_${result.status}` },
+          evidence: {
+            status: result.status,
+            agent_id: result.agent_id ?? result.role_id,
+            role_id: result.role_id,
+            session_id: result.session_id,
+            context_pack_ref: result.context_pack_ref,
+            memory_buffer_ref: result.memory_buffer_ref,
+            driver_run_result_id: result.driver_run_result_id,
+            artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
+            changeset_ref: selection.manifest_ref,
+            expected_sha256: selection.expected_sha256,
+          },
+          artifact_refs: [
+            result.transcript_ref.artifact_id,
+            ...result.artifact_refs.map((artifact) => artifact.artifact_id),
+          ],
+        };
       }
       const selection = await selectionState({
         context,
