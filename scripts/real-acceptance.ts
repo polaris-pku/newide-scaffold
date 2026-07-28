@@ -24,7 +24,7 @@ interface JsonRpcMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
-type Scenario = 'memory' | 'market' | 'council' | 'subagent' | 'restart';
+type Scenario = 'memory' | 'market' | 'council' | 'subagent' | 'restart' | 'resume';
 
 interface CliOptions {
   workspace: string;
@@ -69,7 +69,9 @@ for (const scenario of options.scenarios) {
         ? await runCouncilScenario()
         : scenario === 'subagent'
           ? await runSubagentScenario()
-          : await runRestartScenario();
+          : scenario === 'restart'
+            ? await runRestartScenario()
+            : await runResumeScenario();
   reports.push(report);
   await fs.writeFile(
     path.join(acceptanceDir, `${scenario}.json`),
@@ -793,6 +795,206 @@ async function runRestartScenario(): Promise<ScenarioReport> {
   };
 }
 
+/**
+ * 崩溃恢复验收：SIGKILL 打断执行中的 task，重启后端，task.resume 从 checkpoint 续跑。
+ *
+ * 与 restart 场景的区别：restart 走 run.restart（整条 run 重放，等于从头再做一遍），
+ * 这里走 task.resume（从 checkpoint 的 cursor 续跑）。两者验证的是不同的东西，
+ * 所以是两个场景而不是把 restart 改掉。
+ *
+ * 三条必须在终端上看得见的证据：
+ *   1. 被杀前已落盘的 safepoint，其 resume_cursor 已经越过 execute_agent；
+ *   2. resume 前人为删掉的 agent 产物文件，在 resume 后被 file anchor 还原；
+ *   3. 整个 task 生命周期内 agent 执行只发生过一次（没有因为 resume 而重复副作用）。
+ */
+async function runResumeScenario(): Promise<ScenarioReport> {
+  const errors: string[] = [];
+  const details: Record<string, unknown> = {};
+  const proofPath = path.join(options.workspace, 'resume-proof.txt');
+  const spec =
+    '在工作区创建或覆盖 resume-proof.txt，内容为一行 RESUME_PROOF。不要创建或修改其他文件。';
+
+  await fs.rm(proofPath, { force: true });
+
+  // ---- 阶段一：起后端、建 task、等到 safepoint 越过 execute_agent，然后 SIGKILL ----
+  const firstBackend = await startBackend('resume-first');
+  let taskId = '';
+  let interruptedRunId = '';
+  let killCursor = '';
+  try {
+    const created = await firstBackend.request<Record<string, unknown>>('task.create', {
+      spec,
+      completion_criteria: ['resume-proof.txt 内容为 RESUME_PROOF'],
+      workspace_path: options.workspace,
+      mode: 'single_agent',
+    });
+    taskId = String(asRecord(created.task)?.task_id ?? '');
+    if (!taskId) throw new Error('task.create did not return a task_id');
+    interruptedRunId = String(asRecord(created.current_run)?.run_id ?? '');
+    details.task_id = taskId;
+    log(`task created: ${taskId} (run ${interruptedRunId || 'n/a'})`);
+
+    // 等一个"真干过活"的 safepoint：cursor 已越过 execute_agent，说明 agent 产物已落盘。
+    // 250ms 轮询：kill 窗口是 safepoint 落盘到 task 跑完之间，抢得越快越可靠。
+    const pastExecute = new Set(['council', 'gate', 'deliver']);
+    const safepoint = await firstBackend.waitForTaskEvent(
+      taskId,
+      (event) => {
+        if (event.type !== 'checkpoint.saved') return false;
+        const cursor = asRecord(event.payload)?.resume_cursor;
+        return typeof cursor === 'string' && pastExecute.has(cursor);
+      },
+      runTimeoutMs,
+      250,
+    );
+    const safepointPayload = asRecord(safepoint.payload) ?? {};
+    killCursor = String(safepointPayload.resume_cursor ?? '');
+    interruptedRunId = String(safepoint.run_id ?? interruptedRunId);
+    details.kill_checkpoint_id = safepointPayload.checkpoint_id ?? null;
+    details.kill_resume_cursor = killCursor;
+    details.interrupted_run_id = interruptedRunId;
+    log(`safepoint reached at cursor=${killCursor}; sending SIGKILL`);
+
+    // 硬杀：不 flush、不落盘收尾，磁盘上留下的就是真实的崩溃现场。
+    await firstBackend.kill();
+    log('first backend SIGKILLed');
+    details.kill_signal = 'SIGKILL';
+  } catch (error) {
+    errors.push(toMessage(error));
+    await firstBackend.kill().catch(() => undefined);
+  }
+
+  if (errors.length > 0 || !taskId) {
+    return { scenario: 'resume', status: 'failed', details, errors };
+  }
+
+  // 崩溃后的产物状态：先记下来，再人为删除，用来证明 resume 真的还原了内容。
+  const proofBeforeDelete = await fs.readFile(proofPath, 'utf-8').catch(() => undefined);
+  details.proof_content_before_kill = proofBeforeDelete ?? null;
+  await fs.rm(proofPath, { force: true });
+  details.proof_deleted_before_resume = !(await pathExists(proofPath));
+  log(`deleted ${proofPath} before resume (was ${proofBeforeDelete ? 'present' : 'absent'})`);
+
+  // ---- 阶段二：重启后端，恢复中断 task，resume 续跑 ----
+  const secondBackend = await startBackend('resume-second');
+  try {
+    // 后端启动时会 recoverInterruptedTasks()，把被杀的 task 标成 blocked。
+    const recovered = await secondBackend.request<Record<string, unknown>>('task.get', {
+      task_id: taskId,
+    });
+    const recoveredTask = asRecord(recovered.task) ?? {};
+    details.status_after_restart = recoveredTask.status ?? null;
+    details.current_run_after_restart = asRecord(recovered.current_run)?.run_id ?? null;
+    if (recoveredTask.status === 'completed') {
+      // kill 窗口没抢到：task 在 SIGKILL 之前已经跑完，本次运行没有真实中断可恢复。
+      errors.push(
+        'task had already completed before the SIGKILL landed; the kill window was missed, ' +
+          'so this run proves nothing about resume. Re-run with a heavier spec.',
+      );
+    } else if (recoveredTask.status !== 'blocked') {
+      errors.push(
+        `task status after restart is ${String(recoveredTask.status)}, expected blocked ` +
+          '(recoverInterruptedTasks did not pick up the killed task)',
+      );
+    }
+    if (recovered.current_run) {
+      errors.push('current_run is still set after restart; the killed run was not closed out');
+    }
+
+    const resumed = await secondBackend.request<Record<string, unknown>>('task.resume', {
+      task_id: taskId,
+    });
+    const resumedRunId = String(asRecord(resumed.current_run)?.run_id ?? '');
+    details.resumed_run_id = resumedRunId || null;
+    log(`resumed run: ${resumedRunId || 'n/a'}`);
+    if (resumedRunId && resumedRunId === interruptedRunId) {
+      errors.push('task.resume reused the interrupted run_id');
+    }
+
+    // 证据 2：文件被 anchor 还原（在 resume 返回之后立即可见，早于新 stage 产出）。
+    const proofAfterResume = await fs.readFile(proofPath, 'utf-8').catch(() => undefined);
+    details.proof_content_after_resume = proofAfterResume ?? null;
+    if (proofBeforeDelete && !proofAfterResume) {
+      errors.push('resume did not restore resume-proof.txt from the checkpoint file anchor');
+    }
+    log(`proof after resume: ${proofAfterResume ? JSON.stringify(proofAfterResume) : 'missing'}`);
+
+    if (resumedRunId) {
+      const snapshot = await secondBackend.waitForTerminal(resumedRunId, runTimeoutMs);
+      details.resumed_run_status = snapshot.status;
+      details.resumed_run_errors = snapshot.errors ?? [];
+      if (snapshot.status !== 'completed') {
+        errors.push(`resumed run ended as ${String(snapshot.status)}`);
+      }
+    }
+
+    const finalTask = await secondBackend.request<Record<string, unknown>>('task.get', {
+      task_id: taskId,
+    });
+    details.final_task_status = asRecord(finalTask.task)?.status ?? null;
+
+    // 拉全量落盘事件，统计跨 run 的副作用次数。
+    const allEvents = await secondBackend.listTaskEvents(taskId);
+    const counts = countEventTypes(allEvents);
+    details.event_type_counts = counts;
+
+    const restoreEvent = allEvents.find((event) => event.type === 'checkpoint.workspace_restored');
+    const restorePayload = asRecord(restoreEvent?.payload) ?? {};
+    details.workspace_restore_event = restoreEvent ? restorePayload : null;
+    if (!restoreEvent) {
+      errors.push('no checkpoint.workspace_restored event was recorded for the resumed run');
+    } else if (restorePayload.status !== 'restored') {
+      errors.push(
+        `workspace restore reported status=${String(restorePayload.status)} ` +
+          `reason=${String(restorePayload.reason ?? 'n/a')}`,
+      );
+    }
+
+    // 证据 3：越过 execute_agent 之后 resume，agent 执行与投放都不应再发生一次。
+    for (const eventType of ['agent.execution_completed', 'artifact.delivered']) {
+      const count = counts[eventType] ?? 0;
+      details[`${eventType}_count`] = count;
+      if (count > 1) {
+        errors.push(
+          `${eventType} fired ${count} times across the task; ` +
+            'resume repeated a side effect instead of continuing from the cursor',
+        );
+      }
+    }
+    if ((counts['agent.execution_completed'] ?? 0) === 0) {
+      errors.push('agent.execution_completed never fired; the task never did real work');
+    }
+
+    const proofFinal = await fs.readFile(proofPath, 'utf-8').catch(() => undefined);
+    details.proof_file = proofPath;
+    details.proof_content_final = proofFinal ?? null;
+    if (!proofFinal?.includes('RESUME_PROOF')) {
+      errors.push('resume-proof.txt does not contain RESUME_PROOF after resume');
+    }
+  } catch (error) {
+    errors.push(toMessage(error));
+  } finally {
+    await secondBackend.close();
+    log('second backend stopped');
+  }
+
+  return {
+    scenario: 'resume',
+    status: errors.length === 0 ? 'passed' : 'failed',
+    details,
+    errors,
+  };
+}
+
+function countEventTypes(events: readonly Record<string, unknown>[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const event of events) {
+    if (typeof event.type !== 'string') continue;
+    counts[event.type] = (counts[event.type] ?? 0) + 1;
+  }
+  return counts;
+}
+
 interface MemoryTaskRun {
   created: { run_id: string; task_id: string };
   snapshot: Record<string, unknown>;
@@ -991,6 +1193,22 @@ interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
   subscribeAndLog(runId: string): Promise<void>;
   waitForTerminal(runId: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  /**
+   * task 的全量事件（来自 task.subscribe 回放，即已落盘的事件）。
+   *
+   * 必须走落盘回放而不是实时通知：checkpoint.saved 由 TaskProcessor 直接写 SQLite，
+   * 不经过 run registry，因此永远不会作为 task.event 实时推送出来。
+   */
+  listTaskEvents(taskId: string): Promise<Record<string, unknown>[]>;
+  /** 轮询落盘事件直到命中 predicate；返回该事件本体。 */
+  waitForTaskEvent(
+    taskId: string,
+    predicate: (event: Record<string, unknown>) => boolean,
+    timeoutMs: number,
+    pollMs?: number,
+  ): Promise<Record<string, unknown>>;
+  /** SIGKILL：模拟进程被硬杀，不给任何优雅退出的机会。 */
+  kill(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -1095,6 +1313,22 @@ async function startBackend(label: string): Promise<BackendClient> {
   await request('system.ping', {});
   log(`backend started (${label})`);
 
+  // 已在终端打印过的 task 事件，避免轮询时重复刷屏。
+  const loggedTaskEvents = new Set<string>();
+  const readTaskEvents = async (taskId: string): Promise<Record<string, unknown>[]> => {
+    const result = await request<{ replay_events?: Record<string, unknown>[] }>('task.subscribe', {
+      task_id: taskId,
+    });
+    const events = result.replay_events ?? [];
+    for (const event of events) {
+      const eventId = String(event.event_id ?? '');
+      if (!eventId || loggedTaskEvents.has(eventId)) continue;
+      loggedTaskEvents.add(eventId);
+      if (typeof event.type === 'string') log(`  task event: ${event.type}`);
+    }
+    return events;
+  };
+
   return {
     request,
     subscribeAndLog: async (runId: string) => {
@@ -1136,6 +1370,25 @@ async function startBackend(label: string): Promise<BackendClient> {
         await sleep(1_000);
       }
       throw new Error(`[${label}] run ${runId} did not reach a terminal state`);
+    },
+    listTaskEvents: readTaskEvents,
+    waitForTaskEvent: async (taskId, predicate, timeoutMs, pollMs = 1_000) => {
+      const deadline = Date.now() + timeoutMs;
+      let seen: string[] = [];
+      while (Date.now() < deadline) {
+        const events = await readTaskEvents(taskId);
+        const match = events.find((event) => predicate(event));
+        if (match) return match;
+        seen = events.map((event) => String(event.type));
+        await sleep(pollMs);
+      }
+      throw new Error(
+        `[${label}] task ${taskId} never emitted the awaited event. seen=${seen.join(',')}`,
+      );
+    },
+    kill: async () => {
+      child.kill('SIGKILL');
+      await Promise.race([closed, sleep(5_000)]);
     },
     close: async () => {
       child.stdin?.end();
@@ -1221,12 +1474,13 @@ function parseCli(args: string[]): CliOptions {
   const scenarioValue = scenarioIndex >= 0 ? (args[scenarioIndex + 1] ?? 'all') : 'all';
   const scenarios: Scenario[] =
     scenarioValue === 'all'
-      ? ['memory', 'market', 'council', 'subagent', 'restart']
+      ? ['memory', 'market', 'council', 'subagent', 'restart', 'resume']
       : scenarioValue === 'memory' ||
           scenarioValue === 'market' ||
           scenarioValue === 'council' ||
           scenarioValue === 'subagent' ||
-          scenarioValue === 'restart'
+          scenarioValue === 'restart' ||
+          scenarioValue === 'resume'
         ? [scenarioValue]
         : (() => {
             throw new Error(`Invalid --scenario value: ${scenarioValue}`);
