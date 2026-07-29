@@ -31,6 +31,7 @@ import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-stor
 import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
 import { FileRunAuditWriter } from './run-audit-writer';
+import { FileDriverStreamAuditWriter } from './driver-stream-audit-writer';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
 import { TaskProcessor } from './task-processor';
@@ -221,6 +222,7 @@ export async function createProductionBackendService(
       mailboxRecovery,
       closeRuntime,
       bMemoryService,
+      new FileDriverStreamAuditWriter(runsRoot),
     );
   } catch (error) {
     await closeRuntime().catch(() => undefined);
@@ -395,8 +397,7 @@ function assertValidMarketAgentIds(value: unknown): asserts value is readonly st
   const valid =
     agentIds.length > 0 &&
     agentIds.every(
-      (agentId) =>
-        typeof agentId === 'string' && agentId.length > 0 && agentId.trim() === agentId,
+      (agentId) => typeof agentId === 'string' && agentId.length > 0 && agentId.trim() === agentId,
     ) &&
     new Set(agentIds).size === agentIds.length;
   if (!valid) {

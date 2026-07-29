@@ -448,7 +448,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       expect(initialMessages[0]).not.toContain(negativeExperience.content);
       expect(initialMessages[0]).not.toContain(lowConfidenceExperience.content);
 
-      const prompt = JSON.parse(driver.prompts[0]!.prompt) as {
+      const prompt = parseDriverContext(driver.prompts[0]!.prompt) as {
         task_instruction: string;
         skills: Array<{ id: string; description: string; content: string }>;
         experiences: Array<{ id: string; description: string; content: string }>;
@@ -552,7 +552,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
 
     await facade.runAgent(request('task_original_instruction', 'proposer_a'));
 
-    const prompt = JSON.parse(driver.prompts[0]!.prompt) as {
+    const prompt = parseDriverContext(driver.prompts[0]!.prompt) as {
       task_instruction: string;
       experiences: Array<{ id: string; content: string }>;
     };
@@ -1119,6 +1119,10 @@ function request(taskId: string, roleId: string, workspacePath?: string) {
     session_id: 'session_existing',
     schema_version: SCHEMA_VERSION,
   };
+}
+
+function parseDriverContext(prompt: string): unknown {
+  return JSON.parse(prompt.split('\n\n---\n', 1)[0]!);
 }
 
 class CapturingDriver implements DriverRuntimeHandle {

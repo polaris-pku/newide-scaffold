@@ -57,6 +57,10 @@ import {
 } from './driver-return-converter';
 import type { DriverReturn } from '../memory/schemas';
 import type { DriverTask, DriverHandler } from '../memory/runtime/tools/invoke-driver-tool';
+import {
+  buildDriverReturnInstruction,
+  shouldWriteDriverReportFile,
+} from './driver-return-instruction';
 
 // ──────────────────────────────────────────────
 // DriverBridge 配置
@@ -212,63 +216,10 @@ export class DriverBridge {
         .join('\n\n');
     }
 
-    // 附加六字段报告格式指令
-    promptText += '\n\n---\n';
-    promptText +=
-      'After completing the task, please output a structured report in the following JSON format:\n';
-    promptText += '<<<DRIVER_RETURN>>>\n';
-    promptText += JSON.stringify(
-      {
-        artifacts: [{ type: 'patch', path: '/path/to/file', summary: 'What was changed' }],
-        summary: '3-5 sentence summary of execution',
-        decisions: [
-          {
-            point: 'Decision point description',
-            options: ['option A', 'option B'],
-            chosen: 'option A',
-            reason: 'Why this was chosen',
-          },
-        ],
-        blockers: [
-          {
-            blocker: 'Blocker description',
-            attempts: ['attempt 1', 'attempt 2'],
-            resolution: 'How it was resolved',
-            resolved: true,
-          },
-        ],
-        referenced_experiences: [
-          {
-            experience_id: 'exp_xxx',
-            applied: true,
-            effectiveness: 'fully_effective',
-            note: 'How the experience helped',
-          },
-        ],
-        assumptions: [
-          {
-            assumption: 'What was assumed',
-            risk_if_wrong: 'What happens if wrong',
-          },
-        ],
-      },
-      null,
-      2,
-    );
-    promptText += '\n<<<END_DRIVER_RETURN>>>';
-
-    if (process.env.ACP_WRITE_REPORT_FILE === '1' || process.env.ACP_WRITE_REPORT_FILE === 'true') {
-      promptText += '\n\n---\n';
-      promptText += 'FINAL STEP — After completing the task, you MUST write a report file:\n';
-      promptText += `- File name: exactly \`${taskId}_report.txt\` in the workspace root directory.\n`;
-      promptText +=
-        '- File content: a JSON object containing the six-field report. ' +
-        'The JSON MUST be the object inside the <<<DRIVER_RETURN>>> block above — ' +
-        'DO NOT include the <<<DRIVER_RETURN>>> or <<<END_DRIVER_RETURN>>> markers themselves. ' +
-        'The file MUST start with `{` and end with `}` and be valid JSON.\n';
-      promptText +=
-        '- Required fields: summary, artifacts, decisions, blockers, referenced_experiences, assumptions.';
-    }
+    promptText += `\n\n${buildDriverReturnInstruction({
+      taskId,
+      writeReportFile: shouldWriteDriverReportFile(),
+    })}`;
 
     return {
       task_id: taskId,
