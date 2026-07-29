@@ -69,7 +69,7 @@ describe('B memory evolution end to end', () => {
     await facade.runAgent(request('task_002', 'Apply the architecture lesson to the next task.'));
     await maintenance.waitForIdle();
 
-    const secondContext = JSON.parse(driver.prompts[1]!.prompt) as {
+    const secondContext = parseDriverContext(driver.prompts[1]!.prompt) as {
       experiences: Array<{ content: string }>;
     };
     expect(secondContext.experiences).toEqual(
@@ -271,6 +271,10 @@ function extractionLlm(): LlmClient {
       });
     },
   };
+}
+
+function parseDriverContext(prompt: string): unknown {
+  return JSON.parse(prompt.split('\n\n---\n', 1)[0]!);
 }
 
 function alwaysRelevantEmbedding(): EmbeddingProvider {
