@@ -16,6 +16,7 @@ import {
   type ToolCallingClient,
 } from '../src/memory';
 import type { RunSnapshot } from '../src/protocol/run-snapshot';
+import { writeFakeAcpRunnerBuild } from '../test/fixtures/fake-acp-runner-build';
 
 interface JsonRpcMessage {
   jsonrpc: '2.0';
@@ -489,6 +490,7 @@ process.stdin.on('end', () => {
 });
 `,
     );
+    writeFakeAcpRunnerBuild(directory, { importFromRunnerRoot: 'fake-driver.mjs' });
     return directory;
   } catch (error) {
     await fs.rm(directory, { recursive: true, force: true });
