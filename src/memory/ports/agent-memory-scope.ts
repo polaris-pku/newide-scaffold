@@ -46,5 +46,6 @@ export interface AgentMemoryScope {
 
   saveExperience(experience: ExperienceRecord): Promise<void>;
   saveSkill(skill: SkillRecord): Promise<void>;
+  updateSkill(skill: SkillRecord): Promise<void>;
   updateExperience(experience: ExperienceRecord): Promise<void>;
 }

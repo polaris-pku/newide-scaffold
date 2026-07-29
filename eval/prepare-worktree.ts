@@ -58,9 +58,10 @@ export async function prepareEphemeralWorktree(
 
   await runGit(sourceRepo, ['rev-parse', '--verify', `${baseCommit}^{commit}`]);
 
-  const parent =
+  const parent = path.resolve(
     options.outRoot?.trim() ||
-    path.join(getScaffoldRoot(), '.newide', 'eval-workspaces', options.runId);
+      path.join(getScaffoldRoot(), '.newide', 'eval-workspaces', options.runId),
+  );
   const worktreePath = path.join(parent, 'repo');
 
   await fs.mkdir(parent, { recursive: true });

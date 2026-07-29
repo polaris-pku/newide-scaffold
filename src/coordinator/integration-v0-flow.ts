@@ -85,6 +85,8 @@ export interface IntegrationV0Summary {
   tool_events: DriverRunResult['tool_events'];
   failure?: IntegrationV0Failure;
   worktree_path: string;
+  /** F-eval ablation tag (B0–B3); echoed for --backend-summary alignment. */
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   artifacts_materialized: number;
   files_written: string[];
   changed_files: string[];
@@ -162,6 +164,8 @@ export interface IntegrationV0Options {
   materializer?: IntegrationV0Materializer;
   worktreePath?: string;
   runsRoot?: string;
+  /** F Harness memory ablation; recorded on summary + context_pack events. */
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
@@ -204,6 +208,7 @@ export async function runIntegrationV0Flow(
   options?: IntegrationV0Options,
 ): Promise<IntegrationV0Result> {
   options?.signal?.throwIfAborted();
+  const memoryAblation = options?.memoryAblation;
   const orchestrator = new RuntimeOrchestrator({
     ...(options?.telemetry ? { telemetry: options.telemetry } : {}),
     ...(options?.onEvent ? { onEvent: options.onEvent } : {}),
@@ -340,6 +345,7 @@ export async function runIntegrationV0Flow(
         role_id: contextPack.role_profile_ref.role_id,
         memory_refs: contextPack.memory_refs.map((memoryRef) => memoryRef.memory_id),
         source: 'legacy_direct_driver',
+        ...(memoryAblation ? { ablation: memoryAblation } : {}),
       },
     });
     timeline.push({ name: 'ContextPackBuilt', id: contextEvent.event_id });
@@ -423,6 +429,7 @@ export async function runIntegrationV0Flow(
       ...(options.sessionId ? { session_id: options.sessionId } : {}),
       input_artifact_refs: contextArtifactRefs,
       context_policy: 'integration_v0_default',
+      ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
       schema_version: SCHEMA_VERSION,
     };
     const agentExecutionRequestedEvent = orchestrator.appendEvent({
@@ -459,6 +466,7 @@ export async function runIntegrationV0Flow(
         memory_buffer_ref: agentExecutionResult.memory_buffer_ref,
         context_pack_persisted: agentExecutionResult.diagnostics.context_pack_persisted,
         retrieval: agentExecutionResult.diagnostics.retrieval,
+        ...(memoryAblation ? { ablation: memoryAblation } : {}),
       },
     });
     timeline.push({ name: 'ContextPackBuilt', id: contextEvent.event_id });
@@ -1023,10 +1031,16 @@ export async function runIntegrationV0Flow(
       ? selectionResult.selected_artifacts[0]!.artifact_id
       : undefined;
 
+  // Capability-facing eval reads summary.worktree_path as the agent git workspace.
+  // Prefer workspacePath (ACP write root) over the materializer artifact directory.
+  const evalWorktreePath = options?.workspacePath
+    ? path.resolve(options.workspacePath)
+    : materializationResult.worktree_path;
+
   const mechanicalSnapshot: Checkpoint['mechanical_snapshot'] = {
     base_commit: 'demo-head',
     snapshot_commit: 'demo-head',
-    worktree_path: materializationResult.worktree_path,
+    worktree_path: evalWorktreePath,
     branch: 'integration-v0-demo',
     modified_files: deliveryChangedFiles,
   };
@@ -1165,7 +1179,8 @@ export async function runIntegrationV0Flow(
     response: driverResult.response ?? '',
     tool_events: [...driverResult.tool_events],
     ...(failure ? { failure } : {}),
-    worktree_path: materializationResult.worktree_path,
+    worktree_path: evalWorktreePath,
+    ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     artifacts_materialized: materializationResult.materialized_artifacts.length,
     files_written: materializationResult.files_written,
     changed_files: deliveryChangedFiles,

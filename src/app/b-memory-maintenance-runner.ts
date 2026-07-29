@@ -8,16 +8,21 @@ import {
   createAgentMemoryScope,
   processPendingBuffer,
   promoteExperiencesForAgent,
+  resolveMemoryAblationPolicy,
   type BufferRepository,
   type LlmClient,
+  type MemoryAblation,
   type MemoryRepository,
 } from '../memory';
+import type { SkillRecord } from '../memory/schemas';
 
 export interface BMemoryMaintenanceRequest {
   task_id: string;
   run_id: string;
   role_id: string;
   buffer_seq: number;
+  /** RFC §1.2 ablation; B2/B3 enable inline skill promotion with auto-approve. */
+  memory_ablation?: MemoryAblation;
 }
 
 export interface BSkillPromotionRequest {
@@ -169,6 +174,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     }
 
     try {
+      const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
       const result = await processPendingBuffer(memory, input.buffer_seq, {
         task: {
           task_id: input.task_id,
@@ -186,14 +192,46 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
           },
         }),
       });
+
+      let skills: SkillRecord[] = [];
+      const warnings: string[] = [];
+      if (ablationPolicy.promote_skills) {
+        const outcomes = await promoteExperiencesForAgent(
+          input.role_id,
+          this.options.repository,
+          this.options.bufferRepository,
+          this.options.llm,
+        );
+        skills = [];
+        for (const outcome of outcomes) {
+          if (!outcome.skill) continue;
+          const approved: SkillRecord = {
+            ...outcome.skill,
+            review_status: 'approved',
+          };
+          await memory.updateSkill(approved);
+          skills.push(approved);
+        }
+        if (skills.length === 0) {
+          warnings.push('Ablation B2/B3 promote ran but no eligible Experience was promoted.');
+        } else {
+          warnings.push(
+            'Ablation B2/B3 auto-approved promoted Skills so they are retrievable in subsequent tasks.',
+          );
+        }
+      }
+
       return this.persist({
         maintenance_ref: maintenanceRef,
         kind: 'experience_extraction',
         status: 'completed',
-        ...input,
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: input.role_id,
+        buffer_seq: input.buffer_seq,
         experiences: result.extraction.experiences,
-        skills: [],
-        warnings: [],
+        skills,
+        warnings,
         created_at: startedAt,
         completed_at: nowTimestamp(),
         schema_version: SCHEMA_VERSION,
@@ -203,7 +241,10 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
         maintenance_ref: maintenanceRef,
         kind: 'experience_extraction',
         status: 'failed',
-        ...input,
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: input.role_id,
+        buffer_seq: input.buffer_seq,
         experiences: [],
         skills: [],
         warnings: [],

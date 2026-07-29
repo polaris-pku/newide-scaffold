@@ -20,6 +20,8 @@ export interface CoordinatorRunRequest {
   session_id?: string;
   task_id?: string;
   task_request?: TaskCreateRequest;
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+  worktreePath?: string;
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
@@ -61,6 +63,8 @@ export class IntegrationV0CoordinatorRunner implements CoordinatorRunner {
       ...(request.session_id ? { sessionId: request.session_id } : {}),
       ...(request.task_id ? { taskId: request.task_id } : {}),
       ...(request.task_request ? { taskRequest: request.task_request } : {}),
+      ...(request.memoryAblation ? { memoryAblation: request.memoryAblation } : {}),
+      ...(request.worktreePath ? { worktreePath: request.worktreePath } : {}),
       ...(request.telemetry ? { telemetry: request.telemetry } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(request.onDriverEvent ? { onDriverEvent: request.onDriverEvent } : {}),

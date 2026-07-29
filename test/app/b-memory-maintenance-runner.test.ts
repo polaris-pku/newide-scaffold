@@ -180,6 +180,45 @@ describe('BMemoryMaintenanceRunner', () => {
     ]);
   });
 
+  it('auto-approves Skills when processing Buffer under ablation B2', async () => {
+    const { runner, repository, bufferRepository } = await fixture();
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_b2');
+
+    const result = await runner.processBuffer({
+      task_id: 'task_b2',
+      run_id: 'run_b2',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+      memory_ablation: 'B2',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.skills).toEqual([
+      expect.objectContaining({ review_status: 'approved' }),
+    ]);
+    await expect(repository.listSkills('role_ts_engineer')).resolves.toMatchObject([
+      { review_status: 'approved' },
+    ]);
+  });
+
+  it('does not promote Skills when processing Buffer under ablation B1', async () => {
+    const { runner, repository, bufferRepository } = await fixture();
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_b1');
+
+    const result = await runner.processBuffer({
+      task_id: 'task_b1',
+      run_id: 'run_b1',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+      memory_ablation: 'B1',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.skills).toEqual([]);
+    await expect(repository.listSkills('role_ts_engineer')).resolves.toEqual([]);
+    await expect(repository.listExperiences('role_ts_engineer')).resolves.toHaveLength(1);
+  });
+
   it('waits for an in-flight explicit Skill promotion role operation', async () => {
     let calls = 0;
     let markPromotionStarted!: () => void;

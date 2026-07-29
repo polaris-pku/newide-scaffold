@@ -1,0 +1,12 @@
+{
+  "dataset_version": "cooperbench-hf-v1",
+  "dataset_dir": "../CooperBench/dataset",
+  "cooperbench_root": "../CooperBench",
+  "default_subset": "v0-smoke",
+  "subsets": {
+    "v0-smoke": "eval/cooperbench/datasets/v0-smoke.json",
+    "core": "eval/cooperbench/datasets/core.json"
+  },
+  "default_setting": "coop",
+  "default_model_name": "unspecified"
+}

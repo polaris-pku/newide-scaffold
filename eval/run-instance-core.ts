@@ -149,6 +149,7 @@ export async function runEvalInstance(options: RunInstanceOptions): Promise<RunI
       harness = await runSweEvoHarnessAdapter({
         predictionsPath,
         runId,
+        datasetPath,
         ...(options.outRoot ? { outRoot: options.outRoot } : {}),
         ...(options.sweEvoRoot ? { sweEvoRoot: options.sweEvoRoot } : {}),
         ...(options.harnessMaxWorkers ? { maxWorkers: options.harnessMaxWorkers } : {}),

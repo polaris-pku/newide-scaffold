@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { AppRunEvent } from '../../src/app/run-registry';
 import type { TaskSnapshot } from '../../src/protocol/task-snapshot';
+import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
 
 describe('Task-first JSON-RPC child process acceptance', () => {
   it('runs create and autonomous Council under one durable Task', async () => {
@@ -527,13 +528,14 @@ process.stdin.on('data', chunk => body += chunk);
 process.stdin.on('end', () => {
   const input = JSON.parse(body);
   const created_at = new Date().toISOString();
-  const councilRole = String(input.workspace_path || '').includes('.newide/council');
+  const councilRole = String(input.workspace_path || '').replaceAll('\\\\', '/').includes('.newide/council');
   const suffix = createHash('sha256').update(JSON.stringify([input.task_id, input.workspace_path, input.prompt, input.instruction, input.agent_id])).digest('hex').slice(0, 16);
   const artifact = { artifact_id: 'artifact_' + suffix, type: councilRole ? 'diff' : 'driver_result', uri: 'artifact://fake/result', producer_id: 'fake-acp', task_id: input.task_id, ...(councilRole ? { content: { kind: 'text', content_ref: 'data:text/plain,COUNCIL_FINAL%0A', target_path: 'council-output.txt', media_type: 'text/plain' } } : {}), created_at, schema_version: input.schema_version };
   process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: 'session_fake', status: 'succeeded', response: 'Fake ACP completed.', artifacts: [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
 });
 `,
   );
+  writeFakeAcpRunnerBuild(runnerDir, { importFromRunnerRoot: 'fake.mjs' });
   expect(existsSync(path.join(runnerDir, 'fake.mjs'))).toBe(true);
 }
 
@@ -567,4 +569,5 @@ process.stdin.on('end', () => {
 process.stdout.on('error', () => process.exit(0));
 `,
   );
+  writeFakeAcpRunnerBuild(runnerDir, { importFromRunnerRoot: 'fake.mjs' });
 }

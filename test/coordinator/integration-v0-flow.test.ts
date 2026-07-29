@@ -1273,6 +1273,7 @@ describe('runIntegrationV0Flow', () => {
       outcome: 'failed',
       changed_files: ['index.html', 'style.css'],
       failure: { code: 'DRIVER_FAILED' },
+      worktree_path: path.resolve(workspacePath),
     });
     expect(result.materialization_result.changed_files).toEqual([]);
     expect(result.frontend_snapshot.delivery_report.changed_files).toEqual([
@@ -1280,6 +1281,21 @@ describe('runIntegrationV0Flow', () => {
       'style.css',
     ]);
     expect(result.result_manifest.changed_files).toEqual(['index.html', 'style.css']);
+  });
+
+  it('binds summary.worktree_path to workspacePath for capability-facing eval', async () => {
+    const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-eval-workspace-'));
+    createdWorkspaceDirs.add(workspacePath);
+    const result = await runFlow({ workspacePath });
+
+    expect(result.summary.worktree_path).toBe(path.resolve(workspacePath));
+    expect(result.summary.worktree_path).not.toBe(result.materialization_result.worktree_path);
+
+    const checkpointPath = `.newide/runs/${result.run_id}/checkpoint.json`;
+    const checkpoint = JSON.parse(await fs.readFile(checkpointPath, 'utf-8')) as {
+      mechanical_snapshot: { worktree_path: string };
+    };
+    expect(checkpoint.mechanical_snapshot.worktree_path).toBe(path.resolve(workspacePath));
   });
 
   it('should use real mailbox send/ack mechanism', async () => {
