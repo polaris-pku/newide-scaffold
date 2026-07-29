@@ -193,7 +193,6 @@ export function createProductionStageExecutors(
           context.run_id,
           context.task_id,
           { primary: { result }, selection },
-          context.restarted_from_run_id,
         );
         emit(context, 'agent.execution_completed', result.agent_run_id, {
           agent_id: result.agent_id ?? result.role_id,
