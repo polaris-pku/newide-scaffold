@@ -293,10 +293,6 @@ function extractionLlm(): LlmClient {
   };
 }
 
-function parseDriverContext(prompt: string): unknown {
-  return JSON.parse(prompt.split('\n\n---\n', 1)[0]!);
-}
-
 function alwaysRelevantEmbedding(): EmbeddingProvider {
   return {
     dimensions: 4,
