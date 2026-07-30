@@ -12,6 +12,11 @@ import {
   readArtifactBytes,
 } from '../../coordinator/artifact-content';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../../protocol/agent-execution';
+import type { CouncilParticipantResolver } from '../council-participant-resolver';
+import type {
+  CouncilParticipantBinding,
+  CouncilSeat,
+} from '../council-participant';
 import type {
   CouncilDecision,
   CouncilExecutionOptions,
@@ -38,7 +43,7 @@ export class CouncilRoleExecutionError extends Error {
 
   constructor(
     readonly council_phase: CouncilPhase,
-    readonly role_id: string,
+    readonly participant: CouncilParticipantBinding,
     readonly agent_status: AgentExecutionResult['status'],
     readonly agent_run_id?: string,
     readonly driver_run_result_id?: string,
@@ -52,7 +57,7 @@ export class CouncilRoleExecutionError extends Error {
     return {
       phase: this.phase,
       council_phase: this.council_phase,
-      role_id: this.role_id,
+      ...participantAuditPayload(this.participant),
       agent_status: this.agent_status,
       ...(this.agent_run_id ? { agent_run_id: this.agent_run_id } : {}),
       ...(this.driver_run_result_id ? { driver_run_result_id: this.driver_run_result_id } : {}),
@@ -62,15 +67,18 @@ export class CouncilRoleExecutionError extends Error {
 
 export interface SynthesisAgentCouncilProviderOptions {
   agentExecutionFacade: AgentExecutionFacade;
+  participantResolver?: CouncilParticipantResolver;
   councilRoot?: string;
 }
 
 export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private readonly agentExecutionFacade: AgentExecutionFacade;
+  private readonly participantResolver: CouncilParticipantResolver | undefined;
   private readonly councilRoot: string;
 
   constructor(options: SynthesisAgentCouncilProviderOptions) {
     this.agentExecutionFacade = options.agentExecutionFacade;
+    this.participantResolver = options.participantResolver;
     this.councilRoot = options.councilRoot ?? '.newide/council';
   }
 
@@ -79,31 +87,35 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
     const executionRunId = input.run_id ?? createId('run');
+    const participants = await this.resolveParticipants(input, executionRunId);
+    const proposers = participants
+      .filter((participant) => participant.seat === 'proposer')
+      .sort((left, right) => left.seat_index - right.seat_index);
+    const reviewerParticipant = requireSeat(participants, 'reviewer');
+    const synthesizerParticipant = requireSeat(participants, 'synthesizer');
     const councilDir = path.join(this.councilRoot, executionRunId);
     const generatedResults: AgentExecutionResult[] = [];
     const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];
 
-    for (const [roleId, label] of [
-      ['proposer_a', 'A'],
-      ['proposer_b', 'B'],
-    ] as const) {
+    for (const participant of proposers) {
+      const label = String.fromCharCode(65 + participant.seat_index);
       const result = await this.tryRunRole(
         input,
         executionRunId,
-        roleId,
+        participant,
         `Produce proposal ${label} for: ${input.question}. Work only in this isolated role workspace and create a concrete candidate file.`,
         input.evidence_pack?.artifact_refs ?? [],
         'proposal',
-        path.join(councilDir, roleId),
+        participantWorkspace(councilDir, participant),
         options,
         diagnosticRefs,
       );
       if (!result) continue;
       generatedResults.push(result);
-      const proposal = buildProposal(input, result);
+      const proposal = buildProposal(input, participant, result);
       generatedProposals.push(proposal);
-      await emitLifecycle(options, completedProposalEvent(proposal, result));
+      await emitLifecycle(options, completedProposalEvent(proposal, participant, result));
     }
 
     const proposals = [...input.proposals, ...generatedProposals];
@@ -111,12 +123,12 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       ...(input.candidate_artifacts ?? []),
       ...generatedResults.flatMap((result) => result.artifact_refs),
     ];
-    const reviewerWorkspace = path.join(councilDir, 'reviewer');
+    const reviewerWorkspace = participantWorkspace(councilDir, reviewerParticipant);
     await stageArtifacts(reviewerWorkspace, candidateArtifacts);
     const reviewer = await this.tryRunRole(
       input,
       executionRunId,
-      'reviewer',
+      reviewerParticipant,
       buildReviewerInstruction(input.question, proposals),
       proposals.flatMap((proposal) => proposal.artifact_refs),
       'review',
@@ -125,15 +137,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       diagnosticRefs,
     );
     if (reviewer) generatedResults.push(reviewer);
-    const reviews = buildReviews(proposals, reviewer);
+    const reviews = buildReviews(proposals, reviewerParticipant, reviewer);
     if (reviewer) {
       await emitLifecycle(options, {
         type: 'council.review.completed',
         payload: {
-          role_id: reviewer.role_id,
+          ...participantAuditPayload(reviewerParticipant),
           agent_run_id: reviewer.agent_run_id,
           driver_run_result_id: reviewer.driver_run_result_id,
-          agent_id: reviewer.agent_id,
           context_pack_ref: reviewer.context_pack_ref,
           memory_buffer_ref: reviewer.memory_buffer_ref,
           session_id: reviewer.session_id,
@@ -144,7 +155,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       });
     }
 
-    const synthesizerWorkspace = path.join(councilDir, 'synthesizer');
+    const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
     await stageArtifacts(synthesizerWorkspace, candidateArtifacts);
     await fs.mkdir(synthesizerWorkspace, { recursive: true });
     await fs.writeFile(
@@ -158,7 +169,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       synthesizer = await this.tryRunRole(
         input,
         executionRunId,
-        'synthesizer',
+        synthesizerParticipant,
         buildSynthesisInstruction(input.question, round),
         proposals.flatMap((proposal) => proposal.artifact_refs),
         'synthesis',
@@ -171,16 +182,15 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     }
 
     const synthesis = synthesizer
-      ? buildSynthesis(input, proposals, reviews, synthesizer)
+      ? buildSynthesis(input, proposals, reviews, synthesizerParticipant, synthesizer)
       : undefined;
     if (synthesis && synthesizer) {
       await emitLifecycle(options, {
         type: 'council.synthesis.completed',
         payload: {
-          role_id: synthesizer.role_id,
+          ...participantAuditPayload(synthesizerParticipant),
           agent_run_id: synthesizer.agent_run_id,
           driver_run_result_id: synthesizer.driver_run_result_id,
-          agent_id: synthesizer.agent_id,
           context_pack_ref: synthesizer.context_pack_ref,
           memory_buffer_ref: synthesizer.memory_buffer_ref,
           session_id: synthesizer.session_id,
@@ -201,6 +211,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       council_run_id: createId('council_run'),
       ...(input.run_id ? { run_id: input.run_id } : {}),
       task_id: input.task_id,
+      participants,
       proposals,
       reviews,
       ...(synthesis ? { synthesis } : {}),
@@ -217,7 +228,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private async tryRunRole(
     input: CouncilRoundInput,
     executionRunId: string,
-    roleId: string,
+    participant: CouncilParticipantBinding,
     instruction: string,
     inputArtifactRefs: string[],
     phase: CouncilPhase,
@@ -229,7 +240,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       return await this.runRole(
         input,
         executionRunId,
-        roleId,
+        participant,
         instruction,
         inputArtifactRefs,
         phase,
@@ -239,7 +250,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     } catch (error) {
       if (options?.signal?.aborted) throw error;
       if (!(error instanceof CouncilRoleExecutionError)) throw error;
-      diagnosticRefs.push(`${error.code}:${roleId}`);
+      diagnosticRefs.push(`${error.code}:${participant.participant_id}`);
       return undefined;
     }
   }
@@ -247,7 +258,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private async runRole(
     input: CouncilRoundInput,
     executionRunId: string,
-    roleId: string,
+    participant: CouncilParticipantBinding,
     instruction: string,
     inputArtifactRefs: string[] = input.evidence_pack?.artifact_refs ?? [],
     phase: CouncilPhase,
@@ -261,11 +272,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         {
           task_id: input.task_id,
           run_id: executionRunId,
-          role_id: roleId,
+          role_id: participant.agent_id,
+          participant_id: participant.participant_id,
+          council_seat: participant.seat,
+          council_seat_index: participant.seat_index,
           instruction,
           workspace_path: workspacePath,
           input_artifact_refs: inputArtifactRefs,
-          context_policy: 'council_synthesis_default',
+          context_policy: `council_${participant.seat}`,
           schema_version: SCHEMA_VERSION,
         },
         options?.signal || options?.onDriverEvent
@@ -277,7 +291,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       );
     } catch (error) {
       if (options?.signal?.aborted) throw error;
-      const failure = new CouncilRoleExecutionError(phase, roleId, 'failed');
+      const failure = new CouncilRoleExecutionError(phase, participant, 'failed');
       await emitFailureLifecycle(options, failure);
       throw failure;
     }
@@ -285,7 +299,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     if (result.status !== 'completed') {
       const failure = new CouncilRoleExecutionError(
         phase,
-        roleId,
+        participant,
         result.status,
         result.agent_run_id,
         result.driver_run_result_id,
@@ -295,19 +309,41 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     }
     return result;
   }
+
+  private async resolveParticipants(
+    input: CouncilRoundInput,
+    executionRunId: string,
+  ): Promise<CouncilParticipantBinding[]> {
+    const participants =
+      input.participants ??
+      (await this.participantResolver?.resolve({
+        run_id: executionRunId,
+        task_id: input.task_id,
+        question: input.question,
+        ...(input.participant_profile_refs
+          ? { participant_profile_refs: input.participant_profile_refs }
+          : {}),
+      }));
+    if (!participants) {
+      throw new Error(
+        'Council participants are required; configure a participant resolver or pass explicit bindings',
+      );
+    }
+    return validateParticipants(participants);
+  }
 }
 
 function completedProposalEvent(
   proposal: Proposal,
+  participant: CouncilParticipantBinding,
   result: AgentExecutionResult,
 ): CouncilLifecycleEvent {
   return {
     type: 'council.proposal.completed',
     payload: {
-      role_id: result.role_id,
+      ...participantAuditPayload(participant),
       agent_run_id: result.agent_run_id,
       driver_run_result_id: result.driver_run_result_id,
-      agent_id: result.agent_id,
       context_pack_ref: result.context_pack_ref,
       memory_buffer_ref: result.memory_buffer_ref,
       session_id: result.session_id,
@@ -345,12 +381,85 @@ function failureCode(phase: CouncilPhase): CouncilRoleFailureCode {
   return 'COUNCIL_SYNTHESIS_FAILED';
 }
 
-function buildProposal(input: CouncilRoundInput, result: AgentExecutionResult): Proposal {
+function validateParticipants(
+  input: readonly CouncilParticipantBinding[],
+): CouncilParticipantBinding[] {
+  const participants = input.map((participant) => ({
+    ...participant,
+    ...(participant.conflict_flags
+      ? { conflict_flags: [...participant.conflict_flags] }
+      : {}),
+  }));
+  const participantIds = new Set<string>();
+  for (const participant of participants) {
+    if (!/^[A-Za-z0-9_-]+$/.test(participant.participant_id)) {
+      throw new Error(`Invalid Council participant_id: ${participant.participant_id}`);
+    }
+    if (!participant.agent_id.trim()) {
+      throw new Error('Council participant agent_id must not be empty');
+    }
+    if (!Number.isInteger(participant.seat_index) || participant.seat_index < 0) {
+      throw new Error(`Invalid Council seat_index for ${participant.participant_id}`);
+    }
+    if (participantIds.has(participant.participant_id)) {
+      throw new Error(`Duplicate Council participant_id: ${participant.participant_id}`);
+    }
+    participantIds.add(participant.participant_id);
+  }
+  const proposers = participants.filter((participant) => participant.seat === 'proposer');
+  if (proposers.length !== 2 || new Set(proposers.map((item) => item.seat_index)).size !== 2) {
+    throw new Error('Council requires exactly two distinct proposer seats');
+  }
+  for (const seat of ['reviewer', 'synthesizer'] as const) {
+    if (participants.filter((participant) => participant.seat === seat).length !== 1) {
+      throw new Error(`Council requires exactly one ${seat} seat`);
+    }
+  }
+  return participants;
+}
+
+function requireSeat(
+  participants: readonly CouncilParticipantBinding[],
+  seat: Exclude<CouncilSeat, 'proposer'>,
+): CouncilParticipantBinding {
+  return participants.find((participant) => participant.seat === seat)!;
+}
+
+function participantWorkspace(
+  councilDir: string,
+  participant: CouncilParticipantBinding,
+): string {
+  return path.join(councilDir, participant.participant_id);
+}
+
+function participantAuditPayload(
+  participant: CouncilParticipantBinding,
+): Record<string, unknown> {
+  return {
+    participant_id: participant.participant_id,
+    seat: participant.seat,
+    council_seat: participant.seat,
+    seat_index: participant.seat_index,
+    agent_id: participant.agent_id,
+    ...(participant.role_profile_ref
+      ? { role_profile_ref: participant.role_profile_ref }
+      : {}),
+    ...(participant.conflict_flags
+      ? { conflict_flags: participant.conflict_flags }
+      : {}),
+  };
+}
+
+function buildProposal(
+  input: CouncilRoundInput,
+  participant: CouncilParticipantBinding,
+  result: AgentExecutionResult,
+): Proposal {
   return {
     proposal_id: createId('proposal'),
     ...(input.run_id ? { run_id: input.run_id } : {}),
     task_id: input.task_id,
-    agent_id: result.role_id,
+    agent_id: result.agent_id ?? participant.agent_id,
     artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
     summary: result.response?.trim() || `${result.role_id} generated a council proposal.`,
     claims: [],
@@ -367,6 +476,7 @@ function buildProposal(input: CouncilRoundInput, result: AgentExecutionResult): 
 
 function buildReviews(
   proposals: readonly Proposal[],
+  participant: CouncilParticipantBinding,
   result: AgentExecutionResult | undefined,
 ): Review[] {
   const parsed = result ? parseReviewPayload(result.response) : undefined;
@@ -376,7 +486,7 @@ function buildReviews(
       return {
         review_id: createId('review'),
         proposal_id: proposal.proposal_id,
-        reviewer_id: result?.role_id ?? 'reviewer',
+        reviewer_id: result?.agent_id ?? participant.agent_id,
         verdict: 'needs_revision',
         reason: result
           ? 'Reviewer did not return a valid structured review for this proposal.'
@@ -390,7 +500,7 @@ function buildReviews(
     return {
       review_id: createId('review'),
       proposal_id: proposal.proposal_id,
-      reviewer_id: result?.role_id ?? 'reviewer',
+      reviewer_id: result?.agent_id ?? participant.agent_id,
       verdict: item.verdict,
       reason: item.reason,
       unmet_criteria: [...item.unmet_criteria],
@@ -405,13 +515,14 @@ function buildSynthesis(
   input: CouncilRoundInput,
   proposals: Proposal[],
   reviews: Review[],
+  participant: CouncilParticipantBinding,
   result: AgentExecutionResult,
 ): CouncilSynthesis {
   return {
     synthesis_id: createId('council_synthesis'),
     ...(input.run_id ? { run_id: input.run_id } : {}),
     task_id: input.task_id,
-    synthesizer_id: result.role_id,
+    synthesizer_id: result.agent_id ?? participant.agent_id,
     input_proposal_ids: proposals.map((proposal) => proposal.proposal_id),
     input_review_ids: reviews.map((review) => review.review_id),
     artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),

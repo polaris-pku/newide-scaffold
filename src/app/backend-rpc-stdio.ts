@@ -10,7 +10,10 @@ import type { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runner';
 import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
-import { SynthesisAgentCouncilProvider } from '../council';
+import {
+  AgentBoardCouncilParticipantResolver,
+  SynthesisAgentCouncilProvider,
+} from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
 import {
   LiteLLMClientAdapter,
@@ -185,7 +188,14 @@ export async function createProductionBackendService(
       driver,
       agentExecutionFacade,
       selectAgentHandler,
-      councilProvider: new SynthesisAgentCouncilProvider({ agentExecutionFacade }),
+      councilProvider: new SynthesisAgentCouncilProvider({
+        agentExecutionFacade,
+        participantResolver: new AgentBoardCouncilParticipantResolver({
+          boardQuery: bCapabilities.boardQuery,
+          allowedAgentIds: bRuntime.market_agent_ids,
+          ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
+        }),
+      }),
     });
     const bMemoryService = new BMemoryBackendService(bCapabilities);
 

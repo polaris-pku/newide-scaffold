@@ -98,6 +98,7 @@ export const runSnapshotSchema = z
         required_next_actions: z.array(z.string()),
         blocked_by: z.array(z.string()),
         can_create_merge_authorization: z.boolean(),
+        participants: z.array(recordSchema).optional(),
         proposals: z.array(recordSchema).optional(),
         reviews: z.array(recordSchema).optional(),
         synthesis: recordSchema.optional(),

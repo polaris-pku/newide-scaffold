@@ -156,6 +156,7 @@ export interface FrontendRunSnapshot {
     risk_signals: string[];
     selected_artifact_refs: string[];
     can_create_merge_authorization: boolean;
+    participants: NonNullable<CouncilRunResult['participants']>;
     proposals: CouncilRunResult['proposals'];
     reviews: CouncilRunResult['reviews'];
     synthesis?: CouncilRunResult['synthesis'];
@@ -262,6 +263,7 @@ export function buildFrontendRunSnapshot(
             selected_artifact_refs: [...(input.summary.council_selected_artifact_refs ?? [])],
             can_create_merge_authorization:
               input.summary.council_can_create_merge_authorization ?? false,
+            participants: [...(input.council_run_result?.participants ?? [])],
             proposals: [...(input.council_run_result?.proposals ?? [])],
             reviews: [...(input.council_run_result?.reviews ?? [])],
             ...(input.council_run_result?.synthesis

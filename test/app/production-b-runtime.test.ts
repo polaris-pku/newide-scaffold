@@ -31,14 +31,7 @@ describe('createProductionBRuntime', () => {
     expect(runtime.app_state_root).toBe(appStateRoot);
     expect(runtime.market_agent_ids).toEqual(['role_fullstack_engineer', 'role_ts_engineer']);
     expect(new Set(await runtime.repository.listAgentIds())).toEqual(
-      new Set([
-        'proposer_a',
-        'proposer_b',
-        'reviewer',
-        'role_fullstack_engineer',
-        'role_ts_engineer',
-        'synthesizer',
-      ]),
+      new Set(['role_fullstack_engineer', 'role_ts_engineer']),
     );
     await expect(runtime.repository.getAgent('role_fullstack_engineer')).resolves.toMatchObject({
       tags: expect.arrayContaining(['market_eligible']),
