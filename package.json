@@ -26,6 +26,14 @@
     "eval:smoke": "tsx eval/run-smoke.ts",
     "eval:sweevo-harness": "tsx eval/run-sweevo-harness.ts",
     "eval:record-harness": "tsx eval/record-harness-result.ts",
+    "eval:cooperbench-case": "tsx eval/cooperbench/run-case.ts",
+    "eval:cooperbench-smoke": "tsx eval/cooperbench/run-smoke.ts",
+    "eval:cooperbench-harness": "tsx eval/cooperbench/run-harness.ts",
+    "eval:cooperbench-record": "tsx eval/cooperbench/record-harness-result.ts",
+    "eval:verify-backend-contract": "tsx eval/scripts/verify-backend-contract.ts",
+    "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
+    "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
+    "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
     "prepare": "husky"
   },
   "lint-staged": {

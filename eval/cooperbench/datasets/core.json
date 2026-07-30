@@ -1,0 +1,23 @@
+{
+  "subset_id": "core",
+  "description": "Pinned CooperBench core 10-pair subset (RFC §2 P1-A / official core).",
+  "source_dataset_version": "cooperbench-core",
+  "selection_rule": "Mirror of CooperBench dataset/subsets/core.json feature pairs.",
+  "environment_notes": [
+    "Requires sibling CooperBench checkout with prepared dataset/.",
+    "Use for short coordination comparisons after v0-smoke is green."
+  ],
+  "default_setting": "coop",
+  "case_ids": [
+    "dottxt_ai_outlines_task__1655__f1_f3",
+    "dspy_task__8563__f1_f4",
+    "go_chi_task__27__f3_f4",
+    "llama_index_task__17244__f5_f6",
+    "openai_tiktoken_task__0__f4_f8",
+    "pallets_click_task__2800__f1_f4",
+    "pallets_jinja_task__1559__f5_f8",
+    "pallets_jinja_task__1621__f6_f10",
+    "react_hook_form_task__153__f2_f6",
+    "typst_task__6554__f2_f6"
+  ]
+}

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { describe, expect, it } from 'vitest';
+import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
 
 const postgresUrl = process.env.MEMORY_PG_TEST_URL?.trim();
 const describePostgres = postgresUrl ? describe : describe.skip;
@@ -27,6 +28,7 @@ describePostgres('backend RPC PostgreSQL acceptance', () => {
           scripts: { 'driver:run': 'node --eval "process.exit(0)"' },
         }),
       );
+      writeFakeAcpRunnerBuild(runnerDir);
 
       child = spawn(
         process.execPath,

@@ -11,6 +11,8 @@ export interface IntegrationV0CliOptions {
   councilProviderMode: IntegrationV0CouncilProviderMode;
   externalDriverTimeoutMs?: number;
   driverPrompt: string;
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+  worktreePath?: string;
 }
 
 const DEFAULT_PROMPT = 'Produce a mock patch artifact for integration v0 test';
@@ -52,6 +54,16 @@ export function parseIntegrationV0CliArgs(args: string[]): IntegrationV0CliOptio
       continue;
     }
 
+    if (arg === '--ablation' || arg === '--worktree-path') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('--')) {
+        throw new Error(`${arg} requires a value`);
+      }
+      parsed.set(arg, value);
+      index += 1;
+      continue;
+    }
+
     parsed.set(arg, true);
   }
 
@@ -60,11 +72,15 @@ export function parseIntegrationV0CliArgs(args: string[]): IntegrationV0CliOptio
     parsed.get('--external-driver-timeout-ms'),
     '--external-driver-timeout-ms',
   );
+  const memoryAblation = readMemoryAblation(parsed.get('--ablation'));
+  const worktreePath = readOptionalString(parsed.get('--worktree-path'));
   return {
     enableCouncil: Boolean(parsed.get('--enable-council')) || councilProviderMode !== 'mock',
     useExternalDriver: Boolean(parsed.get('--external-driver')),
     councilProviderMode,
     ...(externalDriverTimeoutMs !== undefined ? { externalDriverTimeoutMs } : {}),
+    ...(memoryAblation ? { memoryAblation } : {}),
+    ...(worktreePath ? { worktreePath } : {}),
     driverPrompt: positional[0] ?? DEFAULT_PROMPT,
   };
 }
@@ -93,4 +109,24 @@ function readPositiveInteger(
     throw new Error(`${label} must be a positive integer`);
   }
   return parsed;
+}
+
+function readMemoryAblation(
+  value: string | boolean | undefined,
+): 'B0' | 'B1' | 'B2' | 'B3' | undefined {
+  if (value === undefined || value === false) {
+    return undefined;
+  }
+  if (value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3') {
+    return value;
+  }
+  throw new Error(`Unsupported --ablation: ${String(value)} (expected B0|B1|B2|B3)`);
+}
+
+function readOptionalString(value: string | boolean | undefined): string | undefined {
+  if (value === undefined || value === false || typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }

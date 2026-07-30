@@ -1,11 +1,17 @@
 {
   "bench": "SWE-bench Verified",
-  "source_parquet": "D:\\SWE-bench-Verified\\test.parquet",
+  "source_parquet": "../SWE-bench-Verified/test.parquet",
   "rfc_repo_quota": {
     "django/django": 9,
     "scikit-learn/scikit-learn": 9,
     "psf/requests": 6,
     "pallets/flask": 6
+  },
+  "effective_repo_quota": {
+    "django/django": 9,
+    "scikit-learn/scikit-learn": 9,
+    "psf/requests": 6,
+    "pallets/flask": 1
   },
   "rfc_tier_quota": {
     "easy": 10,
@@ -16,7 +22,7 @@
     "django/django": 227,
     "pallets/flask": 1,
     "psf/requests": 8,
-    "scikit-learn/scikit-learn": 31
+    "scikit-learn/scikit-learn": 17
   },
   "pool_available_by_repo_tier": {
     "django/django|easy": 90,
@@ -25,11 +31,29 @@
     "pallets/flask|easy": 1,
     "psf/requests|easy": 6,
     "psf/requests|medium": 2,
-    "scikit-learn/scikit-learn|easy": 12,
+    "scikit-learn/scikit-learn|easy": 7,
     "scikit-learn/scikit-learn|hard": 1,
-    "scikit-learn/scikit-learn|medium": 18
+    "scikit-learn/scikit-learn|medium": 9
   },
   "excluded_lt_30_words": 5,
+  "hard_excluded_native_ext": [
+    "scikit-learn__scikit-learn-13124",
+    "scikit-learn__scikit-learn-13135",
+    "scikit-learn__scikit-learn-13142",
+    "scikit-learn__scikit-learn-13328",
+    "scikit-learn__scikit-learn-13439",
+    "scikit-learn__scikit-learn-14053",
+    "scikit-learn__scikit-learn-14087",
+    "scikit-learn__scikit-learn-14629",
+    "scikit-learn__scikit-learn-14894",
+    "scikit-learn__scikit-learn-14983",
+    "scikit-learn__scikit-learn-15100",
+    "scikit-learn__scikit-learn-25747",
+    "scikit-learn__scikit-learn-25931",
+    "scikit-learn__scikit-learn-26323"
+  ],
+  "solo_smoke_excluded": [],
+  "solo_smoke_filter": "deferred_pending_harness",
   "selected_count": 30,
   "selected_by_repo": {
     "django/django": 14,
@@ -50,12 +74,12 @@
       "pallets/flask": 5
     },
     "notes": [
-      "SWE-bench Verified 中 pallets/flask 仅 1 条，无法满足 RFC flask×6。",
-      "psf/requests 仅 8 条，可满足 requests×6。",
-      "solo Driver 冒烟剔除（地板效应）需跑 harness 后才能落地，本草案未执行。",
-      "python:3.10-slim 原生依赖剔除目前仅软标记 soft_flags，未强排除。"
+      "Freeze policy: accept flask Verified inventory=1; django/sklearn top-up to 30.",
+      "Hard-excluded may_need_native_ext for python:3.10-slim target.",
+      "solo Driver smoke floor-effect filter deferred until harness results are written to eval/data/solo-smoke-results.jsonl."
     ]
   },
-  "list_status": "draft_provisional",
-  "blocker_for_formal_list": "flask Verified 库存不足（1 < 6）；正式清单需组长确认是否改配额或换数据源。"
+  "list_status": "frozen_adapted_v1",
+  "decision": "eval/datasets/verified-30.DECISION.md",
+  "blocker_for_formal_list": null
 }

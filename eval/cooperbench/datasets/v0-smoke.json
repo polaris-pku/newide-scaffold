@@ -1,0 +1,13 @@
+{
+  "subset_id": "v0-smoke",
+  "description": "Minimal CooperBench smoke slice (2 pairs from core) for F-eval §2 P1-A pipeline validation.",
+  "source_dataset_version": "cooperbench-core",
+  "selection_rule": "First two pairs from CooperBench dataset/subsets/core.json.",
+  "environment_notes": [
+    "Requires sibling CooperBench checkout with prepared dataset/.",
+    "Real harness needs Docker (or Modal/GCP) via cooperbench eval.",
+    "stub/oracle write predictions + log layout without Docker."
+  ],
+  "default_setting": "coop",
+  "case_ids": ["dottxt_ai_outlines_task__1655__f1_f3", "openai_tiktoken_task__0__f4_f8"]
+}

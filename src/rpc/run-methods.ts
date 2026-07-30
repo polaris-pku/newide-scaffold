@@ -36,6 +36,7 @@ const createParamsSchema = z
     project_id: z.string().min(1).optional(),
     client_task_id: z.string().min(1).optional(),
     title: z.string().min(1).optional(),
+    memory_ablation: z.enum(['B0', 'B1', 'B2', 'B3']).optional(),
   })
   .strict();
 const runIdParamsSchema = z.object({ run_id: z.string().min(1) }).strict();
@@ -136,5 +137,6 @@ function compactCreateParams(input: z.infer<typeof createParamsSchema>): RunCrea
     ...(input.project_id ? { project_id: input.project_id } : {}),
     ...(input.client_task_id ? { client_task_id: input.client_task_id } : {}),
     ...(input.title ? { title: input.title } : {}),
+    ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
   };
 }
