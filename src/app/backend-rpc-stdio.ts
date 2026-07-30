@@ -27,7 +27,7 @@ import { RunRpcMethods } from '../rpc/run-methods';
 import { TaskRpcMethods } from '../rpc/task-methods';
 import { MailboxRpcMethods } from '../rpc/mailbox-methods';
 import { MemoryRpcMethods } from '../rpc/memory-methods';
-import { SqliteCoordinationStore } from '../persistence';
+import { FileRunEvidenceStore, SqliteCoordinationStore } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
 import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
 import { NewideBackendService } from './newide-backend-service';
@@ -47,6 +47,8 @@ import {
 } from './b-memory-maintenance-runner';
 import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
+import { createProductionStageExecutors } from './production-stage-executors';
+import { TaskExecutionLoop } from './task-execution-loop';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -188,24 +190,26 @@ export async function createProductionBackendService(
         root: path.join(repoRoot, '.newide', 'market'),
       }),
     });
+    const councilProvider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade,
+      participantResolver: new AgentBoardCouncilParticipantResolver({
+        boardQuery: bCapabilities.boardQuery,
+        allowedAgentIds: bRuntime.market_agent_ids,
+        ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
+      }),
+    });
+    const gateExecutor =
+      dependencies.gateExecutor ??
+      new ProductionGateExecutor({
+        runsRoot,
+        env,
+      });
     const runner = new IntegrationV0CoordinatorRunner({
       driver,
       agentExecutionFacade,
       selectAgentHandler,
-      councilProvider: new SynthesisAgentCouncilProvider({
-        agentExecutionFacade,
-        participantResolver: new AgentBoardCouncilParticipantResolver({
-          boardQuery: bCapabilities.boardQuery,
-          allowedAgentIds: bRuntime.market_agent_ids,
-          ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
-        }),
-      }),
-      gateExecutor:
-        dependencies.gateExecutor ??
-        new ProductionGateExecutor({
-          runsRoot,
-          env,
-        }),
+      councilProvider,
+      gateExecutor,
     });
     const bMemoryService = new BMemoryBackendService(
       bCapabilities,
@@ -227,6 +231,20 @@ export async function createProductionBackendService(
     coordinationStore = new SqliteCoordinationStore(databasePath);
     const taskProcessor = new TaskProcessor(coordinationStore);
     taskProcessor.recoverInterruptedTasks();
+    const taskExecutionLoop = new TaskExecutionLoop({
+      processor: taskProcessor,
+      evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
+      executors: createProductionStageExecutors({
+        selectAgentHandler,
+        agentExecutionFacade,
+        councilProvider,
+        gateExecutor,
+        bootstrapAgentIds: bRuntime.market_agent_ids,
+        runsRoot,
+        councilRoot: path.join(repoRoot, '.newide', 'council'),
+        worktreesRoot: path.join(repoRoot, '.newide', 'worktrees'),
+      }),
+    });
     const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
     const mailboxRecovery = mailboxService.replayPendingDeliveries();
     try {
@@ -246,6 +264,7 @@ export async function createProductionBackendService(
       closeRuntime,
       bMemoryService,
       new FileDriverStreamAuditWriter(runsRoot),
+      taskExecutionLoop,
     );
   } catch (error) {
     await closeRuntime().catch(() => undefined);

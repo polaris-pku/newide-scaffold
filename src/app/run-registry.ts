@@ -6,6 +6,7 @@
 import type { FrontendRunSnapshot } from '../coordinator/frontend-run-snapshot';
 import { SCHEMA_VERSION, createId } from '../core';
 import { projectRunEventSource, type RunEvent } from '../protocol/run-event';
+import type { RunSnapshot } from '../protocol/run-snapshot';
 
 export type AppRunMode = 'single_agent' | 'council';
 export type AppRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
@@ -26,6 +27,7 @@ export interface AppRunSnapshot {
   };
   events: AppRunEvent[];
   snapshot?: FrontendRunSnapshot;
+  projected_snapshot?: RunSnapshot;
   error?: { code: string; message: string; details?: Record<string, unknown> };
 }
 
@@ -121,16 +123,28 @@ export class InMemoryRunRegistry {
     return event;
   }
 
-  complete(runId: string, snapshot: FrontendRunSnapshot): AppRunSnapshot {
+  complete(runId: string, snapshot?: FrontendRunSnapshot): AppRunSnapshot {
     const record = this.require(runId);
     if (record.events.some((event) => event.type === 'run.completed')) {
       record.status = 'completed';
       record.current = { stage: 'delivery', active_node_code: 'N18' };
-      record.snapshot = snapshot;
+      if (snapshot) record.snapshot = snapshot;
       return this.clone(record);
+    }
+    if (!snapshot) {
+      throw new Error(`Run ${runId} cannot complete without terminal event or snapshot`);
     }
     const staged = this.stageTerminal(runId, { status: 'completed', snapshot });
     return staged ? this.commitTerminal(runId, staged) : this.getSnapshot(runId);
+  }
+
+  setProjectedSnapshot(runId: string, snapshot: RunSnapshot): AppRunSnapshot {
+    const record = this.require(runId);
+    if (snapshot.run_id !== runId || snapshot.task_id !== record.task_id) {
+      throw new Error(`Projected snapshot identity does not match Run ${runId}`);
+    }
+    record.projected_snapshot = snapshot;
+    return this.clone(record);
   }
 
   stageTerminal(
@@ -286,6 +300,13 @@ export class InMemoryRunRegistry {
       terminalReservation: _terminalReservation,
       ...snapshot
     } = record;
-    return { ...snapshot, current: { ...snapshot.current }, events: [...snapshot.events] };
+    return {
+      ...snapshot,
+      current: { ...snapshot.current },
+      events: [...snapshot.events],
+      ...(snapshot.projected_snapshot
+        ? { projected_snapshot: structuredClone(snapshot.projected_snapshot) }
+        : {}),
+    };
   }
 }

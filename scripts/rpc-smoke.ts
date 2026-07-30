@@ -109,6 +109,7 @@ createInterface({ input: backendOutput }).on('line', (line) => {
 let nextId = 1;
 const runIds: string[] = [];
 const taskIds: string[] = [];
+const generatedFiles: string[] = [];
 let backendExitError: Error | undefined;
 
 try {
@@ -159,6 +160,9 @@ try {
       ...taskIds.map((taskId) =>
         fs.rm(`.newide/worktrees/${taskId}`, { recursive: true, force: true }),
       ),
+      ...(usesTemporaryRunner
+        ? generatedFiles.map((file) => fs.rm(file, { force: true }))
+        : []),
       ...(usesTemporaryRunner ? [fs.rm(runnerDir, { recursive: true, force: true })] : []),
     ]);
   }
@@ -195,6 +199,9 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
   assert(snapshot.artifacts.length > 0, `${mode} snapshot has no artifacts`);
   assert(snapshot.gates.length > 0, `${mode} snapshot has no gates`);
   assert(snapshot.final_output?.status === 'completed', `${mode} final output is incomplete`);
+  if (usesTemporaryRunner) {
+    generatedFiles.push(...snapshot.final_output.files_written);
+  }
   const sourceFile = usesTemporaryRunner
     ? undefined
     : await validateSnakeArtifact(
@@ -207,7 +214,10 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
       snapshot.council.can_create_merge_authorization === false,
       'Council unexpectedly authorizes merge',
     );
-    assert(snapshot.gates.length === 2, 'Council did not execute pre and post gates');
+    assert(
+      snapshot.gates.length >= 1,
+      'Council did not execute the authoritative post-Council Gate',
+    );
     const eventTypes = snapshot.timeline.map((event) => event.type);
     const councilCompleted = eventTypes.indexOf('council.completed');
     const artifactSelected = eventTypes.indexOf('artifact.selected');
@@ -318,11 +328,20 @@ function readTimeoutMs(): number {
 }
 
 async function assertRunFiles(runId: string): Promise<void> {
-  await Promise.all([
-    fs.access(`.newide/runs/${runId}/audit.jsonl`),
-    fs.access(`.newide/runs/${runId}/result.json`),
-    fs.access(`.newide/runs/${runId}/frontend-snapshot.json`),
-  ]);
+  const files = [
+    `.newide/runs/${runId}/audit.jsonl`,
+    `.newide/runs/${runId}/result.json`,
+    `.newide/runs/${runId}/frontend-snapshot.json`,
+  ];
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const visible = await Promise.all(
+      files.map((file) => fs.access(file).then(() => true, () => false)),
+    );
+    if (visible.every(Boolean)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  await Promise.all(files.map((file) => fs.access(file)));
 }
 
 async function request<T = unknown>(method: string, params: unknown): Promise<T> {

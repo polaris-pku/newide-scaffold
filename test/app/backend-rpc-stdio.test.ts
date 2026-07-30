@@ -423,11 +423,8 @@ describe('backend RPC stdio entrypoint', () => {
           winner_agent_id: 'role_ts_engineer',
         });
       }
-      expect(snapshot.snapshot?.delivery_report.driver_diagnostics.driver_id).toBe('claude-fake');
-      expect(snapshot.snapshot?.delivery_report.driver_diagnostics.driver_id).not.toBe(
-        'mock-driver',
-      );
-      expect(snapshot.snapshot?.delivery_report).toMatchObject({
+      const externalSnapshot = service.getRunSnapshot(created.run_id);
+      expect(externalSnapshot.delivery_report).toMatchObject({
         outcome: 'completed_response',
         response: 'Fake ACP completed the request.',
         session_id: 'session_fake_acp',
@@ -448,7 +445,10 @@ describe('backend RPC stdio entrypoint', () => {
           session_id: 'session_fake_acp',
           artifact_refs: ['artifact_fake_acp'],
           transcript_ref: 'transcript_fake_acp',
-          diagnostics: expect.objectContaining({ context_pack_persisted: true }),
+          diagnostics: expect.objectContaining({
+            context_pack_persisted: true,
+            driver_id: 'claude-fake',
+          }),
         },
       });
 
@@ -477,7 +477,7 @@ describe('backend RPC stdio entrypoint', () => {
         'role_fullstack_engineer',
       ]);
       const councilEventTypes = councilSnapshot.events.map((event) => event.type);
-      expect(councilEventTypes).not.toContain('market.selected');
+      expect(councilEventTypes).toContain('market.selected');
       expect(
         councilEventTypes.filter((type) => type === 'council.proposal.completed'),
       ).toHaveLength(2);
@@ -487,7 +487,7 @@ describe('backend RPC stdio entrypoint', () => {
       expect(
         councilEventTypes.filter((type) => type === 'council.synthesis.completed'),
       ).toHaveLength(1);
-      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(2);
+      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(1);
       expect(councilEventTypes.indexOf('council.completed')).toBeLessThan(
         councilEventTypes.indexOf('artifact.selected'),
       );
@@ -497,8 +497,8 @@ describe('backend RPC stdio entrypoint', () => {
       expect(councilEventTypes.lastIndexOf('gate.result')).toBeLessThan(
         councilEventTypes.indexOf('worktree.materialized'),
       );
-      expect(councilSnapshot.snapshot?.delivery_report.files_written.length).toBeGreaterThan(0);
-      const councilResult = councilSnapshot.snapshot?.council?.result;
+      expect(externalCouncilSnapshot.delivery_report?.files_written.length).toBeGreaterThan(0);
+      const councilResult = externalCouncilSnapshot.council?.result;
       const deliveredCouncilFile = readFileSync(path.join(workspaceDir, 'council-output.txt'));
       expect(councilResult).toMatchObject({
         quality: 'best_effort',

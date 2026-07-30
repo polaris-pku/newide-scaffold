@@ -35,9 +35,12 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       expect(firstTerminal.task.status).toBe('completed');
       expect(firstTerminal.run_history).toHaveLength(1);
       collectEvidence(firstTerminal, createdRunIds, marketDirectories);
+      const primaryAgentId = firstTerminal.task.owner_agent_id;
+      expect(primaryAgentId).toMatch(/^role_/);
+      if (!primaryAgentId) throw new Error('Completed Task has no selected primary Agent');
       const firstExperiences = await waitForExperiences(
         client,
-        'role_ts_engineer',
+        primaryAgentId,
         created.task.task_id,
       );
       expect(firstExperiences).toMatchObject({
@@ -94,7 +97,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       );
       await expect(
         client.call('memory.promoteSkills', {
-          role_id: 'role_ts_engineer',
+          role_id: primaryAgentId,
           requested_by: 'acceptance',
         }),
       ).resolves.toMatchObject({
@@ -106,7 +109,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         },
       });
       await expect(
-        client.call('memory.listSkills', { role_id: 'role_ts_engineer' }),
+        client.call('memory.listSkills', { role_id: primaryAgentId }),
       ).resolves.toMatchObject({
         skills: expect.arrayContaining([
           expect.objectContaining({ review_status: 'pending' }),

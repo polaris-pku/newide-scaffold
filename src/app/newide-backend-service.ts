@@ -68,6 +68,7 @@ import {
   NoopDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
+import type { TaskExecutionLoop } from './task-execution-loop';
 
 export interface RunCreateParams {
   prompt: string;
@@ -182,6 +183,7 @@ export class NewideBackendService {
     private readonly closeRuntime: () => Promise<void> | void = () => undefined,
     private readonly bMemoryService?: BMemoryBackendService,
     private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new NoopDriverStreamAuditWriter(),
+    private readonly taskExecutionLoop?: TaskExecutionLoop,
   ) {}
 
   close(): Promise<void> {
@@ -433,6 +435,212 @@ export class NewideBackendService {
   }
 
   private startRun(params: RunCreateParams, lineage?: RunLineage): Promise<RunCreateResult> {
+    if (this.taskExecutionLoop && this.taskProcessor) {
+      return this.startTaskLoopRun(params, lineage);
+    }
+    return this.startLegacyRun(params, lineage);
+  }
+
+  private async startTaskLoopRun(
+    params: RunCreateParams,
+    lineage?: RunLineage,
+  ): Promise<RunCreateResult> {
+    if (this.closing) throw new Error('Backend service is closing');
+    const processor = this.taskProcessor!;
+    const loop = this.taskExecutionLoop!;
+    const mode = params.mode ?? 'single_agent';
+    const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
+    const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
+    const identity = {
+      task_id: params.task_id ?? createId('task'),
+      run_id: createId('run'),
+    };
+    const controller = new AbortController();
+    this.registry.create({ ...identity, mode, controller });
+    this.runWorkspaces.set(identity.run_id, workspacePath);
+    this.registry.subscribe(identity.run_id, (event) => {
+      void this.auditWriter.append(event).catch(() => undefined);
+      this.notifyTaskListeners(identity.task_id, event);
+    });
+    try {
+      processor.beginRun({
+        ...identity,
+        task_request: taskRequest,
+        workspace_path: workspacePath,
+        mode,
+        run_intent: lineage?.run_intent ?? { type: 'create' },
+        ...(params.session_id ? { session_id: params.session_id } : {}),
+        ...(lineage?.restarted_from_run_id &&
+        lineage.persist_restarted_from_run_id !== false
+          ? { restarted_from_run_id: lineage.restarted_from_run_id }
+          : {}),
+        ...(lineage?.resume_checkpoint_id
+          ? { resume_checkpoint_id: lineage.resume_checkpoint_id }
+          : {}),
+        ...(lineage?.requested_resume_cursor
+          ? { requested_resume_cursor: lineage.requested_resume_cursor }
+          : {}),
+      });
+      for (const event of processor.listTaskEvents(identity.task_id)) {
+        if (event.run_id === identity.run_id) this.mirrorTaskAuthorityEvent(event);
+      }
+      await this.requestStore.save({
+        ...identity,
+        prompt: params.prompt,
+        workspace_path: workspacePath,
+        mode,
+        task_request: taskRequest,
+        ...(params.session_id ? { session_id: params.session_id } : {}),
+        ...(params.project_id ? { project_id: params.project_id } : {}),
+        ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
+        ...(params.title ? { title: params.title } : {}),
+        ...(lineage?.restarted_from_run_id
+          ? { restarted_from_run_id: lineage.restarted_from_run_id }
+          : {}),
+      });
+    } catch (error) {
+      const normalized = toError(error);
+      try {
+        processor.finishRun({
+          run_id: identity.run_id,
+          status: 'failed',
+          error: { code: 'RUN_START_FAILED', message: normalized.message },
+        });
+        for (const event of processor.listTaskEvents(identity.task_id)) {
+          if (event.run_id === identity.run_id) this.mirrorTaskAuthorityEvent(event);
+        }
+      } catch {
+        // Preserve the original launch failure.
+      }
+      this.registry.fail(identity.run_id, 'RUN_START_FAILED', normalized.message);
+      this.runWorkspaces.delete(identity.run_id);
+      throw normalized;
+    }
+
+    const terminalRun = this.executeTaskAuthorityRun({
+      identity,
+      loop,
+      controller,
+      ...(params.session_id ? { session_id: params.session_id } : {}),
+    });
+    this.terminalRuns.set(identity.run_id, terminalRun);
+    void terminalRun.finally(() => {
+      this.terminalRuns.delete(identity.run_id);
+      this.runWorkspaces.delete(identity.run_id);
+    });
+    return { ...identity, status: 'running' };
+  }
+
+  private async executeTaskAuthorityRun(input: {
+    identity: { run_id: string; task_id: string };
+    loop: TaskExecutionLoop;
+    controller: AbortController;
+    session_id?: string;
+  }): Promise<void> {
+    const processor = this.taskProcessor!;
+    try {
+      const taskSnapshot = await input.loop.run({
+        ...input.identity,
+        ...(input.session_id ? { session_id: input.session_id } : {}),
+        signal: input.controller.signal,
+        on_driver_event: (event) => this.appendDriverStreamEvent(input.identity, event),
+        on_event: (event) => {
+          processor.recordRunEvent(input.identity.run_id, event);
+          this.mirrorTaskAuthorityEvent({
+            event_id: event.event_id,
+            sequence: 0,
+            run_id: input.identity.run_id,
+            task_id: input.identity.task_id,
+            type: event.event_type,
+            source: 'coordinator',
+            created_at: event.created_at,
+            payload: event.payload,
+            schema_version: event.schema_version,
+          });
+        },
+        on_committed_events: (events) => {
+          for (const event of events) {
+            this.mirrorTaskAuthorityEvent({
+              event_id: event.event_id,
+              sequence: event.sequence,
+              run_id: input.identity.run_id,
+              task_id: input.identity.task_id,
+              type: event.event_type,
+              source: 'coordinator',
+              created_at: event.created_at,
+              payload: event.payload,
+              schema_version: event.schema_version,
+            });
+          }
+        },
+      });
+      const projected = processor.getRunSnapshot(input.identity.run_id);
+      if (!projected) throw new Error(`Run ${input.identity.run_id} has no persistent projection`);
+      if (taskSnapshot.task.status === 'completed') {
+        this.registry.complete(input.identity.run_id);
+      } else if (taskSnapshot.task.status === 'cancelled') {
+        this.registry.cancel(input.identity.run_id);
+      } else {
+        this.registry.fail(
+          input.identity.run_id,
+          taskSnapshot.error?.code ?? 'TASK_LOOP_FAILED',
+          taskSnapshot.error?.message ?? `Task ended as ${taskSnapshot.task.status}`,
+        );
+      }
+      this.registry.setProjectedSnapshot(input.identity.run_id, projected);
+      await this.driverStreamAuditWriter.flush(input.identity.run_id);
+      await this.auditWriter.flush(input.identity.run_id);
+      await this.terminalWriter.finalize(this.registry.getSnapshot(input.identity.run_id));
+      await this.auditWriter.flush(input.identity.run_id).catch(() => undefined);
+    } catch (error) {
+      const normalized = toError(error);
+      try {
+        const current = processor.getTaskSnapshot(input.identity.task_id);
+        if (current.current_run?.run_id === input.identity.run_id) {
+          processor.finishRun({
+            run_id: input.identity.run_id,
+            status: input.controller.signal.aborted ? 'cancelled' : 'failed',
+            ...(input.controller.signal.aborted
+              ? {}
+              : {
+                  error: {
+                    code: 'TASK_LOOP_FAILED',
+                    message: normalized.message,
+                  },
+                }),
+          });
+        }
+        for (const event of processor.listTaskEvents(input.identity.task_id)) {
+          if (event.run_id === input.identity.run_id) this.mirrorTaskAuthorityEvent(event);
+        }
+      } catch {
+        // The persistent terminal transition is best-effort after a commit failure.
+      }
+      if (input.controller.signal.aborted) {
+        this.registry.cancel(input.identity.run_id);
+      } else {
+        this.registry.fail(input.identity.run_id, 'TASK_LOOP_FAILED', normalized.message);
+      }
+      const projected = processor.getRunSnapshot(input.identity.run_id);
+      if (projected) this.registry.setProjectedSnapshot(input.identity.run_id, projected);
+      await this.driverStreamAuditWriter.flush(input.identity.run_id).catch(() => undefined);
+      await this.auditWriter.flush(input.identity.run_id).catch(() => undefined);
+      await this.terminalWriter
+        .finalize(this.registry.getSnapshot(input.identity.run_id))
+        .catch(() => undefined);
+    }
+  }
+
+  private mirrorTaskAuthorityEvent(event: AppRunEvent): void {
+    const snapshot = this.registry.getSnapshot(event.run_id);
+    if (snapshot.events.some((candidate) => candidate.event_id === event.event_id)) return;
+    this.registry.appendEvent(event.run_id, event.type, event.payload, {
+      event_id: event.event_id,
+      created_at: event.created_at,
+    });
+  }
+
+  private startLegacyRun(params: RunCreateParams, lineage?: RunLineage): Promise<RunCreateResult> {
     if (this.closing) {
       return Promise.reject(new Error('Backend service is closing'));
     }
@@ -694,13 +902,46 @@ export class NewideBackendService {
   }
 
   getRunSnapshot(runId: string): RunSnapshot {
-    try {
-      return projectRunSnapshot(this.registry.getSnapshot(runId));
-    } catch (error) {
-      const persisted = this.taskProcessor?.getRunSnapshot(runId);
-      if (persisted) return persisted;
-      throw error;
+    const persisted = this.taskProcessor?.getRunSnapshot(runId);
+    if (persisted) {
+      const liveProjection = this.terminalRuns.has(runId)
+        ? this.registry.getSnapshot(runId)
+        : undefined;
+      if (
+        persisted.status !== 'running' &&
+        liveProjection?.status === 'running'
+      ) {
+        const { final_output: _finalOutput, ...terminalizing } = persisted;
+        return {
+          ...terminalizing,
+          status: 'running',
+          current: {
+            ...persisted.current,
+            stage: 'delivery',
+            task_status: 'running',
+          },
+          ...(persisted.task
+            ? {
+                task: {
+                  ...persisted.task,
+                  status: 'running',
+                },
+              }
+            : {}),
+          ...(persisted.run
+            ? {
+                run: {
+                  ...persisted.run,
+                  status: 'running',
+                  completed_at: undefined,
+                },
+              }
+            : {}),
+        };
+      }
+      return persisted;
     }
+    return projectRunSnapshot(this.registry.getSnapshot(runId));
   }
 
   async waitForTerminal(runId: string): Promise<void> {

@@ -3,6 +3,19 @@ import type { RunSnapshot } from '../protocol/run-snapshot';
 import type { AppRunSnapshot } from './run-registry';
 
 export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
+  if (input.projected_snapshot) {
+    return {
+      ...structuredClone(input.projected_snapshot),
+      status: input.status,
+      current: {
+        ...input.projected_snapshot.current,
+        stage: input.current.stage,
+        active_node_code: input.current.active_node_code,
+      },
+      timeline: [...input.events],
+      errors: input.error ? [{ ...input.error }] : [...input.projected_snapshot.errors],
+    };
+  }
   const rich = input.snapshot;
   const task = rich?.task;
   const artifacts = asRecords(rich?.artifacts ?? []);
