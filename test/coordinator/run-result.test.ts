@@ -27,6 +27,8 @@ describe('run-result output writer', () => {
       event_log_path: '.newide/runs/run_001/event-log.json',
       audit_path: '.newide/runs/run_001/audit.jsonl',
       frontend_snapshot_path: '.newide/runs/run_001/frontend-snapshot.json',
+      changeset_manifest_path: '.newide/runs/run_001/changeset-manifest.json',
+      delivery_receipt_path: '.newide/runs/run_001/delivery.json',
     });
   });
 
@@ -39,6 +41,29 @@ describe('run-result output writer', () => {
       run_id: 'run_001',
       task_id: 'task_001',
       status: 'completed',
+      run_outcome: {
+        status: 'best_effort',
+        reason: 'Criterion evidence is unavailable.',
+        criteria: [],
+        gate_result_refs: [],
+        artifact_refs: [],
+      },
+      completion_evaluation: {
+        outcome: {
+          status: 'best_effort',
+          reason: 'Criterion evidence is unavailable.',
+          criteria: [],
+          gate_result_refs: [],
+          artifact_refs: [],
+        },
+        artifact_manifest: {
+          artifact_refs: [],
+          changed_files: [],
+          response_available: true,
+          has_materializable_artifact: false,
+          materialization_status: 'completed',
+        },
+      },
       mode: 'single_agent',
       driver_id: 'mock-driver',
       artifact_outputs: [],
@@ -53,6 +78,9 @@ describe('run-result output writer', () => {
       event_log_path: outputPaths.event_log_path,
       audit_path: outputPaths.audit_path,
       frontend_snapshot_path: outputPaths.frontend_snapshot_path,
+      changeset_manifest_path: outputPaths.changeset_manifest_path,
+      delivery_receipt_path: outputPaths.delivery_receipt_path,
+      changeset_manifest_ref: 'changeset_001',
       created_at: '2026-07-07T00:00:00.000Z',
       schema_version: SCHEMA_VERSION,
     });
@@ -95,6 +123,8 @@ describe('run-result output writer', () => {
       event_log_path: outputPaths.event_log_path,
       audit_path: outputPaths.audit_path,
       frontend_snapshot_path: outputPaths.frontend_snapshot_path,
+      changeset_manifest_path: outputPaths.changeset_manifest_path,
+      delivery_receipt_path: outputPaths.delivery_receipt_path,
     });
   });
 });

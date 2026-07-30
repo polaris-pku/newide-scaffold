@@ -4,6 +4,25 @@ import { runEventSchema } from './run-event';
 
 const recordSchema = z.record(z.string(), z.unknown());
 const taskStatusSchema = z.enum(TASK_STATUSES);
+const runOutcomeSchema = z
+  .object({
+    status: z.enum(['verified', 'best_effort', 'failed', 'blocked', 'cancelled']),
+    reason: z.string().min(1),
+    criteria: z.array(
+      z
+        .object({
+          criterion_id: z.string().min(1),
+          description: z.string().min(1),
+          status: z.enum(['satisfied', 'failed', 'unverified']),
+          gate_result_refs: z.array(z.string()),
+          audit_refs: z.array(z.string()),
+        })
+        .strict(),
+    ),
+    gate_result_refs: z.array(z.string()),
+    artifact_refs: z.array(z.string()),
+  })
+  .strict();
 
 export const runSnapshotSchema = z
   .object({
@@ -13,6 +32,7 @@ export const runSnapshotSchema = z
     task_id: z.string().min(1),
     mode: z.enum(['single_agent', 'council']),
     status: z.enum(['running', 'completed', 'failed', 'cancelled']),
+    quality: runOutcomeSchema.optional(),
     current: z
       .object({
         stage: z.enum(['executing', 'council', 'delivery', 'intervention']),
@@ -67,6 +87,7 @@ export const runSnapshotSchema = z
         response: z.string().optional(),
         session_id: z.string().min(1).optional(),
         tool_events: z.array(recordSchema).optional(),
+        quality: runOutcomeSchema.optional(),
       })
       .strict()
       .optional(),
@@ -127,6 +148,7 @@ export const runSnapshotSchema = z
         response: z.string().optional(),
         session_id: z.string().min(1).optional(),
         tool_events: z.array(recordSchema).optional(),
+        quality: runOutcomeSchema.optional(),
       })
       .strict()
       .optional(),

@@ -27,14 +27,15 @@ import {
   DeliverArtifactHandler,
   type DeliverArtifactResult,
 } from './handlers/deliver-artifact-handler';
-import { HookEngine, type HookEvent, type HookResult } from '../hook';
-import { DecisionAggregator, type GateResult } from '../gate';
+import type { HookEvent, HookResult } from '../hook';
+import type { GateResult } from '../gate';
 import { MockMemoryProvider } from '../memory';
 import { RuntimeOrchestrator } from './orchestrator';
 import type { TelemetrySink } from '../telemetry/telemetry-sink';
 import type { DriverStreamEventListener } from '../driver/contract';
 import {
   ArtifactSelector,
+  attachChangesetManifest,
   type ArtifactSelectionResult,
   type SelectionMode,
 } from './artifact-finalizer';
@@ -68,6 +69,20 @@ import {
 } from './run-result';
 import { buildFrontendRunSnapshot, type FrontendRunSnapshot } from './frontend-run-snapshot';
 import { diffWorkspaceFiles, snapshotWorkspaceFiles } from './workspace-change-detector';
+import {
+  evaluateCompletionCriteria,
+  type CompletionCriteriaEvaluation,
+} from './completion-criteria-evaluator';
+import { isCompletedRunOutcome, type RunOutcome } from './run-outcome';
+import {
+  BestEffortGateExecutor,
+  type IntegrationV0GateExecutor,
+} from './gate-executor';
+import {
+  buildChangesetManifest,
+  writeChangesetManifest,
+  type ChangesetManifest,
+} from './changeset-manifest';
 
 export interface IntegrationV0TimelineItem {
   name: string;
@@ -80,6 +95,8 @@ export interface IntegrationV0Summary {
   mode: SelectionMode;
   status: 'completed' | 'failed';
   outcome: 'completed_files' | 'completed_response' | 'failed';
+  run_outcome: RunOutcome;
+  completion_evaluation: CompletionCriteriaEvaluation;
   session_id: string;
   response: string;
   tool_events: DriverRunResult['tool_events'];
@@ -89,6 +106,8 @@ export interface IntegrationV0Summary {
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   artifacts_materialized: number;
   files_written: string[];
+  task_worktree_files: string[];
+  delivered_files: string[];
   changed_files: string[];
   materialization_status: MaterializationResult['status'];
   materialization_failures: MaterializationResult['failures'];
@@ -117,6 +136,8 @@ export interface IntegrationV0Summary {
   council_result_path?: string;
   council_result?: CouncilResult;
   council_delivery?: DeliverArtifactResult;
+  delivery?: DeliverArtifactResult;
+  changeset_manifest: ChangesetManifest;
   council_decision_id?: string;
   council_decision_mode?: CouncilDecision['decision_mode'];
   council_verdict?: CouncilDecision['verdict'];
@@ -161,6 +182,7 @@ export interface IntegrationV0Options {
   selectAgentHandler?: Pick<SelectAgentHandler, 'execute'>;
   deliverArtifactHandler?: DeliverArtifactHandler;
   hookEngine?: IntegrationV0HookEngine;
+  gateExecutor?: IntegrationV0GateExecutor;
   materializer?: IntegrationV0Materializer;
   worktreePath?: string;
   runsRoot?: string;
@@ -619,37 +641,20 @@ export async function runIntegrationV0Flow(
   });
   timeline.push({ name: 'PrimaryAgentCompleted', id: primaryCompletedEvent.event_id });
 
-  const hookEngine =
-    options?.hookEngine ??
-    new HookEngine({
-      config: {
-        version: 'hook-0.1',
-        settings: {
-          fail_fast: false,
-          default_timeout: 30,
-          parallel: false,
-          output_format: 'json',
-          emergency_env_var: 'AGENT_EMERGENCY_SKIP',
-        },
-        gates: {
-          'allow-gate': {
-            type: 'command',
-            run: 'node -e "process.exit(0)"',
-            retry_threshold: 1,
-          },
-        },
-        hooks: {
-          'task.completed': [{ gate: 'allow-gate', priority: 100, timeout: 30 }],
-          'council.completed': [{ gate: 'allow-gate', priority: 100, timeout: 30 }],
-        },
-      },
-      aggregator: new DecisionAggregator(),
-    });
-
-  const hookResult = await hookEngine.handleEvent({
-    ...primaryCompletedEvent,
-    event_type: 'task.completed',
-  });
+  const gateExecutor = options?.gateExecutor ?? new BestEffortGateExecutor();
+  const hookResult = options?.hookEngine
+    ? await options.hookEngine.handleEvent({
+        ...primaryCompletedEvent,
+        event_type: 'task.completed',
+      })
+    : await gateExecutor.execute({
+        run_id: run.run_id,
+        task_id: task.task_id,
+        phase: options?.enableCouncil ? 'pre_council' : 'pre_selection',
+        workspace_path: options?.workspacePath ?? process.cwd(),
+        completion_criteria: task.completion_criteria,
+        artifact_refs: driverResult.artifacts.map((artifact) => artifact.artifact_id),
+      });
   options?.signal?.throwIfAborted();
 
   const hookEvent = orchestrator.appendEvent({
@@ -730,7 +735,7 @@ export async function runIntegrationV0Flow(
     timeline.push({ name: 'CouncilStarted', id: councilStartedEvent.event_id });
   }
 
-  const selectionResult = await selector.selectArtifacts(
+  let selectionResult = await selector.selectArtifacts(
     {
       run_id: run.run_id,
       task_id: task.task_id,
@@ -823,10 +828,21 @@ export async function runIntegrationV0Flow(
   const postCouncilGateResults: GateResult[] = [];
   const postCouncilGatesRequired = Boolean(councilCompletedEvent);
   if (councilCompletedEvent) {
-    const postCouncilHookResult = await hookEngine.handleEvent({
-      ...councilCompletedEvent,
-      event_type: 'council.completed',
-    });
+    const postCouncilHookResult = options?.hookEngine
+      ? await options.hookEngine.handleEvent({
+          ...councilCompletedEvent,
+          event_type: 'council.completed',
+        })
+      : await gateExecutor.execute({
+          run_id: run.run_id,
+          task_id: task.task_id,
+          phase: 'post_council',
+          workspace_path: options?.workspacePath ?? process.cwd(),
+          completion_criteria: task.completion_criteria,
+          artifact_refs: selectionResult.selected_artifacts.map(
+            (artifact) => artifact.artifact_id,
+          ),
+        });
     options?.signal?.throwIfAborted();
     const usedGateResultIds = new Set(preGateResults.map((gate) => gate.gate_result_id));
     for (const sourceGateResult of postCouncilHookResult.gate_results) {
@@ -864,52 +880,39 @@ export async function runIntegrationV0Flow(
     (postCouncilGateResults.length > 0 &&
       postCouncilGateResults.every((gate) => gate.decision === 'allow'));
   const combinedGateResults = [...preGateResults, ...postCouncilGateResults];
-
-  let councilDelivery: DeliverArtifactResult | undefined;
-  if (
-    selectionResult.council_result &&
-    postCouncilGatesPassed &&
-    options?.workspacePath &&
-    workspaceSnapshotBefore
-  ) {
-    const finalArtifact = selectionResult.selected_artifacts.find(
-      (artifact) => artifact.artifact_id === selectionResult.council_result?.final_artifact_ref,
-    );
-    if (!finalArtifact) {
-      throw new Error('CouncilResult final artifact is not present in the selected artifacts');
-    }
-    councilDelivery = await (
-      options.deliverArtifactHandler ?? new DeliverArtifactHandler()
-    ).execute({
-      workspace_path: options.workspacePath,
-      final_artifact: finalArtifact,
-      expected_sha256: selectionResult.council_result.final_artifact_sha256,
-    });
-    const workspaceVerificationRef = `workspace:${councilDelivery.relative_path}:sha256:${councilDelivery.sha256}`;
-    selectionResult.council_result.verification_refs = [
-      ...selectionResult.council_result.verification_refs,
-      workspaceVerificationRef,
-    ];
-    if (selectionResult.council_run_result?.result) {
-      selectionResult.council_run_result.result = selectionResult.council_result;
-    }
-    workspaceChangedFiles = diffWorkspaceFiles(
-      workspaceSnapshotBefore,
-      await snapshotWorkspaceFiles(options.workspacePath),
-    );
-    const deliveredEvent = orchestrator.appendEvent({
-      event_type: 'artifact.delivered',
-      subject_id: finalArtifact.artifact_id,
-      run_id: run.run_id,
-      task_id: task.task_id,
-      payload: {
-        relative_path: councilDelivery.relative_path,
-        sha256: councilDelivery.sha256,
-        council_quality: selectionResult.council_result.quality,
-      },
-    });
-    timeline.push({ name: 'ArtifactDelivered', id: deliveredEvent.event_id });
-  }
+  const outputPaths = buildRunOutputPaths(run.run_id, options?.runsRoot);
+  const taskWorktreePath = path.join(
+    options?.worktreePath ?? '.newide/worktrees',
+    task.task_id,
+  );
+  const expectedArtifactHashes = selectionResult.council_result
+    ? {
+        [selectionResult.council_result.final_artifact_ref]:
+          selectionResult.council_result.final_artifact_sha256,
+      }
+    : undefined;
+  const changesetManifest = await buildChangesetManifest({
+    run_id: run.run_id,
+    task_id: task.task_id,
+    mode: selectionResult.mode,
+    base_ref: `workspace-before-run:${run.run_id}`,
+    selected_artifacts: selectionResult.selected_artifacts,
+    gate_results: combinedGateResults,
+    producer_agent_id:
+      agentExecutionResult?.agent_id ?? driverResult.diagnostics.driver_id,
+    task_worktree_path: taskWorktreePath,
+    manifest_path: outputPaths.changeset_manifest_path,
+    delivery_receipt_path: outputPaths.delivery_receipt_path,
+    ...(options?.workspacePath ? { user_workspace_path: options.workspacePath } : {}),
+    ...(options?.councilRoot ? { council_workspace_path: options.councilRoot } : {}),
+    observed_changed_files: workspaceChangedFiles,
+    ...(expectedArtifactHashes ? { expected_artifact_hashes: expectedArtifactHashes } : {}),
+  });
+  await writeChangesetManifest(changesetManifest);
+  selectionResult = attachChangesetManifest(
+    selectionResult,
+    changesetManifest.manifest_id,
+  );
 
   // 13. Worktree materialization (C: Coordinator)
   const materializer =
@@ -919,7 +922,15 @@ export async function runIntegrationV0Flow(
     });
 
   let materializationResult: MaterializationResult;
-  const materializationSkipped = postCouncilGatesRequired && !postCouncilGatesPassed;
+  const materializationSkipReason =
+    !preGatesPassed
+      ? 'Pre-selection gate did not allow materialization'
+      : postCouncilGatesRequired && !postCouncilGatesPassed
+        ? 'Post-council gate did not allow materialization'
+        : driverResult.status !== 'succeeded' && !selectionResult.council_result
+          ? 'Driver failed without a Council changeset recovery'
+          : undefined;
+  const materializationSkipped = materializationSkipReason !== undefined;
   if (materializationSkipped) {
     materializationResult = {
       materialization_id: createId('materialization'),
@@ -932,7 +943,7 @@ export async function runIntegrationV0Flow(
       failures: [
         {
           artifact_id: selectionResult.selected_artifacts[0]?.artifact_id ?? 'materializer',
-          reason: 'Post-council gate did not allow materialization',
+          reason: materializationSkipReason!,
         },
       ],
       created_at: nowTimestamp(),
@@ -942,7 +953,7 @@ export async function runIntegrationV0Flow(
     try {
       materializationResult = await materializer.materialize({
         task_id: task.task_id,
-        artifacts: selectionResult.selected_artifacts,
+        manifest: changesetManifest,
       });
     } catch {
       materializationResult = {
@@ -982,6 +993,49 @@ export async function runIntegrationV0Flow(
   });
   timeline.push({ name: 'WorktreeMaterialized', id: materializationEvent.event_id });
 
+  const allRequiredGatesAllow =
+    preGatesPassed &&
+    (!postCouncilGatesRequired || postCouncilGatesPassed) &&
+    (driverResult.status === 'succeeded' || selectionResult.council_result !== undefined);
+  let deliveryResult: DeliverArtifactResult | undefined;
+  if (allRequiredGatesAllow && options?.workspacePath) {
+    deliveryResult = await (
+      options.deliverArtifactHandler ?? new DeliverArtifactHandler()
+    ).execute({ manifest: changesetManifest });
+    if (workspaceSnapshotBefore) {
+      workspaceChangedFiles = diffWorkspaceFiles(
+        workspaceSnapshotBefore,
+        await snapshotWorkspaceFiles(options.workspacePath),
+      );
+    }
+    if (selectionResult.council_result) {
+      selectionResult.council_result.verification_refs = [
+        ...selectionResult.council_result.verification_refs,
+        ...deliveryResult.files.map(
+          (file) => `workspace:${file.relative_path}:sha256:${file.sha256}`,
+        ),
+      ];
+      if (selectionResult.council_run_result?.result) {
+        selectionResult.council_run_result.result = selectionResult.council_result;
+      }
+    }
+    const deliveredEvent = orchestrator.appendEvent({
+      event_type: 'artifact.delivered',
+      subject_id: changesetManifest.manifest_id,
+      run_id: run.run_id,
+      task_id: task.task_id,
+      payload: {
+        manifest_id: changesetManifest.manifest_id,
+        idempotency_key: deliveryResult.idempotency_key,
+        files: deliveryResult.files,
+        ...(selectionResult.council_result
+          ? { council_quality: selectionResult.council_result.quality }
+          : {}),
+      },
+    });
+    timeline.push({ name: 'ArtifactDelivered', id: deliveredEvent.event_id });
+  }
+
   // 14. Calculate flow completion status
   const driverSucceeded = driverResult.status === 'succeeded';
   const gatesPassed = preGatesPassed && (!postCouncilGatesRequired || postCouncilGatesPassed);
@@ -997,17 +1051,29 @@ export async function runIntegrationV0Flow(
       ? workspaceChangedFiles
       : [...materializationResult.changed_files];
   const hasChangedFiles = workspaceChangedFiles.length > 0 || hasMaterializedChanges;
-  const responseOnlyCompleted = !hasChangedFiles && !hasMaterializableArtifact && hasResponse;
   const driverRecoveredByCouncil =
     !driverSucceeded &&
     selectionResult.council_result !== undefined &&
-    councilDelivery !== undefined &&
+    deliveryResult !== undefined &&
     materializationResult.status === 'completed' &&
     hasChangedFiles;
-  const flowCompleted =
-    (driverSucceeded || driverRecoveredByCouncil) &&
-    gatesPassed &&
-    (hasChangedFiles || responseOnlyCompleted);
+  const artifactOutputs = buildArtifactOutputs({
+    artifacts: selectionResult.selected_artifacts,
+    materialized_record_paths: materializationResult.changed_files,
+  });
+  const completionEvaluation = evaluateCompletionCriteria({
+    completion_criteria: task.completion_criteria,
+    gate_results: combinedGateResults,
+    artifact_manifest: {
+      artifact_refs: artifactOutputs.map((artifact) => artifact.artifact_id),
+      changed_files: deliveryChangedFiles,
+      response_available: hasResponse,
+      has_materializable_artifact: hasMaterializableArtifact,
+      materialization_status: materializationResult.status,
+    },
+    execution_succeeded: driverSucceeded || driverRecoveredByCouncil,
+  });
+  const flowCompleted = isCompletedRunOutcome(completionEvaluation.outcome.status);
   const outcome: IntegrationV0Summary['outcome'] = flowCompleted
     ? hasChangedFiles
       ? 'completed_files'
@@ -1125,6 +1191,7 @@ export async function runIntegrationV0Flow(
     payload: {
       status: finalTaskStatus,
       outcome,
+      run_outcome: completionEvaluation.outcome,
       artifact_refs: selectionResult.selected_artifacts.map((artifact) => artifact.artifact_id),
       ...(failure
         ? { code: failure.code, message: failure.message, details: failure.details }
@@ -1143,6 +1210,7 @@ export async function runIntegrationV0Flow(
     payload: {
       status: finalRunStatus,
       outcome,
+      run_outcome: completionEvaluation.outcome,
       ...(failure
         ? { code: failure.code, message: failure.message, details: failure.details }
         : {}),
@@ -1154,7 +1222,6 @@ export async function runIntegrationV0Flow(
   });
 
   // 17. Build summary
-  const outputPaths = buildRunOutputPaths(run.run_id, options?.runsRoot);
   const councilRunOutputPaths = selectionResult.council_run_result
     ? buildCouncilRunOutputPaths(run.run_id, options?.runsRoot)
     : undefined;
@@ -1165,16 +1232,14 @@ export async function runIntegrationV0Flow(
     });
   }
 
-  const artifactOutputs = buildArtifactOutputs({
-    artifacts: selectionResult.selected_artifacts,
-    materialized_record_paths: materializationResult.files_written,
-  });
   const summary: IntegrationV0Summary = {
     run_id: run.run_id,
     task_id: task.task_id,
     mode: selectionResult.mode,
     status: finalRunStatus,
     outcome,
+    run_outcome: completionEvaluation.outcome,
+    completion_evaluation: completionEvaluation,
     session_id: driverResult.session_id,
     response: driverResult.response ?? '',
     tool_events: [...driverResult.tool_events],
@@ -1182,7 +1247,11 @@ export async function runIntegrationV0Flow(
     worktree_path: evalWorktreePath,
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     artifacts_materialized: materializationResult.materialized_artifacts.length,
-    files_written: materializationResult.files_written,
+    files_written:
+      deliveryResult?.files.map((file) => file.file_path) ??
+      materializationResult.changed_files,
+    task_worktree_files: materializationResult.files_written,
+    delivered_files: deliveryResult?.files.map((file) => file.file_path) ?? [],
     changed_files: deliveryChangedFiles,
     materialization_status: materializationResult.status,
     materialization_failures: materializationResult.failures,
@@ -1224,7 +1293,7 @@ export async function runIntegrationV0Flow(
                 council_result: selectionResult.council_result,
               }
             : {}),
-          ...(councilDelivery ? { council_delivery: councilDelivery } : {}),
+          ...(deliveryResult ? { council_delivery: deliveryResult } : {}),
           council_decision_id: selectionResult.council_decision.decision_id,
           council_decision_mode: selectionResult.council_decision.decision_mode,
           council_verdict: selectionResult.council_decision.verdict,
@@ -1233,6 +1302,8 @@ export async function runIntegrationV0Flow(
             selectionResult.council_decision.can_create_merge_authorization,
         }
       : {}),
+    ...(deliveryResult ? { delivery: deliveryResult } : {}),
+    changeset_manifest: changesetManifest,
     created_at: nowTimestamp(),
     schema_version: SCHEMA_VERSION,
   };
@@ -1248,6 +1319,8 @@ export async function runIntegrationV0Flow(
     event_log_path: outputPaths.event_log_path,
     audit_path: outputPaths.audit_path,
     frontend_snapshot_path: outputPaths.frontend_snapshot_path,
+    changeset_manifest_path: outputPaths.changeset_manifest_path,
+    delivery_receipt_path: outputPaths.delivery_receipt_path,
   };
   const frontendSnapshot = buildFrontendRunSnapshot({
     task,
@@ -1264,6 +1337,8 @@ export async function runIntegrationV0Flow(
     run_id: run.run_id,
     task_id: task.task_id,
     status: finalRunStatus,
+    run_outcome: completionEvaluation.outcome,
+    completion_evaluation: completionEvaluation,
     mode: selectionResult.mode,
     driver_id: driverResult.diagnostics.driver_id,
     artifact_outputs: artifactOutputs,
@@ -1278,6 +1353,9 @@ export async function runIntegrationV0Flow(
     event_log_path: outputPaths.event_log_path,
     audit_path: outputPaths.audit_path,
     frontend_snapshot_path: outputPaths.frontend_snapshot_path,
+    changeset_manifest_path: outputPaths.changeset_manifest_path,
+    delivery_receipt_path: outputPaths.delivery_receipt_path,
+    changeset_manifest_ref: changesetManifest.manifest_id,
     ...(summary.council_decision_path
       ? {
           council_decision_path: summary.council_decision_path,

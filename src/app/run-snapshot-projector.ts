@@ -19,6 +19,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
     task_id: input.task_id,
     mode: input.mode,
     status: input.status,
+    ...(rich?.quality ? { quality: rich.quality } : {}),
     current: { ...input.current, ...(task ? { task_status: task.status } : {}) },
     ...(task
       ? {
@@ -59,6 +60,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
             response: rich.delivery_report.response,
             session_id: rich.delivery_report.session_id,
             tool_events: asRecords(rich.delivery_report.tool_events),
+            ...(rich.quality ? { quality: rich.quality } : {}),
           },
           links: asRecord(rich.links),
         }
@@ -98,6 +100,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
                   response: rich.delivery_report.response,
                   session_id: rich.delivery_report.session_id,
                   tool_events: asRecords(rich.delivery_report.tool_events),
+                  ...(rich.quality ? { quality: rich.quality } : {}),
                 }
               : {}),
           },

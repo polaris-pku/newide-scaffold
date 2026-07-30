@@ -34,8 +34,23 @@ export interface ArtifactSelectionResult {
   council_decision?: CouncilDecision;
   council_run_result?: CouncilRunResult;
   council_result?: CouncilResult;
+  changeset_manifest_ref?: string;
   created_at: string;
   schema_version: string;
+}
+
+export function attachChangesetManifest(
+  selection: ArtifactSelectionResult,
+  manifestId: string,
+): ArtifactSelectionResult {
+  return {
+    ...selection,
+    changeset_manifest_ref: manifestId,
+    metadata: {
+      ...selection.metadata,
+      changeset_manifest_ref: manifestId,
+    },
+  };
 }
 
 export interface ArtifactSelectionInput {
