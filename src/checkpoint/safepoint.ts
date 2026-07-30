@@ -21,6 +21,15 @@ export interface BuildSafepointCheckpointInput {
   interrupt_state?: Record<string, unknown>;
   now?: string;
   checkpoint_id?: string;
+  /**
+   * Reuse this snapshot instead of capturing the current workspace.
+   *
+   * Crash recovery runs after the fact: the disk may have been touched since the crash,
+   * and everything the interrupted run did past the last safepoint was mid-stage anyway.
+   * The last safepoint's snapshot already matches the stage boundary the resume cursor
+   * points at, so inheriting it is both safer and more faithful than re-capturing.
+   */
+  inherit_mechanical_snapshot?: PersistedFullCheckpoint['mechanical_snapshot'];
 }
 
 /**
@@ -44,7 +53,23 @@ export function buildSafepointCheckpoint(
     synthesizeCursorInput(resumeCursor, aggregate, runId);
 
   const timestamp = input.now ?? new Date().toISOString();
-  const anchor = captureFileAnchor(aggregate.task.workspace_path);
+  const checkpointId = input.checkpoint_id ?? createId('checkpoint');
+  // An inherited snapshot wins: re-capturing after a crash would pin the checkpoint to
+  // post-crash disk state and silently destroy the last restorable content.
+  const inheritedSnapshot = input.inherit_mechanical_snapshot?.snapshot_commit
+    ? input.inherit_mechanical_snapshot
+    : undefined;
+  // Label the snapshot with the checkpoint id so its ref survives gc until resume.
+  const anchor = inheritedSnapshot
+    ? {
+        base_commit: inheritedSnapshot.base_commit,
+        snapshot_commit: inheritedSnapshot.snapshot_commit,
+        worktree_path: inheritedSnapshot.worktree_path,
+        branch: inheritedSnapshot.branch,
+        modified_files: inheritedSnapshot.modified_files,
+        recoverable: true,
+      }
+    : captureFileAnchor(aggregate.task.workspace_path, { label: checkpointId });
   const agentId =
     readLatestAgentId(aggregate) ??
     aggregate.task.owner_agent_id ??
@@ -52,7 +77,7 @@ export function buildSafepointCheckpoint(
     'coordinator';
 
   return {
-    checkpoint_id: input.checkpoint_id ?? createId('checkpoint'),
+    checkpoint_id: checkpointId,
     ...(input.parent_checkpoint_id ? { parent_checkpoint_id: input.parent_checkpoint_id } : {}),
     task_id: aggregate.task.task_id,
     run_id: runId,

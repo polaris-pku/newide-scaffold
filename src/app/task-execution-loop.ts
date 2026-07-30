@@ -28,6 +28,11 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   workspace_path: string;
   session_id?: string;
   cursor_input: CursorInput<TCursor>;
+  /**
+   * 被中断 run 的 id（仅 resume 时存在）。stage 中间产物按 run_id 落盘，
+   * 续跑 run 需要据此回溯读取上一 run 已完成 stage 的产物。
+   */
+  restarted_from_run_id?: string;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
   on_event?: (event: Event) => void;
@@ -476,6 +481,9 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     workspace_path: state.workspace_path,
     ...(controls.session_id ? { session_id: controls.session_id } : {}),
     cursor_input: cursorInput,
+    ...(state.restarted_from_run_id
+      ? { restarted_from_run_id: state.restarted_from_run_id }
+      : {}),
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
     ...(controls.on_event ? { on_event: controls.on_event } : {}),
