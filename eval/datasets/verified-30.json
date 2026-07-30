@@ -1,15 +1,16 @@
 {
   "subset_id": "verified-30",
-  "description": "RFC §4.1 provisional 30-case slice from SWE-bench Verified (DRAFT; flask quota unmet).",
+  "description": "RFC §4.1 30-case slice from SWE-bench Verified (frozen_adapted_v1; flask inventory adapted).",
   "source_dataset_version": "SWE-bench_Verified-hf",
-  "source_jsonl": "eval/data/swebench-verified-30.draft.jsonl",
-  "selection_rule": "Filter repos django/sklearn/requests/flask; drop problem_statement <30 words; fill RFC quotas with deterministic instance_id order; top up django/sklearn if flask shortfall keeps total <30.",
+  "source_jsonl": "eval/data/swebench-verified-30.jsonl",
+  "selection_rule": "Filter repos django/sklearn/requests/flask; drop problem_statement <30 words; hard-exclude may_need_native_ext; fill effective quotas (min(RFC, available)) with deterministic instance_id order; top up django/sklearn to 30 while preferring underfilled difficulty tiers.",
   "environment_notes": [
     "Sandbox image target: python:3.10-slim",
-    "Full Verified parquet local cache expected at D:/SWE-bench-Verified/test.parquet",
-    "Formal list pending team confirmation due to flask inventory=1 in Verified."
+    "Full Verified parquet local cache expected at ../SWE-bench-Verified/test.parquet",
+    "Solo smoke floor-effect filter optional via eval/data/solo-smoke-results.jsonl"
   ],
-  "list_status": "draft_provisional",
+  "list_status": "frozen_adapted_v1",
+  "solo_smoke_filter": "deferred_pending_harness",
   "rfc_target": {
     "django": 9,
     "scikit-learn": 9,
@@ -60,9 +61,9 @@
     "scikit-learn__scikit-learn-11578",
     "scikit-learn__scikit-learn-12682",
     "scikit-learn__scikit-learn-12973",
-    "scikit-learn__scikit-learn-13124",
-    "scikit-learn__scikit-learn-14053",
-    "scikit-learn__scikit-learn-25102"
+    "scikit-learn__scikit-learn-14710",
+    "scikit-learn__scikit-learn-25102",
+    "scikit-learn__scikit-learn-26194"
   ],
   "instances": [
     {
@@ -390,27 +391,15 @@
       "excluded_reasons": []
     },
     {
-      "instance_id": "scikit-learn__scikit-learn-13124",
+      "instance_id": "scikit-learn__scikit-learn-14710",
       "repo": "scikit-learn/scikit-learn",
       "difficulty_raw": "15 min - 1 hour",
       "tier": "medium",
-      "problem_word_count": 1110,
-      "gold_patch_files": 1,
-      "version": "0.21",
-      "base_commit": "9f0b959a8c9195d1b6e203f08b698e052b426ca9",
-      "soft_flags": ["may_need_native_ext"],
-      "excluded_reasons": []
-    },
-    {
-      "instance_id": "scikit-learn__scikit-learn-14053",
-      "repo": "scikit-learn/scikit-learn",
-      "difficulty_raw": "15 min - 1 hour",
-      "tier": "medium",
-      "problem_word_count": 437,
+      "problem_word_count": 708,
       "gold_patch_files": 1,
       "version": "0.22",
-      "base_commit": "6ab8c86c383dd847a1be7103ad115f174fe23ffd",
-      "soft_flags": ["may_need_native_ext"],
+      "base_commit": "4b6273b87442a4437d8b3873ea3022ae163f4fdf",
+      "soft_flags": [],
       "excluded_reasons": []
     },
     {
@@ -422,6 +411,18 @@
       "gold_patch_files": 2,
       "version": "1.3",
       "base_commit": "f9a1cf072da9d7375d6c2163f68a6038b13b310f",
+      "soft_flags": [],
+      "excluded_reasons": []
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-26194",
+      "repo": "scikit-learn/scikit-learn",
+      "difficulty_raw": "15 min - 1 hour",
+      "tier": "medium",
+      "problem_word_count": 172,
+      "gold_patch_files": 1,
+      "version": "1.3",
+      "base_commit": "e886ce4e1444c61b865e7839c9cff5464ee20ace",
       "soft_flags": [],
       "excluded_reasons": []
     }

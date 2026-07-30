@@ -7,6 +7,8 @@ import {
   InvokeDriverTool,
   createAgentMemoryScope,
   repositoryRetrieveMemoryForTask,
+  resolveMemoryAblationPolicy,
+  runWithMemoryAblationPolicy,
   type AgentTaskRequest,
   type BufferRepository,
   type CollectCompetitionClaimsOptions,
@@ -158,60 +160,69 @@ export class DriverRuntimeAgentExecutionFacade
     options?: AgentExecutionOptions,
   ): Promise<AgentExecutionResult> {
     throwIfAborted(options?.signal);
+    const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
     const task: AgentTaskRequest = {
       spec: input.instruction,
       task_id: input.task_id,
       call_id: createId('call'),
       source_driver: this.options.driver.driver_id,
     };
-    const retrieval = await withAbort(
-      repositoryRetrieveMemoryForTask(
-        createAgentMemoryScope(
-          this.options.repository,
-          this.options.bufferRepository,
-          runtimeRoleId,
+    return runWithMemoryAblationPolicy(ablationPolicy, async () => {
+      const retrieval = await withAbort(
+        repositoryRetrieveMemoryForTask(
+          createAgentMemoryScope(
+            this.options.repository,
+            this.options.bufferRepository,
+            runtimeRoleId,
+          ),
+          task,
+          input.task_id,
+          {
+            selection: {
+              include_skills: ablationPolicy.include_skills,
+              include_recent_experience: ablationPolicy.include_recent_experience,
+            },
+          },
         ),
-        task,
-        input.task_id,
-      ),
-      options?.signal,
-    );
-    throwIfAborted(options?.signal);
-    const invocation: InvocationContext = {
-      task_id: input.task_id,
-      run_id: input.run_id,
-      instruction: input.instruction,
-      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
-      ...(input.session_id ? { session_id: input.session_id } : {}),
-      retrieval,
-      driver_attempts: 0,
-      abortObserved: false,
-      ...(options?.signal ? { signal: options.signal } : {}),
-      ...(options?.onDriverEvent
-        ? {
-            onDriverEvent: (event: DriverStreamEvent) =>
-              options.onDriverEvent?.({ ...event, role_id: input.role_id }),
-          }
-        : {}),
-    };
-    const rawDispatch = await this.invocationContext.run(invocation, () =>
-      manager.dispatchTask(runtimeRoleId, task),
-    );
-    const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
+        options?.signal,
+      );
+      throwIfAborted(options?.signal);
+      const invocation: InvocationContext = {
+        task_id: input.task_id,
+        run_id: input.run_id,
+        instruction: input.instruction,
+        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+        ...(input.session_id ? { session_id: input.session_id } : {}),
+        retrieval,
+        driver_attempts: 0,
+        abortObserved: false,
+        ...(options?.signal ? { signal: options.signal } : {}),
+        ...(options?.onDriverEvent
+          ? {
+              onDriverEvent: (event: DriverStreamEvent) =>
+                options.onDriverEvent?.({ ...event, role_id: input.role_id }),
+            }
+          : {}),
+      };
+      const rawDispatch = await this.invocationContext.run(invocation, () =>
+        manager.dispatchTask(runtimeRoleId, task),
+      );
+      const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
 
-    if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
-      await this.recoverRole(runtimeRoleId);
-      throwIfAborted(invocation.signal);
-    }
-    return this.buildResult(
-      input,
-      dispatched,
-      runtimeRoleId,
-      invocation.execution,
-      invocation.driver_attempts,
-      invocation.driver_invocation_context,
-      invocation.agent_system_prompt_sha256,
-    );
+      if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
+        await this.recoverRole(runtimeRoleId);
+        throwIfAborted(invocation.signal);
+      }
+      return this.buildResult(
+        input,
+        dispatched,
+        runtimeRoleId,
+        invocation.execution,
+        invocation.driver_attempts,
+        invocation.driver_invocation_context,
+        invocation.agent_system_prompt_sha256,
+      );
+    });
   }
 
   private async ensureRole(role_id: string): Promise<AgentManager> {
@@ -480,12 +491,15 @@ export class DriverRuntimeAgentExecutionFacade
     bufferSeq: number,
   ): Promise<BMemoryMaintenanceEvidence | undefined> {
     if (!this.options.memoryMaintenance) return undefined;
+    const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
+    if (!ablationPolicy.schedule_extraction) return undefined;
     try {
       return await this.options.memoryMaintenance.scheduleBuffer({
         task_id: input.task_id,
         run_id: input.run_id,
         role_id: runtimeRoleId,
         buffer_seq: bufferSeq,
+        ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
       });
     } catch (error) {
       const completedAt = nowTimestamp();

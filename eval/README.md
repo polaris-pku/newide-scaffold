@@ -1,6 +1,9 @@
 # F 方向评测
 
-这个目录放 NewIDE 的 F 方向初步评测管线。当前阶段不自建完整数据集，先直接使用 SWE-EVO 作为数据源；`newide-scaffold` 只记录固定子集和评测产物，不复制完整 SWE-EVO 数据。
+这个目录放 NewIDE 的 F 方向初步评测管线。当前阶段不自建完整数据集，先直接使用外部 benchmark 作为数据源；`newide-scaffold` 只记录固定子集和评测产物，不复制完整数据集。
+
+- **SWE-EVO**（本目录根下脚本）：§1 记忆纵向 / 通用出分
+- **CooperBench**（`eval/cooperbench/`）：§2 P1-A 协调主效应；详见 [cooperbench/README.md](./cooperbench/README.md)
 
 ## 埋点：结果层最低要求
 
@@ -23,7 +26,7 @@
 
 - `v0-smoke`：最小冒烟子集，用来确认评测链路能跑通。
 - `v0-dev`：早期开发子集，用来在扩大规模前做稳定迭代。
-- `verified-30`：RFC §4.1 打榜集草案（SWE-bench Verified 裁剪 30 case，**draft**；见下方说明）。
+- `verified-30`：RFC §4.1 打榜集（`frozen_adapted_v1`；flask 库存适配，见下方说明）。
 
 子集元数据在 `eval/datasets/` 下。每个文件记录来源版本、来源 JSONL、筛选规则、环境要求和固定的 instance id 列表。完整 SWE-EVO JSONL 路径由 `eval/manifest.json` 声明（`default_subset` → `subsets`）。
 
@@ -31,32 +34,35 @@
 
 本仓不自带 SWE-EVO。`eval/manifest.json` 默认指向同级目录：
 
-`../SWE-EVO/hf_out/hf_jsonl/test.jsonl`（即 `D:\SWE-EVO\hf_out\hf_jsonl\test.jsonl`）
+`../SWE-EVO/hf_out/hf_jsonl/test.jsonl`
 
 获取方式（任选其一）：
 
 1. 从 Hugging Face 镜像只拉 JSONL（推荐，约 13MB）：
 
 ```powershell
-New-Item -ItemType Directory -Force -Path D:\SWE-EVO\hf_out\hf_jsonl | Out-Null
-curl.exe -L -o D:\SWE-EVO\hf_out\hf_jsonl\test.jsonl `
+New-Item -ItemType Directory -Force -Path ..\SWE-EVO\hf_out\hf_jsonl | Out-Null
+curl.exe -L -o ..\SWE-EVO\hf_out\hf_jsonl\test.jsonl `
   https://hf-mirror.com/datasets/Fsoft-AIC/SWE-EVO/resolve/main/SWE-EVO/hf_jsonl/test.jsonl
 ```
 
-2. 或 clone [SWE-EVO/SWE-EVO](https://github.com/SWE-EVO/SWE-EVO) 到 `D:\SWE-EVO`（若网络可达）；仓库内 `hf_out` 主要是 Arrow，`hf_jsonl` 仍可能需按上式补齐。
+2. 或 clone [SWE-EVO/SWE-EVO](https://github.com/SWE-EVO/SWE-EVO) 到同级 `../SWE-EVO`（若网络可达）；仓库内 `hf_out` 主要是 Arrow，`hf_jsonl` 仍可能需按上式补齐。
 
-### Verified 30 状态检查（草案）
+### Verified 30 状态（frozen_adapted_v1）
 
-| 项                 | 状态                                                                                               |
-| ------------------ | -------------------------------------------------------------------------------------------------- |
-| 规格               | django 9 / scikit-learn 9 / requests 6 / flask 6；easy/medium/hard 各 10；镜像 `python:3.10-slim`  |
-| 正式 instance 清单 | **未冻结**；本仓落盘为 `eval/datasets/verified-30.json`（`list_status=draft_provisional`）         |
-| 库存硬缺口         | SWE-bench Verified 中 `pallets/flask` **仅 1 条**，无法满足 flask×6；requests 有 8 条可取 6        |
-| 状态报告           | `eval/datasets/verified-30.status.json`                                                            |
-| 草案 JSONL         | `eval/data/swebench-verified-30.draft.jsonl`                                                       |
-| 重算脚本           | `python eval/scripts/select_verified30.py`（需本机 parquet：`D:\SWE-bench-Verified\test.parquet`） |
+| 项                 | 状态                                                                                                             |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| 规格（RFC 目标）   | django 9 / scikit-learn 9 / requests 6 / flask 6；easy/medium/hard 各 10；镜像 `python:3.10-slim`                |
+| 正式 instance 清单 | **已冻结（adapted）**：`eval/datasets/verified-30.json`（`list_status=frozen_adapted_v1`）                       |
+| 适配决策           | [`eval/datasets/verified-30.DECISION.md`](./datasets/verified-30.DECISION.md)：接受 flask=1，django/sklearn 补齐 |
+| 库存硬缺口         | SWE-bench Verified 中 `pallets/flask` **仅 1 条**；requests 有 8 条可取 6                                        |
+| 原生依赖           | `may_need_native_ext` **硬排除**                                                                                 |
+| Solo 冒烟地板剔除  | 延后；结果写入 `eval/data/solo-smoke-results.jsonl` 后重跑选择脚本即可应用                                       |
+| 状态报告           | `eval/datasets/verified-30.status.json`                                                                          |
+| 冻结 JSONL         | `eval/data/swebench-verified-30.jsonl`（`*.draft.jsonl` 为兼容别名）                                             |
+| 重算脚本           | `python eval/scripts/select_verified30.py`（需本机 parquet：`../SWE-bench-Verified/test.parquet`）               |
 
-草案在 flask 不足时用 django 补齐到 30，并保持难度阶梯 10/10/10。solo 冒烟剔除与原生依赖硬过滤尚未跑 harness，不能当正式打榜集。
+草案时代的 flask 不足用 django 补齐策略已写入冻结决策；solo 冒烟剔除仍可选延后，不阻塞 `frozen_adapted_v1`。
 
 ## 预测模式
 
@@ -68,7 +74,10 @@ curl.exe -L -o D:\SWE-EVO\hf_out\hf_jsonl\test.jsonl `
 
 注意：`oracle` 是“拿标准答案去判卷”，不能当作 NewIDE 能力指标。真正看能力时应使用 `real`，并显式传 `--model <name>`（默认 `unspecified` 仅作占位）。
 
-`--ablation B0|B1|B2|B3` 目前写入 run 元数据与 telemetry 标签；**是否真正切换记忆行为取决于后端**，评测层本身不 mock 记忆管线。
+`--ablation B0|B1|B2|B3` 写入 eval run 元数据与 telemetry 标签；后端可通过
+`memory_ablation` / CLI `--ablation` 把同一标签写入 `summary.json`（见
+[BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)）。MockMemory 不切换检索行为；真实 B Memory
+实现须自行解释该字段。
 
 ## Worktree 复用规则（重要）
 
@@ -86,7 +95,7 @@ curl.exe -L -o D:\SWE-EVO\hf_out\hf_jsonl\test.jsonl `
 # 一次性干净树 + seed 真实 patch（或金标 patch 做链路自检）
 pnpm eval:instance -- --instance-id conan-io__conan_2.0.14_2.0.15 --mode real `
   --model claude-acp-real `
-  --ephemeral-from D:\Code\NewIDE\sweevo-workspaces\conan-2.0.14-2.0.15 `
+  --ephemeral-from ../sweevo-workspaces/conan-2.0.14-2.0.15 `
   --patch-file path\to\agent.patch --run-harness
 ```
 
@@ -123,11 +132,21 @@ pnpm eval:instance -- --instance-id conan-io__conan_2.0.14_2.0.15 --mode stub
 pnpm eval:smoke -- --subset v0-smoke --mode stub
 ```
 
-跑 Verified 30 草案（stub 验管线；数据来自子集 `source_jsonl`）：
+跑 Verified 30 冻结集（stub 验管线；数据来自子集 `source_jsonl`）：
 
 ```powershell
-pnpm eval:smoke -- --subset verified-30 --mode stub --skip-scaffold
+pnpm eval:smoke -- --subset verified-30 --mode stub
 ```
+
+校验后端 summary 契约 / harness 环境：
+
+```powershell
+pnpm eval:verify-backend-contract -- --fixture
+pnpm eval:check-harness
+# 或：wsl --cd . -e bash eval/scripts/check-harness-env.sh
+```
+
+后端对接细节见 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)。
 
 跑金标冒烟，也就是用 SWE-EVO 标准答案验证评测链路：
 
@@ -142,6 +161,17 @@ pnpm eval:sweevo-harness -- --predictions .newide/eval/<run>/predictions.jsonl -
 ```
 
 去掉 `--dry-run` 后会真正调用 SWE-EVO harness。真实执行需要本机 SWE-EVO 环境和 Docker 可用。
+
+**Windows 注意**：SWE-bench harness 依赖 Linux（`resource` 模块等）。在 PowerShell 里请走 WSL：
+
+```powershell
+$env:NEWIDE_SWE_EVO_PYTHON = "wsl"
+# 可选：$env:NEWIDE_SWE_EVO_WSL_DISTRO = "Ubuntu-22.04"
+# 可选：$env:NEWIDE_SWE_EVO_WSL_PYTHON = "python3"
+pnpm eval:instance -- --instance-id <id> --mode oracle --run-harness
+```
+
+也可把 `NEWIDE_SWE_EVO_PYTHON` 设成任意本机 Python 可执行文件路径（例如 conda `py310`）。
 
 从后端运行结果自动收集 patch，并直接交给 SWE-EVO（后端 worktree 必须干净，或加 `--allow-dirty-worktree`）：
 
@@ -164,6 +194,29 @@ pnpm eval:instance -- --instance-id <instance-id> --mode real --model <name> `
 后端 worktree 的真实 Git index。worktree 必须位于 Git 仓库中，并且仓库中能解析
 该 `base_commit`。共享脏树默认会被拒绝——见上文「Worktree 复用规则」。
 
+## 方向一：SWE-EVO 记忆消融批跑（agent 直写 worktree）
+
+能力向闭环：**按需懒 clone mirror（D 盘）→ ephemeral worktree @ `base_commit` → agent 直接改盘 → 结束后 `git diff` 收 patch → predictions（可选 harness）**。
+
+不默认「先把 subset 里所有 repo 一次缓存满」。Mirror 根目录默认 `D:\newide-sweevo-mirrors`（`NEWIDE_SWE_MIRRORS_ROOT` 可改）。同 repo 多 instance / 多 ablation 共用 mirror；每任务另开 ephemeral，跑完默认删除 worktree。
+
+```powershell
+# 可选：只预热当前要跑的那一条（不要对整个 subset 盲拉）
+pnpm eval:ensure-mirrors -- --instance-id conan-io__conan_2.0.14_2.0.15 --subset v0-smoke
+
+# 单条联调（B2 + harness dry-run）
+pnpm eval:sweevo-ablation -- --subset v0-smoke `
+  --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
+
+# 默认 v0-smoke × B0,B1,B2（真 Claude + Postgres；耗时长）
+pnpm eval:sweevo-ablation -- --subset v0-smoke
+
+# 真 Docker 判卷时再加
+pnpm eval:sweevo-ablation -- --subset v0-smoke --run-harness
+```
+
+产物：`D:\Code\NewIDE\.newide-experiments\sweevo-ablation\<ts>\`（可用 `NEWIDE_SWEEVO_ABLATION_ROOT` 改根）。后端 `summary.worktree_path` 在传入 `workspace_path` 时绑定 agent 的 git 树；评测用 `--allow-dirty-worktree` 从该树相对 `base_commit` 收集 patch。契约见 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)。
+
 ## 怎么理解这套系统
 
 人话版流程是：
@@ -173,3 +226,16 @@ pnpm eval:instance -- --instance-id <instance-id> --mode real --model <name> `
 3. F 方向评测层把数据集、答案、判卷结果和 telemetry 收到同一个 run 目录里，方便复现和解释。
 
 所以 `stub` 用来看管线，`oracle` 用来看判卷系统，`real` 才用于看 NewIDE 的真实能力。
+
+## CooperBench（§2 P1-A）速查
+
+```powershell
+# stub 冒烟（无需 Docker；需同级 ../CooperBench/dataset）
+pnpm eval:cooperbench-smoke -- --subset v0-smoke --mode stub --setting coop
+
+# oracle + harness dry-run
+pnpm eval:cooperbench-case -- --case-id dottxt_ai_outlines_task__1655__f1_f3 `
+  --mode oracle --setting coop --run-harness --harness-dry-run
+```
+
+完整说明见 `eval/cooperbench/README.md`。

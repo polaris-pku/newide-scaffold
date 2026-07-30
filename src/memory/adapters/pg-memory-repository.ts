@@ -260,6 +260,23 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
+    await this.ensureSchema();
+    const stored = await this.withDescriptionEmbedding(skill);
+    SkillRecordSchema.parse(stored);
+
+    const result = await this.pool.query(
+      `UPDATE memory_skills
+       SET payload = $3::jsonb, description_embedding = $4::vector
+       WHERE role_id = $1 AND id = $2`,
+      [role_id, stored.id, JSON.stringify(stored), toPgVector(stored.description_embedding)],
+    );
+
+    if (result.rowCount === 0) {
+      throw new Error(`Skill not found: ${skill.id}`);
+    }
+  }
+
   async updateExperience(role_id: string, experience: ExperienceRecord): Promise<void> {
     await this.ensureSchema();
     const stored = await this.withDescriptionEmbedding(experience);

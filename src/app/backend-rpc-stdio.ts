@@ -89,6 +89,13 @@ export async function createProductionBackendService(
     throw new Error(`ACP driver runner has no driver:run script: ${runnerDir}`);
   }
 
+  const driverRunnerJs = path.join(runnerDir, 'dist', 'src', 'driver', 'contract-runner.js');
+  if (!existsSync(driverRunnerJs)) {
+    throw new Error(
+      `ACP driver runner build missing: ${driverRunnerJs} (run pnpm --dir ${runnerDir} build)`,
+    );
+  }
+
   const driverEnv = loadEnvFile(env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env'));
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
@@ -98,15 +105,18 @@ export async function createProductionBackendService(
       supports_tool_events: true,
     },
     transport: new CommandDriverTransport({
-      command: 'pnpm',
-      args: ['--dir', runnerDir, 'driver:run'],
-      cwd: repoRoot,
+      // Invoke node directly — Windows `spawn('pnpm'/'pnpm.cmd')` is unreliable without shell.
+      command: process.execPath,
+      args: [driverRunnerJs],
+      cwd: runnerDir,
       env: {
         ...driverEnv,
         COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
         ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(repoRoot, '.newide', 'test-workspace'),
+        // Non-interactive eval / batch runs must not block on ACP permission prompts.
+        AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
       },
       unsetEnv: [
         'NEWIDE_B_DATABASE_URL',

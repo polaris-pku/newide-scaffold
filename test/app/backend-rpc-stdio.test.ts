@@ -28,6 +28,7 @@ import {
   BMemoryMaintenanceRunner,
   FileBMemoryMaintenanceEvidenceStore,
 } from '../../src/app/b-memory-maintenance-runner';
+import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
 
 describe('backend RPC stdio entrypoint', () => {
   it('fails fast when the configured ACP runner directory does not exist', async () => {
@@ -77,6 +78,7 @@ describe('backend RPC stdio entrypoint', () => {
     const close = vi.fn(async () => undefined);
     try {
       writeFileSync(path.join(root, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(root);
 
       const service = await createProductionBackendService(
         {
@@ -107,6 +109,7 @@ describe('backend RPC stdio entrypoint', () => {
     } as unknown as BackendBRuntime;
     try {
       writeFileSync(path.join(root, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(root);
 
       await expect(
         createProductionBackendService(
@@ -145,6 +148,7 @@ describe('backend RPC stdio entrypoint', () => {
 
     try {
       writeFileSync(path.join(root, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(root);
       const service = await createProductionBackendService(
         { ACP_DRIVER_RUNNER_DIR: root, NEWIDE_COORDINATION_DB: ':memory:' },
         { bRuntime, memoryMaintenance: maintenance, agentLlm: invokeDriverLlm() },
@@ -183,6 +187,7 @@ describe('backend RPC stdio entrypoint', () => {
     }
     try {
       writeFileSync(path.join(root, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(root);
       let settled = false;
       const servicePromise = createProductionBackendService(
         { ACP_DRIVER_RUNNER_DIR: root, NEWIDE_COORDINATION_DB: ':memory:' },
@@ -223,6 +228,7 @@ describe('backend RPC stdio entrypoint', () => {
     }
     try {
       writeFileSync(path.join(root, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(root);
 
       let failure: unknown;
       try {
@@ -267,6 +273,7 @@ describe('backend RPC stdio entrypoint', () => {
     try {
       mkdirSync(runnerDir, { recursive: true });
       writeFileSync(path.join(runnerDir, 'package.json'), '{"scripts":{"driver:run":"exit 99"}}');
+      writeFakeAcpRunnerBuild(runnerDir);
       const seedStore = new SqliteCoordinationStore(databasePath);
       const seedProcessor = new TaskProcessor(seedStore);
       seedProcessor.beginRun({
@@ -353,12 +360,13 @@ describe('backend RPC stdio entrypoint', () => {
   appendFileSync(new URL('./prompts.log', import.meta.url), input.prompt + '\\n');
   const created_at = new Date().toISOString();
   const reviewerFailed = existsSync(new URL('./fail-reviewer', import.meta.url)) && input.prompt.includes('Review the isolated proposal inputs');
-  const councilRole = String(input.workspace_path || '').includes('.newide/council');
+  const councilRole = String(input.workspace_path || '').replaceAll('\\\\', '/').includes('.newide/council');
   const artifact = { artifact_id: 'artifact_fake_acp', type: councilRole ? 'diff' : 'driver_result', uri: 'artifact://fake/result', producer_id: 'claude-fake', task_id: input.task_id, ...(councilRole ? { content: { kind: 'text', content_ref: 'data:text/plain,COUNCIL_FINAL%0A', target_path: 'council-output.txt', media_type: 'text/plain' } } : {}), created_at, schema_version: input.schema_version };
   process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_result_fake_acp', session_id: 'session_fake_acp', status: reviewerFailed ? 'failed' : 'succeeded', response: reviewerFailed ? '' : 'Fake ACP completed the request.', artifacts: reviewerFailed ? [] : [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_fake_acp', type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'claude-fake', duration_ms: 1, notes: ['fake ACP process'] }, ...(reviewerFailed ? { error: { code: 'FAKE_REVIEW_FAILURE', message: 'controlled failure', retryable: false } } : {}), created_at, schema_version: input.schema_version }));
 });
 `,
       );
+      writeFakeAcpRunnerBuild(runnerDir, { importFromRunnerRoot: 'fake-driver.mjs' });
 
       service = await createProductionBackendService(
         {
@@ -613,6 +621,7 @@ describe('backend RPC stdio entrypoint', () => {
   it('answers ping over a child fixture and exits on stdin EOF', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-acp-runner-'));
     writeFileSync(path.join(runnerDir, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+    writeFakeAcpRunnerBuild(runnerDir);
     const child = spawn(process.execPath, ['--import', 'tsx', 'test/fixtures/task-rpc-server.ts'], {
       cwd: process.cwd(),
       env: {
@@ -641,6 +650,7 @@ describe('backend RPC stdio entrypoint', () => {
   it('does not start stdio before the production B runtime is ready', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-production-readiness-'));
     writeFileSync(path.join(runnerDir, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+    writeFakeAcpRunnerBuild(runnerDir);
     const child = spawn(process.execPath, ['--import', 'tsx', 'src/app/backend-rpc-stdio.ts'], {
       cwd: process.cwd(),
       env: {

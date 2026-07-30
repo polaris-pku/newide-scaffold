@@ -34,6 +34,8 @@ export interface AgentExecutionRequest {
   session_id?: string;
   input_artifact_refs: ArtifactId[];
   context_policy: string;
+  /** RFC §1.2 memory ablation; applied by production Agent execution facade. */
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   schema_version: SchemaVersion;
 }
 

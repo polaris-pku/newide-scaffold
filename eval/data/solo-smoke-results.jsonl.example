@@ -1,0 +1,2 @@
+{"instance_id": "django__django-10097", "exclude": false, "reason": "solo driver resolved; keep"}
+{"instance_id": "example__too_easy", "exclude": true, "reason": "floor effect: solo always passes"}
