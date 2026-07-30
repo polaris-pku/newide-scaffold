@@ -1,6 +1,7 @@
 /** memory.* JSON-RPC methods backed by B's public board and application maintenance services. */
 import { z } from 'zod';
 import type { BMemoryMaintenanceEvidence } from '../app/b-memory-maintenance-runner';
+import type { BMemoryCapabilities } from '../app/b-memory-backend-service';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
@@ -11,6 +12,7 @@ import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatche
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 
 export interface MemoryMethodsService {
+  getMemoryCapabilities(): BMemoryCapabilities;
   listMemoryAgents(): Promise<AgentBoardListItem[]>;
   getMemoryAgent(roleId: string): Promise<AgentBoardAgentView>;
   listMemorySkills(roleId: string): Promise<SkillView[]>;
@@ -35,6 +37,10 @@ export class MemoryRpcMethods {
   constructor(private readonly service: MemoryMethodsService) {}
 
   register(dispatcher: JsonRpcDispatcher): void {
+    dispatcher.register('memory.getCapabilities', (params) => {
+      parseParams(emptyParamsSchema, params ?? {});
+      return { capabilities: this.service.getMemoryCapabilities() };
+    });
     dispatcher.register('memory.listAgents', (params) => {
       parseParams(emptyParamsSchema, params ?? {});
       return this.service.listMemoryAgents().then((agents) => ({ agents }));

@@ -2,7 +2,7 @@
  * 真实链路验收脚本（不注入 fake B LLM，不使用 fake ACP runner）。
  *
  * 用真实 production composition（createProductionBackendService 经 Node stdio backend
- * 子进程）执行四个场景：market / council / subagent / restart。
+ * 子进程）执行五个场景：memory / market / council / subagent / restart。
  * 结果打印到控制台，并留档到 .newide/acceptance/<timestamp>/。
  *
  * 用法：
@@ -24,7 +24,7 @@ interface JsonRpcMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
-type Scenario = 'market' | 'council' | 'subagent' | 'restart';
+type Scenario = 'memory' | 'market' | 'council' | 'subagent' | 'restart';
 
 interface CliOptions {
   workspace: string;
@@ -61,8 +61,10 @@ for (const scenario of options.scenarios) {
   log('');
   log(`=== scenario: ${scenario} ===`);
   const report =
-    scenario === 'market'
-      ? await runMarketScenario()
+    scenario === 'memory'
+      ? await runMemoryScenario()
+      : scenario === 'market'
+        ? await runMarketScenario()
       : scenario === 'council'
         ? await runCouncilScenario()
         : scenario === 'subagent'
@@ -103,6 +105,222 @@ if (reports.some((report) => report.status === 'failed')) {
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
+
+async function runMemoryScenario(): Promise<ScenarioReport> {
+  const errors: string[] = [];
+  const details: Record<string, unknown> = {};
+  let backend: BackendClient | undefined;
+  try {
+    backend = await startBackend('memory');
+    const capabilityResponse = await backend.request<{ capabilities?: unknown }>(
+      'memory.getCapabilities',
+      {},
+    );
+    const capabilities = asRecord(capabilityResponse.capabilities) ?? {};
+    const embedding = asRecord(capabilities.embedding) ?? {};
+    const operations = asRecord(capabilities.operations) ?? {};
+    details.capabilities = capabilities;
+    validateMemoryCapabilities(operations, embedding, errors);
+
+    const listed = await backend.request<{ agents?: Array<{ role_id?: string }> }>(
+      'memory.listAgents',
+      {},
+    );
+    const agentIds = (listed.agents ?? []).flatMap((agent) =>
+      typeof agent.role_id === 'string' ? [agent.role_id] : [],
+    );
+    details.available_agent_ids = agentIds;
+    if (agentIds.length === 0) throw new Error('memory.listAgents returned no real Agents');
+
+    const beforeExperienceIds = await readRecordIdsByAgent(
+      backend,
+      agentIds,
+      'memory.listExperiences',
+      'experiences',
+    );
+    const beforeSkillIds = await readRecordIdsByAgent(
+      backend,
+      agentIds,
+      'memory.listSkills',
+      'skills',
+    );
+
+    const first = await runMemoryTask(
+      backend,
+      [
+        '在工作区创建 b-memory-reuse-first.ts，使用 TypeScript 实现 normalizeProjectSlug(input: string)。',
+        '实现必须处理空白、大小写和连续分隔符，并真实写入文件。',
+        '完成时明确总结一条可复用工程经验：先统一 trim/lowercase，再折叠所有非字母数字字符为单个连字符，最后移除首尾连字符。',
+      ].join(''),
+    );
+    const firstAgentId = requireSelectedAgent(first.snapshot);
+    const firstMaintenance = await waitForMaintenanceEvidence(
+      backend,
+      first.created.run_id,
+      firstAgentId,
+      runTimeoutMs,
+    );
+    const firstExperiences = await listMemoryRecords(
+      backend,
+      'memory.listExperiences',
+      'experiences',
+      firstAgentId,
+    );
+    const firstExperienceIds = recordIds(firstExperiences).filter(
+      (id) => !beforeExperienceIds[firstAgentId]?.includes(id),
+    );
+    const firstExecution = findCompletedAgentExecution(first.snapshot, firstAgentId);
+    const personaRef = readPersonaRef(firstExecution);
+    const persona = await backend.request<{ agent?: unknown }>('memory.getAgent', {
+      role_id: firstAgentId,
+    });
+
+    const promotion = await backend.request<{ maintenance?: unknown }>(
+      'memory.promoteSkills',
+      {
+        role_id: firstAgentId,
+        requested_by: 'real-acceptance',
+      },
+    );
+    const promotionEvidence = asRecord(promotion.maintenance) ?? {};
+    const skillsAfterPromotion = await listMemoryRecords(
+      backend,
+      'memory.listSkills',
+      'skills',
+      firstAgentId,
+    );
+    const promotedSkills = skillsAfterPromotion.filter((skill) => {
+      const id = typeof skill.id === 'string' ? skill.id : undefined;
+      return id && !beforeSkillIds[firstAgentId]?.includes(id);
+    });
+
+    const second = await runMemoryTask(
+      backend,
+      [
+        '在工作区创建 b-memory-reuse-second.ts，使用 TypeScript 实现 normalizePackageSlug(input: string)。',
+        '它与上一任务属于同类规范化问题：处理空白、大小写、连续分隔符和首尾连字符，并真实写入文件。',
+        '请复用已有 Agent 记忆中的相关工程经验完成实现。',
+      ].join(''),
+    );
+    const secondAgentId = requireSelectedAgent(second.snapshot);
+    const secondMaintenance = await waitForMaintenanceEvidence(
+      backend,
+      second.created.run_id,
+      secondAgentId,
+      runTimeoutMs,
+    );
+    const secondExecution = findCompletedAgentExecution(second.snapshot, secondAgentId);
+    const secondContextPack = await readContextPack(secondExecution?.context_pack_ref);
+    const retrieval = asRecord(secondContextPack?.retrieval) ?? {};
+    const retrievedExperienceIds = recordIds(
+      Array.isArray(retrieval.experiences)
+        ? retrieval.experiences.map(asRecord).filter(isRecord)
+        : [],
+    );
+    const retrievedSkillIds = recordIds(
+      Array.isArray(retrieval.skills)
+        ? retrieval.skills.map(asRecord).filter(isRecord)
+        : [],
+    );
+    const reusedExperienceIds = firstExperienceIds.filter((id) =>
+      retrievedExperienceIds.includes(id),
+    );
+    const promotedSkillStates = promotedSkills.map((skill) => ({
+      id: skill.id,
+      review_status: skill.review_status,
+      market_status: skill.market_status,
+      reusable: skill.review_status === 'approved' && skill.market_status !== 'superseded',
+      retrieved_by_second_task:
+        typeof skill.id === 'string' && retrievedSkillIds.includes(skill.id),
+    }));
+
+    details.first_task = {
+      task_id: first.created.task_id,
+      run_id: first.created.run_id,
+      status: first.snapshot.status,
+      selected_agent_id: firstAgentId,
+      persona_ref: personaRef,
+      persona: asRecord(persona.agent)?.persona ?? null,
+      maintenance: firstMaintenance,
+      generated_experience_ids: firstExperienceIds,
+      context_pack_ref: firstExecution?.context_pack_ref ?? null,
+    };
+    details.second_task = {
+      task_id: second.created.task_id,
+      run_id: second.created.run_id,
+      status: second.snapshot.status,
+      selected_agent_id: secondAgentId,
+      maintenance: secondMaintenance,
+      context_pack_ref: secondExecution?.context_pack_ref ?? null,
+      retrieved_experience_ids: retrievedExperienceIds,
+      reused_first_experience_ids: reusedExperienceIds,
+      retrieved_skill_ids: retrievedSkillIds,
+    };
+    details.embedding = {
+      provider: embedding.provider ?? null,
+      model: embedding.model ?? null,
+      dimensions: embedding.dimensions ?? null,
+      readiness: embedding.readiness ?? null,
+    };
+    details.skill_promotion = {
+      maintenance: promotionEvidence,
+      skills: promotedSkillStates,
+      approval_transition_available:
+        asRecord(operations.approve_skill)?.status === 'available',
+    };
+
+    if (first.snapshot.status !== 'completed') {
+      errors.push(`first memory run ended as ${String(first.snapshot.status)}`);
+    }
+    if (second.snapshot.status !== 'completed') {
+      errors.push(`second memory run ended as ${String(second.snapshot.status)}`);
+    }
+    if (firstAgentId !== secondAgentId) {
+      errors.push(
+        `similar tasks selected different Agents: ${firstAgentId} -> ${secondAgentId}`,
+      );
+    }
+    if (!personaRef) errors.push('first Agent execution did not expose a Persona ref');
+    if (firstMaintenance.status !== 'completed') {
+      errors.push(`first memory maintenance ended as ${String(firstMaintenance.status)}`);
+    }
+    if (secondMaintenance.status !== 'completed') {
+      errors.push(`second memory maintenance ended as ${String(secondMaintenance.status)}`);
+    }
+    if (firstExperienceIds.length === 0) {
+      errors.push('first task produced no new persisted Experience');
+    }
+    if (reusedExperienceIds.length === 0) {
+      errors.push('second task did not retrieve any Experience generated by the first task');
+    }
+    if (promotionEvidence.status !== 'completed') {
+      errors.push(`Skill promotion ended as ${String(promotionEvidence.status)}`);
+    }
+    if (promotedSkills.length === 0) {
+      errors.push('Skill promotion produced no persisted Skill');
+    }
+
+    log(`memory first run: ${first.created.run_id} agent=${firstAgentId}`);
+    log(`memory first experiences: ${firstExperienceIds.join(', ') || '(none)'}`);
+    log(`memory second run: ${second.created.run_id} agent=${secondAgentId}`);
+    log(`memory reused experiences: ${reusedExperienceIds.join(', ') || '(none)'}`);
+    log(
+      `memory promoted Skills: ${promotedSkillStates
+        .map((skill) => `${String(skill.id)}:${String(skill.review_status)}`)
+        .join(', ') || '(none)'}`,
+    );
+  } catch (error) {
+    errors.push(toMessage(error));
+  } finally {
+    await backend?.close();
+  }
+  return {
+    scenario: 'memory',
+    status: errors.length === 0 ? 'passed' : 'failed',
+    details,
+    errors,
+  };
+}
 
 async function runMarketScenario(): Promise<ScenarioReport> {
   const errors: string[] = [];
@@ -575,6 +793,196 @@ async function runRestartScenario(): Promise<ScenarioReport> {
   };
 }
 
+interface MemoryTaskRun {
+  created: { run_id: string; task_id: string };
+  snapshot: Record<string, unknown>;
+}
+
+async function runMemoryTask(
+  backend: BackendClient,
+  prompt: string,
+): Promise<MemoryTaskRun> {
+  const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
+    prompt,
+    mode: 'single_agent',
+    workspace_path: options.workspace,
+  });
+  await backend.subscribeAndLog(created.run_id);
+  return {
+    created,
+    snapshot: await backend.waitForTerminal(created.run_id, runTimeoutMs),
+  };
+}
+
+function validateMemoryCapabilities(
+  operations: Record<string, unknown>,
+  embedding: Record<string, unknown>,
+  errors: string[],
+): void {
+  for (const operation of [
+    'list_agents',
+    'get_agent_persona',
+    'list_experiences',
+    'list_skills',
+    'list_maintenance',
+    'promote_skills',
+  ]) {
+    if (asRecord(operations[operation])?.status !== 'available') {
+      errors.push(`memory capability ${operation} is not available`);
+    }
+  }
+  for (const operation of ['approve_skill', 'reject_skill', 'update_persona']) {
+    const capability = asRecord(operations[operation]);
+    if (
+      capability?.status !== 'unavailable' ||
+      typeof capability.reason !== 'string' ||
+      !capability.reason.trim()
+    ) {
+      errors.push(`memory capability ${operation} lacks an explicit unavailable reason`);
+    }
+  }
+  if (typeof embedding.provider !== 'string' || !embedding.provider) {
+    errors.push('embedding provider is missing from memory capabilities');
+  }
+  if (typeof embedding.model !== 'string' || !embedding.model) {
+    errors.push('embedding model is missing from memory capabilities');
+  }
+  if (
+    typeof embedding.dimensions !== 'number' ||
+    !Number.isInteger(embedding.dimensions) ||
+    embedding.dimensions <= 0
+  ) {
+    errors.push('embedding dimensions are missing or invalid');
+  }
+}
+
+async function readRecordIdsByAgent(
+  backend: BackendClient,
+  agentIds: readonly string[],
+  method: 'memory.listExperiences' | 'memory.listSkills',
+  resultField: 'experiences' | 'skills',
+): Promise<Record<string, string[]>> {
+  const entries = await Promise.all(
+    agentIds.map(async (agentId) => [
+      agentId,
+      recordIds(await listMemoryRecords(backend, method, resultField, agentId)),
+    ] as const),
+  );
+  return Object.fromEntries(entries);
+}
+
+async function listMemoryRecords(
+  backend: BackendClient,
+  method: 'memory.listExperiences' | 'memory.listSkills',
+  resultField: 'experiences' | 'skills',
+  agentId: string,
+): Promise<Record<string, unknown>[]> {
+  const result = await backend.request<Record<string, unknown>>(method, {
+    role_id: agentId,
+  });
+  const values = result[resultField];
+  return Array.isArray(values) ? values.map(asRecord).filter(isRecord) : [];
+}
+
+async function waitForMaintenanceEvidence(
+  backend: BackendClient,
+  runId: string,
+  agentId: string,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = await backend.request<{ maintenance?: unknown[] }>(
+      'memory.listMaintenance',
+      { role_id: agentId },
+    );
+    const evidence = (result.maintenance ?? [])
+      .map(asRecord)
+      .filter(isRecord)
+      .find(
+        (item) =>
+          item.kind === 'experience_extraction' &&
+          item.run_id === runId &&
+          item.role_id === agentId,
+      );
+    if (
+      evidence &&
+      ['completed', 'skipped', 'failed'].includes(String(evidence.status))
+    ) {
+      return evidence;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for B maintenance for run ${runId}`);
+    }
+    await sleep(500);
+  }
+}
+
+function requireSelectedAgent(snapshot: Record<string, unknown>): string {
+  const marketAgentId = asRecord(snapshot.market)?.winner_agent_id;
+  if (typeof marketAgentId === 'string' && marketAgentId) return marketAgentId;
+  const agentRuns = Array.isArray(snapshot.agent_runs) ? snapshot.agent_runs : [];
+  for (const value of agentRuns) {
+    const execution = asRecord(value);
+    if (
+      execution?.type === 'agent.execution_completed' &&
+      typeof execution.agent_id === 'string'
+    ) {
+      return execution.agent_id;
+    }
+  }
+  throw new Error('Run snapshot did not expose a selected B Agent');
+}
+
+function findCompletedAgentExecution(
+  snapshot: Record<string, unknown>,
+  agentId: string,
+): Record<string, unknown> | undefined {
+  const agentRuns = Array.isArray(snapshot.agent_runs) ? snapshot.agent_runs : [];
+  return agentRuns
+    .map(asRecord)
+    .filter(isRecord)
+    .find(
+      (execution) =>
+        execution.type === 'agent.execution_completed' &&
+        execution.agent_id === agentId,
+    );
+}
+
+function readPersonaRef(execution: Record<string, unknown> | undefined): string | undefined {
+  const diagnostics = asRecord(execution?.diagnostics);
+  const agentRuntime = asRecord(diagnostics?.agent_runtime);
+  return typeof agentRuntime?.persona_ref === 'string'
+    ? agentRuntime.persona_ref
+    : undefined;
+}
+
+async function readContextPack(reference: unknown): Promise<Record<string, unknown> | undefined> {
+  if (
+    typeof reference !== 'string' ||
+    !/^context_pack_[a-f0-9]{24}$/.test(reference)
+  ) {
+    return undefined;
+  }
+  return asRecord(
+    await readJsonIfExists(
+      path.join(repoRoot, '.newide', 'b', 'context-packs', `${reference}.json`),
+    ),
+  );
+}
+
+function recordIds(records: readonly Record<string, unknown>[]): string[] {
+  return records.flatMap((record) =>
+    typeof record.id === 'string' ? [record.id] : [],
+  );
+}
+
+function isRecord(
+  value: Record<string, unknown> | undefined,
+): value is Record<string, unknown> {
+  return value !== undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Backend process client
 // ---------------------------------------------------------------------------
@@ -630,12 +1038,48 @@ async function startBackend(label: string): Promise<BackendClient> {
   const request = async <T>(method: string, params: unknown): Promise<T> => {
     const id = nextId++;
     const waiting = new Promise<JsonRpcMessage>((resolve, reject) => {
-      const waiter = { predicate: (message: JsonRpcMessage) => message.id === id, resolve };
-      waiters.add(waiter);
-      setTimeout(() => {
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        child.off('close', onClose);
+        child.off('error', onError);
+      };
+      const resolveResponse = (message: JsonRpcMessage): void => {
+        cleanup();
+        resolve(message);
+      };
+      const rejectRequest = (error: Error): void => {
         if (!waiters.delete(waiter)) return;
-        reject(new Error(`[${label}] timed out waiting for ${method}. stderr=${stderr.join('')}`));
-      }, 60_000).unref();
+        cleanup();
+        reject(error);
+      };
+      const onClose = (code: number | null): void => {
+        rejectRequest(
+          new Error(
+            `[${label}] backend exited with code ${String(code)} while waiting for ${method}. ` +
+              `stderr=${stderr.join('')}`,
+          ),
+        );
+      };
+      const onError = (error: Error): void => {
+        rejectRequest(
+          new Error(
+            `[${label}] backend failed while waiting for ${method}: ${error.message}. ` +
+              `stderr=${stderr.join('')}`,
+          ),
+        );
+      };
+      const waiter = {
+        predicate: (message: JsonRpcMessage) => message.id === id,
+        resolve: resolveResponse,
+      };
+      waiters.add(waiter);
+      child.once('close', onClose);
+      child.once('error', onError);
+      const timeout = setTimeout(() => {
+        rejectRequest(
+          new Error(`[${label}] timed out waiting for ${method}. stderr=${stderr.join('')}`),
+        );
+      }, 60_000);
     });
     child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     const response = await waiting;
@@ -777,8 +1221,9 @@ function parseCli(args: string[]): CliOptions {
   const scenarioValue = scenarioIndex >= 0 ? (args[scenarioIndex + 1] ?? 'all') : 'all';
   const scenarios: Scenario[] =
     scenarioValue === 'all'
-      ? ['market', 'council', 'subagent', 'restart']
-      : scenarioValue === 'market' ||
+      ? ['memory', 'market', 'council', 'subagent', 'restart']
+      : scenarioValue === 'memory' ||
+          scenarioValue === 'market' ||
           scenarioValue === 'council' ||
           scenarioValue === 'subagent' ||
           scenarioValue === 'restart'
@@ -809,7 +1254,7 @@ function toMessage(error: unknown): string {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms).unref());
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function log(message: string): void {

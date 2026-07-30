@@ -197,7 +197,10 @@ export async function createProductionBackendService(
         }),
       }),
     });
-    const bMemoryService = new BMemoryBackendService(bCapabilities);
+    const bMemoryService = new BMemoryBackendService(
+      bCapabilities,
+      bRuntime.embedding_info,
+    );
 
     try {
       await agentExecutionFacade.ready();

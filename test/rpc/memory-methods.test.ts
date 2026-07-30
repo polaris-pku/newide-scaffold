@@ -15,6 +15,9 @@ describe('MemoryRpcMethods', () => {
     new MemoryRpcMethods(service).register(dispatcher);
     const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
 
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":0,"method":"memory.getCapabilities","params":{}}',
+    );
     await session.handleLine('{"jsonrpc":"2.0","id":1,"method":"memory.listAgents","params":{}}');
     await session.handleLine(
       '{"jsonrpc":"2.0","id":2,"method":"memory.getAgent","params":{"role_id":"role_ts_engineer"}}',
@@ -36,6 +39,25 @@ describe('MemoryRpcMethods', () => {
     );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
+      {
+        id: 0,
+        result: {
+          capabilities: {
+            embedding: { provider: 'test', model: 'test-embedding', dimensions: 4 },
+            operations: {
+              list_experiences: { status: 'available' },
+              approve_skill: {
+                status: 'unavailable',
+                reason: expect.any(String),
+              },
+              update_persona: {
+                status: 'unavailable',
+                reason: expect.any(String),
+              },
+            },
+          },
+        },
+      },
       { id: 1, result: { agents: [{ role_id: 'role_ts_engineer' }] } },
       { id: 2, result: { agent: { role_id: 'role_ts_engineer' } } },
       { id: 3, result: { experiences: [{ id: 'experience_1' }] } },
@@ -50,6 +72,26 @@ describe('MemoryRpcMethods', () => {
 
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
+    getMemoryCapabilities: () => ({
+      schema_version: 'newide.b-memory-capabilities.v1',
+      embedding: {
+        provider: 'test',
+        model: 'test-embedding',
+        dimensions: 4,
+        readiness: 'verified',
+      },
+      operations: {
+        list_agents: { status: 'available' },
+        get_agent_persona: { status: 'available' },
+        list_experiences: { status: 'available' },
+        list_skills: { status: 'available' },
+        list_maintenance: { status: 'available' },
+        promote_skills: { status: 'available' },
+        approve_skill: { status: 'unavailable', reason: 'not exposed' },
+        reject_skill: { status: 'unavailable', reason: 'not exposed' },
+        update_persona: { status: 'unavailable', reason: 'not exposed' },
+      },
+    }),
     listMemoryAgents: async () => [
       {
         role_id: 'role_ts_engineer',
