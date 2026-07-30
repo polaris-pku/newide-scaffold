@@ -1,47 +1,41 @@
 import {
-  RepositoryAgentBoardQuery,
   type AgentBoardAgentView,
   type AgentBoardListItem,
   type ExperienceView,
-  type MemoryRepository,
   type SkillView,
 } from '../memory';
-import type {
-  BMemoryMaintenanceEvidence,
-  BMemoryMaintenanceRunner,
-} from './b-memory-maintenance-runner';
+import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
+import type { BPublicCapabilities } from './b-public-capabilities';
 
 export class BMemoryBackendService {
-  private readonly board: RepositoryAgentBoardQuery;
-
   constructor(
-    repository: MemoryRepository,
-    private readonly maintenance: BMemoryMaintenanceRunner,
-  ) {
-    this.board = new RepositoryAgentBoardQuery(repository);
-  }
+    private readonly capabilities: Pick<BPublicCapabilities, 'boardQuery' | 'maintenance'>,
+  ) {}
 
   listAgents(): Promise<AgentBoardListItem[]> {
-    return this.board.listAgents();
+    return this.capabilities.boardQuery.listAgents();
   }
 
   getAgent(roleId: string): Promise<AgentBoardAgentView> {
-    return this.board.getAgent(roleId);
+    return this.capabilities.boardQuery.getAgent(roleId);
   }
 
   listSkills(roleId: string): Promise<SkillView[]> {
-    return this.board.listSkills(roleId);
+    return this.capabilities.boardQuery.listSkills(roleId);
   }
 
   listExperiences(roleId: string): Promise<ExperienceView[]> {
-    return this.board.listExperiences(roleId);
+    return this.capabilities.boardQuery.listExperiences(roleId);
   }
 
   listMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]> {
-    return this.maintenance.listEvidence(roleId);
+    return this.capabilities.maintenance.listEvidence(roleId);
   }
 
   promoteSkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
-    return this.maintenance.promoteSkills({ role_id: roleId, requested_by: requestedBy });
+    return this.capabilities.maintenance.promoteSkills({
+      role_id: roleId,
+      requested_by: requestedBy,
+    });
   }
 }

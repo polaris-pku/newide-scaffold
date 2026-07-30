@@ -9,7 +9,10 @@ import {
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
+  type AgentTaskRequest,
   type BufferRepository,
+  type CollectCompetitionClaimsOptions,
+  type CompetitionClaimBatch,
   type DispatchTaskResult,
   type DriverContext,
   type DriverTask,
@@ -24,12 +27,6 @@ import type {
   AgentExecutionResult,
   AgentExecutionStatus,
 } from '../protocol/agent-execution';
-import type { AgentTaskRequest } from '../memory/agent-types';
-import type {
-  CollectCompetitionClaimsOptions,
-  CompetitionClaimBatch,
-} from '../memory/competition-types';
-import type { AgentCompetitionQuery } from '../memory/ports/agent-competition-query';
 import type {
   AgentMailboxWakePort,
   AgentMailboxWakeRequestV1,
@@ -73,24 +70,19 @@ interface InvocationContext {
   execution?: DriverRunResult;
   retrieval: MemoryRetrievalResult;
   driver_invocation_context?: DriverRuntimeInvokerInput['driver_context'];
+  agent_system_prompt_sha256?: string;
   driver_attempts: number;
   abortObserved: boolean;
 }
 
-const AGENT_SYSTEM_PROMPT = [
-  'You execute one role in a Coordinator-managed workflow.',
-  'You may call query_memory before delegating when prior context is useful.',
-  'Call invoke_driver exactly once with the complete concrete task.',
-  'After invoke_driver returns, do not call more tools. Summarize the result and include "[done]".',
-].join('\n');
-
+const AGENT_RUNTIME_POLICY_ID = 'b-persona-tools-v1';
 const TOP_LEVEL_MEMORY_ITEM_LIMIT = 5;
 const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
 const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
 const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
 
 export class DriverRuntimeAgentExecutionFacade
-  implements AgentExecutionFacade, AgentCompetitionQuery, AgentMailboxWakePort
+  implements AgentExecutionFacade, AgentMailboxWakePort
 {
   private readonly manager: Promise<AgentManager>;
   private readonly roleReady = new Map<string, Promise<AgentManager>>();
@@ -115,7 +107,6 @@ export class DriverRuntimeAgentExecutionFacade
           completeWithTools: (input) => this.completeWithTools(input),
         },
         tools: [new InvokeDriverTool((task) => this.invokeDriver(task))],
-        systemPrompt: AGENT_SYSTEM_PROMPT,
         maxToolCalls: 4,
       },
     });
@@ -229,6 +220,7 @@ export class DriverRuntimeAgentExecutionFacade
         invocation.execution,
         invocation.driver_attempts,
         invocation.driver_invocation_context,
+        invocation.agent_system_prompt_sha256,
       );
     });
   }
@@ -269,6 +261,10 @@ export class DriverRuntimeAgentExecutionFacade
     }
     try {
       throwIfAborted(invocation.signal);
+      const systemPromptSha256 = hashSystemPrompt(input.messages);
+      if (systemPromptSha256) {
+        invocation.agent_system_prompt_sha256 ??= systemPromptSha256;
+      }
       return await withAbort(
         this.options.llm.completeWithTools(withTopLevelMemoryContext(input, invocation.retrieval)),
         invocation.signal,
@@ -342,6 +338,7 @@ export class DriverRuntimeAgentExecutionFacade
     execution: DriverRunResult | undefined,
     driverAttempts: number,
     driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
+    agentSystemPromptSha256: string | undefined,
   ): Promise<AgentExecutionResult> {
     const memoryMaintenance = await this.processMemoryMaintenance(
       input,
@@ -354,6 +351,7 @@ export class DriverRuntimeAgentExecutionFacade
         dispatched,
         runtimeRoleId,
         driverInvocationContext,
+        agentSystemPromptSha256,
         memoryMaintenance,
       );
     }
@@ -363,7 +361,9 @@ export class DriverRuntimeAgentExecutionFacade
       dispatched,
       runtimeRoleId,
       driverInvocationContext,
+      agentSystemPromptSha256,
     );
+    const agentRuntime = buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256);
 
     const dispatchFailed = dispatched.status !== 'completed';
     const dispatchError = dispatchFailed
@@ -398,6 +398,7 @@ export class DriverRuntimeAgentExecutionFacade
           skills: dispatched.cycle.retrieval.skills.length,
         },
         promotion: dispatched.cycle.promotion.check,
+        agent_runtime: agentRuntime,
         ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
@@ -419,6 +420,7 @@ export class DriverRuntimeAgentExecutionFacade
     dispatched: DispatchTaskResult,
     runtimeRoleId: string,
     driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
+    agentSystemPromptSha256: string | undefined,
     memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
@@ -439,7 +441,9 @@ export class DriverRuntimeAgentExecutionFacade
       dispatched,
       runtimeRoleId,
       driverInvocationContext,
+      agentSystemPromptSha256,
     );
+    const agentRuntime = buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256);
 
     return {
       agent_run_id: createId('agent_run'),
@@ -469,6 +473,7 @@ export class DriverRuntimeAgentExecutionFacade
           experiences: dispatched.cycle.retrieval.experiences.length,
           skills: dispatched.cycle.retrieval.skills.length,
         },
+        agent_runtime: agentRuntime,
         ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
@@ -522,6 +527,7 @@ export class DriverRuntimeAgentExecutionFacade
     dispatched: DispatchTaskResult,
     runtimeRoleId: string,
     driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
+    agentSystemPromptSha256: string | undefined,
   ): Promise<{
     context_pack_ref: string;
     memory_buffer_ref: string;
@@ -540,6 +546,7 @@ export class DriverRuntimeAgentExecutionFacade
       retrieval: dispatched.cycle.retrieval,
       driver_context: dispatched.cycle.driver_context,
       ...(driverInvocationContext ? { driver_invocation_context: driverInvocationContext } : {}),
+      agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
     });
     const contextPackRef = `context_pack_${createHash('sha256').update(identity).digest('hex').slice(0, 24)}`;
     const evidence: AgentContextPackEvidence = {
@@ -557,6 +564,7 @@ export class DriverRuntimeAgentExecutionFacade
       },
       driver_context: dispatched.cycle.driver_context,
       ...(driverInvocationContext ? { driver_invocation_context: driverInvocationContext } : {}),
+      agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
@@ -605,6 +613,31 @@ export class DriverRuntimeAgentExecutionFacade
     });
     return rejectWhileQueued(running, signal, () => started);
   }
+}
+
+function hashSystemPrompt(
+  messages: Array<{ role: string; content: string | null }>,
+): string | undefined {
+  const prompt = messages
+    .filter((message) => message.role === 'system' && message.content)
+    .map((message) => message.content)
+    .join('\n\n');
+  if (!prompt) return undefined;
+  return createHash('sha256').update(prompt).digest('hex');
+}
+
+function buildAgentRuntimeEvidence(
+  dispatched: DispatchTaskResult,
+  systemPromptSha256: string | undefined,
+): AgentContextPackEvidence['agent_runtime'] {
+  const persona = dispatched.cycle.persona;
+  return {
+    policy_id: AGENT_RUNTIME_POLICY_ID,
+    persona_ref: `persona://${encodeURIComponent(persona.role_id)}/v${String(persona.version)}`,
+    persona_version: persona.version,
+    persona_generated_at: persona.generated_at,
+    ...(systemPromptSha256 ? { system_prompt_sha256: systemPromptSha256 } : {}),
+  };
 }
 
 function mapStatus(

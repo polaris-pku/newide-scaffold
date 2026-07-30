@@ -1,12 +1,20 @@
-import type { AgentTaskRequest } from '../memory/agent-types';
 import type {
+  AgentTaskRequest,
   AgentBoardAgentView,
   AgentBoardQuery,
+  CollectCompetitionClaimsOptions,
+  CompetitionClaimBatch,
   ExperienceView,
   SkillView,
-} from '../memory/ports/agent-board-query';
-import type { AgentCompetitionQuery } from '../memory/ports/agent-competition-query';
+} from '../memory';
 import { AgentProjectionSchema, type AgentProjection } from './models';
+
+export interface AgentCompetitionClaimQuery {
+  collectCompetitionClaims(
+    task: AgentTaskRequest,
+    options?: CollectCompetitionClaimsOptions,
+  ): Promise<CompetitionClaimBatch>;
+}
 
 export interface AgentProjectionSource {
   projectCandidates(
@@ -20,7 +28,7 @@ export interface AgentProjectionOptions {
 }
 
 export interface BAgentProjectionAdapterOptions {
-  competitionQuery: AgentCompetitionQuery;
+  competitionQuery: AgentCompetitionClaimQuery;
   boardQuery: AgentBoardQuery;
   ensureAgent?: (agentId: string) => Promise<void>;
   allowedAgentIds?: readonly string[];
@@ -33,9 +41,7 @@ export class BAgentProjectionAdapter implements AgentProjectionSource {
 
   constructor(private readonly options: BAgentProjectionAdapterOptions) {
     this.now = options.now ?? Date.now;
-    this.allowedAgentIds = options.allowedAgentIds
-      ? new Set(options.allowedAgentIds)
-      : undefined;
+    this.allowedAgentIds = options.allowedAgentIds ? new Set(options.allowedAgentIds) : undefined;
   }
 
   async projectCandidates(
@@ -136,9 +142,7 @@ function daysSince(lastTaskAt: string | undefined, now: number): number {
 function uniqueKeywords(values: readonly string[]): string[] {
   return [
     ...new Set(
-      values
-        .flatMap((value) => value.toLowerCase().split(/[^\p{L}\p{N}]+/u))
-        .filter(Boolean),
+      values.flatMap((value) => value.toLowerCase().split(/[^\p{L}\p{N}]+/u)).filter(Boolean),
     ),
   ];
 }

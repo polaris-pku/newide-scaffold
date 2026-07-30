@@ -252,10 +252,14 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
 
   it('preserves B-owned query_memory alongside the app-owned driver tool', async () => {
     const exposedTools: string[][] = [];
+    const systemPrompts: string[] = [];
     const delegate = invokeDriverLlm();
     const llm: ToolCallingClient = {
       async completeWithTools(input) {
         exposedTools.push(input.tools.map((tool) => tool.function.name));
+        systemPrompts.push(
+          input.messages.find((message) => message.role === 'system')?.content ?? '',
+        );
         return delegate.completeWithTools(input);
       },
     };
@@ -268,6 +272,8 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     await facade.runAgent(request('task_tool_surface', 'tool_surface_role'));
 
     expect(exposedTools[0]).toEqual(['query_memory', 'invoke_driver']);
+    expect(systemPrompts[0]).toContain('You are Agent "tool_surface_role".');
+    expect(systemPrompts[0]).toContain('## Your Identity');
   });
 
   it('registers and projects a market candidate without executing A', async () => {
@@ -479,6 +485,12 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       expect(persisted).toMatchObject({
         agent_id: roleId,
         memory_buffer_ref: `${roleId}:1`,
+        agent_runtime: {
+          policy_id: 'b-persona-tools-v1',
+          persona_ref: `persona://${roleId}/v1`,
+          persona_version: 1,
+          system_prompt_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+        },
       });
       expect(persisted.retrieval).toEqual({
         skills: [storedApprovedSkill],
