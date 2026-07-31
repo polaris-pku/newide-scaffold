@@ -32,6 +32,7 @@ export interface BAgentProjectionAdapterOptions {
   boardQuery: AgentBoardQuery;
   ensureAgent?: (agentId: string) => Promise<void>;
   allowedAgentIds?: readonly string[];
+  candidateSource?: 'competition_claims' | 'allowed_catalog';
   now?: () => number;
 }
 
@@ -59,22 +60,27 @@ export class BAgentProjectionAdapter implements AgentProjectionSource {
     for (const agentId of bootstrapAgentIds) {
       await this.options.ensureAgent!(agentId);
     }
-    const batch = await this.options.competitionQuery.collectCompetitionClaims(task);
-    const eligible = batch.claims
-      .filter(
-        (claim) =>
-          this.isAllowed(claim.role_id) &&
-          claim.decision === 'participate' &&
-          claim.availability.busy !== true,
-      )
-      .sort((left, right) => left.role_id.localeCompare(right.role_id));
+    const eligibleRoleIds =
+      this.options.candidateSource === 'allowed_catalog'
+        ? bootstrapAgentIds
+        : (
+            await this.options.competitionQuery.collectCompetitionClaims(task)
+          ).claims
+            .filter(
+              (claim) =>
+                this.isAllowed(claim.role_id) &&
+                claim.decision === 'participate' &&
+                claim.availability.busy !== true,
+            )
+            .map((claim) => claim.role_id)
+            .sort();
 
     return Promise.all(
-      eligible.map(async (claim) => {
+      eligibleRoleIds.map(async (roleId) => {
         const [agent, skills, experiences] = await Promise.all([
-          this.options.boardQuery.getAgent(claim.role_id),
-          this.options.boardQuery.listSkills(claim.role_id),
-          this.options.boardQuery.listExperiences(claim.role_id),
+          this.options.boardQuery.getAgent(roleId),
+          this.options.boardQuery.listSkills(roleId),
+          this.options.boardQuery.listExperiences(roleId),
         ]);
         return toProjection(agent, skills, experiences, this.now());
       }),

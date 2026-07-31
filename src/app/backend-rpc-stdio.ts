@@ -182,6 +182,7 @@ export async function createProductionBackendService(
       driver,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
+      ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
       llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
@@ -194,6 +195,7 @@ export async function createProductionBackendService(
         boardQuery: bCapabilities.boardQuery,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
         allowedAgentIds: bRuntime.market_agent_ids,
+        candidateSource: 'allowed_catalog',
       }),
       evidenceStore: new FileMarketEvidenceStore({
         root: path.join(stateRoot, 'market'),

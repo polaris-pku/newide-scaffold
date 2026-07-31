@@ -23,6 +23,7 @@ import {
   type DispatchTaskResult,
   type DriverContext,
   type DriverTask,
+  type EmbeddingProvider,
   type MemoryRetrievalResult,
   type MemoryRepository,
   type ToolCallingClient,
@@ -62,6 +63,7 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
+  embedding?: EmbeddingProvider;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
 }
@@ -116,6 +118,7 @@ export class DriverRuntimeAgentExecutionFacade
         tools: [new InvokeDriverTool((task) => this.invokeDriver(task))],
         maxToolCalls: 4,
       },
+      ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
     });
   }
 
@@ -185,6 +188,7 @@ export class DriverRuntimeAgentExecutionFacade
           task,
           input.task_id,
           {
+            ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
             selection: {
               include_skills: ablationPolicy.include_skills,
               include_recent_experience: ablationPolicy.include_recent_experience,
@@ -845,7 +849,9 @@ function mergeArtifacts(
 ): ArtifactRef[] {
   const result: ArtifactRef[] = [];
   const seenTargets = new Set<string>();
-  for (const artifact of [...driverArtifacts, ...workspaceArtifacts]) {
+  // Workspace snapshots contain the complete post-run file. Prefer them over
+  // Driver edit snippets when both artifacts target the same path.
+  for (const artifact of [...workspaceArtifacts, ...driverArtifacts]) {
     const target = artifact.content?.target_path;
     if (target && seenTargets.has(target)) continue;
     if (target) seenTargets.add(target);

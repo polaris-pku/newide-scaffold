@@ -18,6 +18,7 @@ export interface AutonomousCouncilExecution {
   council_run_result: CouncilRunResult;
   council_result: CouncilResult;
   final_artifact: ArtifactRef;
+  final_artifacts: ArtifactRef[];
 }
 
 export class AutonomousCouncilHandler {
@@ -34,9 +35,12 @@ export class AutonomousCouncilHandler {
         artifact,
       ]),
     );
-    const selected = firstMaterializable(runResult.selected_artifact_refs, artifacts);
-    const fallback = selected ? undefined : selectReviewedProposal(runResult.proposals, runResult.reviews, artifacts);
-    const finalArtifact = selected ?? fallback;
+    const selected = materializableArtifacts(runResult.selected_artifact_refs, artifacts);
+    const fallback = selected.length > 0
+      ? []
+      : selectReviewedProposalArtifacts(runResult.proposals, runResult.reviews, artifacts);
+    const finalArtifacts = selected.length > 0 ? selected : fallback;
+    const finalArtifact = finalArtifacts[0];
     if (!finalArtifact) throw new Error('Council produced no materializable artifact');
 
     const unmetCriteria = unique(
@@ -52,9 +56,13 @@ export class AutonomousCouncilHandler {
         ['agent_reused_across_council_seats', 'best_effort_identity'].includes(flag),
       ),
     );
-    const verified = Boolean(selected && runResult.synthesis && fullyApproved && !identityConflict);
+    const verified = Boolean(
+      selected.length > 0 && runResult.synthesis && fullyApproved && !identityConflict,
+    );
     const warnings: string[] = [];
-    if (fallback) warnings.push('Council synthesis was unavailable; selected a reviewed proposal.');
+    if (fallback.length > 0) {
+      warnings.push('Council synthesis was unavailable; selected a reviewed proposal.');
+    }
     if (identityConflict) {
       warnings.push(
         'Council reused a persisted Agent across seats; the result is best_effort and not fully verified.',
@@ -75,39 +83,51 @@ export class AutonomousCouncilHandler {
       decision_record_ref: runResult.decision.decision_id,
     };
     const councilRunResult = { ...runResult, result: councilResult };
-    return { council_run_result: councilRunResult, council_result: councilResult, final_artifact: finalArtifact };
+    return {
+      council_run_result: councilRunResult,
+      council_result: councilResult,
+      final_artifact: finalArtifact,
+      final_artifacts: finalArtifacts,
+    };
   }
 }
 
-function firstMaterializable(
+function materializableArtifacts(
   artifactIds: readonly string[],
   artifacts: ReadonlyMap<string, ArtifactRef>,
-): ArtifactRef | undefined {
+): ArtifactRef[] {
   return artifactIds
     .map((artifactId) => artifacts.get(artifactId))
-    .find((artifact): artifact is ArtifactRef => Boolean(artifact && isMaterializableFileArtifact(artifact)));
+    .filter(
+      (artifact): artifact is ArtifactRef =>
+        Boolean(artifact && isMaterializableFileArtifact(artifact)),
+    );
 }
 
-function selectReviewedProposal(
+function selectReviewedProposalArtifacts(
   proposals: readonly Proposal[],
   reviews: readonly Review[],
   artifacts: ReadonlyMap<string, ArtifactRef>,
-): ArtifactRef | undefined {
+): ArtifactRef[] {
   const reviewScore = new Map<string, number>();
   for (const review of reviews) {
     const score = review.verdict === 'approve' ? 2 : review.verdict === 'needs_revision' ? 1 : 0;
     reviewScore.set(review.proposal_id, Math.max(reviewScore.get(review.proposal_id) ?? -1, score));
   }
-  return proposals
+  const selectedProposal = proposals
     .map((proposal, index) => ({
       proposal,
       index,
       score: reviewScore.get(proposal.proposal_id) ?? 0,
     }))
-    .sort((left, right) => right.score - left.score || left.index - right.index)
-    .flatMap(({ proposal }) => proposal.artifact_refs)
+    .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.proposal;
+  if (!selectedProposal) return [];
+  return selectedProposal.artifact_refs
     .map((artifactId) => artifacts.get(artifactId))
-    .find((artifact): artifact is ArtifactRef => Boolean(artifact && isMaterializableFileArtifact(artifact)));
+    .filter(
+      (artifact): artifact is ArtifactRef =>
+        Boolean(artifact && isMaterializableFileArtifact(artifact)),
+    );
 }
 
 function unique(values: readonly string[]): string[] {

@@ -31,6 +31,7 @@ const MARKET_AGENT_CATALOG = [
 
 export interface BMemoryStorage {
   readonly repository: MemoryRepository;
+  readonly embedding?: EmbeddingProvider;
   readonly embedding_info?: BEmbeddingRuntimeInfo;
   close(): Promise<void>;
 }
@@ -46,6 +47,7 @@ export interface BEmbeddingRuntimeInfo {
 export interface BackendBRuntime {
   readonly repository: MemoryRepository;
   readonly bufferRepository: BufferRepository;
+  readonly embedding?: EmbeddingProvider;
   readonly app_state_root: string;
   readonly market_agent_ids: readonly string[];
   readonly embedding_info: BEmbeddingRuntimeInfo;
@@ -87,6 +89,7 @@ export async function createProductionBRuntime(
     return {
       repository: storage.repository,
       bufferRepository,
+      ...(storage.embedding ? { embedding: storage.embedding } : {}),
       app_state_root: appStateRoot,
       market_agent_ids: MARKET_AGENT_CATALOG.map((agent) => agent.role_id),
       embedding_info: storage.embedding_info ?? {
@@ -119,7 +122,12 @@ async function createPostgresStorage(
     await verifyEmbeddingReadiness(embedding.provider);
     const repository = new PgMemoryRepository({ pool, embedding: embedding.provider });
     await repository.listAgentIds();
-    return { repository, close, embedding_info: embedding.info };
+    return {
+      repository,
+      embedding: embedding.provider,
+      close,
+      embedding_info: embedding.info,
+    };
   } catch (error) {
     await close().catch(() => undefined);
     throw operationalError(

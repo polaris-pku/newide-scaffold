@@ -21,6 +21,7 @@ import type { SelectAgentHandler } from '../coordinator/handlers/select-agent-ha
 import { AutonomousCouncilHandler } from '../coordinator/handlers/autonomous-council-handler';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import type { CouncilProvider, CouncilRunResult, EvidencePack } from '../council';
+import { prepareCouncilWorkspace } from '../council/council-workspace';
 import type { GateResult } from '../gate';
 import type { TaskResumeCursor } from '../persistence';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../protocol/agent-execution';
@@ -151,7 +152,11 @@ export function createProductionStageExecutors(
         context.mode === 'council'
           ? path.join(dependencies.councilRoot, context.run_id, 'primary')
           : context.workspace_path;
-      await fs.mkdir(executionWorkspace, { recursive: true });
+      if (context.mode === 'council') {
+        await prepareCouncilWorkspace(context.workspace_path, executionWorkspace);
+      } else {
+        await fs.mkdir(executionWorkspace, { recursive: true });
+      }
       emit(context, 'agent.execution_requested', context.run_id, {
         role_id: context.cursor_input.winner_agent_id,
         workspace_path: executionWorkspace,
