@@ -206,7 +206,10 @@ export function createProductionSystemStatusService(
       degraded('driver.execute', 'DRIVER_HANDSHAKE_UNAVAILABLE', driver),
       unavailable('driver.workspace', 'PER_REQUEST_WORKSPACE_NOT_CONFIRMED', driver),
       available('agent.read', bRepository),
-      unavailable('artifact.result_bundle', 'RESULT_BUNDLE_NOT_PUBLISHED'),
+      available(
+        'artifact.result_bundle',
+        provider('file-run-output-writer', undefined, 'persisted-files'),
+      ),
       unavailable('driver.session.continue', 'DRIVER_SESSION_HANDSHAKE_UNAVAILABLE'),
       unavailable('driver.audit', 'DRIVER_AUDIT_QUERY_NOT_PUBLISHED'),
       degraded('memory.semantic_retrieval', 'END_TO_END_RETRIEVAL_NOT_VERIFIED', bEmbedding),
