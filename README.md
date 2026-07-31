@@ -68,8 +68,9 @@ newide council run \
 `--allow-degraded`. It still executes real model calls and writes real artifacts; the terminal JSON
 preserves the capability status and result quality. stdout contains one
 `newide.eval.council.v1` terminal JSON object with `run_id`, `task_id`, `status`, `quality`,
-`council_capability`, `result_path`, `frontend_snapshot_path`, `audit_path`, decision summary, and
-errors. Progress and lifecycle diagnostics use stderr.
+`council_capability`, `result_path`, `summary_path`, `frontend_snapshot_path`, `audit_path`, decision
+summary, and errors. Progress and lifecycle diagnostics use stderr. A terminal production run also
+publishes `summary.json` under its run directory; Eval consumes its top-level `worktree_path`.
 
 Runtime configuration is loaded from the caller's `.env.local` plus process environment. Required
 external dependencies are explicit:

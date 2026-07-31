@@ -23,6 +23,7 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
     const runDir = path.join(this.runsRoot, snapshot.run_id);
     await fs.mkdir(runDir, { recursive: true });
     const resultPath = path.join(runDir, 'result.json');
+    const summaryPath = path.join(runDir, 'summary.json');
     const timelinePath = path.join(runDir, 'timeline.json');
     const frontendSnapshotPath = path.join(runDir, 'frontend-snapshot.json');
 
@@ -31,10 +32,18 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
       writeJsonIfMissing(resultPath, {
         ...projected,
         result_path: resultPath,
+        summary_path: summaryPath,
         timeline_path: timelinePath,
         audit_path: path.join(runDir, 'audit.jsonl'),
         frontend_snapshot_path: frontendSnapshotPath,
       }),
+      writeJsonIfMissing(summaryPath, buildBackendSummary(projected, {
+        result_path: resultPath,
+        summary_path: summaryPath,
+        timeline_path: timelinePath,
+        audit_path: path.join(runDir, 'audit.jsonl'),
+        frontend_snapshot_path: frontendSnapshotPath,
+      })),
       writeJsonIfMissing(timelinePath, snapshot.events),
     ];
     const serializedSnapshot = JSON.stringify(projected, null, 2);
@@ -47,6 +56,54 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
       sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),
     };
   }
+}
+
+function buildBackendSummary(
+  projected: ReturnType<typeof projectRunSnapshot>,
+  paths: {
+    result_path: string;
+    summary_path: string;
+    timeline_path: string;
+    audit_path: string;
+    frontend_snapshot_path: string;
+  },
+): Record<string, unknown> {
+  const delivery = projected.delivery_report;
+  const finalOutput = projected.final_output;
+  const worktreePath = delivery?.worktree_path;
+  const filesWritten = finalOutput?.files_written ?? delivery?.files_written ?? [];
+  const changedFiles = finalOutput?.changed_files ?? delivery?.changed_files ?? [];
+  const artifactRefs = finalOutput?.artifact_refs ?? [];
+  const memoryAblation = projected.timeline
+    .filter((event) => event.type === 'memory.context_pack_built')
+    .map((event) => event.payload.ablation)
+    .find((value): value is string => typeof value === 'string');
+  const outcome =
+    finalOutput?.outcome ??
+    delivery?.outcome ??
+    (projected.status === 'completed' ? 'completed_response' : 'failed');
+
+  return {
+    run_id: projected.run_id,
+    task_id: projected.task_id,
+    mode: projected.mode,
+    status: projected.status,
+    outcome,
+    ...(projected.quality ? { run_outcome: projected.quality } : {}),
+    ...(delivery?.session_id ? { session_id: delivery.session_id } : {}),
+    ...(delivery?.response ? { response: delivery.response } : {}),
+    ...(worktreePath ? { worktree_path: worktreePath } : {}),
+    files_written: [...filesWritten],
+    changed_files: [...changedFiles],
+    artifact_refs: [...artifactRefs],
+    artifacts_materialized: projected.artifacts.length,
+    ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
+    result_path: paths.result_path,
+    summary_path: paths.summary_path,
+    timeline_path: paths.timeline_path,
+    audit_path: paths.audit_path,
+    frontend_snapshot_path: paths.frontend_snapshot_path,
+  };
 }
 
 async function writeJsonIfMissing(filePath: string, value: unknown): Promise<void> {

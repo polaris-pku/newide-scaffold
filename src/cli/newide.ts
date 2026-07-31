@@ -229,6 +229,7 @@ function buildCouncilCliResult(
     service_status: serviceStatus,
     council_capability: capability,
     result_path: stringField(links, 'result_path'),
+    summary_path: stringField(links, 'summary_path'),
     frontend_snapshot_path: stringField(links, 'frontend_snapshot_path'),
     audit_path: stringField(links, 'audit_path'),
     council: {
