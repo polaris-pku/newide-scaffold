@@ -21,12 +21,14 @@ interface CouncilRunRequest {
   state_root?: string;
   timeout_ms?: number;
   allow_degraded?: boolean;
+  allow_seat_reuse?: boolean;
 }
 
 interface CouncilRunOptions extends CouncilRunRequest {
   state_root: string;
   timeout_ms: number;
   allow_degraded: boolean;
+  allow_seat_reuse: boolean;
 }
 
 export async function main(args = process.argv.slice(2)): Promise<number> {
@@ -55,9 +57,10 @@ async function runCouncilCli(args: string[]): Promise<number> {
     await assertDirectory(options.workspace_path, 'workspace');
     await fs.mkdir(options.state_root, { recursive: true });
 
-    const env = materializeRuntimeEnv(
-      withStateRoot(loadRuntimeEnvDefaults(process.env), options.state_root),
-    );
+    const env = materializeRuntimeEnv({
+      ...withStateRoot(loadRuntimeEnvDefaults(process.env), options.state_root),
+      ...(options.allow_seat_reuse ? { NEWIDE_COUNCIL_ALLOW_SEAT_REUSE: '1' } : {}),
+    });
     service = await createProductionBackendService(env);
     readiness = service.getSystemReadiness();
     councilCapability = readiness.capabilities.find(
@@ -152,6 +155,8 @@ async function parseCouncilRunOptions(args: string[]): Promise<CouncilRunOptions
     ? parsePositiveInteger(timeoutRaw, '--timeout-ms')
     : (request?.timeout_ms ?? 900_000);
   const allowDegraded = args.includes('--allow-degraded') || request?.allow_degraded === true;
+  const allowSeatReuse =
+    args.includes('--allow-seat-reuse') || request?.allow_seat_reuse === true;
 
   if (!prompt?.trim()) throw new Error('Council prompt is required');
   if (!workspacePath || !path.isAbsolute(workspacePath)) {
@@ -163,6 +168,7 @@ async function parseCouncilRunOptions(args: string[]): Promise<CouncilRunOptions
     state_root: path.resolve(stateRoot),
     timeout_ms: timeoutMs,
     allow_degraded: allowDegraded,
+    allow_seat_reuse: allowSeatReuse,
   };
 }
 
@@ -177,6 +183,7 @@ function parseCouncilRequest(value: unknown): CouncilRunRequest {
     'state_root',
     'timeout_ms',
     'allow_degraded',
+    'allow_seat_reuse',
   ]);
   const unknown = Object.keys(request).filter((key) => !allowed.has(key));
   if (unknown.length > 0) throw new Error(`Unknown Council request fields: ${unknown.join(', ')}`);
@@ -198,6 +205,9 @@ function parseCouncilRequest(value: unknown): CouncilRunRequest {
   if (request.allow_degraded !== undefined && typeof request.allow_degraded !== 'boolean') {
     throw new Error('Council request allow_degraded must be a boolean');
   }
+  if (request.allow_seat_reuse !== undefined && typeof request.allow_seat_reuse !== 'boolean') {
+    throw new Error('Council request allow_seat_reuse must be a boolean');
+  }
   return {
     prompt: request.prompt.trim(),
     workspace_path: request.workspace_path,
@@ -205,6 +215,9 @@ function parseCouncilRequest(value: unknown): CouncilRunRequest {
     ...(typeof request.timeout_ms === 'number' ? { timeout_ms: request.timeout_ms } : {}),
     ...(typeof request.allow_degraded === 'boolean'
       ? { allow_degraded: request.allow_degraded }
+      : {}),
+    ...(typeof request.allow_seat_reuse === 'boolean'
+      ? { allow_seat_reuse: request.allow_seat_reuse }
       : {}),
   };
 }
@@ -309,7 +322,7 @@ function writeUsage(): void {
       'Usage:',
       '  newide serve --stdio [--state-root PATH]',
       '  newide council run --request FILE',
-      '  newide council run --workspace ABS --prompt TEXT [--state-root PATH] [--allow-degraded]',
+      '  newide council run --workspace ABS --prompt TEXT [--state-root PATH] [--allow-degraded] [--allow-seat-reuse]',
       '',
     ].join('\n'),
   );
