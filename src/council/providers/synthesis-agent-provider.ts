@@ -36,6 +36,7 @@ export type CouncilRoleFailureCode =
   | 'COUNCIL_SYNTHESIS_FAILED';
 
 type CouncilPhase = 'proposal' | 'review' | 'synthesis';
+type CouncilRoleFailureDetails = Record<string, unknown>;
 
 export class CouncilRoleExecutionError extends Error {
   readonly code: CouncilRoleFailureCode;
@@ -47,6 +48,7 @@ export class CouncilRoleExecutionError extends Error {
     readonly agent_status: AgentExecutionResult['status'],
     readonly agent_run_id?: string,
     readonly driver_run_result_id?: string,
+    readonly failure_details: CouncilRoleFailureDetails = {},
   ) {
     super(`Council ${council_phase} role failed`);
     this.name = 'CouncilRoleExecutionError';
@@ -61,6 +63,9 @@ export class CouncilRoleExecutionError extends Error {
       agent_status: this.agent_status,
       ...(this.agent_run_id ? { agent_run_id: this.agent_run_id } : {}),
       ...(this.driver_run_result_id ? { driver_run_result_id: this.driver_run_result_id } : {}),
+      ...(Object.keys(this.failure_details).length > 0
+        ? { failure_details: { ...this.failure_details } }
+        : {}),
     };
   }
 }
@@ -291,7 +296,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       );
     } catch (error) {
       if (options?.signal?.aborted) throw error;
-      const failure = new CouncilRoleExecutionError(phase, participant, 'failed');
+      const failure = new CouncilRoleExecutionError(
+        phase,
+        participant,
+        'failed',
+        undefined,
+        undefined,
+        errorDetails(error),
+      );
       await emitFailureLifecycle(options, failure);
       throw failure;
     }
@@ -303,6 +315,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         result.status,
         result.agent_run_id,
         result.driver_run_result_id,
+        agentFailureDetails(result),
       );
       await emitFailureLifecycle(options, failure);
       throw failure;
@@ -379,6 +392,33 @@ function failureCode(phase: CouncilPhase): CouncilRoleFailureCode {
   if (phase === 'proposal') return 'COUNCIL_PROPOSAL_FAILED';
   if (phase === 'review') return 'COUNCIL_REVIEW_FAILED';
   return 'COUNCIL_SYNTHESIS_FAILED';
+}
+
+function errorDetails(error: unknown): CouncilRoleFailureDetails {
+  if (error instanceof Error) {
+    return {
+      error_name: error.name,
+      error_message: error.message,
+    };
+  }
+  return { error_message: String(error) };
+}
+
+function agentFailureDetails(result: AgentExecutionResult): CouncilRoleFailureDetails {
+  const details: CouncilRoleFailureDetails = {};
+  const diagnostics = result.diagnostics;
+  const dispatchStatus = diagnostics.dispatch_status;
+  if (typeof dispatchStatus === 'string') details.dispatch_status = dispatchStatus;
+  const driverErrorCode = diagnostics.driver_error_code;
+  if (typeof driverErrorCode === 'string') details.driver_error_code = driverErrorCode;
+  const driverError = diagnostics.driver_error;
+  if (driverError && typeof driverError === 'object' && !Array.isArray(driverError)) {
+    const record = driverError as Record<string, unknown>;
+    if (typeof record.code === 'string') details.driver_error_code = record.code;
+    if (typeof record.message === 'string') details.driver_error_message = record.message;
+    if (typeof record.retryable === 'boolean') details.retryable = record.retryable;
+  }
+  return details;
 }
 
 function validateParticipants(
