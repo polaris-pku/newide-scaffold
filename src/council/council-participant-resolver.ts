@@ -20,30 +20,24 @@ export interface AgentBoardCouncilParticipantResolverOptions {
   boardQuery: AgentBoardQuery;
   allowedAgentIds: readonly string[];
   ensureAgent?: (agentId: string) => Promise<void>;
-  /**
-   * Seat reuse is an explicit degraded-mode decision. Normal Council runs
-   * require one distinct persisted Agent per seat.
-   */
-  allowSeatReuse?: boolean;
 }
 
 /**
  * 从 B AgentBoard 的真实 Agent 中解析 Council 席位。
  *
  * 当前 MVP 固定为两个 proposer、一个 reviewer 和一个 synthesizer。
- * 正常运行要求四个互不重复的真实 Agent；只有调用方显式允许时才复用。
+ * 两个不同的真实 Agent 即可正常启动；reviewer/synthesizer 复用会被审计。
+ * 单 Agent 运行直接阻断。
  */
 export class AgentBoardCouncilParticipantResolver implements CouncilParticipantResolver {
   private readonly boardQuery: AgentBoardQuery;
   private readonly allowedAgentIds: ReadonlySet<string>;
   private readonly ensureAgent: ((agentId: string) => Promise<void>) | undefined;
-  private readonly allowSeatReuse: boolean;
 
   constructor(options: AgentBoardCouncilParticipantResolverOptions) {
     this.boardQuery = options.boardQuery;
     this.allowedAgentIds = new Set(options.allowedAgentIds);
     this.ensureAgent = options.ensureAgent;
-    this.allowSeatReuse = options.allowSeatReuse ?? false;
   }
 
   async resolve(
@@ -67,10 +61,9 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     if (candidates.length === 0) {
       throw new Error('No eligible persisted Agent is available for Council participation');
     }
-    if (candidates.length < 4 && !this.allowSeatReuse) {
+    if (candidates.length < 2) {
       throw new Error(
-        `Council requires four distinct persisted Agents; found ${candidates.length}. ` +
-          'Explicitly enable seat reuse for a best-effort run.',
+        `Council requires at least two distinct persisted Agents; found ${candidates.length}.`,
       );
     }
 

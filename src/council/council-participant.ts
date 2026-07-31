@@ -6,8 +6,9 @@ export type CouncilSeat = 'proposer' | 'reviewer' | 'synthesizer';
  * Council 席位与真实持久化 Agent 的单轮绑定。
  *
  * participant_id 标识本轮参与实例；agent_id 始终指向 B 仓库中的真实 Agent。
- * 正常 Council 要求每个席位绑定不同的真实 Agent。只有显式降级运行
- * 才允许同一 Agent 承担多个席位，并通过 conflict_flags 披露。
+ * 当前 v0 Council 至少绑定两个不同的真实 Agent；内部 reviewer/synthesizer
+ * 可能复用 proposer 身份，并通过 conflict_flags 披露。单 Agent 运行才属于
+ * 显式降级路径。
  */
 export interface CouncilParticipantBinding {
   participant_id: string;

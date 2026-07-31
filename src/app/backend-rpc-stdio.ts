@@ -206,7 +206,6 @@ export async function createProductionBackendService(
         boardQuery: bCapabilities.boardQuery,
         allowedAgentIds: bRuntime.market_agent_ids,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
-        allowSeatReuse: env.NEWIDE_COUNCIL_ALLOW_SEAT_REUSE === '1',
       }),
     });
     const gateExecutor =

@@ -19,7 +19,6 @@ describe('AgentBoardCouncilParticipantResolver', () => {
         'role_disabled',
         'role_fullstack_engineer',
       ],
-      allowSeatReuse: true,
     });
 
     const participants = await resolver.resolve({
