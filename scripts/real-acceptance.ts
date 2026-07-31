@@ -7,6 +7,8 @@
  *
  * 用法：
  *   pnpm acceptance:real -- --workspace /absolute/path --scenario all
+ *   pnpm acceptance:real -- --workspace /absolute/path --scenario council \
+ *     --existing-run run_xxx
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -29,6 +31,7 @@ type Scenario = 'memory' | 'market' | 'council' | 'subagent' | 'restart' | 'resu
 interface CliOptions {
   workspace: string;
   scenarios: Scenario[];
+  existingRunId?: string;
 }
 
 interface ScenarioReport {
@@ -445,41 +448,77 @@ async function runMarketScenario(): Promise<ScenarioReport> {
 async function runCouncilScenario(): Promise<ScenarioReport> {
   const errors: string[] = [];
   const details: Record<string, unknown> = {};
-  const backend = await startBackend('council');
+  let backend: BackendClient | undefined;
   try {
-    const before = await snapshotWorkspaceFiles();
-    const prompt = [
-      '在工作区实现一个最小的 TypeScript 工具函数文件。',
-      '要求：创建 council-final.ts，导出函数 slugify(input: string): string，',
-      '将任意字符串转换为小写连字符 slug。候选与最终文件都必须真实写入工作区。',
-    ].join('');
-    const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
-      prompt,
-      mode: 'council',
-      workspace_path: options.workspace,
-    });
-    log(`council run created: ${created.run_id}`);
-    await backend.subscribeAndLog(created.run_id);
-    const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
-    const after = await snapshotWorkspaceFiles();
-    const workspaceChanges = diffWorkspace(before, after);
+    let runId: string;
+    let taskId: string;
+    let snapshot: Record<string, unknown>;
+    let workspaceChanges: string[];
+
+    if (options.existingRunId) {
+      runId = options.existingRunId;
+      const persistedSnapshot = asRecord(
+        await readJsonIfExists(path.join(repoRoot, '.newide', 'runs', runId, 'result.json')),
+      );
+      if (!persistedSnapshot) {
+        throw new Error(`persisted Council result not found for ${runId}`);
+      }
+      snapshot = persistedSnapshot;
+      taskId = typeof snapshot.task_id === 'string' ? snapshot.task_id : '';
+      const persistedOutput = asRecord(snapshot.final_output) ?? {};
+      workspaceChanges = Array.isArray(persistedOutput.changed_files)
+        ? persistedOutput.changed_files.filter(
+            (value): value is string => typeof value === 'string',
+          )
+        : [];
+      log(`verifying persisted council run: ${runId}`);
+    } else {
+      backend = await startBackend('council');
+      const before = await snapshotWorkspaceFiles();
+      const prompt = [
+        '在工作区实现一个最小的 TypeScript 工具函数文件。',
+        '要求：创建 council-final.ts，导出函数 slugify(input: string): string，',
+        '将任意字符串转换为小写连字符 slug。候选与最终文件都必须真实写入工作区。',
+      ].join('');
+      const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
+        prompt,
+        mode: 'council',
+        workspace_path: options.workspace,
+      });
+      runId = created.run_id;
+      taskId = created.task_id;
+      log(`council run created: ${runId}`);
+      await backend.subscribeAndLog(runId);
+      snapshot = await backend.waitForTerminal(runId, runTimeoutMs);
+      const after = await snapshotWorkspaceFiles();
+      workspaceChanges = diffWorkspace(before, after);
+    }
 
     const council = asRecord(snapshot.council) ?? {};
     const councilResult = asRecord(council.result);
     const proposals = Array.isArray(council.proposals) ? council.proposals : [];
-    const runDir = path.join(repoRoot, '.newide', 'runs', created.run_id);
-    const decision = await readJsonIfExists(path.join(runDir, 'council', 'decision.json'));
-    const reviews = await readJsonIfExists(path.join(runDir, 'council', 'reviews.json'));
-    const synthesis = await readJsonIfExists(path.join(runDir, 'council', 'synthesis.json'));
-    const persistedCouncilResult = await readJsonIfExists(
-      path.join(runDir, 'council', 'result.json'),
-    );
+    const participants = Array.isArray(council.participants) ? council.participants : [];
+    const runDir = path.join(repoRoot, '.newide', 'runs', runId);
+    const councilStagePath = path.join(runDir, 'stages', 'council.json');
+    const councilStage = asRecord(await readJsonIfExists(councilStagePath));
+    const legacyCouncilDir = path.join(runDir, 'council');
+    const decision =
+      asRecord(councilStage?.decision) ??
+      asRecord(await readJsonIfExists(path.join(legacyCouncilDir, 'decision.json')));
+    const legacyReviews = await readJsonIfExists(path.join(legacyCouncilDir, 'reviews.json'));
+    const reviews = Array.isArray(council.reviews) ? council.reviews : legacyReviews;
+    const synthesis =
+      asRecord(council.synthesis) ??
+      asRecord(await readJsonIfExists(path.join(legacyCouncilDir, 'synthesis.json')));
+    const persistedCouncilResult =
+      councilResult ??
+      asRecord(await readJsonIfExists(path.join(legacyCouncilDir, 'result.json')));
     const finalOutput = asRecord(snapshot.final_output) ?? {};
 
-    details.run_id = created.run_id;
-    details.task_id = created.task_id;
+    details.run_id = runId;
+    details.task_id = taskId;
     details.status = snapshot.status;
-    details.decision_id = council.decision_id ?? asRecord(decision)?.decision_id ?? null;
+    details.decision_id = council.decision_id ?? decision?.decision_id ?? null;
     details.verdict = council.verdict ?? null;
     details.decision_semantics =
       'CouncilDecision is advisory evidence; it is NOT a MergeAuthorization ' +
@@ -500,34 +539,34 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
     details.tool_events = finalOutput.tool_events ?? [];
     details.workspace_changes = workspaceChanges;
     details.council_files = {
-      decision: path.join(runDir, 'council', 'decision.json'),
-      proposals: path.join(runDir, 'council', 'proposals.json'),
-      reviews: path.join(runDir, 'council', 'reviews.json'),
-      synthesis: path.join(runDir, 'council', 'synthesis.json'),
-      output: path.join(runDir, 'council', 'output.json'),
-      result: path.join(runDir, 'council', 'result.json'),
+      result: path.join(runDir, 'result.json'),
+      frontend_snapshot: path.join(runDir, 'frontend-snapshot.json'),
+      stage: councilStagePath,
+      production_stage_state: path.join(runDir, 'production-stage-state.json'),
     };
-    details.council_role_directories = [
-      'primary',
-      'proposer_a',
-      'proposer_b',
-      'reviewer',
-      'synthesizer',
-    ].map((role) => path.join(repoRoot, '.newide', 'council', created.run_id, role));
+    const participantIds = participants
+      .map((value) => asRecord(value)?.participant_id)
+      .filter(
+        (value): value is string =>
+          typeof value === 'string' && value.length > 0 && path.basename(value) === value,
+      );
+    details.council_role_directories = ['primary', ...participantIds].map((participantId) =>
+      path.join(repoRoot, '.newide', 'council', runId, participantId),
+    );
     details.run_dir = runDir;
     details.errors_from_run = snapshot.errors ?? [];
 
     if (snapshot.status !== 'completed') {
       errors.push(`council run ended as ${String(snapshot.status)}`);
     }
-    if (!decision) errors.push('council decision.json was not written');
+    if (!decision) errors.push('Council decision was not persisted in the canonical stage state');
     if (proposals.length < 2) errors.push('council snapshot has fewer than two proposals');
     if (!Array.isArray(reviews) || reviews.length === 0) {
       errors.push('council has no structured reviews');
     } else if (!reviews.every(isStructuredReview)) {
       errors.push('council review payload is not structured');
     }
-    if (!synthesis) errors.push('council synthesis.json was not written');
+    if (!synthesis) errors.push('Council synthesis was not persisted in the run snapshot');
     if (!councilResult && !persistedCouncilResult) {
       errors.push('CouncilResult was not returned or persisted');
     }
@@ -571,7 +610,7 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
   } catch (error) {
     errors.push(toMessage(error));
   } finally {
-    await backend.close();
+    await backend?.close();
   }
   return {
     scenario: 'council',
@@ -1485,7 +1524,15 @@ function parseCli(args: string[]): CliOptions {
         : (() => {
             throw new Error(`Invalid --scenario value: ${scenarioValue}`);
           })();
-  return { workspace: path.resolve(workspace), scenarios };
+  const existingRunIndex = args.indexOf('--existing-run');
+  const existingRunId = existingRunIndex >= 0 ? args[existingRunIndex + 1] : undefined;
+  if (existingRunIndex >= 0 && (!existingRunId || !/^run_[a-zA-Z0-9-]+$/.test(existingRunId))) {
+    throw new Error('--existing-run must be a valid run id');
+  }
+  if (existingRunId && (scenarios.length !== 1 || scenarios[0] !== 'council')) {
+    throw new Error('--existing-run is only supported with --scenario council');
+  }
+  return { workspace: path.resolve(workspace), scenarios, existingRunId };
 }
 
 function readPositiveInt(value: string | undefined, fallback: number): number {
