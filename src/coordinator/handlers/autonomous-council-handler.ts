@@ -47,9 +47,19 @@ export class AutonomousCouncilHandler {
       runResult.reviews.every(
         (review) => review.verdict === 'approve' && (review.unmet_criteria?.length ?? 0) === 0,
       );
-    const verified = Boolean(selected && runResult.synthesis && fullyApproved);
+    const identityConflict = runResult.participants?.some((participant) =>
+      participant.conflict_flags?.some((flag) =>
+        ['agent_reused_across_council_seats', 'best_effort_identity'].includes(flag),
+      ),
+    );
+    const verified = Boolean(selected && runResult.synthesis && fullyApproved && !identityConflict);
     const warnings: string[] = [];
     if (fallback) warnings.push('Council synthesis was unavailable; selected a reviewed proposal.');
+    if (identityConflict) {
+      warnings.push(
+        'Council reused a persisted Agent across seats; the result is best_effort and not fully verified.',
+      );
+    }
     if (!verified) {
       warnings.push(
         'Council verification did not fully pass; delivering the best available artifact.',

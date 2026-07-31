@@ -20,23 +20,30 @@ export interface AgentBoardCouncilParticipantResolverOptions {
   boardQuery: AgentBoardQuery;
   allowedAgentIds: readonly string[];
   ensureAgent?: (agentId: string) => Promise<void>;
+  /**
+   * Seat reuse is an explicit degraded-mode decision. Normal Council runs
+   * require one distinct persisted Agent per seat.
+   */
+  allowSeatReuse?: boolean;
 }
 
 /**
  * 从 B AgentBoard 的真实 Agent 中解析 Council 席位。
  *
  * 当前 MVP 固定为两个 proposer、一个 reviewer 和一个 synthesizer。
- * 当真实 Agent 少于四个时允许复用，但会在 binding 上留下冲突标记。
+ * 正常运行要求四个互不重复的真实 Agent；只有调用方显式允许时才复用。
  */
 export class AgentBoardCouncilParticipantResolver implements CouncilParticipantResolver {
   private readonly boardQuery: AgentBoardQuery;
   private readonly allowedAgentIds: ReadonlySet<string>;
   private readonly ensureAgent: ((agentId: string) => Promise<void>) | undefined;
+  private readonly allowSeatReuse: boolean;
 
   constructor(options: AgentBoardCouncilParticipantResolverOptions) {
     this.boardQuery = options.boardQuery;
     this.allowedAgentIds = new Set(options.allowedAgentIds);
     this.ensureAgent = options.ensureAgent;
+    this.allowSeatReuse = options.allowSeatReuse ?? false;
   }
 
   async resolve(
@@ -59,6 +66,12 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     );
     if (candidates.length === 0) {
       throw new Error('No eligible persisted Agent is available for Council participation');
+    }
+    if (candidates.length < 4 && !this.allowSeatReuse) {
+      throw new Error(
+        `Council requires four distinct persisted Agents; found ${candidates.length}. ` +
+          'Explicitly enable seat reuse for a best-effort run.',
+      );
     }
 
     const assignments: Array<{ seat: CouncilSeat; seat_index: number; agent_id: string }> = [
@@ -93,7 +106,12 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       agent_id: assignment.agent_id,
       role_profile_ref: assignment.agent_id,
       ...(usage.get(assignment.agent_id)! > 1
-        ? { conflict_flags: ['agent_reused_across_council_seats'] }
+        ? {
+            conflict_flags: [
+              'agent_reused_across_council_seats',
+              'best_effort_identity',
+            ],
+          }
         : {}),
     }));
   }
