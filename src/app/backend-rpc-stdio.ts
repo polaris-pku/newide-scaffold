@@ -49,6 +49,8 @@ import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
 import { createProductionStageExecutors } from './production-stage-executors';
 import { TaskExecutionLoop } from './task-execution-loop';
+import { SystemRpcMethods } from '../rpc/system-methods';
+import { createProductionSystemStatusService } from './system-status-service';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -87,6 +89,11 @@ export async function createProductionBackendService(
   }
   const packagePath = path.join(runnerDir, 'package.json');
   const runnerPackage = readJson(packagePath);
+  const runnerPackageIdentity = readPackageIdentity(
+    runnerPackage,
+    'acp-external-runner',
+    'unknown',
+  );
   if (!hasDriverRunScript(runnerPackage)) {
     throw new Error(`ACP driver runner has no driver:run script: ${runnerDir}`);
   }
@@ -252,6 +259,24 @@ export async function createProductionBackendService(
     } catch {
       throw new Error('Production mailbox recovery failed');
     }
+    const backendPackageIdentity = readPackageIdentity(
+      readJson(path.join(repoRoot, 'package.json')),
+      'newide-bcd',
+      'unknown',
+    );
+    const systemStatusService = createProductionSystemStatusService({
+      package_name: backendPackageIdentity.name,
+      package_version: backendPackageIdentity.version,
+      build_commit: env.NEWIDE_BUILD_COMMIT?.trim() || 'dev',
+      coordination_durable: databasePath !== ':memory:',
+      driver_provider_id: runnerPackageIdentity.name,
+      driver_provider_version: runnerPackageIdentity.version,
+      b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
+      b_embedding: bRuntime.embedding_info ?? {
+        provider: 'host-managed repository',
+        readiness: 'host_managed',
+      },
+    });
     return new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
@@ -265,6 +290,7 @@ export async function createProductionBackendService(
       bMemoryService,
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
+      systemStatusService,
     );
   } catch (error) {
     await closeRuntime().catch(() => undefined);
@@ -305,6 +331,28 @@ function hasDriverRunScript(value: unknown): boolean {
   return typeof command === 'string' && command.trim().length > 0;
 }
 
+function readPackageIdentity(
+  value: unknown,
+  fallbackName: string,
+  fallbackVersion: string,
+): { name: string; version: string } {
+  if (!value || typeof value !== 'object') {
+    return { name: fallbackName, version: fallbackVersion };
+  }
+  const rawName = Reflect.get(value, 'name');
+  const rawVersion = Reflect.get(value, 'version');
+  return {
+    name:
+      typeof rawName === 'string' && rawName.trim().length > 0
+        ? rawName.trim()
+        : fallbackName,
+    version:
+      typeof rawVersion === 'string' && rawVersion.trim().length > 0
+        ? rawVersion.trim()
+        : fallbackVersion,
+  };
+}
+
 export function startBackendRpcServer(options: BackendRpcServerOptions): BackendRpcServer {
   const dispatcher = new JsonRpcDispatcher();
   const session = new JsonRpcLineSession(dispatcher, options.writeLine);
@@ -317,6 +365,8 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   );
   const mailboxMethods = new MailboxRpcMethods(service);
   const memoryMethods = new MemoryRpcMethods(service);
+  const systemMethods = new SystemRpcMethods(service);
+  systemMethods.register(dispatcher);
   runMethods.register(dispatcher);
   taskMethods.register(dispatcher);
   mailboxMethods.register(dispatcher);

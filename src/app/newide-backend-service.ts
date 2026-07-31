@@ -74,6 +74,17 @@ import {
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
 import type { TaskExecutionLoop } from './task-execution-loop';
+import {
+  createUnavailableSystemStatusService,
+  type SystemStatusService,
+} from './system-status-service';
+import type {
+  SystemCapabilitiesV1,
+  SystemLivenessV1,
+  SystemReadinessV1,
+  SystemSchemaManifestV1,
+  SystemVersionV1,
+} from '../protocol/system-status';
 
 export interface RunCreateParams {
   prompt: string;
@@ -194,7 +205,28 @@ export class NewideBackendService {
     private readonly bMemoryService?: BMemoryBackendService,
     private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new NoopDriverStreamAuditWriter(),
     private readonly taskExecutionLoop?: TaskExecutionLoop,
+    private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
   ) {}
+
+  getSystemLiveness(): SystemLivenessV1 {
+    return this.systemStatusService.liveness();
+  }
+
+  getSystemReadiness(): SystemReadinessV1 {
+    return this.systemStatusService.readiness();
+  }
+
+  getSystemCapabilities(required?: readonly string[]): SystemCapabilitiesV1 {
+    return this.systemStatusService.capabilities(required);
+  }
+
+  getSystemVersion(): SystemVersionV1 {
+    return this.systemStatusService.version();
+  }
+
+  getSystemSchema(): SystemSchemaManifestV1 {
+    return this.systemStatusService.schema();
+  }
 
   close(): Promise<void> {
     if (!this.closePromise) {

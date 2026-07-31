@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../../src/rpc/json-rpc-dispatcher';
 
 describe('JsonRpcLineSession', () => {
-  it('responds to system.ping with protocol metadata', async () => {
+  it('does not embed application methods in the transport dispatcher', async () => {
     const output: string[] = [];
     const session = new JsonRpcLineSession(new JsonRpcDispatcher(), (line) => output.push(line));
 
@@ -12,7 +12,7 @@ describe('JsonRpcLineSession', () => {
       {
         jsonrpc: '2.0',
         id: 1,
-        result: { status: 'ok', protocol_version: '0.1.0' },
+        error: { code: -32601, message: 'Method not found' },
       },
     ]);
   });
