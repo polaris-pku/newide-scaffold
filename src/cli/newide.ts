@@ -47,8 +47,11 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
 async function runCouncilCli(args: string[]): Promise<number> {
   let service: NewideBackendService | undefined;
   let runId: string | undefined;
+  let options: CouncilRunOptions | undefined;
+  let readiness: ReturnType<NewideBackendService['getSystemReadiness']> | undefined;
+  let councilCapability: CapabilityStatusV1 | undefined;
   try {
-    const options = await parseCouncilRunOptions(args);
+    options = await parseCouncilRunOptions(args);
     await assertDirectory(options.workspace_path, 'workspace');
     await fs.mkdir(options.state_root, { recursive: true });
 
@@ -56,8 +59,8 @@ async function runCouncilCli(args: string[]): Promise<number> {
       withStateRoot(loadRuntimeEnvDefaults(process.env), options.state_root),
     );
     service = await createProductionBackendService(env);
-    const readiness = service.getSystemReadiness();
-    const councilCapability = readiness.capabilities.find(
+    readiness = service.getSystemReadiness();
+    councilCapability = readiness.capabilities.find(
       (capability) => capability.capability_id === 'council.execute',
     );
     if (!councilCapability || councilCapability.status === 'unavailable') {
@@ -86,14 +89,40 @@ async function runCouncilCli(args: string[]): Promise<number> {
     );
     return snapshot.status === 'completed' ? 0 : 1;
   } catch (error) {
+    const message = toMessage(error);
     if (service && runId) {
-      await service.cancelRun(runId).catch(() => undefined);
+      const cancelError = await service.cancelRun(runId).catch((cancelFailure) => cancelFailure);
+      const terminal = service.getRunSnapshot(runId);
+      if (options && readiness && councilCapability && terminal) {
+        const cancellationMessage =
+          cancelError instanceof Error ? cancelError.message : undefined;
+        process.stdout.write(
+          `${JSON.stringify(
+            buildCouncilCliResult(
+              terminal,
+              options,
+              councilCapability,
+              readiness.service.status,
+              {
+                code: isTimeoutError(message) ? 'COUNCIL_CLI_TIMEOUT' : 'COUNCIL_CLI_FAILED',
+                message: cancellationMessage
+                  ? `${message}; cancellation failed: ${cancellationMessage}`
+                  : message,
+              },
+            ),
+          )}\n`,
+        );
+        return 1;
+      }
     }
     process.stdout.write(
       `${JSON.stringify({
         contract_version: COUNCIL_CLI_CONTRACT,
         status: 'failed',
-        error: { code: 'COUNCIL_CLI_FAILED', message: toMessage(error) },
+        error: {
+          code: isTimeoutError(message) ? 'COUNCIL_CLI_TIMEOUT' : 'COUNCIL_CLI_FAILED',
+          message,
+        },
       })}\n`,
     );
     return 1;
@@ -185,6 +214,7 @@ function buildCouncilCliResult(
   options: CouncilRunOptions,
   capability: CapabilityStatusV1,
   serviceStatus: string,
+  cliError?: { code: string; message: string },
 ): Record<string, unknown> {
   const links = snapshot.links ?? {};
   const councilResult = snapshot.council?.result ?? {};
@@ -210,6 +240,7 @@ function buildCouncilCliResult(
       final_artifact_sha256: stringField(councilResult, 'final_artifact_sha256'),
     },
     errors: snapshot.errors,
+    ...(cliError ? { error: cliError } : {}),
   };
 }
 
@@ -265,6 +296,10 @@ function stringField(record: Record<string, unknown>, field: string): string | n
 
 function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isTimeoutError(message: string): boolean {
+  return message.startsWith('Council run timed out after ');
 }
 
 function writeUsage(): void {
