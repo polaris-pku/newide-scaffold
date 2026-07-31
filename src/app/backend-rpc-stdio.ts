@@ -239,7 +239,11 @@ export async function createProductionBackendService(
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
-    const taskProcessor = new TaskProcessor(coordinationStore, { runsRoot });
+    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
+    const taskProcessor = new TaskProcessor(coordinationStore, {
+      runsRoot,
+      mailboxStore: coordinationStore,
+    });
     taskProcessor.recoverInterruptedTasks();
     const taskExecutionLoop = new TaskExecutionLoop({
       processor: taskProcessor,
@@ -255,7 +259,6 @@ export async function createProductionBackendService(
         worktreesRoot: path.join(stateRoot, 'worktrees'),
       }),
     });
-    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
     const mailboxRecovery = mailboxService.replayPendingDeliveries();
     try {
       await mailboxRecovery;
