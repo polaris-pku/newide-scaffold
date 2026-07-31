@@ -18,7 +18,12 @@ export function hasP2pRegression(report: SweBenchInstanceReport | undefined): bo
   if (!passToPass) {
     return false;
   }
-  return Object.values(passToPass).some((status) => status !== 'PASSED');
+  if (Array.isArray(passToPass.failure)) {
+    return passToPass.failure.length > 0;
+  }
+  return Object.values(passToPass).some(
+    (status) => typeof status === 'string' && status !== 'PASSED',
+  );
 }
 
 export function countApplied(report: SweBenchInstanceReport | undefined): boolean {

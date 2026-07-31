@@ -43,6 +43,7 @@
     "eval:verify-backend-contract": "tsx eval/scripts/verify-backend-contract.ts",
     "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
     "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
+    "eval:council:smoke": "tsx scripts/run-sweevo-memory-ablation.ts --subset v0-smoke --instance-id psf__requests_v2.27.0_v2.27.1 --ablations B2 --run-harness",
     "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
     "prepare": "husky"
   },
