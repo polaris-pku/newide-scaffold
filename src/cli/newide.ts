@@ -91,7 +91,13 @@ async function runCouncilCli(args: string[]): Promise<number> {
   } catch (error) {
     const message = toMessage(error);
     if (service && runId) {
-      const cancelError = await service.cancelRun(runId).catch((cancelFailure) => cancelFailure);
+      const cancellationReason = {
+        code: isTimeoutError(message) ? 'COUNCIL_CLI_TIMEOUT' : 'COUNCIL_CLI_FAILED',
+        message,
+      };
+      const cancelError = await service
+        .cancelRun(runId, cancellationReason)
+        .catch((cancelFailure) => cancelFailure);
       const terminal = service.getRunSnapshot(runId);
       if (options && readiness && councilCapability && terminal) {
         const cancellationMessage =
@@ -104,10 +110,10 @@ async function runCouncilCli(args: string[]): Promise<number> {
               councilCapability,
               readiness.service.status,
               {
-                code: isTimeoutError(message) ? 'COUNCIL_CLI_TIMEOUT' : 'COUNCIL_CLI_FAILED',
+                code: cancellationReason.code,
                 message: cancellationMessage
-                  ? `${message}; cancellation failed: ${cancellationMessage}`
-                  : message,
+                  ? `${cancellationReason.message}; cancellation failed: ${cancellationMessage}`
+                  : cancellationReason.message,
               },
             ),
           )}\n`,

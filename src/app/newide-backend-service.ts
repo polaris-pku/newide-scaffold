@@ -31,6 +31,7 @@ import {
   type AppRunEvent,
   type AppRunMode,
   type AppRunSnapshot,
+  type RunCancellationReason,
   type StagedTerminalTransition,
 } from './run-registry';
 import { FileRunAuditWriter, type RunAuditWriter } from './run-audit-writer';
@@ -1077,8 +1078,14 @@ export class NewideBackendService {
     }
   }
 
-  async cancelRun(runId: string): Promise<{ cancelled: true }> {
-    const staged = this.registry.stageTerminal(runId, { status: 'cancelled' });
+  async cancelRun(
+    runId: string,
+    reason?: RunCancellationReason,
+  ): Promise<{ cancelled: true }> {
+    const staged = this.registry.stageTerminal(runId, {
+      status: 'cancelled',
+      ...(reason ? { reason } : {}),
+    });
     if (staged) await this.persistTerminal(runId, staged);
     else await this.waitForTerminal(runId);
     const snapshot = this.registry.getSnapshot(runId);
