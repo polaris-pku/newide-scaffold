@@ -651,7 +651,7 @@ describe('backend RPC stdio entrypoint', () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-production-readiness-'));
     writeFileSync(path.join(runnerDir, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
     writeFakeAcpRunnerBuild(runnerDir);
-    const child = spawn(process.execPath, ['--import', 'tsx', 'src/app/backend-rpc-stdio.ts'], {
+    const child = spawn(process.execPath, ['--import', 'tsx', 'src/app/backend-rpc-entry.ts'], {
       cwd: process.cwd(),
       env: {
         ...process.env,

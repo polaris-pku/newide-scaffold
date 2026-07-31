@@ -7,7 +7,6 @@ import { createInterface } from 'node:readline';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
-import { pathToFileURL } from 'node:url';
 import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runner';
 import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
 import {
@@ -77,7 +76,8 @@ export async function createProductionBackendService(
   dependencies: ProductionBackendServiceDependencies = {},
 ): Promise<NewideBackendService> {
   const repoRoot = process.cwd();
-  const runsRoot = path.join(repoRoot, '.newide', 'runs');
+  const stateRoot = path.resolve(env.NEWIDE_STATE_ROOT?.trim() || path.join(repoRoot, '.newide'));
+  const runsRoot = path.join(stateRoot, 'runs');
   const runnerDir = path.resolve(
     env.ACP_DRIVER_RUNNER_DIR ?? path.join(repoRoot, '..', 'acp-client-prototype'),
   );
@@ -123,7 +123,7 @@ export async function createProductionBackendService(
         COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
         ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
-        ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(repoRoot, '.newide', 'test-workspace'),
+        ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
       },
@@ -158,7 +158,9 @@ export async function createProductionBackendService(
   });
 
   try {
-    bRuntime = dependencies.bRuntime ?? (await createProductionBRuntime(env, { repoRoot }));
+    bRuntime =
+      dependencies.bRuntime ??
+      (await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot }));
     assertValidMarketAgentIds(bRuntime.market_agent_ids);
     memoryMaintenance =
       dependencies.memoryMaintenance ??
@@ -183,7 +185,7 @@ export async function createProductionBackendService(
       llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
-        root: path.join(repoRoot, '.newide', 'b', 'context-packs'),
+        root: path.join(stateRoot, 'b', 'context-packs'),
       }),
     });
     const selectAgentHandler = new SelectAgentHandler({
@@ -194,11 +196,12 @@ export async function createProductionBackendService(
         allowedAgentIds: bRuntime.market_agent_ids,
       }),
       evidenceStore: new FileMarketEvidenceStore({
-        root: path.join(repoRoot, '.newide', 'market'),
+        root: path.join(stateRoot, 'market'),
       }),
     });
     const councilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
+      councilRoot: path.join(stateRoot, 'council'),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
         allowedAgentIds: bRuntime.market_agent_ids,
@@ -230,13 +233,13 @@ export async function createProductionBackendService(
     }
 
     const configuredDatabasePath =
-      env.NEWIDE_COORDINATION_DB ?? path.join(repoRoot, '.newide', 'coordination.sqlite');
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
     const databasePath =
       configuredDatabasePath === ':memory:'
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
-    const taskProcessor = new TaskProcessor(coordinationStore);
+    const taskProcessor = new TaskProcessor(coordinationStore, { runsRoot });
     taskProcessor.recoverInterruptedTasks();
     const taskExecutionLoop = new TaskExecutionLoop({
       processor: taskProcessor,
@@ -248,8 +251,8 @@ export async function createProductionBackendService(
         gateExecutor,
         bootstrapAgentIds: bRuntime.market_agent_ids,
         runsRoot,
-        councilRoot: path.join(repoRoot, '.newide', 'council'),
-        worktreesRoot: path.join(repoRoot, '.newide', 'worktrees'),
+        councilRoot: path.join(stateRoot, 'council'),
+        worktreesRoot: path.join(stateRoot, 'worktrees'),
       }),
     });
     const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
@@ -442,7 +445,9 @@ export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
   );
 }
 
-async function runMain(): Promise<void> {
+export async function runBackendRpcMain(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
   let service: NewideBackendService | undefined;
   let server: BackendRpcServer | undefined;
   let shutdownRequested = false;
@@ -454,7 +459,8 @@ async function runMain(): Promise<void> {
   process.once('SIGTERM', close);
   process.once('SIGINT', close);
   try {
-    service = await createProductionBackendService(loadRuntimeEnvDefaults(process.env));
+    const runtimeEnv = materializeRuntimeEnv(loadRuntimeEnvDefaults(env));
+    service = await createProductionBackendService(runtimeEnv);
     if (shutdownRequested) {
       await service.close();
       return;
@@ -472,11 +478,11 @@ async function runMain(): Promise<void> {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  void runMain().catch((error: unknown) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 1;
-  });
+export function materializeRuntimeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) process.env[key] = value;
+  }
+  return env;
 }
 
 function onceAsync(operation: () => Promise<void>): () => Promise<void> {
