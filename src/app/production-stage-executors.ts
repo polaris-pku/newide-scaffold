@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef, type Event } from '../core';
 import { ArtifactSelector, WorktreeMaterializer } from '../coordinator';
 import {
@@ -762,5 +762,7 @@ function pathFromFileRef(reference: string): string {
   const url = new URL(reference);
   if (url.protocol !== 'file:')
     throw new Error(`Expected file ChangesetManifest ref: ${reference}`);
-  return decodeURIComponent(url.pathname);
+  // Windows: URL.pathname is "/D:/..." — path.resolve turns that into "D:\D:\...".
+  // fileURLToPath handles drive letters and percent-encoding correctly.
+  return fileURLToPath(url);
 }
