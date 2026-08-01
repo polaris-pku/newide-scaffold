@@ -15,7 +15,7 @@ import {
 } from '../../src/app/backend-rpc-stdio';
 import type { NewideBackendService } from '../../src/app/newide-backend-service';
 import type { AppRunEvent } from '../../src/app/run-registry';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import {
   InMemoryBufferRepository,
   InMemoryRepository,

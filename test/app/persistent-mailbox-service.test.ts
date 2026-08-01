@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   MailboxValidationError,
   PersistentMailboxService,
-} from '../../src/app/persistent-mailbox-service';
+} from '../../src/mailbox';
 import type {
   AgentMailboxWakePort,
   AgentMailboxWakeRequestV1,

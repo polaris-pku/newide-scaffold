@@ -15,7 +15,7 @@ import {
   type TaskListResult,
   type TaskSubscription,
 } from '../app/newide-backend-service';
-import { TaskEventCursorNotFoundError } from '../app/task-processor';
+import { TaskEventCursorNotFoundError } from '../coordination';
 import type { AppRunEvent } from '../app/run-registry';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';

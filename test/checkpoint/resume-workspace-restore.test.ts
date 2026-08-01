@@ -8,7 +8,7 @@ import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { InMemoryRunRegistry } from '../../src/app/run-registry';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { NewideBackendService } from '../../src/app/newide-backend-service';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import type { CoordinatorRunner } from '../../src/coordinator/coordinator-runner';
 import type { IntegrationV0Result } from '../../src/coordinator/integration-v0-flow';

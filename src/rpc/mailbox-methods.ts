@@ -9,12 +9,12 @@ import {
   type MailboxReplyInput,
   type MailboxSendInput,
   type MailboxSendResult,
-} from '../app/persistent-mailbox-service';
+} from '../mailbox';
 import type {
   PersistedMailboxDelivery,
   PersistedMailboxEnvelope,
   SaveMailboxReplyResult,
-} from '../persistence';
+} from '../mailbox';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 

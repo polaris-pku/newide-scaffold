@@ -1,3 +1,4 @@
+/** C application service: advances one durable Task Run through committed stage cursors. */
 import { createId, type Event, type TaskCreateRequest } from '../core';
 import type { DriverStreamEventListener } from '../driver/contract';
 import type {

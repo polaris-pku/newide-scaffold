@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type {
   PersistedMailboxDelivery,
   PersistedMailboxMessage,
-} from '../../src/persistence/mailbox-state-store';
+} from '../../src/mailbox';
 import { SqliteCoordinationStore } from '../../src/persistence';
 
 const temporaryDirectories: string[] = [];

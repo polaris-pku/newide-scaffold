@@ -3,7 +3,7 @@ import {
   MailboxDeliveryNotFoundError,
   type MailboxReplyInput,
   type MailboxSendInput,
-} from '../../src/app/persistent-mailbox-service';
+} from '../../src/mailbox';
 import type { MessageRecipient } from '../../src/core';
 import type {
   PersistedMailboxDelivery,

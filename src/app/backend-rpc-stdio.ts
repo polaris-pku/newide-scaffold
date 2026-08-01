@@ -37,8 +37,8 @@ import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
-import { TaskProcessor } from './task-processor';
-import { PersistentMailboxService } from './persistent-mailbox-service';
+import { TaskExecutionLoop, TaskProcessor } from '../coordination';
+import { PersistentMailboxService } from '../mailbox';
 import { createProductionBRuntime, type BackendBRuntime } from './production-b-runtime';
 import {
   BMemoryMaintenanceRunner,
@@ -47,7 +47,6 @@ import {
 import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
 import { createProductionStageExecutors } from './production-stage-executors';
-import { TaskExecutionLoop } from './task-execution-loop';
 import { SystemRpcMethods } from '../rpc/system-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 

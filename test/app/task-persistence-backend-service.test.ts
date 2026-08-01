@@ -7,7 +7,7 @@ import { InMemoryRunRegistry } from '../../src/app/run-registry';
 import type { AppRunEvent } from '../../src/app/run-registry';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { NewideBackendService } from '../../src/app/newide-backend-service';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import type {
   CoordinatorRunner,

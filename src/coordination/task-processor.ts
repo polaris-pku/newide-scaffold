@@ -28,9 +28,9 @@ import {
 import type { RunSnapshot } from '../protocol/run-snapshot';
 import { projectRunEventSource } from '../protocol/run-event';
 import { taskSnapshotSchema, type TaskSnapshot } from '../protocol/task-snapshot';
-import type { AppRunEvent } from './run-registry';
-import { projectPersistedRunSnapshot } from './task-run-snapshot-projector';
-import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
+import type { AppRunEvent } from '../app/run-registry';
+import { projectPersistedRunSnapshot } from '../app/task-run-snapshot-projector';
+import { projectTaskSnapshot, type TaskRunFact } from '../app/task-snapshot-projector';
 
 export interface TaskProcessorOptions {
   now?: () => string;

@@ -5,8 +5,8 @@ import path from 'node:path';
 import {
   TaskExecutionLoop,
   type TaskExecutionLoopExecutors,
-} from '../../src/app/task-execution-loop';
-import { TaskProcessor } from '../../src/app/task-processor';
+} from '../../src/coordination';
+import { TaskProcessor } from '../../src/coordination';
 import { buildResumePackage, ResumePackageError } from '../../src/checkpoint';
 import {
   FileRunEvidenceStore,

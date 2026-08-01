@@ -54,19 +54,18 @@ import {
   TaskProcessorTaskNotFoundError,
   type BeginTaskRunIntent,
   type TaskProcessor,
-} from './task-processor';
+  type TaskExecutionLoop,
+} from '../coordination';
 import type {
   PersistentMailboxService,
   MailboxReplyInput,
   MailboxSendInput,
   MailboxSendResult,
-} from './persistent-mailbox-service';
-import type { DriverStreamEvent } from '../driver/contract';
-import type {
   PersistedMailboxDelivery,
   PersistedMailboxEnvelope,
   SaveMailboxReplyResult,
-} from '../persistence';
+} from '../mailbox';
+import type { DriverStreamEvent } from '../driver/contract';
 import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
@@ -74,7 +73,6 @@ import {
   NoopDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
-import type { TaskExecutionLoop } from './task-execution-loop';
 import {
   createUnavailableSystemStatusService,
   type SystemStatusService,

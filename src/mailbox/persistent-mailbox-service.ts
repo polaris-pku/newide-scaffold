@@ -11,7 +11,7 @@ import type {
   PersistedMailboxError,
   PersistedMailboxMessage,
   SaveMailboxReplyResult,
-} from '../persistence';
+} from './mailbox-state-store';
 import type { AgentMailboxWakePort } from '../protocol/agent-mailbox-wake';
 
 export interface PersistentMailboxServiceOptions {

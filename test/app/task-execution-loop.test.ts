@@ -3,8 +3,8 @@ import { SCHEMA_VERSION, type TaskCreateRequest } from '../../src/core';
 import {
   TaskExecutionLoop,
   type TaskExecutionLoopExecutors,
-} from '../../src/app/task-execution-loop';
-import { TaskProcessor } from '../../src/app/task-processor';
+} from '../../src/coordination';
+import { TaskProcessor } from '../../src/coordination';
 import {
   SqliteCoordinationStore,
   type CoordinationStateCommit,

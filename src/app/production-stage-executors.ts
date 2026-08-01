@@ -33,7 +33,7 @@ import type {
   SelectAgentStageExecutor,
   TaskExecutionLoopExecutors,
   TaskStageExecutionContext,
-} from './task-execution-loop';
+} from '../coordination';
 
 export interface ProductionStageExecutorDependencies {
   selectAgentHandler: Pick<SelectAgentHandler, 'execute'>;

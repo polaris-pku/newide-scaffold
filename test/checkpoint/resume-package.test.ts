@@ -10,7 +10,7 @@ import {
   type PersistedFullCheckpoint,
   type PersistedTaskAggregate,
 } from '../../src/persistence';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';

@@ -8,7 +8,7 @@ import { InMemoryRunRegistry, type AppRunEvent } from '../../src/app/run-registr
 import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
-import type { TaskProcessor } from '../../src/app/task-processor';
+import type { TaskProcessor } from '../../src/coordination';
 import { IntegrationV0CoordinatorRunner } from '../../src/coordinator/coordinator-runner';
 import { runSnapshotSchema } from '../../src/protocol/run-snapshot';
 
