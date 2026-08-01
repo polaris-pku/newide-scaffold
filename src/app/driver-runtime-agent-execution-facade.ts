@@ -843,7 +843,12 @@ async function collectWorkspaceArtifacts(
   return artifacts;
 }
 
-function mergeArtifacts(
+/** Normalize artifact target paths so Windows `\` and POSIX `/` compare equal. */
+export function normalizeArtifactTargetPath(value: string): string {
+  return value.replace(/\\/g, '/');
+}
+
+export function mergeArtifacts(
   driverArtifacts: readonly ArtifactRef[],
   workspaceArtifacts: readonly ArtifactRef[],
 ): ArtifactRef[] {
@@ -853,8 +858,9 @@ function mergeArtifacts(
   // Driver edit snippets when both artifacts target the same path.
   for (const artifact of [...workspaceArtifacts, ...driverArtifacts]) {
     const target = artifact.content?.target_path;
-    if (target && seenTargets.has(target)) continue;
-    if (target) seenTargets.add(target);
+    const key = target ? normalizeArtifactTargetPath(target) : undefined;
+    if (key && seenTargets.has(key)) continue;
+    if (key) seenTargets.add(key);
     result.push(artifact);
   }
   return result;

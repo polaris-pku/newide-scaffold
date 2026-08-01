@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type ArtifactRef } from '../../src/core';
 import { buildChangesetManifest } from '../../src/coordinator/changeset-manifest';
@@ -50,12 +51,12 @@ describe('buildChangesetManifest', () => {
     expect(manifest.entries).toEqual([
       expect.objectContaining({
         artifact_id: 'artifact_new',
-        relative_paths: ['src/new.ts'],
+        relative_paths: [path.normalize('src/new.ts')],
         producer_agent_id: 'role_council_synthesizer',
         delivery_strategy: 'copy_file',
       }),
       expect.objectContaining({
-        relative_paths: ['src/existing.ts'],
+        relative_paths: [path.normalize('src/existing.ts')],
         producer_agent_id: 'role_ts_engineer',
         delivery_strategy: 'already_in_workspace',
       }),
@@ -102,6 +103,50 @@ describe('buildChangesetManifest', () => {
         delivery_receipt_path: path.join(root, 'run', 'delivery.json'),
       }),
     ).rejects.toThrow('Changeset path escapes workspace');
+  });
+
+  it('dedupes slash/backslash paths and prefers full file over edit snippet', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'newide-changeset-dedupe-'));
+    tempDirs.push(root);
+    const workspaceFile = path.join(root, 'full-utils.py');
+    const fullBody = `${'x'.repeat(1000)}\nfull file body\n`;
+    await writeFile(workspaceFile, fullBody);
+    const fullFile: ArtifactRef = {
+      artifact_id: 'artifact_full_utils',
+      type: 'patch',
+      uri: 'artifact://workspace-file/task/requests%2Futils.py',
+      producer_id: 'claude',
+      task_id: 'task_changeset',
+      metadata: { source: 'workspace-change', target_path: 'requests/utils.py' },
+      content: {
+        kind: 'file',
+        content_ref: pathToFileURL(workspaceFile).href,
+        target_path: 'requests/utils.py',
+        media_type: 'text/plain',
+      },
+      created_at: '2026-08-01T00:00:00.000Z',
+      schema_version: SCHEMA_VERSION,
+    };
+    const snippet = artifact('artifact_snippet_utils', 'requests\\utils.py', 'snippet only\n');
+
+    const manifest = await buildChangesetManifest({
+      run_id: 'run_dedupe',
+      task_id: 'task_changeset',
+      mode: 'council',
+      base_ref: 'workspace-before-run:run_dedupe',
+      selected_artifacts: [fullFile, snippet],
+      gate_results: [allowGate()],
+      producer_agent_id: 'role_ts_engineer',
+      task_worktree_path: path.join(root, 'worktree'),
+      manifest_path: path.join(root, 'run', 'changeset-manifest.json'),
+      delivery_receipt_path: path.join(root, 'run', 'delivery.json'),
+    });
+
+    const utilsEntries = manifest.entries.filter((entry) =>
+      entry.relative_paths.some((relativePath) => relativePath.replace(/\\/g, '/') === 'requests/utils.py'),
+    );
+    expect(utilsEntries).toHaveLength(1);
+    expect(utilsEntries[0]?.artifact_id).toBe('artifact_full_utils');
   });
 });
 

@@ -68,16 +68,25 @@ export async function buildChangesetManifest(
 ): Promise<ChangesetManifest> {
   const gateResultRefs = input.gate_results.map((result) => result.gate_result_id);
   const observedEntries = await buildObservedWorkspaceEntries(input, gateResultRefs);
-  const artifactEntries = await Promise.all(
-    input.selected_artifacts.map((artifact) =>
-      buildArtifactEntry(input, artifact, gateResultRefs),
+  const artifactEntries = dedupeArtifactEntriesByPath(
+    await Promise.all(
+      input.selected_artifacts.map((artifact) =>
+        buildArtifactEntry(input, artifact, gateResultRefs),
+      ),
     ),
   );
-  const selectedPaths = new Set(artifactEntries.flatMap((entry) => entry.relative_paths));
+  const selectedPaths = new Set(
+    artifactEntries.flatMap((entry) =>
+      entry.relative_paths.map((relativePath) => normalizePathKey(relativePath)),
+    ),
+  );
   const entries = [
     ...artifactEntries,
     ...observedEntries.filter(
-      (entry) => !entry.relative_paths.some((relativePath) => selectedPaths.has(relativePath)),
+      (entry) =>
+        !entry.relative_paths.some((relativePath) =>
+          selectedPaths.has(normalizePathKey(relativePath)),
+        ),
     ),
   ];
   const digest = createHash('sha256')
@@ -195,6 +204,79 @@ async function buildArtifactEntry(
 
 function changesetEntryId(value: string): string {
   return `changeset_entry_${createHash('sha256').update(value).digest('hex').slice(0, 24)}`;
+}
+
+function normalizePathKey(value: string): string {
+  return value.replace(/\\/g, '/');
+}
+
+/**
+ * Selected artifacts can include both a full workspace file and an Edit-tool
+ * text snippet for the same path (e.g. `requests/utils.py` vs `requests\\utils.py`).
+ * Keep one entry per path, preferring complete file content over snippets.
+ */
+function dedupeArtifactEntriesByPath(
+  entries: readonly ChangesetManifestEntry[],
+): ChangesetManifestEntry[] {
+  const byPath = new Map<string, ChangesetManifestEntry>();
+  for (const entry of entries) {
+    const key = entry.relative_paths.map((relativePath) => normalizePathKey(relativePath)).join('|');
+    if (!key) {
+      // Keep pathless metadata entries as-is (append after path-keyed ones).
+      continue;
+    }
+    const existing = byPath.get(key);
+    if (!existing || preferArtifactEntry(entry, existing) === entry) {
+      byPath.set(key, entry);
+    }
+  }
+  const pathless = entries.filter((entry) => entry.relative_paths.length === 0);
+  return [...byPath.values(), ...pathless];
+}
+
+function preferArtifactEntry(
+  candidate: ChangesetManifestEntry,
+  incumbent: ChangesetManifestEntry,
+): ChangesetManifestEntry {
+  const candidateKind = candidate.artifact_ref?.content?.kind;
+  const incumbentKind = incumbent.artifact_ref?.content?.kind;
+  if (candidateKind === 'file' && incumbentKind !== 'file') return candidate;
+  if (incumbentKind === 'file' && candidateKind !== 'file') return incumbent;
+
+  const candidateSource = candidate.artifact_ref?.metadata?.source;
+  const incumbentSource = incumbent.artifact_ref?.metadata?.source;
+  if (candidateSource === 'workspace-change' && incumbentSource !== 'workspace-change') {
+    return candidate;
+  }
+  if (incumbentSource === 'workspace-change' && candidateSource !== 'workspace-change') {
+    return incumbent;
+  }
+
+  // Prefer larger payloads when both are text/snippets (full file vs edit fragment).
+  const candidateBytes = estimateEntryBytes(candidate);
+  const incumbentBytes = estimateEntryBytes(incumbent);
+  if (candidateBytes > incumbentBytes) return candidate;
+  return incumbent;
+}
+
+function estimateEntryBytes(entry: ChangesetManifestEntry): number {
+  const contentRef = entry.artifact_ref?.content?.content_ref;
+  if (typeof contentRef === 'string' && contentRef.startsWith('data:')) {
+    const comma = contentRef.indexOf(',');
+    if (comma >= 0) {
+      try {
+        return decodeURIComponent(contentRef.slice(comma + 1)).length;
+      } catch {
+        return contentRef.length;
+      }
+    }
+  }
+  // File artifacts are typically much larger than edit snippets; use a high
+  // sentinel when content is a file URL so they win over data: snippets.
+  if (typeof contentRef === 'string' && contentRef.startsWith('file:')) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return 0;
 }
 
 function safeRelativePath(value: string): string {
