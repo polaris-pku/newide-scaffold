@@ -808,6 +808,25 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(repository.managerLoadCount).toBe(2);
   });
 
+  it('rebuilds a failed B role so the next run is not blocked as busy', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const { facade } = createFacade(
+      driver,
+      new InMemoryBufferRepository(),
+      failOnceThenInvokeDriverLlm(),
+    );
+
+    await expect(facade.runAgent(request('task_role_failure', 'reviewer'))).resolves.toMatchObject({
+      status: 'failed',
+      diagnostics: { dispatch_status: 'failed' },
+    });
+    await expect(facade.runAgent(request('task_role_retry', 'reviewer'))).resolves.toMatchObject({
+      status: 'completed',
+      agent_id: 'reviewer',
+    });
+    expect(driver.prompts).toHaveLength(1);
+  });
+
   it('continues a queued role execution after the active execution is aborted', async () => {
     const controller = new AbortController();
     const driver = new AbortOnceDriver();
@@ -1034,6 +1053,20 @@ function invokeDriverLlm(): ToolCallingClient {
           },
         ],
       };
+    },
+  };
+}
+
+function failOnceThenInvokeDriverLlm(): ToolCallingClient {
+  const delegate = invokeDriverLlm();
+  let failed = false;
+  return {
+    async completeWithTools(input) {
+      if (!failed) {
+        failed = true;
+        throw new Error('Transient top-level Agent failure');
+      }
+      return delegate.completeWithTools(input);
     },
   };
 }

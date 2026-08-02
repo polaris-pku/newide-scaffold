@@ -147,7 +147,7 @@ describe('SynthesisAgentCouncilProvider', () => {
     [COUNCIL_AGENTS.reviewer, 'participant_reviewer_0', 'COUNCIL_REVIEW_FAILED'],
     [COUNCIL_AGENTS.synthesizer, 'participant_synthesizer_0', 'COUNCIL_SYNTHESIS_FAILED'],
   ] as const)(
-    'records a stable diagnostic and continues autonomously when %s fails',
+    'records a stable diagnostic and stops before downstream roles when %s fails',
     async (failedAgent, failedParticipant, expectedCode) => {
       const requests: string[] = [];
       const lifecycleEvents: Array<{ type: string; payload: Record<string, unknown> }> = [];
@@ -177,37 +177,29 @@ describe('SynthesisAgentCouncilProvider', () => {
         },
       };
       const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+      const roleOrder = [
+        COUNCIL_AGENTS.proposerA,
+        COUNCIL_AGENTS.proposerB,
+        COUNCIL_AGENTS.reviewer,
+        COUNCIL_AGENTS.synthesizer,
+      ];
 
-      const result = await provider.runCouncilRound(
-        {
-          run_id: 'run_failed_role',
-          task_id: 'task_failed_role',
-          trigger: 'manual',
-          decision_mode: 'advisory',
-          question: 'Fail one Council role.',
-          participants: participantBindings(),
-          proposals: [],
-          schema_version: SCHEMA_VERSION,
-        },
-        { onLifecycleEvent: (event) => lifecycleEvents.push(event) },
-      );
-      expect(result.diagnostic_refs).toContain(`${expectedCode}:${failedParticipant}`);
-      expect(requests).toEqual(
-        failedAgent === COUNCIL_AGENTS.synthesizer
-          ? [
-              COUNCIL_AGENTS.proposerA,
-              COUNCIL_AGENTS.proposerB,
-              COUNCIL_AGENTS.reviewer,
-              COUNCIL_AGENTS.synthesizer,
-              COUNCIL_AGENTS.synthesizer,
-            ]
-          : [
-              COUNCIL_AGENTS.proposerA,
-              COUNCIL_AGENTS.proposerB,
-              COUNCIL_AGENTS.reviewer,
-              COUNCIL_AGENTS.synthesizer,
-            ],
-      );
+      await expect(
+        provider.runCouncilRound(
+          {
+            run_id: 'run_failed_role',
+            task_id: 'task_failed_role',
+            trigger: 'manual',
+            decision_mode: 'advisory',
+            question: 'Fail one Council role.',
+            participants: participantBindings(),
+            proposals: [],
+            schema_version: SCHEMA_VERSION,
+          },
+          { onLifecycleEvent: (event) => lifecycleEvents.push(event) },
+        ),
+      ).rejects.toMatchObject({ code: expectedCode });
+      expect(requests).toEqual(roleOrder.slice(0, roleOrder.indexOf(failedAgent) + 1));
       expect(lifecycleEvents).toContainEqual(
         expect.objectContaining({
           type: 'council.failed',
@@ -270,7 +262,7 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(lifecycleEvents).not.toContain('council.failed');
   });
 
-  it('surfaces a lifecycle publication failure instead of silently losing audit events', async () => {
+  it('preserves the Council role failure when its failure observer is unavailable', async () => {
     const failedProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade: createFacade(COUNCIL_AGENTS.proposerA),
     });
@@ -280,7 +272,7 @@ describe('SynthesisAgentCouncilProvider', () => {
           throw new Error('observer unavailable');
         },
       }),
-    ).rejects.toThrow('observer unavailable');
+    ).rejects.toMatchObject({ code: 'COUNCIL_PROPOSAL_FAILED' });
   });
 });
 

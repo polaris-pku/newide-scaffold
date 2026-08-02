@@ -101,14 +101,13 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     const synthesizerParticipant = requireSeat(participants, 'synthesizer');
     const councilDir = path.join(this.councilRoot, executionRunId);
     const generatedResults: AgentExecutionResult[] = [];
-    const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];
 
     for (const participant of proposers) {
       const label = String.fromCharCode(65 + participant.seat_index);
       const workspace = participantWorkspace(councilDir, participant);
       await prepareCouncilWorkspace(input.workspace_path, workspace);
-      const result = await this.tryRunRole(
+      const result = await this.runRole(
         input,
         executionRunId,
         participant,
@@ -117,9 +116,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         'proposal',
         workspace,
         options,
-        diagnosticRefs,
       );
-      if (!result) continue;
       generatedResults.push(result);
       const proposal = buildProposal(input, participant, result);
       generatedProposals.push(proposal);
@@ -134,7 +131,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     const reviewerWorkspace = participantWorkspace(councilDir, reviewerParticipant);
     await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
     await stageArtifacts(reviewerWorkspace, candidateArtifacts);
-    const reviewer = await this.tryRunRole(
+    const reviewer = await this.runRole(
       input,
       executionRunId,
       reviewerParticipant,
@@ -143,26 +140,23 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       'review',
       reviewerWorkspace,
       options,
-      diagnosticRefs,
     );
-    if (reviewer) generatedResults.push(reviewer);
+    generatedResults.push(reviewer);
     const reviews = buildReviews(proposals, reviewerParticipant, reviewer);
-    if (reviewer) {
-      await emitLifecycle(options, {
-        type: 'council.review.completed',
-        payload: {
-          ...participantAuditPayload(reviewerParticipant),
-          agent_run_id: reviewer.agent_run_id,
-          driver_run_result_id: reviewer.driver_run_result_id,
-          context_pack_ref: reviewer.context_pack_ref,
-          memory_buffer_ref: reviewer.memory_buffer_ref,
-          session_id: reviewer.session_id,
-          proposal_ids: proposals.map((proposal) => proposal.proposal_id),
-          review_ids: reviews.map((review) => review.review_id),
-          artifact_refs: reviewer.artifact_refs.map((artifact) => artifact.artifact_id),
-        },
-      });
-    }
+    await emitLifecycle(options, {
+      type: 'council.review.completed',
+      payload: {
+        ...participantAuditPayload(reviewerParticipant),
+        agent_run_id: reviewer.agent_run_id,
+        driver_run_result_id: reviewer.driver_run_result_id,
+        context_pack_ref: reviewer.context_pack_ref,
+        memory_buffer_ref: reviewer.memory_buffer_ref,
+        session_id: reviewer.session_id,
+        proposal_ids: proposals.map((proposal) => proposal.proposal_id),
+        review_ids: reviews.map((review) => review.review_id),
+        artifact_refs: reviewer.artifact_refs.map((artifact) => artifact.artifact_id),
+      },
+    });
 
     const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
     await prepareCouncilWorkspace(input.workspace_path, synthesizerWorkspace);
@@ -176,7 +170,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     let synthesizer: AgentExecutionResult | undefined;
     const maxRounds = Math.min(Math.max(input.max_rounds ?? 2, 1), 2);
     for (let round = 1; round <= maxRounds; round += 1) {
-      synthesizer = await this.tryRunRole(
+      synthesizer = await this.runRole(
         input,
         executionRunId,
         synthesizerParticipant,
@@ -185,9 +179,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         'synthesis',
         synthesizerWorkspace,
         options,
-        diagnosticRefs,
       );
-      if (synthesizer) generatedResults.push(synthesizer);
+      generatedResults.push(synthesizer);
       if (synthesizer?.artifact_refs.some(isMaterializableFileArtifact)) break;
     }
 
@@ -228,40 +221,9 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       output: buildOutput(input, decision, generatedArtifactRefs),
       generated_artifact_refs: generatedArtifactRefs,
       selected_artifact_refs: selectedArtifactRefs,
-      ...(diagnosticRefs.length > 0 ? { diagnostic_refs: diagnosticRefs } : {}),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
-  }
-
-  private async tryRunRole(
-    input: CouncilRoundInput,
-    executionRunId: string,
-    participant: CouncilParticipantBinding,
-    instruction: string,
-    inputArtifactRefs: string[],
-    phase: CouncilPhase,
-    workspacePath: string,
-    options: CouncilExecutionOptions | undefined,
-    diagnosticRefs: string[],
-  ): Promise<AgentExecutionResult | undefined> {
-    try {
-      return await this.runRole(
-        input,
-        executionRunId,
-        participant,
-        instruction,
-        inputArtifactRefs,
-        phase,
-        workspacePath,
-        options,
-      );
-    } catch (error) {
-      if (options?.signal?.aborted) throw error;
-      if (!(error instanceof CouncilRoleExecutionError)) throw error;
-      diagnosticRefs.push(`${error.code}:${participant.participant_id}`);
-      return undefined;
-    }
   }
 
   private async runRole(

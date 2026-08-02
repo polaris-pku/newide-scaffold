@@ -156,8 +156,21 @@ export class DriverRuntimeAgentExecutionFacade
       queueKeys,
       async () => {
         throwIfAborted(options?.signal);
-        const manager = await this.ensureRole(runtimeRoleId);
-        return this.execute(manager, normalizedInput, runtimeRoleId, options);
+        let manager = await this.ensureRole(runtimeRoleId);
+        let result = await this.execute(manager, normalizedInput, runtimeRoleId, options);
+
+        // The public B runtime can retain currentTask when an execution aborts before
+        // finalizeLoop. The app-owned queue proves that B_BLOCKED/busy is stale here,
+        // so rebuild only this role and retry once without changing B-owned code/data.
+        if (isAgentBusyResult(result)) {
+          await this.recoverRole(runtimeRoleId);
+          manager = await this.ensureRole(runtimeRoleId);
+          result = await this.execute(manager, normalizedInput, runtimeRoleId, options);
+        }
+        if (result.status !== 'completed') {
+          await this.recoverRole(runtimeRoleId);
+        }
+        return result;
       },
       options?.signal,
     );
@@ -687,6 +700,17 @@ function mapStatus(
       interrupted: 'interrupted',
     } as const
   )[driverStatus];
+}
+
+function isAgentBusyResult(result: AgentExecutionResult): boolean {
+  const driverError = result.diagnostics.driver_error;
+  if (!driverError || typeof driverError !== 'object' || Array.isArray(driverError)) return false;
+  return (
+    result.status === 'failed' &&
+    result.diagnostics.dispatch_status === 'blocked' &&
+    Reflect.get(driverError, 'code') === 'B_BLOCKED' &&
+    Reflect.get(driverError, 'message') === 'Agent is busy with another task.'
+  );
 }
 
 function toMemoryItems(prefix: string, values: string[] | undefined) {

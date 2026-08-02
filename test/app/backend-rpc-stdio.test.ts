@@ -555,22 +555,25 @@ describe('backend RPC stdio entrypoint', () => {
       const failedSnapshot = await waitForTerminal(service, failedCouncilCreated.run_id);
       unsubscribeFailed();
       expect(service.getRunSnapshot(failedCouncilCreated.run_id)).toMatchObject({
-        status: 'completed',
-        council: {
-          result: {
-            quality: 'best_effort',
-            warnings: expect.arrayContaining([
-              'Council verification did not fully pass; delivering the best available artifact.',
-            ]),
-          },
-        },
-        errors: [],
+        status: 'failed',
+        errors: [
+          expect.objectContaining({
+            code: 'stage_execution_failed',
+            message: 'Council review role failed',
+          }),
+        ],
       });
       expect(failedNotifications.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.failed', 'run.failed']),
       );
-      expect(failedSnapshot.events.map((event) => event.type)).toContain('council.completed');
-      expect(failedSnapshot.events.map((event) => event.type)).toContain('worktree.materialized');
+      expect(failedSnapshot.events.map((event) => event.type)).not.toContain('council.completed');
+      expect(failedSnapshot.events.map((event) => event.type)).not.toContain(
+        'worktree.materialized',
+      );
+      expect(failedSnapshot.events.map((event) => event.type)).not.toContain('artifact.delivered');
+      expect(readFileSync(path.join(workspaceDir, 'council-output.txt'))).toEqual(
+        deliveredCouncilFile,
+      );
       const failedAudit = readFileSync(
         path.join('.newide', 'runs', failedCouncilCreated.run_id, 'audit.jsonl'),
         'utf8',
@@ -579,8 +582,10 @@ describe('backend RPC stdio entrypoint', () => {
         .split('\n')
         .map((line) => JSON.parse(line) as AppRunEvent);
       expect(failedAudit.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.failed', 'run.failed']),
       );
+      expect(failedAudit.map((event) => event.type)).not.toContain('council.completed');
+      expect(failedAudit.map((event) => event.type)).not.toContain('artifact.delivered');
     } finally {
       await service?.close();
       rmSync(runnerDir, { recursive: true, force: true });
