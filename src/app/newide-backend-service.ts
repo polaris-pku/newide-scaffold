@@ -11,7 +11,6 @@ import {
   SCHEMA_VERSION,
   createId,
   type Event,
-  type MessageRecipient,
   type TaskCreateRequest,
 } from '../core';
 import {
@@ -256,19 +255,26 @@ export class NewideBackendService {
   }
 
   async listMailboxInbox(
-    recipient: MessageRecipient,
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
     afterDeliveryId?: string,
   ): Promise<PersistedMailboxEnvelope[]> {
     await this.mailboxRecovery;
-    return this.requireMailboxService().inbox(recipient, afterDeliveryId);
+    return this.requireMailboxService().inbox(
+      taskId,
+      workspacePath,
+      recipientRoleId,
+      afterDeliveryId,
+    );
   }
 
   async acknowledgeMailboxDelivery(
     deliveryId: string,
-    recipient: MessageRecipient,
+    recipientRoleId: string,
   ): Promise<PersistedMailboxDelivery> {
     await this.mailboxRecovery;
-    return this.requireMailboxService().ack(deliveryId, recipient);
+    return this.requireMailboxService().ack(deliveryId, recipientRoleId);
   }
 
   async replyMailboxMessage(input: MailboxReplyInput): Promise<SaveMailboxReplyResult> {

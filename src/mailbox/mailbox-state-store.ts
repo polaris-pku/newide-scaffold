@@ -1,12 +1,11 @@
 /** Mailbox-owned persistence port. SQLite remains an application adapter. */
-import type {
-  AgentMessageType,
-  MessageRecipient,
-  SchemaVersion,
-  Timestamp,
-} from '../core';
+import type { AgentMessageType, SchemaVersion, Timestamp } from '../core';
 
-export type PersistedMailboxDeliveryStatus = 'pending' | 'delivered' | 'acknowledged';
+export type PersistedMailboxDeliveryStatus =
+  | 'pending'
+  | 'injected'
+  | 'acknowledged'
+  | 'failed';
 
 export interface PersistedMailboxError {
   code: string;
@@ -16,13 +15,16 @@ export interface PersistedMailboxError {
 
 export interface PersistedMailboxMessage {
   message_id: string;
+  task_id: string;
+  workspace_path: string;
   thread_id: string;
-  from_agent_id: string;
+  from_role_id: string;
   type: AgentMessageType;
   payload: Record<string, unknown>;
   artifact_refs: string[];
   requires_ack: boolean;
   reply_to_message_id?: string;
+  idempotency_key: string;
   created_at: Timestamp;
   schema_version: SchemaVersion;
 }
@@ -30,11 +32,13 @@ export interface PersistedMailboxMessage {
 export interface PersistedMailboxDelivery {
   delivery_id: string;
   message_id: string;
-  recipient_agent_id?: string;
-  recipient_role_id?: string;
+  task_id: string;
+  workspace_path: string;
+  recipient_role_id: string;
+  recipient_session_id?: string;
   status: PersistedMailboxDeliveryStatus;
   deadline_at?: Timestamp;
-  delivered_at?: Timestamp;
+  injected_at?: Timestamp;
   acknowledged_at?: Timestamp;
   retry_count: number;
   last_error?: PersistedMailboxError;
@@ -52,7 +56,7 @@ export interface PersistedMailboxEnvelope {
 
 export interface SaveMailboxReplyInput {
   source_delivery_id: string;
-  source_recipient: MessageRecipient;
+  source_recipient_role_id: string;
   message: PersistedMailboxMessage;
   deliveries: PersistedMailboxDelivery[];
   acknowledged_at: Timestamp;
@@ -71,22 +75,49 @@ export interface MailboxStateStore {
     message: PersistedMailboxMessage,
     deliveries: PersistedMailboxDelivery[],
   ): void;
-  receiveMailboxInbox(
-    recipient: MessageRecipient,
-    deliveredAt: Timestamp,
+  listMailboxInbox(
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
     afterDeliveryId?: string,
   ): PersistedMailboxEnvelope[];
+  markMailboxDeliveryInjected(
+    deliveryId: string,
+    input: {
+      recipient_role_id: string;
+      recipient_session_id: string;
+      injected_at: Timestamp;
+    },
+  ): PersistedMailboxDelivery;
+  markMailboxDeliveryFailed(
+    deliveryId: string,
+    input: { failed_at: Timestamp; error: PersistedMailboxError },
+  ): PersistedMailboxDelivery;
   acknowledgeMailboxDelivery(
     deliveryId: string,
-    recipient: MessageRecipient,
+    recipientRoleId: string,
     acknowledgedAt: Timestamp,
   ): PersistedMailboxDelivery;
   saveMailboxReply(input: SaveMailboxReplyInput): SaveMailboxReplyResult;
-  recordMailboxWakeAttempt(
+  recordMailboxDeliveryAttempt(
     deliveryId: string,
     input: { attempted_at: Timestamp; error?: PersistedMailboxError },
   ): PersistedMailboxDelivery;
   getMailboxEnvelope(deliveryId: string): PersistedMailboxEnvelope | undefined;
   listMailboxThread(threadId: string): PersistedMailboxMessage[];
-  listReplayableMailboxDeliveries(): PersistedMailboxEnvelope[];
+  listReplayableMailboxDeliveries(scope?: {
+    task_id?: string;
+    workspace_path?: string;
+    recipient_role_id?: string;
+  }): PersistedMailboxEnvelope[];
+  findMailboxSendByIdempotencyKey(
+    taskId: string,
+    fromRoleId: string,
+    idempotencyKey: string,
+  ): MailboxSendPersistenceResult | undefined;
+}
+
+export interface MailboxSendPersistenceResult {
+  message: PersistedMailboxMessage;
+  deliveries: PersistedMailboxDelivery[];
 }

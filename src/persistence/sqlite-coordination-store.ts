@@ -6,7 +6,6 @@ import {
   TASK_STATUSES,
   type AgentMessageType,
   type Event,
-  type MessageRecipient,
 } from '../core';
 import {
   type CoordinationStateCommit,
@@ -27,6 +26,8 @@ import type {
   PersistedMailboxMessage,
   SaveMailboxReplyInput,
   SaveMailboxReplyResult,
+  MailboxSendPersistenceResult,
+  PersistedMailboxError,
 } from '../mailbox/mailbox-state-store';
 
 const RUN_STATUSES = [
@@ -61,7 +62,12 @@ const MAILBOX_MESSAGE_TYPES = [
   'driver.requested',
   'driver.completed',
 ] as const satisfies readonly AgentMessageType[];
-const MAILBOX_DELIVERY_STATUSES = ['pending', 'delivered', 'acknowledged'] as const;
+const MAILBOX_DELIVERY_STATUSES = [
+  'pending',
+  'injected',
+  'acknowledged',
+  'failed',
+] as const;
 
 type SqlRow = Record<string, unknown>;
 
@@ -159,69 +165,100 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
     }
   }
 
-  receiveMailboxInbox(
-    recipient: MessageRecipient,
-    deliveredAt: string,
+  listMailboxInbox(
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
     afterDeliveryId?: string,
   ): PersistedMailboxEnvelope[] {
-    validateMailboxRecipient(recipient);
     const cursor = afterDeliveryId ? this.requireMailboxDelivery(afterDeliveryId) : undefined;
-    if (cursor && !deliveryMatchesRecipient(cursor, recipient)) {
+    if (
+      cursor &&
+      (cursor.task_id !== taskId ||
+        cursor.workspace_path !== workspacePath ||
+        cursor.recipient_role_id !== recipientRoleId)
+    ) {
       throw new Error(`Mailbox delivery cursor ${afterDeliveryId} belongs to another recipient`);
     }
-    const where = recipient.agent_id
-      ? 'recipient_agent_id = ?'
-      : 'recipient_role_id = ?';
-    const recipientId = recipient.agent_id ?? recipient.role_id;
     const cursorClause = cursor
       ? 'AND (created_at > ? OR (created_at = ? AND delivery_id > ?))'
       : '';
-    const parameters: SQLInputValue[] = [recipientId ?? ''];
+    const parameters: SQLInputValue[] = [taskId, workspacePath, recipientRoleId];
     if (cursor) parameters.push(cursor.created_at, cursor.created_at, cursor.delivery_id);
+    return this.database
+      .prepare(
+        `SELECT delivery_id FROM deliveries
+         WHERE task_id = ? AND workspace_path = ? AND recipient_role_id = ?
+           ${cursorClause}
+         ORDER BY created_at ASC, delivery_id ASC`,
+      )
+      .all(...parameters)
+      .map((row) => this.readMailboxEnvelope(readString(row, 'delivery_id')));
+  }
 
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      const rows = this.database
-        .prepare(
-          `SELECT * FROM deliveries
-           WHERE ${where} AND status IN ('pending', 'delivered') ${cursorClause}
-           ORDER BY created_at ASC, delivery_id ASC`,
-        )
-        .all(...parameters);
-      const deliveries = rows.map((row) => readMailboxDelivery(row));
-      const update = this.database.prepare(
-        `UPDATE deliveries
-         SET status = 'delivered', delivered_at = COALESCE(delivered_at, ?), updated_at = ?
-         WHERE delivery_id = ? AND status = 'pending'`,
-      );
-      for (const delivery of deliveries) {
-        update.run(deliveredAt, deliveredAt, delivery.delivery_id);
+  markMailboxDeliveryInjected(
+    deliveryId: string,
+    input: {
+      recipient_role_id: string;
+      recipient_session_id: string;
+      injected_at: string;
+    },
+  ): PersistedMailboxDelivery {
+    const delivery = this.requireMailboxDelivery(deliveryId);
+    assertMailboxDeliveryRecipient(delivery, input.recipient_role_id);
+    if (delivery.status === 'injected' || delivery.status === 'acknowledged') {
+      if (delivery.recipient_session_id !== input.recipient_session_id) {
+        throw new Error(`Mailbox delivery ${deliveryId} was injected into another Session`);
       }
-      const envelopes = deliveries.map((delivery) =>
-        this.readMailboxEnvelope(delivery.delivery_id),
-      );
-      this.database.exec('COMMIT');
-      return envelopes;
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
+      return delivery;
     }
+    if (delivery.status !== 'pending') {
+      throw new Error(`Mailbox delivery ${deliveryId} cannot be injected from ${delivery.status}`);
+    }
+    this.database
+      .prepare(
+        `UPDATE deliveries
+         SET status = 'injected', recipient_session_id = ?,
+             injected_at = COALESCE(injected_at, ?), last_error_json = NULL, updated_at = ?
+         WHERE delivery_id = ? AND status = 'pending'`,
+      )
+      .run(input.recipient_session_id, input.injected_at, input.injected_at, deliveryId);
+    return this.requireMailboxDelivery(deliveryId);
+  }
+
+  markMailboxDeliveryFailed(
+    deliveryId: string,
+    input: { failed_at: string; error: PersistedMailboxError },
+  ): PersistedMailboxDelivery {
+    const result = this.database
+      .prepare(
+        `UPDATE deliveries
+         SET status = 'failed', last_error_json = ?, updated_at = ?
+         WHERE delivery_id = ? AND status = 'pending'`,
+      )
+      .run(toJson(input.error), input.failed_at, deliveryId);
+    if (result.changes === 0) {
+      throw new Error(`Pending mailbox delivery ${deliveryId} was not found`);
+    }
+    return this.requireMailboxDelivery(deliveryId);
   }
 
   acknowledgeMailboxDelivery(
     deliveryId: string,
-    recipient: MessageRecipient,
+    recipientRoleId: string,
     acknowledgedAt: string,
   ): PersistedMailboxDelivery {
-    validateMailboxRecipient(recipient);
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const delivery = this.requireMailboxDelivery(deliveryId);
-      assertMailboxDeliveryRecipient(delivery, recipient);
+      assertMailboxDeliveryRecipient(delivery, recipientRoleId);
       if (delivery.status === 'pending') {
-        throw new Error(`Mailbox delivery ${deliveryId} must be delivered before acknowledgement`);
+        throw new Error(`Mailbox delivery ${deliveryId} must be injected before acknowledgement`);
       }
-      if (delivery.status === 'delivered') {
+      if (delivery.status === 'failed') {
+        throw new Error(`Failed mailbox delivery ${deliveryId} cannot be acknowledged`);
+      }
+      if (delivery.status === 'injected') {
         this.database
           .prepare(
             `UPDATE deliveries
@@ -240,21 +277,23 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
   }
 
   saveMailboxReply(input: SaveMailboxReplyInput): SaveMailboxReplyResult {
-    validateMailboxRecipient(input.source_recipient);
     validateMailboxWrite(input.message, input.deliveries);
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const source = this.requireMailboxDelivery(input.source_delivery_id);
-      assertMailboxDeliveryRecipient(source, input.source_recipient);
+      assertMailboxDeliveryRecipient(source, input.source_recipient_role_id);
       if (source.status === 'pending') {
         throw new Error(
-          `Mailbox delivery ${input.source_delivery_id} must be delivered before reply`,
+          `Mailbox delivery ${input.source_delivery_id} must be injected before reply`,
         );
+      }
+      if (source.status === 'failed') {
+        throw new Error(`Failed mailbox delivery ${input.source_delivery_id} cannot be replied to`);
       }
       if (input.message.reply_to_message_id !== source.message_id) {
         throw new Error('Mailbox reply must reference the source message');
       }
-      if (source.status === 'delivered') {
+      if (source.status === 'injected') {
         this.database
           .prepare(
             `UPDATE deliveries
@@ -277,7 +316,7 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
     }
   }
 
-  recordMailboxWakeAttempt(
+  recordMailboxDeliveryAttempt(
     deliveryId: string,
     input: { attempted_at: string; error?: { code: string; message: string; details?: Record<string, unknown> } },
   ): PersistedMailboxDelivery {
@@ -285,7 +324,7 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
       .prepare(
         `UPDATE deliveries
          SET retry_count = retry_count + 1, last_error_json = ?, updated_at = ?
-         WHERE delivery_id = ? AND status IN ('pending', 'delivered')`,
+         WHERE delivery_id = ? AND status = 'pending'`,
       )
       .run(input.error ? toJson(input.error) : null, input.attempted_at, deliveryId);
     if (result.changes === 0) {
@@ -308,15 +347,56 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
       .map((row) => readMailboxMessage(row));
   }
 
-  listReplayableMailboxDeliveries(): PersistedMailboxEnvelope[] {
+  listReplayableMailboxDeliveries(scope: {
+    task_id?: string;
+    workspace_path?: string;
+    recipient_role_id?: string;
+  } = {}): PersistedMailboxEnvelope[] {
+    const clauses = ["status = 'pending'"];
+    const params: SQLInputValue[] = [];
+    if (scope.task_id) {
+      clauses.push('task_id = ?');
+      params.push(scope.task_id);
+    }
+    if (scope.workspace_path) {
+      clauses.push('workspace_path = ?');
+      params.push(scope.workspace_path);
+    }
+    if (scope.recipient_role_id) {
+      clauses.push('recipient_role_id = ?');
+      params.push(scope.recipient_role_id);
+    }
     return this.database
       .prepare(
         `SELECT delivery_id FROM deliveries
-         WHERE status IN ('pending', 'delivered')
+         WHERE ${clauses.join(' AND ')}
          ORDER BY created_at, delivery_id`,
       )
-      .all()
+      .all(...params)
       .map((row) => this.readMailboxEnvelope(readString(row, 'delivery_id')));
+  }
+
+  findMailboxSendByIdempotencyKey(
+    taskId: string,
+    fromRoleId: string,
+    idempotencyKey: string,
+  ): MailboxSendPersistenceResult | undefined {
+    const row = this.database
+      .prepare(
+        'SELECT message_id FROM messages WHERE task_id = ? AND from_role_id = ? AND idempotency_key = ?',
+      )
+      .get(taskId, fromRoleId, idempotencyKey);
+    if (!row) return undefined;
+    const messageId = readString(row, 'message_id');
+    const messageRow = this.database
+      .prepare('SELECT * FROM messages WHERE message_id = ?')
+      .get(messageId);
+    if (!messageRow) return undefined;
+    const deliveries = this.database
+      .prepare('SELECT * FROM deliveries WHERE message_id = ? ORDER BY created_at, delivery_id')
+      .all(messageId)
+      .map((deliveryRow) => readMailboxDelivery(deliveryRow));
+    return { message: readMailboxMessage(messageRow), deliveries };
   }
 
   close(): void {
@@ -431,13 +511,16 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
 
         CREATE TABLE IF NOT EXISTS messages (
           message_id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          workspace_path TEXT NOT NULL,
           thread_id TEXT NOT NULL,
-          from_agent_id TEXT NOT NULL,
+          from_role_id TEXT NOT NULL,
           type TEXT NOT NULL,
           payload_json TEXT NOT NULL,
           artifact_refs_json TEXT NOT NULL,
           requires_ack INTEGER NOT NULL CHECK (requires_ack IN (0, 1)),
           reply_to_message_id TEXT REFERENCES messages(message_id),
+          idempotency_key TEXT NOT NULL,
           created_at TEXT NOT NULL,
           schema_version TEXT NOT NULL
         );
@@ -445,11 +528,13 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
         CREATE TABLE IF NOT EXISTS deliveries (
           delivery_id TEXT PRIMARY KEY,
           message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
-          recipient_agent_id TEXT,
-          recipient_role_id TEXT,
-          status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'acknowledged')),
+          task_id TEXT NOT NULL,
+          workspace_path TEXT NOT NULL,
+          recipient_role_id TEXT NOT NULL,
+          recipient_session_id TEXT,
+          status TEXT NOT NULL CHECK (status IN ('pending', 'injected', 'acknowledged', 'failed')),
           deadline_at TEXT,
-          delivered_at TEXT,
+          injected_at TEXT,
           acknowledged_at TEXT,
           retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
           last_error_json TEXT,
@@ -457,14 +542,11 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
           replay_cursor TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
-          schema_version TEXT NOT NULL,
-          CHECK (recipient_agent_id IS NOT NULL OR recipient_role_id IS NOT NULL)
+          schema_version TEXT NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS messages_by_thread
           ON messages(thread_id, created_at, message_id);
-        CREATE INDEX IF NOT EXISTS deliveries_by_agent_status
-          ON deliveries(recipient_agent_id, status, created_at, delivery_id);
         CREATE INDEX IF NOT EXISTS deliveries_by_role_status
           ON deliveries(recipient_role_id, status, created_at, delivery_id);
       `);
@@ -475,6 +557,23 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
       this.database
         .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
         .run(2, new Date().toISOString());
+      migrateMailboxTables(this.database);
+      this.database.exec(`
+        CREATE INDEX IF NOT EXISTS messages_by_thread
+          ON messages(thread_id, created_at, message_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS messages_by_sender_idempotency
+          ON messages(task_id, from_role_id, idempotency_key);
+        CREATE UNIQUE INDEX IF NOT EXISTS one_mailbox_reply_per_message
+          ON messages(reply_to_message_id)
+          WHERE reply_to_message_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS deliveries_by_role_status
+          ON deliveries(recipient_role_id, status, created_at, delivery_id);
+        CREATE INDEX IF NOT EXISTS deliveries_by_task_role_status
+          ON deliveries(task_id, recipient_role_id, status, created_at, delivery_id);
+      `);
+      this.database
+        .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(3, new Date().toISOString());
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -627,19 +726,23 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
     this.database
       .prepare(
         `INSERT INTO messages (
-          message_id, thread_id, from_agent_id, type, payload_json, artifact_refs_json,
-          requires_ack, reply_to_message_id, created_at, schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          message_id, task_id, workspace_path, thread_id, from_role_id,
+          type, payload_json, artifact_refs_json, requires_ack, reply_to_message_id,
+          idempotency_key, created_at, schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         message.message_id,
+        message.task_id,
+        message.workspace_path,
         message.thread_id,
-        message.from_agent_id,
+        message.from_role_id,
         message.type,
         toJson(message.payload),
         toJson(message.artifact_refs),
         message.requires_ack ? 1 : 0,
         message.reply_to_message_id ?? null,
+        message.idempotency_key,
         message.created_at,
         message.schema_version,
       );
@@ -649,19 +752,22 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
     this.database
       .prepare(
         `INSERT INTO deliveries (
-          delivery_id, message_id, recipient_agent_id, recipient_role_id, status, deadline_at,
-          delivered_at, acknowledged_at, retry_count, last_error_json, last_delivery_event_id,
+          delivery_id, message_id, task_id, workspace_path, recipient_role_id,
+          recipient_session_id, status, deadline_at, injected_at, acknowledged_at,
+          retry_count, last_error_json, last_delivery_event_id,
           replay_cursor, created_at, updated_at, schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         delivery.delivery_id,
         delivery.message_id,
-        delivery.recipient_agent_id ?? null,
-        delivery.recipient_role_id ?? null,
+        delivery.task_id,
+        delivery.workspace_path,
+        delivery.recipient_role_id,
+        delivery.recipient_session_id ?? null,
         delivery.status,
         delivery.deadline_at ?? null,
-        delivery.delivered_at ?? null,
+        delivery.injected_at ?? null,
         delivery.acknowledged_at ?? null,
         delivery.retry_count,
         delivery.last_error ? toJson(delivery.last_error) : null,
@@ -978,8 +1084,10 @@ function readCheckpoint(row: SqlRow): PersistedFullCheckpoint {
 function readMailboxMessage(row: SqlRow): PersistedMailboxMessage {
   return {
     message_id: readString(row, 'message_id'),
+    task_id: readString(row, 'task_id'),
+    workspace_path: readString(row, 'workspace_path'),
     thread_id: readString(row, 'thread_id'),
-    from_agent_id: readString(row, 'from_agent_id'),
+    from_role_id: readString(row, 'from_role_id'),
     type: readEnum(row, 'type', MAILBOX_MESSAGE_TYPES),
     payload: readJson<Record<string, unknown>>(row, 'payload_json'),
     artifact_refs: readJson<string[]>(row, 'artifact_refs_json'),
@@ -987,6 +1095,8 @@ function readMailboxMessage(row: SqlRow): PersistedMailboxMessage {
     ...(readOptionalString(row, 'reply_to_message_id')
       ? { reply_to_message_id: readString(row, 'reply_to_message_id') }
       : {}),
+    idempotency_key:
+      readOptionalString(row, 'idempotency_key') ?? `legacy:${readString(row, 'message_id')}`,
     created_at: readString(row, 'created_at'),
     schema_version: readSchemaVersion(row),
   };
@@ -1000,18 +1110,18 @@ function readMailboxDelivery(row: SqlRow): PersistedMailboxDelivery {
   return {
     delivery_id: readString(row, 'delivery_id'),
     message_id: readString(row, 'message_id'),
-    ...(readOptionalString(row, 'recipient_agent_id')
-      ? { recipient_agent_id: readString(row, 'recipient_agent_id') }
-      : {}),
-    ...(readOptionalString(row, 'recipient_role_id')
-      ? { recipient_role_id: readString(row, 'recipient_role_id') }
+    task_id: readString(row, 'task_id'),
+    workspace_path: readString(row, 'workspace_path'),
+    recipient_role_id: readString(row, 'recipient_role_id'),
+    ...(readOptionalString(row, 'recipient_session_id')
+      ? { recipient_session_id: readString(row, 'recipient_session_id') }
       : {}),
     status: readEnum(row, 'status', MAILBOX_DELIVERY_STATUSES),
     ...(readOptionalString(row, 'deadline_at')
       ? { deadline_at: readString(row, 'deadline_at') }
       : {}),
-    ...(readOptionalString(row, 'delivered_at')
-      ? { delivered_at: readString(row, 'delivered_at') }
+    ...(readOptionalString(row, 'injected_at')
+      ? { injected_at: readString(row, 'injected_at') }
       : {}),
     ...(readOptionalString(row, 'acknowledged_at')
       ? { acknowledged_at: readString(row, 'acknowledged_at') }
@@ -1038,23 +1148,26 @@ function validateMailboxWrite(
   if (message.schema_version !== SCHEMA_VERSION) {
     throw new Error(`Unsupported mailbox message schema: ${message.schema_version}`);
   }
+  if (deliveries.length !== 1) throw new Error('Mailbox requires exactly one delivery');
+  if (!message.task_id || !message.workspace_path || !message.idempotency_key) {
+    throw new Error('Mailbox requires task, workspace and idempotency key');
+  }
   const recipients = new Set<string>();
   for (const delivery of deliveries) {
     if (delivery.message_id !== message.message_id) {
       throw new Error('Mailbox delivery belongs to another message');
     }
+    if (
+      delivery.task_id !== message.task_id ||
+      delivery.workspace_path !== message.workspace_path
+    ) {
+      throw new Error('Mailbox delivery belongs to another task or workspace');
+    }
     if (delivery.status !== 'pending') {
       throw new Error('New mailbox delivery must be pending');
     }
-    const recipient = delivery.recipient_agent_id
-      ? { agent_id: delivery.recipient_agent_id }
-      : delivery.recipient_role_id
-        ? { role_id: delivery.recipient_role_id }
-        : {};
-    validateMailboxRecipient(recipient);
-    const key = delivery.recipient_agent_id
-      ? `agent:${delivery.recipient_agent_id}`
-      : `role:${delivery.recipient_role_id ?? ''}`;
+    if (!delivery.recipient_role_id) throw new Error('Mailbox delivery requires role_id');
+    const key = `role:${delivery.recipient_role_id}`;
     if (recipients.has(key)) throw new Error(`Duplicate mailbox recipient ${key}`);
     recipients.add(key);
     if (delivery.schema_version !== SCHEMA_VERSION) {
@@ -1063,28 +1176,11 @@ function validateMailboxWrite(
   }
 }
 
-function validateMailboxRecipient(recipient: MessageRecipient): void {
-  const count = Number(Boolean(recipient.agent_id)) + Number(Boolean(recipient.role_id));
-  if (count !== 1) {
-    throw new Error('Mailbox recipient must set exactly one of agent_id or role_id');
-  }
-}
-
-function deliveryMatchesRecipient(
-  delivery: PersistedMailboxDelivery,
-  recipient: MessageRecipient,
-): boolean {
-  return (
-    (recipient.agent_id !== undefined && delivery.recipient_agent_id === recipient.agent_id) ||
-    (recipient.role_id !== undefined && delivery.recipient_role_id === recipient.role_id)
-  );
-}
-
 function assertMailboxDeliveryRecipient(
   delivery: PersistedMailboxDelivery,
-  recipient: MessageRecipient,
+  recipientRoleId: string,
 ): void {
-  if (!deliveryMatchesRecipient(delivery, recipient)) {
+  if (delivery.recipient_role_id !== recipientRoleId) {
     throw new Error(`Mailbox delivery ${delivery.delivery_id} belongs to another recipient`);
   }
 }
@@ -1149,6 +1245,141 @@ function ensureRuntimeCursorInputColumn(database: DatabaseSync): void {
   if (!columns.includes('cursor_input_json')) {
     database.exec('ALTER TABLE task_runtime_states ADD COLUMN cursor_input_json TEXT');
   }
+}
+
+function migrateMailboxTables(database: DatabaseSync): void {
+  const messageColumns = tableColumns(database, 'messages');
+  const deliveryColumns = tableColumns(database, 'deliveries');
+  const deliverySql = String(
+    (database
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'")
+      .get() as SqlRow | undefined)?.sql ?? '',
+  );
+  const current =
+    messageColumns.has('task_id') &&
+    messageColumns.has('workspace_path') &&
+    messageColumns.has('from_role_id') &&
+    !messageColumns.has('from_agent_id') &&
+    messageColumns.has('idempotency_key') &&
+    deliveryColumns.has('task_id') &&
+    deliveryColumns.has('workspace_path') &&
+    deliveryColumns.has('recipient_role_id') &&
+    !deliveryColumns.has('recipient_agent_id') &&
+    deliveryColumns.has('recipient_session_id') &&
+    deliveryColumns.has('injected_at') &&
+    !deliveryColumns.has('delivered_at') &&
+    deliverySql.includes("'injected'") &&
+    deliverySql.includes("'failed'");
+  if (current) return;
+
+  const messageTask = mailboxColumn(messageColumns, 'task_id', "'legacy'");
+  const messageWorkspace = mailboxColumn(messageColumns, 'workspace_path', "'.'");
+  const fromRole = messageColumns.has('from_role_id')
+    ? messageColumns.has('from_agent_id')
+      ? "COALESCE(NULLIF(from_role_id, ''), NULLIF(from_agent_id, ''), 'legacy')"
+      : "COALESCE(NULLIF(from_role_id, ''), 'legacy')"
+    : messageColumns.has('from_agent_id')
+      ? "COALESCE(NULLIF(from_agent_id, ''), 'legacy')"
+      : "'legacy'";
+  const idempotency = messageColumns.has('idempotency_key')
+    ? "COALESCE(NULLIF(idempotency_key, ''), 'legacy:' || message_id)"
+    : "'legacy:' || message_id";
+  const deliveryTask = mailboxColumn(deliveryColumns, 'task_id', "'legacy'");
+  const deliveryWorkspace = mailboxColumn(deliveryColumns, 'workspace_path', "'.'");
+  const recipientRole = deliveryColumns.has('recipient_role_id')
+    ? deliveryColumns.has('recipient_agent_id')
+      ? "COALESCE(NULLIF(recipient_role_id, ''), NULLIF(recipient_agent_id, ''), 'legacy')"
+      : "COALESCE(NULLIF(recipient_role_id, ''), 'legacy')"
+    : deliveryColumns.has('recipient_agent_id')
+      ? "COALESCE(NULLIF(recipient_agent_id, ''), 'legacy')"
+      : "'legacy'";
+  const recipientSession = mailboxColumn(deliveryColumns, 'recipient_session_id', 'NULL');
+  const injectedAt = mailboxColumn(deliveryColumns, 'injected_at', 'NULL');
+
+  database.exec(`
+    CREATE TABLE messages_mailbox_v3 (
+      message_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      workspace_path TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      from_role_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      artifact_refs_json TEXT NOT NULL,
+      requires_ack INTEGER NOT NULL CHECK (requires_ack IN (0, 1)),
+      reply_to_message_id TEXT REFERENCES messages_mailbox_v3(message_id),
+      idempotency_key TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      schema_version TEXT NOT NULL
+    );
+    INSERT INTO messages_mailbox_v3 (
+      message_id, task_id, workspace_path, thread_id, from_role_id, type,
+      payload_json, artifact_refs_json, requires_ack, reply_to_message_id,
+      idempotency_key, created_at, schema_version
+    )
+    SELECT message_id, ${messageTask}, ${messageWorkspace}, thread_id, ${fromRole}, type,
+      payload_json, artifact_refs_json, requires_ack, reply_to_message_id,
+      ${idempotency}, created_at, schema_version
+    FROM messages;
+
+    CREATE TABLE deliveries_mailbox_v3 (
+      delivery_id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL REFERENCES messages_mailbox_v3(message_id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL,
+      workspace_path TEXT NOT NULL,
+      recipient_role_id TEXT NOT NULL,
+      recipient_session_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'injected', 'acknowledged', 'failed')),
+      deadline_at TEXT,
+      injected_at TEXT,
+      acknowledged_at TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+      last_error_json TEXT,
+      last_delivery_event_id TEXT REFERENCES events(event_id),
+      replay_cursor TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      schema_version TEXT NOT NULL
+    );
+    INSERT INTO deliveries_mailbox_v3 (
+      delivery_id, message_id, task_id, workspace_path, recipient_role_id,
+      recipient_session_id, status, deadline_at, injected_at, acknowledged_at,
+      retry_count, last_error_json, last_delivery_event_id, replay_cursor,
+      created_at, updated_at, schema_version
+    )
+    SELECT delivery_id, message_id, ${deliveryTask}, ${deliveryWorkspace}, ${recipientRole},
+      ${recipientSession},
+      CASE status
+        WHEN 'delivered' THEN 'pending'
+        WHEN 'injected' THEN 'injected'
+        WHEN 'acknowledged' THEN 'acknowledged'
+        WHEN 'failed' THEN 'failed'
+        ELSE 'pending'
+      END,
+      deadline_at,
+      CASE WHEN status = 'delivered' THEN NULL ELSE ${injectedAt} END,
+      acknowledged_at, retry_count, last_error_json, last_delivery_event_id,
+      replay_cursor, created_at, updated_at, schema_version
+    FROM deliveries;
+
+    DROP TABLE deliveries;
+    DROP TABLE messages;
+    ALTER TABLE messages_mailbox_v3 RENAME TO messages;
+    ALTER TABLE deliveries_mailbox_v3 RENAME TO deliveries;
+  `);
+}
+
+function tableColumns(database: DatabaseSync, table: string): Set<string> {
+  return new Set(
+    database
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .map((row) => String((row as SqlRow).name)),
+  );
+}
+
+function mailboxColumn(columns: Set<string>, column: string, fallback: string): string {
+  return columns.has(column) ? column : fallback;
 }
 
 function isActiveRun(status: PersistedRunState['status']): boolean {

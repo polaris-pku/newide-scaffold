@@ -75,8 +75,7 @@ export function buildResumePackage(input: BuildResumePackageInput): ResumePackag
   const pendingDeliveries =
     input.mailboxStore
       ?.listReplayableMailboxDeliveries()
-      .map((envelope) => envelope.delivery)
-      .filter((delivery) => delivery.status === 'pending' || delivery.status === 'delivered') ?? [];
+      .map((envelope) => envelope.delivery) ?? [];
 
   const mechanical = checkpoint.mechanical_snapshot;
   // recoverable means workspace content can actually be restored, so a usable

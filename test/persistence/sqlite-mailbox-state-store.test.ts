@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import type {
   PersistedMailboxDelivery,
@@ -17,83 +18,72 @@ afterEach(() => {
 });
 
 describe('SqliteCoordinationStore persistent mailbox', () => {
-  it('persists send, inbox delivery and ack across a database restart', () => {
+  it('persists a scoped delivery, Session injection and ack across restart', () => {
     const { databasePath, store } = createStore();
     const message = mailboxMessage('message_1');
-    const agentDelivery = mailboxDelivery('delivery_agent', message.message_id, {
-      agent_id: 'agent_reviewer',
-    });
-    const roleDelivery = mailboxDelivery('delivery_role', message.message_id, {
-      role_id: 'role_reviewer',
-    });
+    const delivery = mailboxDelivery('delivery_1', message.message_id, 'role_reviewer');
 
-    store.saveMailboxMessage(message, [agentDelivery, roleDelivery]);
-    expect(store.listReplayableMailboxDeliveries()).toEqual([
-      { message, delivery: agentDelivery },
-      { message, delivery: roleDelivery },
-    ]);
-
-    const inbox = store.receiveMailboxInbox(
-      { agent_id: 'agent_reviewer' },
-      '2026-07-19T06:00:01.000Z',
-    );
-    expect(inbox).toEqual([
-      {
-        message,
-        delivery: {
-          ...agentDelivery,
-          status: 'delivered',
-          delivered_at: '2026-07-19T06:00:01.000Z',
-          updated_at: '2026-07-19T06:00:01.000Z',
-        },
-      },
+    store.saveMailboxMessage(message, [delivery]);
+    expect(store.listReplayableMailboxDeliveries()).toEqual([{ message, delivery }]);
+    expect(store.listMailboxInbox('task_1', '/workspace', 'role_reviewer')).toEqual([
+      { message, delivery },
     ]);
     expect(
+      store.markMailboxDeliveryInjected(delivery.delivery_id, {
+        recipient_role_id: 'role_reviewer',
+        recipient_session_id: 'session_reviewer',
+        injected_at: '2026-07-19T06:00:01.000Z',
+      }),
+    ).toMatchObject({
+      status: 'injected',
+      recipient_session_id: 'session_reviewer',
+      injected_at: '2026-07-19T06:00:01.000Z',
+    });
+    expect(
       store.acknowledgeMailboxDelivery(
-        agentDelivery.delivery_id,
-        { agent_id: 'agent_reviewer' },
+        delivery.delivery_id,
+        'role_reviewer',
         '2026-07-19T06:00:02.000Z',
       ),
-    ).toMatchObject({
-      delivery_id: agentDelivery.delivery_id,
-      status: 'acknowledged',
-      acknowledged_at: '2026-07-19T06:00:02.000Z',
-    });
+    ).toMatchObject({ status: 'acknowledged' });
     store.close();
 
     const reopened = new SqliteCoordinationStore(databasePath);
     expect(reopened.listMailboxThread('thread_1')).toEqual([message]);
-    expect(reopened.listReplayableMailboxDeliveries()).toEqual([
-      { message, delivery: roleDelivery },
-    ]);
+    expect(reopened.listReplayableMailboxDeliveries()).toEqual([]);
     reopened.close();
   });
 
-  it('acks the source delivery and creates a reply delivery in one transaction', () => {
+  it('acks the source delivery and creates one reply delivery atomically', () => {
     const { store } = createStore();
     const source = mailboxMessage('message_source');
-    const sourceDelivery = mailboxDelivery('delivery_source', source.message_id, {
-      agent_id: 'agent_target',
-    });
+    const sourceDelivery = mailboxDelivery(
+      'delivery_source',
+      source.message_id,
+      'role_reviewer',
+    );
     store.saveMailboxMessage(source, [sourceDelivery]);
-    store.receiveMailboxInbox({ agent_id: 'agent_target' }, '2026-07-19T06:01:00.000Z');
-
-    const reply = mailboxMessage('message_reply', source.message_id);
-    const replyDelivery = mailboxDelivery('delivery_reply', reply.message_id, {
-      agent_id: 'agent_source',
+    store.markMailboxDeliveryInjected(sourceDelivery.delivery_id, {
+      recipient_role_id: 'role_reviewer',
+      recipient_session_id: 'session_reviewer',
+      injected_at: '2026-07-19T06:01:00.000Z',
     });
+
+    const reply = mailboxMessage('message_reply', source.message_id, 'role_reviewer');
+    const replyDelivery = mailboxDelivery(
+      'delivery_reply',
+      reply.message_id,
+      'role_source',
+    );
     const result = store.saveMailboxReply({
       source_delivery_id: sourceDelivery.delivery_id,
-      source_recipient: { agent_id: 'agent_target' },
+      source_recipient_role_id: 'role_reviewer',
       message: reply,
       deliveries: [replyDelivery],
       acknowledged_at: '2026-07-19T06:01:01.000Z',
     });
 
-    expect(result.source_delivery).toMatchObject({
-      delivery_id: sourceDelivery.delivery_id,
-      status: 'acknowledged',
-    });
+    expect(result.source_delivery).toMatchObject({ status: 'acknowledged' });
     expect(result.reply).toEqual({ message: reply, deliveries: [replyDelivery] });
     expect(store.listMailboxThread('thread_1')).toEqual([source, reply]);
     expect(store.listReplayableMailboxDeliveries()).toEqual([
@@ -102,26 +92,64 @@ describe('SqliteCoordinationStore persistent mailbox', () => {
     store.close();
   });
 
-  it('records failed wake attempts without losing the pending delivery', () => {
+  it('records retry evidence without claiming pending delivery was injected', () => {
     const { store } = createStore();
     const message = mailboxMessage('message_retry');
-    const delivery = mailboxDelivery('delivery_retry', message.message_id, {
-      agent_id: 'agent_sleeping',
-    });
+    const delivery = mailboxDelivery('delivery_retry', message.message_id, 'role_reviewer');
     store.saveMailboxMessage(message, [delivery]);
 
     expect(
-      store.recordMailboxWakeAttempt(delivery.delivery_id, {
+      store.recordMailboxDeliveryAttempt(delivery.delivery_id, {
         attempted_at: '2026-07-19T06:02:00.000Z',
-        error: { code: 'WAKE_FAILED', message: 'B runtime unavailable' },
+        error: { code: 'SESSION_UNAVAILABLE', message: 'Session unavailable' },
       }),
     ).toMatchObject({
       status: 'pending',
       retry_count: 1,
-      last_error: { code: 'WAKE_FAILED', message: 'B runtime unavailable' },
+      last_error: { code: 'SESSION_UNAVAILABLE' },
     });
-    expect(store.listReplayableMailboxDeliveries()).toHaveLength(1);
     store.close();
+  });
+
+  it('migrates legacy Agent-addressed deliveries back to honest pending role deliveries', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-mailbox-legacy-'));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, 'coordination.sqlite');
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE messages (
+        message_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, from_agent_id TEXT NOT NULL,
+        type TEXT NOT NULL, payload_json TEXT NOT NULL, artifact_refs_json TEXT NOT NULL,
+        requires_ack INTEGER NOT NULL, reply_to_message_id TEXT, created_at TEXT NOT NULL,
+        schema_version TEXT NOT NULL
+      );
+      CREATE TABLE deliveries (
+        delivery_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, recipient_agent_id TEXT,
+        recipient_role_id TEXT, status TEXT NOT NULL, deadline_at TEXT, delivered_at TEXT,
+        acknowledged_at TEXT, retry_count INTEGER NOT NULL, last_error_json TEXT,
+        last_delivery_event_id TEXT, replay_cursor TEXT, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, schema_version TEXT NOT NULL
+      );
+      INSERT INTO messages VALUES (
+        'message_legacy', 'thread_legacy', 'role_legacy_sender', 'ask_help', '{}', '[]',
+        0, NULL, '2026-07-19T06:00:00.000Z', 'v0'
+      );
+      INSERT INTO deliveries VALUES (
+        'delivery_legacy', 'message_legacy', 'role_legacy_receiver', NULL, 'delivered',
+        NULL, '2026-07-19T06:00:01.000Z', NULL, 1, NULL, NULL, NULL,
+        '2026-07-19T06:00:00.000Z', '2026-07-19T06:00:01.000Z', 'v0'
+      );
+    `);
+    legacy.close();
+
+    const migrated = new SqliteCoordinationStore(databasePath);
+    expect(migrated.listReplayableMailboxDeliveries()).toMatchObject([
+      {
+        message: { from_role_id: 'role_legacy_sender' },
+        delivery: { recipient_role_id: 'role_legacy_receiver', status: 'pending' },
+      },
+    ]);
+    migrated.close();
   });
 });
 
@@ -135,16 +163,20 @@ function createStore(): { databasePath: string; store: SqliteCoordinationStore }
 function mailboxMessage(
   messageId: string,
   replyToMessageId?: string,
+  fromRoleId = 'role_source',
 ): PersistedMailboxMessage {
   return {
     message_id: messageId,
+    task_id: 'task_1',
+    workspace_path: '/workspace',
     thread_id: 'thread_1',
-    from_agent_id: 'agent_source',
+    from_role_id: fromRoleId,
     type: replyToMessageId ? 'decision_response' : 'decision_request',
     payload: replyToMessageId ? { answer: 'Approved' } : { question: 'Approve?' },
     artifact_refs: [],
     requires_ack: true,
     ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
+    idempotency_key: `key_${messageId}`,
     created_at: replyToMessageId
       ? '2026-07-19T06:01:01.000Z'
       : '2026-07-19T06:00:00.000Z',
@@ -155,14 +187,14 @@ function mailboxMessage(
 function mailboxDelivery(
   deliveryId: string,
   messageId: string,
-  recipient: { agent_id: string } | { role_id: string },
+  recipientRoleId: string,
 ): PersistedMailboxDelivery {
   return {
     delivery_id: deliveryId,
     message_id: messageId,
-    ...('agent_id' in recipient
-      ? { recipient_agent_id: recipient.agent_id }
-      : { recipient_role_id: recipient.role_id }),
+    task_id: 'task_1',
+    workspace_path: '/workspace',
+    recipient_role_id: recipientRoleId,
     status: 'pending',
     retry_count: 0,
     created_at: '2026-07-19T06:00:00.000Z',

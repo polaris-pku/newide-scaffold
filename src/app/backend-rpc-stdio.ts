@@ -240,7 +240,7 @@ export async function createProductionBackendService(
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
-    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
+    const mailboxService = new PersistentMailboxService(coordinationStore);
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
       mailboxStore: coordinationStore,
