@@ -1,9 +1,9 @@
 /**
- * §1 SWE-EVO Council memory ablation batch: subset × B0/B1/B2.
+ * §1 SWE-EVO memory ablation batch: subset × B0/B1/B2.
  *
- * Council roles run against isolated git worktrees created from the instance base commit.
+ * Agent writes directly into an ephemeral git worktree @ base_commit.
  * After the run, eval collects the patch via git diff (collectWorktreePatch).
- * Repo mirrors are lazy-cloned under .newide/eval-mirrors (NEWIDE_SWE_MIRRORS_ROOT).
+ * Repo mirrors are lazy-cloned under D:\newide-sweevo-mirrors (NEWIDE_SWE_MIRRORS_ROOT).
  *
  * Usage:
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
@@ -52,26 +52,6 @@ interface TokenUsage {
   session_id?: string;
 }
 
-interface CouncilSessionUsage {
-  session_id: string;
-  role_id?: string;
-  started_at?: string;
-  finished_at?: string;
-  duration_ms?: number;
-  context_tokens_used?: number;
-  cost?: { amount: number; currency: string };
-  event_count: number;
-}
-
-interface CouncilUsage {
-  source: 'driver_stream_audit';
-  session_count: number;
-  driver_duration_ms: number;
-  context_tokens_used: number;
-  cost_by_currency: Record<string, number>;
-  sessions: CouncilSessionUsage[];
-}
-
 interface InstanceRow {
   ablation: MemoryAblation;
   instance_id: string;
@@ -91,36 +71,21 @@ interface InstanceRow {
   driver_duration_ms?: number;
   maintenance_wait_ms?: number;
   token_usage?: TokenUsage;
-  council_usage?: CouncilUsage;
   eval_run_dir?: string;
   eval_predictions_path?: string;
-  eval_result?: {
-    resolved_count: number;
-    unresolved_count: number;
-    applied_count: number;
-    p2p_regression_count: number;
-    harness_report_path?: string;
-  };
   eval_error?: string;
   status: 'ok' | 'failed' | 'skipped_eval';
 }
 
 const repoRoot = process.cwd();
-const configuredEnv = {
-  ...loadEnvFile(path.join(repoRoot, '.env')),
-  ...loadEnvFile(path.join(repoRoot, '.env.local')),
-};
-for (const [key, value] of Object.entries(configuredEnv)) {
-  process.env[key] ??= value;
-}
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
   process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
-    path.join(repoRoot, '.newide', 'eval', 'sweevo-ablation'),
+    'D:\\Code\\NewIDE\\.newide-experiments\\sweevo-ablation',
   stamp,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 2_700_000);
+const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 900_000);
 const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
 const mirrorsRoot = resolveMirrorsRoot(readFlag('--mirrors-root'));
 
@@ -152,14 +117,12 @@ for (const id of instanceIds) {
 
 const baseEnv = {
   ...process.env,
+  ...loadEnvFile(path.join(repoRoot, '.env')),
+  ...loadEnvFile(path.join(repoRoot, '.env.local')),
   ACP_DRIVER_RUNNER_DIR:
     process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
   ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '600000',
 };
-baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ??= 'hash';
-if (baseEnv.NEWIDE_B_EMBEDDING_PROVIDER === 'hash') {
-  baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ??= '32';
-}
 // SWE-EVO paper alignment: deny WebFetch/WebSearch and network Bash at ACP permission gate.
 // Override with NEWIDE_SWE_EVO_BLOCK_INTERNET=0 only for debugging.
 baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET ??= '1';
@@ -175,11 +138,7 @@ const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> 
 for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
   await fs.mkdir(armDir, { recursive: true });
-  const configuredDbUrl = baseEnv.NEWIDE_B_DATABASE_URL?.trim();
-  const dbUrl =
-    ablations.length === 1 && configuredDbUrl
-      ? configuredDbUrl
-      : `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
   log('');
   log(`=== arm ${ablation} ===`);
 
@@ -228,8 +187,7 @@ await fs.writeFile(
 const timingTotals = summarizeTiming(metricsRows);
 const tokenTotals = summarizeTokens(metricsRows);
 const summary = {
-  schema_version: 'sweevo-council-memory-ablation.v0',
-  execution_mode: 'council',
+  schema_version: 'sweevo-memory-ablation.v0',
   started_at: startedAt.toISOString(),
   finished_at: finishedAt.toISOString(),
   wall_ms: finishedAt.getTime() - startedAt.getTime(),
@@ -239,19 +197,12 @@ const summary = {
   instance_ids: instanceIds,
   ablations,
   model_name: modelName,
-  embedding_runtime: {
-    provider: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER,
-    dimensions: Number(baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? 0),
-    semantic_quality:
-      baseEnv.NEWIDE_B_EMBEDDING_PROVIDER === 'hash' ? 'degraded_non_semantic' : 'semantic',
-  },
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
   skip_eval: skipEval,
   metrics_path: metricsPath,
   timing_totals: timingTotals,
   token_totals: tokenTotals,
-  council_usage_totals: summarizeCouncilUsage(metricsRows),
   arms: armReports,
 };
 const summaryPath = path.join(experimentRoot, 'summary.json');
@@ -312,7 +263,7 @@ async function runOneInstance(input: {
 
     const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
       prompt: buildPrompt(instance),
-      mode: 'council',
+      mode: 'single_agent',
       workspace_path: prepared.worktreePath,
       memory_ablation: ablation,
       title: `${ablation}-${instance.instance_id}`,
@@ -323,10 +274,6 @@ async function runOneInstance(input: {
     await backend.request('run.subscribe', { run_id: created.run_id });
     const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
     row.snapshot_status = String(snapshot.status ?? '');
-    row.council_usage = await collectCouncilUsage(created.run_id);
-    if (row.council_usage.session_count > 0) {
-      row.driver_duration_ms = row.council_usage.driver_duration_ms;
-    }
 
     if (ablation !== 'B0') {
       row.maintenance_wait_ms = maintenanceWaitMs;
@@ -349,11 +296,7 @@ async function runOneInstance(input: {
         row.session_id = summaryObj.session_id;
       }
       const driverMs = summaryObj.driver_diagnostics?.duration_ms;
-      if (
-        row.driver_duration_ms === undefined &&
-        typeof driverMs === 'number' &&
-        Number.isFinite(driverMs)
-      ) {
+      if (typeof driverMs === 'number' && Number.isFinite(driverMs)) {
         row.driver_duration_ms = Math.max(0, Math.floor(driverMs));
       }
     }
@@ -386,15 +329,6 @@ async function runOneInstance(input: {
       });
       row.eval_run_dir = evalResult.runDir;
       row.eval_predictions_path = evalResult.summary.predictions_path;
-      row.eval_result = {
-        resolved_count: evalResult.summary.resolved_count,
-        unresolved_count: evalResult.summary.unresolved_count,
-        applied_count: evalResult.summary.applied_count,
-        p2p_regression_count: evalResult.summary.p2p_regression_count,
-        ...(evalResult.summary.harness_report_path
-          ? { harness_report_path: evalResult.summary.harness_report_path }
-          : {}),
-      };
       row.status =
         row.snapshot_status === 'succeeded' || row.snapshot_status === 'completed'
           ? 'ok'
@@ -435,7 +369,6 @@ function buildPrompt(instance: SweEvoInstance): string {
     'You are fixing a real GitHub issue in an already-checked-out repository worktree.',
     'Edit files directly in the workspace. Do not only describe a plan.',
     'Produce a minimal correct patch that addresses the problem statement.',
-    'Do not modify benchmark tests or add test files; the harness injects its own hidden test patch.',
     '',
     'Offline evaluation constraints (SWE-EVO paper alignment):',
     '- You have NO internet access. Do not use WebFetch, WebSearch, or any browser tool.',
@@ -492,121 +425,6 @@ function emptyTokenUsage(
     assistant_messages: 0,
     source,
     ...extras,
-  };
-}
-
-async function collectCouncilUsage(runId: string): Promise<CouncilUsage> {
-  const streamPath = path.join(repoRoot, '.newide', 'runs', runId, 'driver-stream.jsonl');
-  const sessions = new Map<
-    string,
-    CouncilSessionUsage & { started_ms?: number; finished_ms?: number }
-  >();
-
-  if (existsSync(streamPath)) {
-    const stream = await fs.readFile(streamPath, 'utf-8');
-    for (const line of stream.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      let record: {
-        event?: {
-          event_type?: string;
-          session_id?: string;
-          role_id?: string;
-          created_at?: string;
-          payload?: {
-            sessionId?: string;
-            update?: {
-              used?: number;
-              cost?: { amount?: number; currency?: string };
-            };
-          };
-        };
-      };
-      try {
-        record = JSON.parse(line) as typeof record;
-      } catch {
-        continue;
-      }
-      const event = record.event;
-      const sessionId = event?.session_id ?? event?.payload?.sessionId;
-      if (!event || !sessionId) continue;
-
-      const current = sessions.get(sessionId) ?? {
-        session_id: sessionId,
-        event_count: 0,
-      };
-      current.event_count += 1;
-      if (event.role_id) current.role_id = event.role_id;
-
-      const eventMs = event.created_at ? Date.parse(event.created_at) : Number.NaN;
-      if (event.event_type === 'driver.turn_started' && Number.isFinite(eventMs)) {
-        current.started_at = event.created_at;
-        current.started_ms = eventMs;
-      }
-      if (
-        (event.event_type === 'driver.turn_completed' ||
-          event.event_type === 'driver.turn_failed') &&
-        Number.isFinite(eventMs)
-      ) {
-        current.finished_at = event.created_at;
-        current.finished_ms = eventMs;
-      }
-
-      const used = event.payload?.update?.used;
-      if (typeof used === 'number' && Number.isFinite(used)) {
-        current.context_tokens_used = Math.max(
-          current.context_tokens_used ?? 0,
-          Math.max(0, Math.floor(used)),
-        );
-      }
-      const cost = event.payload?.update?.cost;
-      if (
-        cost &&
-        typeof cost.amount === 'number' &&
-        Number.isFinite(cost.amount) &&
-        typeof cost.currency === 'string'
-      ) {
-        current.cost = { amount: cost.amount, currency: cost.currency };
-      }
-      sessions.set(sessionId, current);
-    }
-  }
-
-  const projected = [...sessions.values()].map((session): CouncilSessionUsage => {
-    const durationMs =
-      session.started_ms !== undefined && session.finished_ms !== undefined
-        ? Math.max(0, session.finished_ms - session.started_ms)
-        : undefined;
-    return {
-      session_id: session.session_id,
-      ...(session.role_id ? { role_id: session.role_id } : {}),
-      ...(session.started_at ? { started_at: session.started_at } : {}),
-      ...(session.finished_at ? { finished_at: session.finished_at } : {}),
-      ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
-      ...(session.context_tokens_used !== undefined
-        ? { context_tokens_used: session.context_tokens_used }
-        : {}),
-      ...(session.cost ? { cost: session.cost } : {}),
-      event_count: session.event_count,
-    };
-  });
-
-  const costByCurrency: Record<string, number> = {};
-  for (const session of projected) {
-    if (!session.cost) continue;
-    costByCurrency[session.cost.currency] =
-      (costByCurrency[session.cost.currency] ?? 0) + session.cost.amount;
-  }
-
-  return {
-    source: 'driver_stream_audit',
-    session_count: projected.length,
-    driver_duration_ms: projected.reduce((sum, session) => sum + (session.duration_ms ?? 0), 0),
-    context_tokens_used: projected.reduce(
-      (sum, session) => sum + (session.context_tokens_used ?? 0),
-      0,
-    ),
-    cost_by_currency: costByCurrency,
-    sessions: projected,
   };
 }
 
@@ -778,38 +596,10 @@ function summarizeTokens(rows: InstanceRow[]): {
   };
 }
 
-function summarizeCouncilUsage(rows: InstanceRow[]): {
-  instances: number;
-  sessions: number;
-  driver_duration_ms: number;
-  context_tokens_used: number;
-  cost_by_currency: Record<string, number>;
-} {
-  const costByCurrency: Record<string, number> = {};
-  for (const row of rows) {
-    for (const [currency, amount] of Object.entries(row.council_usage?.cost_by_currency ?? {})) {
-      costByCurrency[currency] = (costByCurrency[currency] ?? 0) + amount;
-    }
-  }
-  return {
-    instances: rows.length,
-    sessions: rows.reduce((sum, row) => sum + (row.council_usage?.session_count ?? 0), 0),
-    driver_duration_ms: rows.reduce(
-      (sum, row) => sum + (row.council_usage?.driver_duration_ms ?? 0),
-      0,
-    ),
-    context_tokens_used: rows.reduce(
-      (sum, row) => sum + (row.council_usage?.context_tokens_used ?? 0),
-      0,
-    ),
-    cost_by_currency: costByCurrency,
-  };
-}
-
 async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<BackendClient> {
   const child: ChildProcess = spawn(
     process.execPath,
-    ['--import', 'tsx', 'src/app/backend-rpc-entry.ts'],
+    ['--import', 'tsx', 'src/app/backend-rpc-stdio.ts'],
     {
       cwd: repoRoot,
       env,
@@ -853,14 +643,7 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }, 60_000).unref();
     });
     child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-    const response = await Promise.race([
-      waiting,
-      closed.then((code) => {
-        throw new Error(
-          `[${label}] backend exited before ${method} responded (code=${String(code)}). stderr=${stderr.join('')}`,
-        );
-      }),
-    ]);
+    const response = await waiting;
     if (response.error) {
       throw new Error(
         `[${label}] ${method}: ${String(response.error.code)} ${response.error.message} stderr=${stderr.join('')}`,

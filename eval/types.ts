@@ -48,14 +48,10 @@ export interface SweBenchInstanceReport {
   patch_successfully_applied?: boolean;
   resolved?: boolean;
   tests_status?: {
-    FAIL_TO_PASS?: SweBenchTestStatus;
-    PASS_TO_PASS?: SweBenchTestStatus;
+    FAIL_TO_PASS?: Record<string, string>;
+    PASS_TO_PASS?: Record<string, string>;
   };
 }
-
-export type SweBenchTestStatus =
-  | Record<string, string>
-  | { success?: string[]; failure?: string[] };
 
 export type SweBenchHarnessReport = Record<string, SweBenchInstanceReport>;
 

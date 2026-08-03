@@ -44,7 +44,6 @@
     "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
     "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
     "eval:build-pr-context": "tsx eval/scripts/build-sweevo-pr-context.ts",
-    "eval:council:smoke": "tsx scripts/run-sweevo-memory-ablation.ts --subset v0-smoke --instance-id psf__requests_v2.27.0_v2.27.1 --ablations B2 --run-harness",
     "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
     "prepare": "husky"
   },
