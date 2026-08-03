@@ -79,7 +79,7 @@ export interface ArtifactSelectorOptions {
  * ArtifactSelector: Unified artifact selection for single-agent and council modes.
  *
  * - single_agent mode: directly selects the first artifact from driver result if gates allow
- * - council mode: delegates to CouncilProvider, currently also selects first artifact via MockCouncil
+ * - council mode: delegates to the configured CouncilProvider
  *
  * Both modes return the same ArtifactSelectionResult structure.
  */
@@ -180,7 +180,7 @@ export class ArtifactSelector {
     // Convert council verdict to selection
     const selectedArtifactIds = new Set(
       autonomousExecution
-        ? [autonomousExecution.final_artifact.artifact_id]
+        ? autonomousExecution.final_artifacts.map((artifact) => artifact.artifact_id)
         : councilDecision.selected_artifact_refs,
     );
     const selectableArtifacts = [

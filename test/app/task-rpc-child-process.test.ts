@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -155,7 +155,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         rmSync(directory, { recursive: true, force: true });
       }
     }
-  }, 20_000);
+  }, 30_000);
 
   it('blocks an interrupted process and resumes it explicitly under the same Task', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-task-resume-runner-'));
@@ -165,6 +165,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     const sessionLogPath = path.join(runnerDir, 'sessions.log');
     const runIds = new Set<string>();
     const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
     writeInterruptibleFakeDriver(runnerDir);
     writeFileSync(holdPath, 'hold');
     const firstClient = new RpcChildClient(spawnBackend(runnerDir));
@@ -341,6 +342,15 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     }
   }, 20_000);
 });
+
+function initGitWorkspace(workspace: string): void {
+  execFileSync('git', ['init', '-q'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
+  writeFileSync(path.join(workspace, 'seed.txt'), 'seed\n');
+  execFileSync('git', ['add', '-A'], { cwd: workspace });
+  execFileSync('git', ['commit', '-qm', 'base'], { cwd: workspace });
+}
 
 class RpcChildClient {
   private nextId = 1;

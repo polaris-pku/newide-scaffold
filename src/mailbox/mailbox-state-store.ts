@@ -1,3 +1,4 @@
+/** Mailbox-owned persistence port. SQLite remains an application adapter. */
 import type {
   AgentMessageType,
   MessageRecipient,

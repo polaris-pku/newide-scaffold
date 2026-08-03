@@ -11,6 +11,7 @@ import {
   type JsonRpcRequest,
   type JsonRpcResponse,
 } from './json-rpc-line-protocol';
+import { ApplicationError } from '../protocol/application-error';
 
 export type JsonRpcMethodHandler = (params: unknown) => unknown | Promise<unknown>;
 
@@ -30,10 +31,6 @@ export class JsonRpcMethodError extends Error {
 
 export class JsonRpcDispatcher {
   private readonly handlers = new Map<string, JsonRpcMethodHandler>();
-
-  constructor() {
-    this.register('system.ping', () => ({ status: 'ok', protocol_version: '0.1.0' }));
-  }
 
   register(method: string, handler: JsonRpcMethodHandler): void {
     if (this.handlers.has(method)) {
@@ -59,6 +56,16 @@ export class JsonRpcDispatcher {
       const result = await handler(request.params);
       return hasResponse ? createSuccessResponse(request.id ?? null, result) : undefined;
     } catch (error) {
+      if (error instanceof ApplicationError) {
+        return hasResponse
+          ? createErrorResponse(
+              request.id ?? null,
+              JSON_RPC_ERROR_CODES.APPLICATION_ERROR,
+              error.message,
+              error.data,
+            )
+          : undefined;
+      }
       if (error instanceof JsonRpcMethodError) {
         return hasResponse
           ? createErrorResponse(request.id ?? null, error.code, error.message, error.data)

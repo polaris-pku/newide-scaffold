@@ -28,13 +28,14 @@ import {
 import type { RunSnapshot } from '../protocol/run-snapshot';
 import { projectRunEventSource } from '../protocol/run-event';
 import { taskSnapshotSchema, type TaskSnapshot } from '../protocol/task-snapshot';
-import type { AppRunEvent } from './run-registry';
-import { projectPersistedRunSnapshot } from './task-run-snapshot-projector';
-import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
+import type { AppRunEvent } from '../app/run-registry';
+import { projectPersistedRunSnapshot } from '../app/task-run-snapshot-projector';
+import { projectTaskSnapshot, type TaskRunFact } from '../app/task-snapshot-projector';
 
 export interface TaskProcessorOptions {
   now?: () => string;
   createEventId?: () => string;
+  runsRoot?: string;
 }
 
 export interface BeginTaskRunInput {
@@ -171,6 +172,7 @@ export class TaskProcessorStageCommitError extends Error {
 export class TaskProcessor {
   private readonly now: () => string;
   private readonly createEventId: () => string;
+  private readonly runsRoot: string;
   private readonly mailboxStore?:
     | Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>
     | undefined;
@@ -183,6 +185,7 @@ export class TaskProcessor {
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.createEventId = options.createEventId ?? (() => createId('event'));
+    this.runsRoot = options.runsRoot ?? '.newide/runs';
     this.mailboxStore = options.mailboxStore;
   }
 
@@ -606,7 +609,7 @@ export class TaskProcessor {
     }
     if (aggregate.runtime_state.diagnostics.council_override === true) {
       return {
-        snapshot: projectAggregate(aggregate),
+        snapshot: projectAggregate(aggregate, this.runsRoot),
         committed_events: [],
       };
     }
@@ -651,7 +654,7 @@ export class TaskProcessor {
   recordRunEvent(runId: string, event: Event): TaskSnapshot {
     const aggregate = this.requireAggregateForRun(runId);
     if (aggregate.events.some((candidate) => candidate.event_id === event.event_id)) {
-      return projectAggregate(aggregate);
+      return projectAggregate(aggregate, this.runsRoot);
     }
     const run = requireRun(aggregate, runId);
     if (!isActiveRun(run)) throw new Error(`Run ${runId} is already ${run.status}`);
@@ -724,7 +727,7 @@ export class TaskProcessor {
     const aggregate = this.requireAggregateForRun(input.run_id);
     const run = requireRun(aggregate, input.run_id);
     if (!isActiveRun(run)) {
-      if (run.status === input.status) return projectAggregate(aggregate);
+      if (run.status === input.status) return projectAggregate(aggregate, this.runsRoot);
       throw new Error(`Run ${input.run_id} already reached ${run.status}`);
     }
     assertTaskStatusTransition(aggregate.task.status, input.status);
@@ -807,11 +810,13 @@ export class TaskProcessor {
   getTaskSnapshot(taskId: string): TaskSnapshot {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
-    return projectAggregate(aggregate);
+    return projectAggregate(aggregate, this.runsRoot);
   }
 
   listTaskSnapshots(): TaskSnapshot[] {
-    return this.store.listTaskAggregates().map(projectAggregate);
+    return this.store
+      .listTaskAggregates()
+      .map((aggregate) => projectAggregate(aggregate, this.runsRoot));
   }
 
   listTaskEvents(taskId: string, afterEventId?: string): AppRunEvent[] {
@@ -844,7 +849,7 @@ export class TaskProcessor {
     if (!aggregate) return undefined;
     return (
       aggregate.runs.find((run) => run.run_id === runId)?.snapshot ??
-      projectPersistedRunSnapshot(aggregate, runId)
+      projectPersistedRunSnapshot(aggregate, runId, this.runsRoot)
     );
   }
 
@@ -1028,7 +1033,7 @@ export class TaskProcessor {
 
   private recoverInterruptedTask(aggregate: PersistedTaskAggregate): TaskSnapshot {
     const run = aggregate.runs.find((candidate) => isActiveRun(candidate));
-    if (!run) return projectAggregate(aggregate);
+    if (!run) return projectAggregate(aggregate, this.runsRoot);
     assertTaskStatusTransition(aggregate.task.status, 'blocked');
 
     const timestamp = this.now();
@@ -1134,7 +1139,7 @@ export class TaskProcessor {
   }
 }
 
-function projectAggregate(aggregate: PersistedTaskAggregate): TaskSnapshot {
+function projectAggregate(aggregate: PersistedTaskAggregate, runsRoot: string): TaskSnapshot {
   const projected = projectTaskSnapshot({
     task_id: aggregate.task.task_id,
     task_request: {
@@ -1148,7 +1153,7 @@ function projectAggregate(aggregate: PersistedTaskAggregate): TaskSnapshot {
     },
     created_at: aggregate.task.created_at,
     runs: aggregate.runs.map((run) =>
-      toRunFact(run, run.snapshot ?? projectPersistedRunSnapshot(aggregate, run.run_id)),
+      toRunFact(run, run.snapshot ?? projectPersistedRunSnapshot(aggregate, run.run_id, runsRoot)),
     ),
   });
   const waitingReason = readWaitingReason(aggregate);

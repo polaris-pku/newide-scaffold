@@ -29,6 +29,7 @@ import type {
   Proposal,
   Review,
 } from '../contract';
+import { prepareCouncilWorkspace } from '../council-workspace';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -36,6 +37,7 @@ export type CouncilRoleFailureCode =
   | 'COUNCIL_SYNTHESIS_FAILED';
 
 type CouncilPhase = 'proposal' | 'review' | 'synthesis';
+type CouncilRoleFailureDetails = Record<string, unknown>;
 
 export class CouncilRoleExecutionError extends Error {
   readonly code: CouncilRoleFailureCode;
@@ -47,6 +49,7 @@ export class CouncilRoleExecutionError extends Error {
     readonly agent_status: AgentExecutionResult['status'],
     readonly agent_run_id?: string,
     readonly driver_run_result_id?: string,
+    readonly failure_details: CouncilRoleFailureDetails = {},
   ) {
     super(`Council ${council_phase} role failed`);
     this.name = 'CouncilRoleExecutionError';
@@ -61,6 +64,9 @@ export class CouncilRoleExecutionError extends Error {
       agent_status: this.agent_status,
       ...(this.agent_run_id ? { agent_run_id: this.agent_run_id } : {}),
       ...(this.driver_run_result_id ? { driver_run_result_id: this.driver_run_result_id } : {}),
+      ...(Object.keys(this.failure_details).length > 0
+        ? { failure_details: { ...this.failure_details } }
+        : {}),
     };
   }
 }
@@ -100,14 +106,16 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
 
     for (const participant of proposers) {
       const label = String.fromCharCode(65 + participant.seat_index);
+      const workspace = participantWorkspace(councilDir, participant);
+      await prepareCouncilWorkspace(input.workspace_path, workspace);
       const result = await this.tryRunRole(
         input,
         executionRunId,
         participant,
-        `Produce proposal ${label} for: ${input.question}. Work only in this isolated role workspace and create a concrete candidate file.`,
+        `Produce proposal ${label} for: ${input.question}. Work only in this isolated role workspace and implement a concrete candidate solution.`,
         input.evidence_pack?.artifact_refs ?? [],
         'proposal',
-        participantWorkspace(councilDir, participant),
+        workspace,
         options,
         diagnosticRefs,
       );
@@ -124,6 +132,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       ...generatedResults.flatMap((result) => result.artifact_refs),
     ];
     const reviewerWorkspace = participantWorkspace(councilDir, reviewerParticipant);
+    await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
     await stageArtifacts(reviewerWorkspace, candidateArtifacts);
     const reviewer = await this.tryRunRole(
       input,
@@ -156,6 +165,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     }
 
     const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
+    await prepareCouncilWorkspace(input.workspace_path, synthesizerWorkspace);
     await stageArtifacts(synthesizerWorkspace, candidateArtifacts);
     await fs.mkdir(synthesizerWorkspace, { recursive: true });
     await fs.writeFile(
@@ -202,7 +212,6 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     const selectedArtifactRefs =
       synthesizer?.artifact_refs
         .filter(isMaterializableFileArtifact)
-        .slice(0, 1)
         .map((artifact) => artifact.artifact_id) ?? [];
     const generatedArtifactRefs = generatedResults.flatMap((result) => result.artifact_refs);
     const decision = buildDecision(input, synthesis, selectedArtifactRefs);
@@ -276,7 +285,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           participant_id: participant.participant_id,
           council_seat: participant.seat,
           council_seat_index: participant.seat_index,
-          instruction,
+          instruction: requireDriverDelegation(instruction),
           workspace_path: workspacePath,
           input_artifact_refs: inputArtifactRefs,
           context_policy: `council_${participant.seat}`,
@@ -291,7 +300,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       );
     } catch (error) {
       if (options?.signal?.aborted) throw error;
-      const failure = new CouncilRoleExecutionError(phase, participant, 'failed');
+      const failure = new CouncilRoleExecutionError(
+        phase,
+        participant,
+        'failed',
+        undefined,
+        undefined,
+        errorDetails(error),
+      );
       await emitFailureLifecycle(options, failure);
       throw failure;
     }
@@ -303,6 +319,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         result.status,
         result.agent_run_id,
         result.driver_run_result_id,
+        agentFailureDetails(result),
       );
       await emitFailureLifecycle(options, failure);
       throw failure;
@@ -381,6 +398,33 @@ function failureCode(phase: CouncilPhase): CouncilRoleFailureCode {
   return 'COUNCIL_SYNTHESIS_FAILED';
 }
 
+function errorDetails(error: unknown): CouncilRoleFailureDetails {
+  if (error instanceof Error) {
+    return {
+      error_name: error.name,
+      error_message: error.message,
+    };
+  }
+  return { error_message: String(error) };
+}
+
+function agentFailureDetails(result: AgentExecutionResult): CouncilRoleFailureDetails {
+  const details: CouncilRoleFailureDetails = {};
+  const diagnostics = result.diagnostics;
+  const dispatchStatus = diagnostics.dispatch_status;
+  if (typeof dispatchStatus === 'string') details.dispatch_status = dispatchStatus;
+  const driverErrorCode = diagnostics.driver_error_code;
+  if (typeof driverErrorCode === 'string') details.driver_error_code = driverErrorCode;
+  const driverError = diagnostics.driver_error;
+  if (driverError && typeof driverError === 'object' && !Array.isArray(driverError)) {
+    const record = driverError as Record<string, unknown>;
+    if (typeof record.code === 'string') details.driver_error_code = record.code;
+    if (typeof record.message === 'string') details.driver_error_message = record.message;
+    if (typeof record.retryable === 'boolean') details.retryable = record.retryable;
+  }
+  return details;
+}
+
 function validateParticipants(
   input: readonly CouncilParticipantBinding[],
 ): CouncilParticipantBinding[] {
@@ -448,6 +492,14 @@ function participantAuditPayload(
       ? { conflict_flags: participant.conflict_flags }
       : {}),
   };
+}
+
+function requireDriverDelegation(instruction: string): string {
+  return [
+    instruction,
+    '',
+    'Council execution requirement: call the invoke_driver tool before marking the task complete. Do not complete this role only from the top-level Agent.',
+  ].join('\n');
 }
 
 function buildProposal(
@@ -642,8 +694,8 @@ function buildSynthesisInstruction(question: string, round: number): string {
   return [
     `Synthesis round ${String(round)} for: ${question}.`,
     'Read the staged proposal inputs and reviews.json in this isolated workspace.',
-    'Create one concrete final candidate file in the workspace root.',
-    'Do not merely describe a decision; a materializable file artifact is required.',
+    'Implement the concrete final candidate changes in the repository workspace.',
+    'Do not merely describe a decision; at least one materializable file change is required.',
   ].join(' ');
 }
 

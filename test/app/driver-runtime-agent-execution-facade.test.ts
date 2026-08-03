@@ -3,7 +3,11 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DriverRuntimeAgentExecutionFacade } from '../../src/app/driver-runtime-agent-execution-facade';
+import {
+  DriverRuntimeAgentExecutionFacade,
+  mergeArtifacts,
+  normalizeArtifactTargetPath,
+} from '../../src/app/driver-runtime-agent-execution-facade';
 import { FileAgentExecutionEvidenceStore } from '../../src/app/agent-execution-evidence-store';
 import type { BMemoryMaintenancePort } from '../../src/app/b-memory-maintenance-runner';
 import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
@@ -894,6 +898,49 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       pending_count: 1,
       total_processed: 0,
     });
+  });
+});
+
+describe('mergeArtifacts path normalization', () => {
+  it('treats forward-slash and backslash target paths as the same file', () => {
+    expect(normalizeArtifactTargetPath('requests\\utils.py')).toBe('requests/utils.py');
+
+    const workspaceFile: ArtifactRef = {
+      artifact_id: 'artifact_workspace_full',
+      type: 'patch',
+      uri: 'artifact://workspace-file/task/requests%2Futils.py',
+      producer_id: 'agent',
+      task_id: 'task_001',
+      metadata: { source: 'workspace-change', target_path: 'requests/utils.py' },
+      content: {
+        kind: 'file',
+        content_ref: 'file:///tmp/requests/utils.py',
+        target_path: 'requests/utils.py',
+        media_type: 'text/plain',
+      },
+      created_at: '2026-08-01T00:00:00.000Z',
+      schema_version: SCHEMA_VERSION,
+    };
+    const editSnippet: ArtifactRef = {
+      artifact_id: 'artifact-edit-snippet',
+      type: 'patch',
+      uri: 'artifact://diff/task/requests%5Cutils.py',
+      producer_id: 'claude',
+      task_id: 'task_001',
+      metadata: { path: 'requests\\utils.py', tool_call_id: 'toolu_test' },
+      content: {
+        kind: 'text',
+        content_ref: 'data:text/plain,snippet',
+        target_path: 'requests\\utils.py',
+        media_type: 'text/plain',
+      },
+      created_at: '2026-08-01T00:00:00.000Z',
+      schema_version: SCHEMA_VERSION,
+    };
+
+    const merged = mergeArtifacts([editSnippet], [workspaceFile]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.artifact_id).toBe('artifact_workspace_full');
   });
 });
 

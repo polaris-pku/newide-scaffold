@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type Event, type TaskCreateRequest } from '../../src/core';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import { SqliteCoordinationStore, type TaskCursorInput } from '../../src/persistence';
 import type { RunSnapshot } from '../../src/protocol/run-snapshot';
 

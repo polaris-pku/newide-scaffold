@@ -27,7 +27,7 @@ import type {
   PersistedMailboxMessage,
   SaveMailboxReplyInput,
   SaveMailboxReplyResult,
-} from './mailbox-state-store';
+} from '../mailbox/mailbox-state-store';
 
 const RUN_STATUSES = [
   'created',

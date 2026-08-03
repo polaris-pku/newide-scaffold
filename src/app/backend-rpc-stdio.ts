@@ -7,7 +7,6 @@ import { createInterface } from 'node:readline';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
-import { pathToFileURL } from 'node:url';
 import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runner';
 import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
 import {
@@ -38,8 +37,8 @@ import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
-import { TaskProcessor } from './task-processor';
-import { PersistentMailboxService } from './persistent-mailbox-service';
+import { TaskExecutionLoop, TaskProcessor } from '../coordination';
+import { PersistentMailboxService } from '../mailbox';
 import { createProductionBRuntime, type BackendBRuntime } from './production-b-runtime';
 import {
   BMemoryMaintenanceRunner,
@@ -48,7 +47,8 @@ import {
 import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
 import { createProductionStageExecutors } from './production-stage-executors';
-import { TaskExecutionLoop } from './task-execution-loop';
+import { SystemRpcMethods } from '../rpc/system-methods';
+import { createProductionSystemStatusService } from './system-status-service';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -75,7 +75,8 @@ export async function createProductionBackendService(
   dependencies: ProductionBackendServiceDependencies = {},
 ): Promise<NewideBackendService> {
   const repoRoot = process.cwd();
-  const runsRoot = path.join(repoRoot, '.newide', 'runs');
+  const stateRoot = path.resolve(env.NEWIDE_STATE_ROOT?.trim() || path.join(repoRoot, '.newide'));
+  const runsRoot = path.join(stateRoot, 'runs');
   const runnerDir = path.resolve(
     env.ACP_DRIVER_RUNNER_DIR ?? path.join(repoRoot, '..', 'acp-client-prototype'),
   );
@@ -87,6 +88,11 @@ export async function createProductionBackendService(
   }
   const packagePath = path.join(runnerDir, 'package.json');
   const runnerPackage = readJson(packagePath);
+  const runnerPackageIdentity = readPackageIdentity(
+    runnerPackage,
+    'acp-external-runner',
+    'unknown',
+  );
   if (!hasDriverRunScript(runnerPackage)) {
     throw new Error(`ACP driver runner has no driver:run script: ${runnerDir}`);
   }
@@ -116,7 +122,7 @@ export async function createProductionBackendService(
         COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
         ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
-        ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(repoRoot, '.newide', 'test-workspace'),
+        ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
       },
@@ -151,7 +157,9 @@ export async function createProductionBackendService(
   });
 
   try {
-    bRuntime = dependencies.bRuntime ?? (await createProductionBRuntime(env, { repoRoot }));
+    bRuntime =
+      dependencies.bRuntime ??
+      (await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot }));
     assertValidMarketAgentIds(bRuntime.market_agent_ids);
     memoryMaintenance =
       dependencies.memoryMaintenance ??
@@ -173,10 +181,11 @@ export async function createProductionBackendService(
       driver,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
+      ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
       llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
-        root: path.join(repoRoot, '.newide', 'b', 'context-packs'),
+        root: path.join(stateRoot, 'b', 'context-packs'),
       }),
     });
     const selectAgentHandler = new SelectAgentHandler({
@@ -185,13 +194,15 @@ export async function createProductionBackendService(
         boardQuery: bCapabilities.boardQuery,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
         allowedAgentIds: bRuntime.market_agent_ids,
+        candidateSource: 'allowed_catalog',
       }),
       evidenceStore: new FileMarketEvidenceStore({
-        root: path.join(repoRoot, '.newide', 'market'),
+        root: path.join(stateRoot, 'market'),
       }),
     });
     const councilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
+      councilRoot: path.join(stateRoot, 'council'),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
         allowedAgentIds: bRuntime.market_agent_ids,
@@ -223,13 +234,17 @@ export async function createProductionBackendService(
     }
 
     const configuredDatabasePath =
-      env.NEWIDE_COORDINATION_DB ?? path.join(repoRoot, '.newide', 'coordination.sqlite');
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
     const databasePath =
       configuredDatabasePath === ':memory:'
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
-    const taskProcessor = new TaskProcessor(coordinationStore);
+    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
+    const taskProcessor = new TaskProcessor(coordinationStore, {
+      runsRoot,
+      mailboxStore: coordinationStore,
+    });
     taskProcessor.recoverInterruptedTasks();
     const taskExecutionLoop = new TaskExecutionLoop({
       processor: taskProcessor,
@@ -241,17 +256,34 @@ export async function createProductionBackendService(
         gateExecutor,
         bootstrapAgentIds: bRuntime.market_agent_ids,
         runsRoot,
-        councilRoot: path.join(repoRoot, '.newide', 'council'),
-        worktreesRoot: path.join(repoRoot, '.newide', 'worktrees'),
+        councilRoot: path.join(stateRoot, 'council'),
+        worktreesRoot: path.join(stateRoot, 'worktrees'),
       }),
     });
-    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
     const mailboxRecovery = mailboxService.replayPendingDeliveries();
     try {
       await mailboxRecovery;
     } catch {
       throw new Error('Production mailbox recovery failed');
     }
+    const backendPackageIdentity = readPackageIdentity(
+      readJson(path.join(repoRoot, 'package.json')),
+      'newide-bcd',
+      'unknown',
+    );
+    const systemStatusService = createProductionSystemStatusService({
+      package_name: backendPackageIdentity.name,
+      package_version: backendPackageIdentity.version,
+      build_commit: env.NEWIDE_BUILD_COMMIT?.trim() || 'dev',
+      coordination_durable: databasePath !== ':memory:',
+      driver_provider_id: runnerPackageIdentity.name,
+      driver_provider_version: runnerPackageIdentity.version,
+      b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
+      b_embedding: bRuntime.embedding_info ?? {
+        provider: 'host-managed repository',
+        readiness: 'host_managed',
+      },
+    });
     return new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
@@ -265,6 +297,7 @@ export async function createProductionBackendService(
       bMemoryService,
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
+      systemStatusService,
     );
   } catch (error) {
     await closeRuntime().catch(() => undefined);
@@ -305,6 +338,28 @@ function hasDriverRunScript(value: unknown): boolean {
   return typeof command === 'string' && command.trim().length > 0;
 }
 
+function readPackageIdentity(
+  value: unknown,
+  fallbackName: string,
+  fallbackVersion: string,
+): { name: string; version: string } {
+  if (!value || typeof value !== 'object') {
+    return { name: fallbackName, version: fallbackVersion };
+  }
+  const rawName = Reflect.get(value, 'name');
+  const rawVersion = Reflect.get(value, 'version');
+  return {
+    name:
+      typeof rawName === 'string' && rawName.trim().length > 0
+        ? rawName.trim()
+        : fallbackName,
+    version:
+      typeof rawVersion === 'string' && rawVersion.trim().length > 0
+        ? rawVersion.trim()
+        : fallbackVersion,
+  };
+}
+
 export function startBackendRpcServer(options: BackendRpcServerOptions): BackendRpcServer {
   const dispatcher = new JsonRpcDispatcher();
   const session = new JsonRpcLineSession(dispatcher, options.writeLine);
@@ -317,6 +372,8 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   );
   const mailboxMethods = new MailboxRpcMethods(service);
   const memoryMethods = new MemoryRpcMethods(service);
+  const systemMethods = new SystemRpcMethods(service);
+  systemMethods.register(dispatcher);
   runMethods.register(dispatcher);
   taskMethods.register(dispatcher);
   mailboxMethods.register(dispatcher);
@@ -392,7 +449,9 @@ export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
   );
 }
 
-async function runMain(): Promise<void> {
+export async function runBackendRpcMain(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
   let service: NewideBackendService | undefined;
   let server: BackendRpcServer | undefined;
   let shutdownRequested = false;
@@ -404,7 +463,8 @@ async function runMain(): Promise<void> {
   process.once('SIGTERM', close);
   process.once('SIGINT', close);
   try {
-    service = await createProductionBackendService(loadRuntimeEnvDefaults(process.env));
+    const runtimeEnv = materializeRuntimeEnv(loadRuntimeEnvDefaults(env));
+    service = await createProductionBackendService(runtimeEnv);
     if (shutdownRequested) {
       await service.close();
       return;
@@ -422,11 +482,11 @@ async function runMain(): Promise<void> {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  void runMain().catch((error: unknown) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 1;
-  });
+export function materializeRuntimeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) process.env[key] = value;
+  }
+  return env;
 }
 
 function onceAsync(operation: () => Promise<void>): () => Promise<void> {

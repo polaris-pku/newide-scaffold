@@ -9,7 +9,7 @@ import { JsonRpcDispatcher, JsonRpcLineSession } from '../../src/rpc/json-rpc-di
 import { TaskRpcMethods, type TaskMethodsService } from '../../src/rpc/task-methods';
 import type { TaskSnapshot } from '../../src/protocol/task-snapshot';
 import type { AppRunEvent } from '../../src/app/run-registry';
-import { TaskEventCursorNotFoundError } from '../../src/app/task-processor';
+import { TaskEventCursorNotFoundError } from '../../src/coordination';
 
 describe('TaskRpcMethods', () => {
   it('validates task.create and exposes create/get/list', async () => {

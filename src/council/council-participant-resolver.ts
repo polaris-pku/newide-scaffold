@@ -26,7 +26,8 @@ export interface AgentBoardCouncilParticipantResolverOptions {
  * 从 B AgentBoard 的真实 Agent 中解析 Council 席位。
  *
  * 当前 MVP 固定为两个 proposer、一个 reviewer 和一个 synthesizer。
- * 当真实 Agent 少于四个时允许复用，但会在 binding 上留下冲突标记。
+ * 两个不同的真实 Agent 即可正常启动；reviewer/synthesizer 复用会被审计。
+ * 单 Agent 运行直接阻断。
  */
 export class AgentBoardCouncilParticipantResolver implements CouncilParticipantResolver {
   private readonly boardQuery: AgentBoardQuery;
@@ -59,6 +60,11 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     );
     if (candidates.length === 0) {
       throw new Error('No eligible persisted Agent is available for Council participation');
+    }
+    if (candidates.length < 2) {
+      throw new Error(
+        `Council requires at least two distinct persisted Agents; found ${candidates.length}.`,
+      );
     }
 
     const assignments: Array<{ seat: CouncilSeat; seat_index: number; agent_id: string }> = [
@@ -93,7 +99,12 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       agent_id: assignment.agent_id,
       role_profile_ref: assignment.agent_id,
       ...(usage.get(assignment.agent_id)! > 1
-        ? { conflict_flags: ['agent_reused_across_council_seats'] }
+        ? {
+            conflict_flags: [
+              'agent_reused_across_council_seats',
+              'best_effort_identity',
+            ],
+          }
         : {}),
     }));
   }

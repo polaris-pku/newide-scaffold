@@ -10,11 +10,12 @@ import {
   TaskNotBlockedError,
   TaskNotFoundError,
   TaskNotRunningError,
+  TaskResumeAnchorError,
   type TaskCreateParams,
   type TaskListResult,
   type TaskSubscription,
 } from '../app/newide-backend-service';
-import { TaskEventCursorNotFoundError } from '../app/task-processor';
+import { TaskEventCursorNotFoundError } from '../coordination';
 import type { AppRunEvent } from '../app/run-registry';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
@@ -159,6 +160,17 @@ export class TaskRpcMethods {
           JSON_RPC_ERROR_CODES.TASK_NOT_BLOCKED,
           'Task not blocked',
           { task_id: error.taskId },
+        );
+      }
+      if (error instanceof TaskResumeAnchorError) {
+        throw new JsonRpcMethodError(
+          JSON_RPC_ERROR_CODES.TASK_RESUME_ANCHOR_INVALID,
+          'Checkpoint workspace anchor is not recoverable',
+          {
+            task_id: error.taskId,
+            checkpoint_id: error.checkpointId,
+            reason: error.reason,
+          },
         );
       }
       if (error instanceof TaskEventCursorNotFoundError) {

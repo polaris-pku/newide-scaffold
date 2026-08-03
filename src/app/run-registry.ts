@@ -52,6 +52,12 @@ export interface StagedTerminalTransition {
   snapshot: AppRunSnapshot;
 }
 
+export interface RunCancellationReason {
+  code: string;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
 const EVENT_NODE_CODES: Readonly<Record<string, string>> = {
   'task.created': 'N2',
   'run.started': 'N3',
@@ -158,7 +164,7 @@ export class InMemoryRunRegistry {
           details?: Record<string, unknown>;
           snapshot?: FrontendRunSnapshot;
         }
-      | { status: 'cancelled' },
+      | { status: 'cancelled'; reason?: RunCancellationReason },
   ): StagedTerminalTransition | undefined {
     const record = this.require(runId);
     if (record.status !== 'running' || record.terminalReservation) return undefined;
@@ -178,7 +184,14 @@ export class InMemoryRunRegistry {
             message: input.message,
             ...(input.details ? { details: input.details } : {}),
           }
-        : { status: input.status };
+        : input.status === 'cancelled' && input.reason
+          ? {
+              status: input.status,
+              code: input.reason.code,
+              message: input.reason.message,
+              ...(input.reason.details ? { details: input.reason.details } : {}),
+            }
+          : { status: input.status };
     const event = this.buildEvent(record, type, payload);
     const snapshot: AppRunSnapshot = {
       ...this.clone(record),
@@ -200,6 +213,9 @@ export class InMemoryRunRegistry {
               ...(input.details ? { details: input.details } : {}),
             },
           }
+        : {}),
+      ...(input.status === 'cancelled' && input.reason
+        ? { error: { ...input.reason } }
         : {}),
     };
     return { token, event, snapshot };
@@ -244,10 +260,13 @@ export class InMemoryRunRegistry {
     return [...this.records.values()].map((record) => this.clone(record));
   }
 
-  cancel(runId: string): AppRunSnapshot {
+  cancel(runId: string, reason?: RunCancellationReason): AppRunSnapshot {
     const record = this.require(runId);
     if (record.status !== 'running') return this.clone(record);
-    const staged = this.stageTerminal(runId, { status: 'cancelled' });
+    const staged = this.stageTerminal(runId, {
+      status: 'cancelled',
+      ...(reason ? { reason } : {}),
+    });
     if (!staged) return this.clone(record);
     return this.commitTerminal(runId, staged);
   }

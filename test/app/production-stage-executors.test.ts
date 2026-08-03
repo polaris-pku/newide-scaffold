@@ -1,6 +1,7 @@
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
 import { completionCriterionId } from '../../src/coordinator/completion-criteria-evaluator';
@@ -150,6 +151,11 @@ describe('production stage executors', () => {
       },
     });
     expect(gated.status).toBe('allowed');
+    // Gate resolves selection.manifest_ref (file URL) back to a native path.
+    // On Windows, URL.pathname("/D:/...") must not become "D:\D:\...".
+    const manifestPath = path.join(root, 'runs', 'run_1', 'changeset-manifest.json');
+    await access(manifestPath);
+    expect(pathToFileURL(manifestPath).href).toBe(executed.changeset_ref);
     const delivered = await executors.deliver.execute({
       ...common,
       cursor_input: {

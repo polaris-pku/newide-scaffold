@@ -31,6 +31,7 @@ import {
   type AppRunEvent,
   type AppRunMode,
   type AppRunSnapshot,
+  type RunCancellationReason,
   type StagedTerminalTransition,
 } from './run-registry';
 import { FileRunAuditWriter, type RunAuditWriter } from './run-audit-writer';
@@ -53,19 +54,18 @@ import {
   TaskProcessorTaskNotFoundError,
   type BeginTaskRunIntent,
   type TaskProcessor,
-} from './task-processor';
+  type TaskExecutionLoop,
+} from '../coordination';
 import type {
   PersistentMailboxService,
   MailboxReplyInput,
   MailboxSendInput,
   MailboxSendResult,
-} from './persistent-mailbox-service';
-import type { DriverStreamEvent } from '../driver/contract';
-import type {
   PersistedMailboxDelivery,
   PersistedMailboxEnvelope,
   SaveMailboxReplyResult,
-} from '../persistence';
+} from '../mailbox';
+import type { DriverStreamEvent } from '../driver/contract';
 import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
@@ -73,7 +73,17 @@ import {
   NoopDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
-import type { TaskExecutionLoop } from './task-execution-loop';
+import {
+  createUnavailableSystemStatusService,
+  type SystemStatusService,
+} from './system-status-service';
+import type {
+  SystemCapabilitiesV1,
+  SystemLivenessV1,
+  SystemReadinessV1,
+  SystemSchemaManifestV1,
+  SystemVersionV1,
+} from '../protocol/system-status';
 
 export interface RunCreateParams {
   prompt: string;
@@ -155,6 +165,21 @@ export class TaskNotBlockedError extends Error {
   }
 }
 
+export class TaskResumeAnchorError extends Error {
+  readonly code = 'CHECKPOINT_ANCHOR_INVALID';
+
+  constructor(
+    readonly taskId: string,
+    readonly checkpointId: string,
+    readonly reason: string,
+  ) {
+    super(
+      `Task ${taskId} cannot resume checkpoint ${checkpointId}: workspace anchor ${reason}`,
+    );
+    this.name = 'TaskResumeAnchorError';
+  }
+}
+
 interface RunLineage {
   run_intent?: BeginTaskRunIntent;
   restarted_from_run_id?: string;
@@ -194,7 +219,28 @@ export class NewideBackendService {
     private readonly bMemoryService?: BMemoryBackendService,
     private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new NoopDriverStreamAuditWriter(),
     private readonly taskExecutionLoop?: TaskExecutionLoop,
+    private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
   ) {}
+
+  getSystemLiveness(): SystemLivenessV1 {
+    return this.systemStatusService.liveness();
+  }
+
+  getSystemReadiness(): SystemReadinessV1 {
+    return this.systemStatusService.readiness();
+  }
+
+  getSystemCapabilities(required?: readonly string[]): SystemCapabilitiesV1 {
+    return this.systemStatusService.capabilities(required);
+  }
+
+  getSystemVersion(): SystemVersionV1 {
+    return this.systemStatusService.version();
+  }
+
+  getSystemSchema(): SystemSchemaManifestV1 {
+    return this.systemStatusService.schema();
+  }
 
   close(): Promise<void> {
     if (!this.closePromise) {
@@ -358,8 +404,16 @@ export class NewideBackendService {
     if (!this.taskProcessor) {
       throw new Error(`Task ${taskId} cannot resume without the persistent Task processor`);
     }
+    const resumePackage = this.taskProcessor.buildResumePackage(taskId);
     const resume = this.taskProcessor.getTaskResumeContext(taskId);
-    this.restoreResumeWorkspace(taskId);
+    const restore = this.restoreResumeWorkspace(taskId, resumePackage);
+    if (restore.status !== 'restored') {
+      throw new TaskResumeAnchorError(
+        taskId,
+        resume.checkpoint_id,
+        restore.reason ?? 'restore_failed',
+      );
+    }
     await this.startRun(
       {
         prompt: resume.task_request.spec,
@@ -385,19 +439,24 @@ export class NewideBackendService {
    * resumed run starts, so the resumed stage sees the files the interrupted run left
    * behind rather than whatever is on disk now.
    *
-   * Never blocks resume: an unrecoverable anchor (no snapshot, non-Git workspace,
-   * pruned object) means stages re-execute against the current workspace, which is
-   * the pre-existing behaviour. The outcome is recorded either way.
+   * A failed restore is terminal for resume: the caller keeps the Task blocked and
+   * must choose an explicit restart from the beginning. The outcome is recorded
+   * before the failure is surfaced to the RPC caller.
    */
-  private restoreResumeWorkspace(taskId: string): void {
-    if (!this.taskProcessor) return;
-    let resumePackage: ResumePackage;
-    try {
-      resumePackage = this.taskProcessor.buildResumePackage(taskId);
-    } catch {
-      return;
+  private restoreResumeWorkspace(
+    taskId: string,
+    resumePackage: ResumePackage,
+  ): RestoreFileAnchorResult {
+    const processor = this.taskProcessor;
+    if (!processor) {
+      return {
+        status: 'skipped',
+        reason: 'task_processor_unavailable',
+        restored_files: [],
+        extra_files: [],
+        pruned_files: [],
+      };
     }
-
     const anchor = resumePackage.file_anchor;
     const result: RestoreFileAnchorResult = anchor.recoverable
       ? restoreFileAnchor(anchor)
@@ -409,7 +468,7 @@ export class NewideBackendService {
           pruned_files: [],
         };
 
-    this.taskProcessor.recordWorkspaceRestore(
+    processor.recordWorkspaceRestore(
       taskId,
       resumePackage.checkpoint_id,
       // The interrupted run is the only real run this event can hang off: the resumed
@@ -424,6 +483,7 @@ export class NewideBackendService {
         extra_files: result.extra_files,
       },
     );
+    return result;
   }
 
   async subscribeTask(
@@ -1016,8 +1076,14 @@ export class NewideBackendService {
     }
   }
 
-  async cancelRun(runId: string): Promise<{ cancelled: true }> {
-    const staged = this.registry.stageTerminal(runId, { status: 'cancelled' });
+  async cancelRun(
+    runId: string,
+    reason?: RunCancellationReason,
+  ): Promise<{ cancelled: true }> {
+    const staged = this.registry.stageTerminal(runId, {
+      status: 'cancelled',
+      ...(reason ? { reason } : {}),
+    });
     if (staged) await this.persistTerminal(runId, staged);
     else await this.waitForTerminal(runId);
     const snapshot = this.registry.getSnapshot(runId);

@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,7 +9,7 @@ import { InMemoryRunRegistry } from '../../src/app/run-registry';
 import type { AppRunEvent } from '../../src/app/run-registry';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { NewideBackendService } from '../../src/app/newide-backend-service';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import type {
   CoordinatorRunner,
@@ -15,6 +17,15 @@ import type {
 } from '../../src/coordinator/coordinator-runner';
 import type { IntegrationV0Result } from '../../src/coordinator/integration-v0-flow';
 import { SqliteCoordinationStore } from '../../src/persistence';
+
+function initGitWorkspace(workspace: string): void {
+  execFileSync('git', ['init', '-q'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
+  writeFileSync(path.join(workspace, 'seed.txt'), 'seed\n');
+  execFileSync('git', ['add', '-A'], { cwd: workspace });
+  execFileSync('git', ['commit', '-qm', 'base'], { cwd: workspace });
+}
 
 describe('NewideBackendService SQLite lifecycle', () => {
   it('persists a Council override on the active Run without starting another Run', async () => {
@@ -131,7 +142,10 @@ describe('NewideBackendService SQLite lifecycle', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-service-resume-'));
     const runsRoot = path.join(root, 'runs');
     const databasePath = path.join(root, 'coordination.sqlite');
-    const workspacePath = await realpath(root);
+    const workspaceDirectory = path.join(root, 'workspace');
+    mkdirSync(workspaceDirectory);
+    initGitWorkspace(workspaceDirectory);
+    const workspacePath = await realpath(workspaceDirectory);
     const requestStore = new FileRunRequestStore(runsRoot);
     const seedStore = new SqliteCoordinationStore(databasePath);
     const seedProcessor = new TaskProcessor(seedStore);

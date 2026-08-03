@@ -13,6 +13,7 @@ import { buildRunOutputPaths } from '../coordinator/run-result';
 export function projectPersistedRunSnapshot(
   aggregate: PersistedTaskAggregate,
   runId: string,
+  runsRoot = '.newide/runs',
 ): RunSnapshot {
   const run = aggregate.runs.find((candidate) => candidate.run_id === runId);
   if (!run) throw new Error(`Run ${runId} does not belong to Task ${aggregate.task.task_id}`);
@@ -62,7 +63,7 @@ export function projectPersistedRunSnapshot(
   const worktreePath =
     stringValue(completion?.payload.worktree_path) ??
     stringValue(delivered?.payload.workspace_path);
-  const outputPaths = buildRunOutputPaths(runId);
+  const outputPaths = buildRunOutputPaths(runId, runsRoot);
   const { run_dir: _runDir, ...standardLinks } = outputPaths;
   const links = compactRecord({
     ...standardLinks,

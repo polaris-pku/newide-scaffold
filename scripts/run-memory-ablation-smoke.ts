@@ -177,7 +177,7 @@ async function startBackend(
 ): Promise<BackendClient> {
   const child: ChildProcess = spawn(
     process.execPath,
-    ['--import', 'tsx', 'src/app/backend-rpc-stdio.ts'],
+    ['--import', 'tsx', 'src/app/backend-rpc-entry.ts'],
     {
       cwd: repoRoot,
       env,

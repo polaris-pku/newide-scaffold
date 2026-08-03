@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef, type Event } from '../core';
 import { ArtifactSelector, WorktreeMaterializer } from '../coordinator';
 import {
@@ -21,6 +21,7 @@ import type { SelectAgentHandler } from '../coordinator/handlers/select-agent-ha
 import { AutonomousCouncilHandler } from '../coordinator/handlers/autonomous-council-handler';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import type { CouncilProvider, CouncilRunResult, EvidencePack } from '../council';
+import { prepareCouncilWorkspace } from '../council/council-workspace';
 import type { GateResult } from '../gate';
 import type { TaskResumeCursor } from '../persistence';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../protocol/agent-execution';
@@ -32,7 +33,7 @@ import type {
   SelectAgentStageExecutor,
   TaskExecutionLoopExecutors,
   TaskStageExecutionContext,
-} from './task-execution-loop';
+} from '../coordination';
 
 export interface ProductionStageExecutorDependencies {
   selectAgentHandler: Pick<SelectAgentHandler, 'execute'>;
@@ -151,7 +152,11 @@ export function createProductionStageExecutors(
         context.mode === 'council'
           ? path.join(dependencies.councilRoot, context.run_id, 'primary')
           : context.workspace_path;
-      await fs.mkdir(executionWorkspace, { recursive: true });
+      if (context.mode === 'council') {
+        await prepareCouncilWorkspace(context.workspace_path, executionWorkspace);
+      } else {
+        await fs.mkdir(executionWorkspace, { recursive: true });
+      }
       emit(context, 'agent.execution_requested', context.run_id, {
         role_id: context.cursor_input.winner_agent_id,
         workspace_path: executionWorkspace,
@@ -757,5 +762,7 @@ function pathFromFileRef(reference: string): string {
   const url = new URL(reference);
   if (url.protocol !== 'file:')
     throw new Error(`Expected file ChangesetManifest ref: ${reference}`);
-  return decodeURIComponent(url.pathname);
+  // Windows: URL.pathname is "/D:/..." — path.resolve turns that into "D:\D:\...".
+  // fileURLToPath handles drive letters and percent-encoding correctly.
+  return fileURLToPath(url);
 }

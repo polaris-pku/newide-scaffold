@@ -1,6 +1,8 @@
 # newIDE-BCD
 
-`newIDE-BCD` is the v0 TypeScript scaffold for running a minimal A/B/C/D end-to-end flow:
+`newIDE-BCD` is the backend composition for the newIDE A/B/C/D flow. The
+production path now includes a real external Driver, persistent B role/persona/memory,
+durable Task/Run state, and Council proposal/review/synthesis/delivery.
 
 ```text
 TaskCreateRequest
@@ -19,7 +21,9 @@ TaskCreateRequest
 -> RunCompleted
 ```
 
-The first version uses mock implementations, but the objects, interfaces, event names, and module boundaries are real v0 contracts.
+Legacy mock/demo implementations still exist for deterministic development tests; they are not
+the production CLI composition. Query `system.readiness` and `system.capabilities` instead of
+inferring production support from source files.
 
 ## Repository Shape
 
@@ -43,13 +47,39 @@ src/
 
 ```bash
 pnpm install
-pnpm typecheck
-pnpm lint
-pnpm format
-pnpm example:basic
+pnpm build
+pnpm pack --pack-destination .newide/packages
 ```
 
-`pnpm example:basic` prints the v0 flow timeline and IDs.
+The tarball exposes a `newide` binary. It can run the JSON-RPC service or a one-shot Council
+evaluation:
+
+```bash
+newide serve --stdio --state-root /absolute/state/root
+
+newide council run \
+  --workspace /absolute/task/workspace \
+  --state-root /absolute/state/root \
+  --prompt "Implement the requested change" \
+  --allow-degraded
+```
+
+`council.execute` is currently reported as `degraded`, so the one-shot command requires explicit
+`--allow-degraded`. It still executes real model calls and writes real artifacts; the terminal JSON
+preserves the capability status and result quality. stdout contains one
+`newide.eval.council.v1` terminal JSON object with `run_id`, `task_id`, `status`, `quality`,
+`council_capability`, `result_path`, `summary_path`, `frontend_snapshot_path`, `audit_path`, decision
+summary, and errors. Progress and lifecycle diagnostics use stderr. A terminal production run also
+publishes `summary.json` under its run directory; Eval consumes its top-level `worktree_path`.
+
+Runtime configuration is loaded from the caller's `.env.local` plus process environment. Required
+external dependencies are explicit:
+
+- `NEWIDE_B_DATABASE_URL` for the B PostgreSQL repository;
+- a real model provider/API key;
+- `ACP_DRIVER_RUNNER_DIR` when the A runner is not in the default sibling checkout;
+- a real semantic embedding provider for non-degraded memory evaluation. Setting
+  `NEWIDE_B_EMBEDDING_PROVIDER=hash` is an explicit local/degraded mode.
 
 ## F Eval Real Harness Setup
 
@@ -141,15 +171,20 @@ Notes:
 
 `src/driver` owns Direction A's runtime boundary. v0 defines `DriverRuntimeHandle`, `DriverCapabilities`, `DriverPrompt`, `DriverRunResult`, `DriverError`, and `MockDriver`. Real ACP, adapter, and PTY integrations should be added behind these contracts later.
 
-`src/memory` owns Direction B's runtime-facing context contract. v0 builds auditable `ContextPack` objects for driver, gate, and council use. It does not implement long-term memory, skill promotion, persona induction, agent splitting, or skill markets.
+`src/memory` owns Direction B's role/persona/memory implementation and public ports. The
+application composition consumes those ports and must not replace them with app-owned memory
+models.
 
 `src/hook` owns Direction D.1 hook system. Hook decides when to trigger gate evaluation based on events.
 
 `src/gate` owns Direction D.2 gate evaluation system. Gate decides how to evaluate requests. The v0 implementation supports explicit `GateResult.decision` and aggregation priority `deny > ask > defer > allow`.
 
-`src/council` owns the Council contract from Direction C. v0 accepts proposals and evidence, then returns a structured decision. It does not merge code, bypass gates, write long-term memory, or perform multi-agent debate.
+`src/council` owns Council participant resolution and proposal/review/synthesis contracts. The
+current production flow is executable but remains `degraded` until participant identity reuse and
+Driver Session continuation are closed.
 
-`src/coordinator` owns Direction C coordination layer. It manages task state machine, checkpoints, event store, artifact store, and orchestration. Current stores are in-memory and intentionally small.
+`src/coordinator` owns Direction C coordination. Production Task/Run state uses the SQLite-backed
+coordination store; in-memory stores remain test/demo implementations.
 
 ## Development Boundaries
 

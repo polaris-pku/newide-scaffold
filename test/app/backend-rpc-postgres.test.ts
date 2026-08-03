@@ -32,7 +32,7 @@ describePostgres('backend RPC PostgreSQL acceptance', () => {
 
       child = spawn(
         process.execPath,
-        ['--import', 'tsx', path.join(process.cwd(), 'src/app/backend-rpc-stdio.ts')],
+        ['--import', 'tsx', path.join(process.cwd(), 'src/app/backend-rpc-entry.ts')],
         {
           cwd: process.cwd(),
           env: {
