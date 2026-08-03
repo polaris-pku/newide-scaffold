@@ -125,6 +125,10 @@ export async function createProductionBackendService(
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
+        // SWE-EVO offline eval: forward so ACP PermissionHandler can deny network tools.
+        ...(env.NEWIDE_SWE_EVO_BLOCK_INTERNET !== undefined
+          ? { NEWIDE_SWE_EVO_BLOCK_INTERNET: env.NEWIDE_SWE_EVO_BLOCK_INTERNET }
+          : {}),
       },
       unsetEnv: [
         'NEWIDE_B_DATABASE_URL',

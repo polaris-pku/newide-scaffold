@@ -85,8 +85,19 @@ const experimentRoot = path.resolve(
     'D:\\Code\\NewIDE\\.newide-experiments\\sweevo-ablation',
   stamp,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 900_000);
-const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
+// Load dotenv before reading timeout knobs so .env.local actually applies.
+const fileEnv = {
+  ...loadEnvFile(path.join(repoRoot, '.env')),
+  ...loadEnvFile(path.join(repoRoot, '.env.local')),
+};
+const runTimeoutMs = readPositiveInt(
+  process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? fileEnv.ACCEPTANCE_RUN_TIMEOUT_MS,
+  900_000,
+);
+const maintenanceWaitMs = readPositiveInt(
+  process.env.ABLATION_MAINTENANCE_WAIT_MS ?? fileEnv.ABLATION_MAINTENANCE_WAIT_MS,
+  45_000,
+);
 const mirrorsRoot = resolveMirrorsRoot(readFlag('--mirrors-root'));
 
 const subsetId = readFlag('--subset') ?? 'v0-smoke';
@@ -117,12 +128,13 @@ for (const id of instanceIds) {
 
 const baseEnv = {
   ...process.env,
-  ...loadEnvFile(path.join(repoRoot, '.env')),
-  ...loadEnvFile(path.join(repoRoot, '.env.local')),
+  ...fileEnv,
   ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
-  ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '600000',
+    process.env.ACP_DRIVER_RUNNER_DIR ??
+    fileEnv.ACP_DRIVER_RUNNER_DIR ??
+    path.resolve(repoRoot, '..', 'acp-client-prototype'),
 };
+baseEnv.ACP_DRIVER_TIMEOUT_MS ??= '1800000';
 // SWE-EVO paper alignment: deny WebFetch/WebSearch and network Bash at ACP permission gate.
 // Override with NEWIDE_SWE_EVO_BLOCK_INTERNET=0 only for debugging.
 baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET ??= '1';
@@ -131,6 +143,8 @@ log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
 log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
+log(`ACCEPTANCE_RUN_TIMEOUT_MS: ${String(runTimeoutMs)}`);
+log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
 log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
 
 const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> = [];
@@ -599,7 +613,7 @@ function summarizeTokens(rows: InstanceRow[]): {
 async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<BackendClient> {
   const child: ChildProcess = spawn(
     process.execPath,
-    ['--import', 'tsx', 'src/app/backend-rpc-stdio.ts'],
+    ['--import', 'tsx', 'src/app/backend-rpc-entry.ts'],
     {
       cwd: repoRoot,
       env,
@@ -666,6 +680,28 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
         if (snapshot.status !== 'running') return snapshot;
         await sleep(1_000);
       }
+
+      // Timeout must cancel the live run; otherwise the shared backend keeps the
+      // ACP driver busy and the next instance starves with zero tool events.
+      log(`[${label}] run ${runId} timed out after ${String(timeoutMs)}ms; cancelling`);
+      try {
+        await request('run.cancel', { run_id: runId });
+      } catch (error) {
+        log(
+          `[${label}] warn: run.cancel failed for ${runId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      const cancelDeadline = Date.now() + 60_000;
+      while (Date.now() < cancelDeadline) {
+        const snapshot = await request<Record<string, unknown>>('run.getSnapshot', {
+          run_id: runId,
+        });
+        if (snapshot.status !== 'running') break;
+        await sleep(500);
+      }
+
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
     },
     close: async () => {

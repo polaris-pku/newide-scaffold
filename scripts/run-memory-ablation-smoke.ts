@@ -244,6 +244,28 @@ async function startBackend(
         if (snapshot.status !== 'running') return snapshot;
         await sleep(1_000);
       }
+
+      // Timeout must cancel the live run; otherwise the shared backend keeps the
+      // ACP driver busy and the next instance starves with zero tool events.
+      log(`[${label}] run ${runId} timed out after ${String(timeoutMs)}ms; cancelling`);
+      try {
+        await request('run.cancel', { run_id: runId });
+      } catch (error) {
+        log(
+          `[${label}] warn: run.cancel failed for ${runId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      const cancelDeadline = Date.now() + 60_000;
+      while (Date.now() < cancelDeadline) {
+        const snapshot = await request<Record<string, unknown>>('run.getSnapshot', {
+          run_id: runId,
+        });
+        if (snapshot.status !== 'running') break;
+        await sleep(500);
+      }
+
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
     },
     close: async () => {
