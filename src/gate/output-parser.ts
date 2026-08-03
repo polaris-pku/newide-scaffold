@@ -103,7 +103,7 @@ function parseJunit(stdout: string): ParsedGateOutput {
   // Find all <testsuite> opening tags and extract numeric attributes
   const suiteTagRegex = /<testsuite\b([^>]*)>/gi;
   for (const tagMatch of Array.from(stdout.matchAll(suiteTagRegex))) {
-    const attrs = tagMatch[1];
+    const attrs = tagMatch[1] ?? '';
     total += extractIntAttr(attrs, 'tests');
     failures += extractIntAttr(attrs, 'failures');
     errors += extractIntAttr(attrs, 'errors');
@@ -112,8 +112,8 @@ function parseJunit(stdout: string): ParsedGateOutput {
   // Find <testcase> elements and check for <failure> or <error> children
   const tcRegex = /<testcase\b([^>]*)>([\s\S]*?)<\/testcase>/gi;
   for (const tc of Array.from(stdout.matchAll(tcRegex))) {
-    const attrs = tc[1];
-    const body = tc[2];
+    const attrs = tc[1] ?? '';
+    const body = tc[2] ?? '';
     const name = extractStrAttr(attrs, 'name');
     const className = extractStrAttr(attrs, 'classname');
 
@@ -151,12 +151,12 @@ function parseJunit(stdout: string): ParsedGateOutput {
 
 function extractIntAttr(attrs: string, name: string): number {
   const m = attrs.match(new RegExp(`${name}\\s*=\\s*"(\\d+)"`, 'i'));
-  return m ? Number(m[1]) : 0;
+  return m?.[1] !== undefined ? Number(m[1]) : 0;
 }
 
 function extractStrAttr(attrs: string, name: string): string {
   const m = attrs.match(new RegExp(`${name}\\s*=\\s*"([^"]*)"`, 'i'));
-  return m ? m[1] : '';
+  return m?.[1] ?? '';
 }
 
 // ──────────────────────────────────────────────
@@ -172,11 +172,16 @@ function parseJson(stdout: string): ParsedGateOutput {
     // npm audit style: { "advisories": { ... }, "metadata": { "vulnerabilities": {...} } }
     if (data?.advisories && typeof data.advisories === 'object') {
       for (const [key, adv] of Object.entries(data.advisories as Record<string, Record<string, unknown>>)) {
-        findings.push({
+        const advFindings = adv?.findings as Array<{ paths?: Array<string | undefined> }> | undefined;
+        const firstPath = advFindings?.[0]?.paths?.[0];
+        const finding: Finding = {
           severity: String(adv?.severity ?? 'moderate'),
           message: `${String(adv?.title ?? key)} (${String(adv?.module_name ?? '')}) — ${String(adv?.recommendation ?? '')}`,
-          file: adv?.findings?.[0]?.paths?.[0] as string | undefined,
-        });
+        };
+        if (typeof firstPath === 'string') {
+          finding.file = firstPath;
+        }
+        findings.push(finding);
       }
       return { findings };
     }

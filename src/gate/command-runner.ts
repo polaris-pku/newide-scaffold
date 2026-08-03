@@ -223,12 +223,14 @@ export class CommandRunner extends BaseGateRunner {
   ): string {
     const severityCounts = new Map<string, { count: number; decision: GateDecision }>();
     for (let i = 0; i < findings.length; i++) {
-      const sev = findings[i].severity.toLowerCase();
+      const finding = findings[i]!;
+      const decision = decisions[i]!;
+      const sev = finding.severity.toLowerCase();
       const existing = severityCounts.get(sev);
       if (existing) {
         existing.count++;
       } else {
-        severityCounts.set(sev, { count: 1, decision: decisions[i] });
+        severityCounts.set(sev, { count: 1, decision });
       }
     }
 
