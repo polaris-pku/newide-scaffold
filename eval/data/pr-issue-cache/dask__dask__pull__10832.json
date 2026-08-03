@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10832",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10832,
+  "title": "Unskip and adjust tests for groupby-aggregate with median using dask-expr",
+  "body": "Sibling to https://github.com/dask-contrib/dask-expr/pull/766\r\n\r\n- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:41.919Z",
+  "status": "ok"
+}

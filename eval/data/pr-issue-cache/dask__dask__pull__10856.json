@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10856",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10856,
+  "title": "Update DataFrame examples section",
+  "body": "This PR expands our existing examples to include a few compelling large-scale examples (in addition to https://examples.dask.org/dataframe.html which we're already pointing to)\r\n\r\ncc @jacobtomlinson @scharlottej13",
+  "fetched_at": "2026-08-02T06:41:38.123Z",
+  "status": "ok"
+}

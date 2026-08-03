@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9547",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9547,
+  "title": "Move dependabot configuration file",
+  "body": "I think this actually needs to be in `.github/` not `.github/workflows`",
+  "fetched_at": "2026-08-02T06:39:39.727Z",
+  "status": "ok"
+}

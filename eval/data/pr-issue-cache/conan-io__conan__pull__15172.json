@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15172",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15172,
+  "title": "proposal for deploy() feature",
+  "body": "Changelog: Feature: New ``deploy()`` method in recipes for explicit per-recipe deployment.\r\nDocs: https://github.com/conan-io/docs/pull/3494\r\n\r\nClose https://github.com/conan-io/conan/issues/14811",
+  "fetched_at": "2026-08-02T06:10:32.972Z",
+  "status": "ok"
+}

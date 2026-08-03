@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10520",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10520,
+  "title": "Temporarily skip failing tests with ``fsspec==2023.9.1``",
+  "body": "Closes https://github.com/dask/dask/issues/10515",
+  "fetched_at": "2026-08-02T06:41:25.272Z",
+  "status": "ok"
+}

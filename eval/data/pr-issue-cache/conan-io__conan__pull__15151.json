@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15151",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15151,
+  "title": "Allow querying the contents of settings.yml (and settings_user!) from ConfigAPI",
+  "body": "Changelog: Feature: Allow accessing the contents of `settings.yml` (and `settings_user`!) from `ConfigAPI`.\r\nChangelog: Feature: Add builtin conf access from `ConfigAPI`.\r\nDocs: Omit\r\n\r\n\r\nCloses #15125",
+  "fetched_at": "2026-08-02T06:15:00.554Z",
+  "status": "ok"
+}

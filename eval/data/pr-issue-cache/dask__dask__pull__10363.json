@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10363",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10363,
+  "title": "Remove unnecessary try-except in ``isna``",
+  "body": "- [x] Passes `pre-commit run --all-files`\r\n\r\nSaw this while working on isin for dask-expr",
+  "fetched_at": "2026-08-02T06:40:54.443Z",
+  "status": "ok"
+}

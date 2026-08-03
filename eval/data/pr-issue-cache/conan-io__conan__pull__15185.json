@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15185",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15185,
+  "title": "Fix serialization of tool_requires in `conan profile show --format=json`",
+  "body": "Changelog: Bugfix: Fix serialization of tool_requires in `conan profile show --format=json`.\r\nDocs: Omit\r\n\r\nTo check with the team if we want to fully serialize the reference, or if printing its str representation would be enough\r\n\r\nCloses #15183",
+  "fetched_at": "2026-08-02T06:36:21.456Z",
+  "status": "ok"
+}

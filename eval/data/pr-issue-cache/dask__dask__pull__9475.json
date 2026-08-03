@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9475",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9475,
+  "title": "Backend library dispatching for IO in Dask-Array and Dask-DataFrame",
+  "body": "This PR serves as a reference implementation for (what is expected to be) \"Dask Design Proposal 1\": https://github.com/dask/design-docs/pull/1\r\n\r\nRequired cudf branch for Dask-DataFrame dispatching to cudf: https://github.com/rjzamora/cudf/tree/backend-class",
+  "fetched_at": "2026-08-02T06:39:12.298Z",
+  "status": "ok"
+}

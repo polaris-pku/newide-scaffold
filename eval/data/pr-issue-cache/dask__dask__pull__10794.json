@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10794",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10794,
+  "title": "Generalize ``CreationDispatch`` for dask-expr",
+  "body": "Minor change to simplify migration of creation dispatching to dask-expr (see https://github.com/dask-contrib/dask-expr/pull/728).",
+  "fetched_at": "2026-08-02T06:42:01.008Z",
+  "status": "ok"
+}

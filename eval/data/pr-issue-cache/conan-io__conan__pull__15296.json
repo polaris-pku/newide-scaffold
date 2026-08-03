@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15296",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15296,
+  "title": "Make user confs have at leats one `:` separator",
+  "body": "Changelog: Bugfix: Ensure `user` confs have at least 1 `:` separator\r\nChangelog: Fix: Fix `user` confs package scoping when no separator was given\r\nDocs: Omit\r\n\r\nFix comes from trying to fix error messages when they disdnt have a `:` but were scoped",
+  "fetched_at": "2026-08-02T06:30:35.759Z",
+  "status": "ok"
+}

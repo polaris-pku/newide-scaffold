@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9504",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9504,
+  "title": "Shuffle-based groupby for single functions",
+  "body": "This includes the new `shuffle` kwarg in more of the groupby aggregations, and enables shuffle-based aggregation in those places. So now `df.groupby(\"a\").sum()` and `df.groupby(\"a\").agg(\"sum\")` both have access to the same aggregations.\r\n\r\nNew functions with shuffling:\r\n* sum\r\n* prod\r\n* min\r\n* max\r\n* idxmin\r\n* idxmax\r\n* count\r\n* mean\r\n* size\r\n* first\r\n* last\r\n* head\r\n* tail\r\n\r\n~~While I'm here, I also added `groupby().median()`. This one is a bit unusual, in that I'm skipping the initial agg step before the shuffle (there is a dummy `set_index` step instead).~~ (Leaving for a follow-up)\r\n\r\n- [x] Closes #9487\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nTODO \r\n- [x] add some more tests.\r\n- [ ] ~~Possibly add `cov`, `var`, `nunique`, which need special treatment~~",
+  "fetched_at": "2026-08-02T06:39:18.960Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10349",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10349,
+  "title": "Deprecate `DataFrame.fillna`/`Series.fillna` with `method`",
+  "body": "See https://github.com/dask/dask/issues/10347.\r\n\r\nHandles `fillna` deprecations like this one:\r\n\r\n```\r\nFAILED dask/dataframe/tests/test_dataframe.py::test_fillna - FutureWarning: DataFrame.fillna with 'method' is deprecated and will raise in a future version. Use obj.ffill() or obj.bfill() instead.\r\n```\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nThe remaining failures are not the same issue.",
+  "fetched_at": "2026-08-02T06:40:48.227Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15150",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15150,
+  "title": "Add `redirect_stdout` to CMake integration methods",
+  "body": "Changelog: Feature: Add `redirect_stdout` to CMake integration methods.\r\nDocs: Omit\r\n\r\nThis PR focuses on adding the functionality to the CMake integrations only. We're happy to make them available in other integrations if there're requests for it from users\r\n\r\nCloses #15108",
+  "fetched_at": "2026-08-02T06:16:07.316Z",
+  "status": "ok"
+}

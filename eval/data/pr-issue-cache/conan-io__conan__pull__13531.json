@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13531",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13531,
+  "title": "Add MacOS SDK version 13.1",
+  "body": "Changelog: Feature: Support MacOS SDK 13.1 (available in Xcode 14.2).\r\nDocs: Omit\r\n\r\nfixes #13530\r\n\r\n- [x] I've read the [Contributing guide](https://github.com/conan-io/conan/blob/develop/.github/CONTRIBUTING.md).\r\n- [x] I've followed the PEP8 style guides for Python code.\r\n- [ ] I've opened another PR in the Conan docs repo to the ``develop`` branch, documenting this one.",
+  "fetched_at": "2026-08-02T06:36:35.007Z",
+  "status": "ok"
+}

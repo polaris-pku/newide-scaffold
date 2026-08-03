@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10128",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10128,
+  "title": "Handle `None` column name when checking if columns are all numeric",
+  "body": "We cannot ask for the names of the grouper since if the data frame has\r\na column named None we cannot distinguish it as a grouping column from\r\nthe case where the groupby argument is not a column selection (e.g. a\r\nfunction that assigns rows to groups). To fix this, just perform the\r\ngroupby on meta and see what we get out.\r\n\r\nCloses #10127.\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:57.012Z",
+  "status": "ok"
+}

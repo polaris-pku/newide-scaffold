@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9545",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9545,
+  "title": "Avoid race condition in lazy dispatch registration",
+  "body": "This makes it so we delete the `toplevel` entry from the `_lazy` lookup dictionary only after we're registered the corresponding dispatch method\r\n\r\nCloses https://github.com/dask/dask/issues/9181, closes https://github.com/dask/distributed/issues/7061",
+  "fetched_at": "2026-08-02T06:39:23.081Z",
+  "status": "ok"
+}

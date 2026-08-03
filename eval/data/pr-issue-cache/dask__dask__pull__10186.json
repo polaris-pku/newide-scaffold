@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10186",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10186,
+  "title": "Temporarily pin `scikit-image` to fix Windows CI",
+  "body": "xref https://github.com/dask/dask/issues/10183",
+  "fetched_at": "2026-08-02T06:40:08.704Z",
+  "status": "ok"
+}

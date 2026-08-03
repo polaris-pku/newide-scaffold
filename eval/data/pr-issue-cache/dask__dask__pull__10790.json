@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10790",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10790,
+  "title": "Adjust mostly indexing tests",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\n\r\nMostly indexing focused",
+  "fetched_at": "2026-08-02T06:42:12.279Z",
+  "status": "ok"
+}

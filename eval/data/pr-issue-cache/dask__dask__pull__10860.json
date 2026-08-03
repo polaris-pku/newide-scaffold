@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10860",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10860,
+  "title": "Temporarily pin ``mimesis<13.1.0``",
+  "body": "Quickfix to unblock CI\r\n\r\nxref https://github.com/dask/dask/issues/10858",
+  "fetched_at": "2026-08-02T06:41:39.352Z",
+  "status": "ok"
+}

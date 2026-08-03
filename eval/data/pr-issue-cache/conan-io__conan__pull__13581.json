@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13581",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13581,
+  "title": "clean temp folders in cache",
+  "body": "Changelog: Feature: ``conan cache clean`` learned the ``--all`` and ``--temp`` to clean everything (sources, builds) and also the temporary folders.\r\nDocs: https://github.com/conan-io/docs/pull/3145\r\n\r\nClose https://github.com/conan-io/conan/issues/13576\r\n\r\n- Minor refactor to improve ProfilesAPI interface, avoiding possible caching bugs",
+  "fetched_at": "2026-08-02T06:36:29.511Z",
+  "status": "ok"
+}

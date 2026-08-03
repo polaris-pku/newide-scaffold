@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13544",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13544,
+  "title": "do not skip requirements of editable packages",
+  "body": "Changelog: Bugfix: Avoid generators errors because dependencies binaries of editable packages were \"skip\".\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/13543",
+  "fetched_at": "2026-08-02T06:37:04.669Z",
+  "status": "ok"
+}

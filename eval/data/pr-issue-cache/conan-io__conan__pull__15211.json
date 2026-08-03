@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15211",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15211,
+  "title": "allow hard set_name() set_version()",
+  "body": "Changelog: Fix: Allow hard ``set_name()`` and ``set_version()`` to mutate name and version provided in command line.\r\nDocs: https://github.com/conan-io/docs/pull/3491\r\n\r\n\r\nClose https://github.com/conan-io/conan/issues/15208",
+  "fetched_at": "2026-08-02T06:32:49.178Z",
+  "status": "ok"
+}

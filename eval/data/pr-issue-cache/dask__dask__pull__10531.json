@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10531",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10531,
+  "title": "Match `pandas` reverting `apply` deprecation",
+  "body": "`pandas` recently reverted this deprecations (xref https://github.com/pandas-dev/pandas/pull/55189). We do the same thing here to match behavior with `pandas` and fix test that are currently failing in CI\r\n\r\ncc @phofl",
+  "fetched_at": "2026-08-02T06:41:22.606Z",
+  "status": "ok"
+}

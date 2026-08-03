@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10133",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10133,
+  "title": "Deprecate `convert_dtype` in `Series.apply`",
+  "body": "* Xref https://github.com/pandas-dev/pandas/pull/52257.\r\n\r\nFixes the following upstream failures:\r\n\r\n```\r\ndask/dataframe/tests/test_dataframe.py::test_apply: FutureWarning: the convert_dtype parameter is deprecated and will be removed in a future version.  Do ``ser.astype(object).apply()`` instead if you want ``convert_dtype=False``.\r\ndask/dataframe/tests/test_dataframe.py::test_apply_infer_columns: FutureWarning: the convert_dtype parameter is deprecated and will be removed in a future version.  Do ``ser.astype(object).apply()`` instead if you want ``convert_dtype=False``.\r\n```\r\n\r\n- [x] Closes https://github.com/dask/dask/issues/10089\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:03.474Z",
+  "status": "ok"
+}

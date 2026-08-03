@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10346",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10346,
+  "title": "Update nightly wheel index for pandas/numpy/scipy",
+  "body": "pandas, numpy and scipy recently changed their nightly location to https://anaconda.org/scientific-python-nightly-wheels so updating the index here",
+  "fetched_at": "2026-08-02T06:40:59.593Z",
+  "status": "ok"
+}

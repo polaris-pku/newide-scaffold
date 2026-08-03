@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10076",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10076,
+  "title": "Deprecate `use_nullable_dtypes=` and add `dtype_backend=`",
+  "body": "Xref https://github.com/pandas-dev/pandas/pull/51853.\r\nXref https://github.com/geopandas/dask-geopandas/pull/242.\r\n\r\n- [x] Closes https://github.com/dask/dask/issues/10062\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:02.224Z",
+  "status": "ok"
+}

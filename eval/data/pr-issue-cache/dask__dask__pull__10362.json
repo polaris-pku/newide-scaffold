@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10362",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10362,
+  "title": "mypy support for numpy 1.25",
+  "body": "mypy has started failing (not in CI yet, since CI is still using a cache with numpy 1.24):\n```\ndask/array/routines.py:1569: error: Module has no attribute \"round_\"  [attr-defined]\nFound 1 error in 1 file (checked 255 source files)\n```",
+  "fetched_at": "2026-08-02T06:40:55.651Z",
+  "status": "ok"
+}

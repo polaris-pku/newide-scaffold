@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13461",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13461,
+  "title": "Proposal for sources backup feature",
+  "body": "Changelog: Feature: Automatic server side source backups for third parties.\r\nDocs: Omit",
+  "fetched_at": "2026-08-02T06:36:44.712Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10441",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10441,
+  "title": "Fix ValueError when running to_csv in append mode with single_file as True",
+  "body": "- [x] Closes #10414\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nI think this is pretty well described here: https://github.com/dask/dask/issues/10414\r\n\r\nCurrently dask adds on \"a\" to the mode when single_file is True, but this clashes when the mode is already set to \"a\".\r\n\r\nThis PR adds in a conditional check the the mode ending with \"a\" before appending \"a\" to the end.\r\n\r\nAlso, testing added to cover the bug fix.",
+  "fetched_at": "2026-08-02T06:41:18.820Z",
+  "status": "ok"
+}

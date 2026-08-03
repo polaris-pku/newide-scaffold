@@ -26,6 +26,8 @@
 
 - `v0-smoke`：最小冒烟子集，用来确认评测链路能跑通。
 - `v0-dev`：早期开发子集，用来在扩大规模前做稳定迭代。
+- `v0-repo-full`：整仓覆盖切片（conan 2 + dask 8 + requests 4 = 14）；入选 repo 全部 instance，无半截仓。
+- `v0-repo-full-prctx`：同上 14 题，但 `problem_statement` 为 release-note + 离线 PR/Issue body（论文 Appendix N.1）；先跑 `pnpm eval:build-pr-context -- --subset v0-repo-full`。
 - `verified-30`：RFC §4.1 打榜集（`frozen_adapted_v1`；flask 库存适配，见下方说明）。
 
 子集元数据在 `eval/datasets/` 下。每个文件记录来源版本、来源 JSONL、筛选规则、环境要求和固定的 instance id 列表。完整 SWE-EVO JSONL 路径由 `eval/manifest.json` 声明（`default_subset` → `subsets`）。
@@ -213,6 +215,25 @@ pnpm eval:sweevo-ablation -- --subset v0-smoke
 
 # 真 Docker 判卷时再加
 pnpm eval:sweevo-ablation -- --subset v0-smoke --run-harness
+
+# 整仓覆盖子集 × B0,B1,B2 + 真 Docker 判卷（14×3，耗时长）
+pnpm eval:sweevo-ablation -- --subset v0-repo-full --ablations "B0,B1,B2" --run-harness
+```
+
+方向一批跑默认开启 `NEWIDE_SWE_EVO_BLOCK_INTERNET=1`（对齐 SWE-EVO 论文：生成阶段禁止外网检索）。实现为 ACP 权限门拒绝 `WebFetch`/`WebSearch`/出网 Bash，并在 ephemeral worktree 写入 `.claude/settings.json` deny 列表。数据集 `PRs[].patch_without_test` **不会**注入 prompt（避免泄漏金标 patch）。注意：PowerShell 下逗号参数需加引号 `"B0,B1,B2"`。
+
+### 离线 PR/Issue context（论文默认设定）
+
+公开 HF `problem_statement` 只有 release-note。要对齐论文「release-note + PR/issue context」：
+
+```powershell
+# 推荐设置 GITHUB_TOKEN / GH_TOKEN；无 token 时约 60 次/小时，可断点续跑
+pnpm eval:build-pr-context -- --subset v0-repo-full
+
+# 缓存：eval/data/pr-issue-cache/*.json
+# 增强 JSONL：eval/data/sweevo-v0-repo-full-prctx.jsonl
+# 随后批跑：
+pnpm eval:sweevo-ablation -- --subset v0-repo-full-prctx --ablations "B0,B1,B2" --run-harness
 ```
 
 当前 Council 交付冒烟可直接运行：

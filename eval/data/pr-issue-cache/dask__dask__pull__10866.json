@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10866",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10866,
+  "title": "Add recommended deployment options to deployment docs",
+  "body": "Our current deployment docs lists many options for deploying Dask clusters. This PR keeps the same list, but adds recommended options for each category:\r\n\r\n- HPC --> dask-jobqueue\r\n- Cloud --> coiled\r\n- Kubernetes --> dask-kubernetes operator\r\n- Managed --> coiled\r\n\r\nI've also added a few, mostly stylistic updates to the \"Cloud\" subpage in the deployment docs (e.g. added an image with cloud provider logos, added sphinx tabs in a couple of places) \r\n\r\ncc @quasiben",
+  "fetched_at": "2026-08-02T06:41:32.930Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/14871",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 14871,
+  "title": "New [platform_requires]  similar to system-tools, but for all requires",
+  "body": "Changelog: Feature: New ``[platform_requires]`` profile definition to be able to replace Conan dependencies by platform-provided dependencies.\r\nChangelog: Fix: Deprecate ``[system_tools]`` in favor of ``[platform_tool_requires]`` to align with ``[platform_requires]`` for regular dependencies. Changed output from \"System tool\" to \"Platform\".\r\nDocs: https://github.com/conan-io/docs/pull/3495\r\n\r\n\r\nClose https://github.com/conan-io/conan/issues/14566\r\nAddress https://github.com/conan-io/conan/issues/15001\r\nClose https://github.com/conan-io/conan/issues/15101\r\nClose https://github.com/conan-io/conan/issues/1330\r\n\r\nTO LOOK INTO:\r\n- Renamed to ``[system_requires]``, I didn't like ``[system_deps]``, but still not convinced because of overlap with ``system_requirements()``\r\n- The cases of replacement of a requires with another Conan recipe, more like override, needs to be treated in a different way\r\n- Some generalization of \"System tool\" => \"System requirement\" is needed, but lets agree on the naming first",
+  "fetched_at": "2026-08-02T06:25:02.277Z",
+  "status": "ok"
+}

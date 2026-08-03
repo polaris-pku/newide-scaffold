@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10827",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10827,
+  "title": "Deprecate 'convert_dtype' in apply",
+  "body": "- [x] Closes #10802\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:26.493Z",
+  "status": "ok"
+}

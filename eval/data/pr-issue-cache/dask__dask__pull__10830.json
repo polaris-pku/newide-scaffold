@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10830",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10830,
+  "title": "Expose dataframe tests",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\nI've moved the contest setting that is necessary for tests into the package, the dockets stuff is still in the root directory",
+  "fetched_at": "2026-08-02T06:41:58.469Z",
+  "status": "ok"
+}

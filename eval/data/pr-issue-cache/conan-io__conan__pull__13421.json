@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13421",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13421,
+  "title": "Feature/urls auth",
+  "body": "Changelog: Feature: Authentication for ``tools.files.download()``.\r\nDocs: https://github.com/conan-io/docs/pull/3149\r\n\r\nThis was further modified by https://github.com/conan-io/conan/pull/13461, with better source_credentials.json syntax",
+  "fetched_at": "2026-08-02T06:36:50.002Z",
+  "status": "ok"
+}

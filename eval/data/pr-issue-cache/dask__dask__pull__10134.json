@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10134",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10134,
+  "title": "Document `Generator` based random number generation",
+  "body": "Create a page to document `Generator` based random numbere generation behaviour and use `Generator` based random number generation in examples.\r\n\r\n- [x] Closes #8547\r\n- [ ] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:04.785Z",
+  "status": "ok"
+}

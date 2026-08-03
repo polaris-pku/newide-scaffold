@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10125",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10125,
+  "title": "Relax `assert_eq` checks on `Scalar`-like objects",
+  "body": "This is part of an effort to reuse assert_eq on other objects that are similar to Dask Dataframe, but not exactly Dask dataframe objects.\r\n\r\nThis was done previously with Series/Dataframe types above, now we allow any object that isn't a Series/DataFrame/Index to be interpretted as a Scalar.  Previously this would raise an exception.",
+  "fetched_at": "2026-08-02T06:40:27.792Z",
+  "status": "ok"
+}

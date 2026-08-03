@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15136",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15136,
+  "title": "require-replaces proposal",
+  "body": "Changelog: Feature: New ``[replace_requires]`` and ``[replace_tool_requires]`` in profile for redefining requires, useful for package replacements like ``zlibng/zlib``, to solve conflicts, and to replace some dependencies by system alternatives wrapped in another Conan package recipe.\r\nDocs: https://github.com/conan-io/docs/pull/3495\r\n\r\nComplement https://github.com/conan-io/conan/pull/14871",
+  "fetched_at": "2026-08-02T06:20:34.856Z",
+  "status": "ok"
+}

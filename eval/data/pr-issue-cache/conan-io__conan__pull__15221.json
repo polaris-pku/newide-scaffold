@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15221",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15221,
+  "title": "Add `in` operator support for ConanFile's `self.dependencies`",
+  "body": "Changelog: Feature: Add `in` operator support for ConanFile's `self.dependencies`.\r\nDocs: https://github.com/conan-io/docs/pull/3481\r\n\r\nCloses https://github.com/conan-io/conan/issues/12832\r\n\r\nFound this in the wild as a leftover while going over my created issues :)",
+  "fetched_at": "2026-08-02T06:02:45.664Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15109",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15109,
+  "title": "Fix default path fallack when `core.sources:download_cache` is not set",
+  "body": "Changelog: Bugfix: Fix backup sources error when no `core.sources:download_cache` is set.\r\nDocs: Omit\r\n\r\nThe tests were unfortunately not covering that case\r\n\r\nCloses #15103",
+  "fetched_at": "2026-08-02T06:36:28.186Z",
+  "status": "ok"
+}

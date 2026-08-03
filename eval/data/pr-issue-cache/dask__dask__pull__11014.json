@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/11014",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 11014,
+  "title": "Build nightlies on tag releases",
+  "body": "Since Distributed's conda build CI is dependent on `dask-core` nightlies for the upcoming release being present, make sure those are always available by also publishing on tag creation (i.e. release).\n\nPlays a role in unblocking https://github.com/dask/dask-expr/pull/986, where this issue is present.\n\n- [ ] Closes #xxxx\n- [ ] Tests added / passed\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:42:21.627Z",
+  "status": "ok"
+}

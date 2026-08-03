@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3491",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3491,
+  "title": "set_version and set_name flexibility",
+  "body": "Docs for https://github.com/conan-io/conan/pull/15211",
+  "fetched_at": "2026-08-02T06:33:55.838Z",
+  "status": "ok"
+}

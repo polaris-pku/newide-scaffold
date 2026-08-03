@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3483",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3483,
+  "title": "Add pkglist formatter for conan export command docs",
+  "body": "Docs for https://github.com/conan-io/conan/pull/15266",
+  "fetched_at": "2026-08-02T05:58:18.474Z",
+  "status": "ok"
+}

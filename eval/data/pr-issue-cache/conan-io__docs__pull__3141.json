@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3141",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3141,
+  "title": "Add `*=` dict syntax docs",
+  "body": "",
+  "fetched_at": "2026-08-02T06:36:33.734Z",
+  "status": "ok"
+}

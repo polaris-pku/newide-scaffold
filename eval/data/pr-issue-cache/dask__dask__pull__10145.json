@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10145",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10145,
+  "title": "Fix `update_graph` counting logic in `test_default_scheduler_on_worker`",
+  "body": "Closes https://github.com/dask/dask/issues/10144. I'm certainly open to other suggestions. \r\n\r\ncc @fjetter @gjoseph92",
+  "fetched_at": "2026-08-02T06:40:20.260Z",
+  "status": "ok"
+}

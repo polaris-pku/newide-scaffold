@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10383",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10383,
+  "title": "Ensure that ``df`` is immutable after ``from_pandas``",
+  "body": "- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nWe had a similar problem in dask-expr",
+  "fetched_at": "2026-08-02T06:41:04.769Z",
+  "status": "ok"
+}

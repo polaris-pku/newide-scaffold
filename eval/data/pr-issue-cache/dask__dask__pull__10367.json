@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10367",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10367,
+  "title": "Fix annotations and spans leaking between threads",
+  "body": "Switch global annotations to use `ContextVar` instead of setting values in dask config.\r\n\r\nDependent PR in distributed: https://github.com/dask/distributed/pull/7935\r\n\r\n- [x] Closes https://github.com/dask/dask/issues/10340\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\ncc @fjetter @crusaderky",
+  "fetched_at": "2026-08-02T06:40:51.997Z",
+  "status": "ok"
+}

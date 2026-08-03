@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10102",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10102,
+  "title": "Use declarative setuptools",
+  "body": "- [x] Closes #10032\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nlike https://github.com/dask/dask/pull/10055 but keeps setuptools and versioneer for now, maybe dask and distributed can move to hatchling/hatch-vcs in the future",
+  "fetched_at": "2026-08-02T06:40:26.503Z",
+  "status": "ok"
+}

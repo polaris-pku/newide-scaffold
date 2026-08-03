@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15215",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15215,
+  "title": "Define toolset and architecture in CMakePresets.json for VS to avoid mismatches",
+  "body": "Changelog: Bugfix: Add ``architecture`` to ``CMakePresets`` to avoid cmake ignoring toolchain definitions when using presets.\r\nDocs: Omit\r\n\r\nThis doesn't have explicit docs, UI should be the same, just avoiding an error\r\n\r\nClose https://github.com/conan-io/conan/issues/13792",
+  "fetched_at": "2026-08-02T06:36:18.572Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10850",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10850,
+  "title": "Fix test for sizeof(pd.MultiIndex) in upstream CI",
+  "body": "- Part of #10593 \r\n\r\nOutput is much smaller than vs. published releases, but still very accurate for non-trivial data sizes",
+  "fetched_at": "2026-08-02T06:41:43.193Z",
+  "status": "ok"
+}

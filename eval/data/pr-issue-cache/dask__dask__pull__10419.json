@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10419",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10419,
+  "title": "Adding support for cgroup v2 to `cpu_count`",
+  "body": "Control Group v2 has a different folder structure than its v1 counterpart. Currently, the `dask.system.cpu_count()` function only supports reading from Control Group v1. Lots of distributions have already switched to the new version and more importantly Kubernetes 1.25. This change would make the transition seemless and not have the `multiprocessor` scheduler of dask default to the physical number of CPUs all of a sudden.\r\n\r\n~~Closes #xxxx~~\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:13.826Z",
+  "status": "ok"
+}

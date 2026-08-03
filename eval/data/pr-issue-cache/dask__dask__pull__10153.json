@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10153",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10153,
+  "title": "Temporarily remove `xarray` from CI with `pandas` 2.0",
+  "body": "Let's see if this works \r\n\r\nxref https://github.com/dask/dask/issues/10152",
+  "fetched_at": "2026-08-02T06:40:19.008Z",
+  "status": "ok"
+}

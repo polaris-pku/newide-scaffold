@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10446",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10446,
+  "title": "Add default `types_mapper` to `from_pyarrow_table_dispatch` for pandas",
+  "body": "`dask.dataframe.dispatch.from_pyarrow_table_dispatch` is currently used by `distributed`'s p2p-shuffle algorithm. However, in order to ensure that pyarrow string types are not lost during the pandas-arrow-pandas round trip, a special `types_mapper` argument is passed through to `pa.Table.to_pandas`. The `types_mapper` argument is not backend agnostic, as such an argument must be ignored by the `cudf` implementation of `from_pyarrow_table_dispatch`.\r\n\r\nThis PR moves the `types_mapper` logic into the pandas implementation of `from_pyarrow_table_dispatch`.",
+  "fetched_at": "2026-08-02T06:41:20.088Z",
+  "status": "ok"
+}

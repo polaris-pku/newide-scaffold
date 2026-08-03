@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15282",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15282,
+  "title": "new CMake.ctest() method",
+  "body": "Changelog: Feature: New ``CMake.ctest()`` helper method to launch directly ``ctest`` instead of via ``cmake --target=RUN_TEST``.\r\nDocs: Omit\r\n\r\nThis is documented in code docstrings\r\n\r\nClose https://github.com/conan-io/conan/issues/14798",
+  "fetched_at": "2026-08-02T05:51:37.568Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10831",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10831,
+  "title": "Changed dtype arithmetics in numpy 2",
+  "body": "Part of #10593",
+  "fetched_at": "2026-08-02T06:41:50.827Z",
+  "status": "ok"
+}

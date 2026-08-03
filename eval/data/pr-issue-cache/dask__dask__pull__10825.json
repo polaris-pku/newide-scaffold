@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10825",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10825,
+  "title": "Minor[CI]: publish-test-results not marked as failed",
+  "body": "Change the [publish unit test result action](https://github.com/EnricoMi/publish-unit-test-result-action) to not report itself as failed if other tests in CI have failed, only on errors. \r\n\r\nRationale:\r\nPRs like https://github.com/dask/dask/pull/10824 get the ugly :x: when any tests fail b/c the action itself reports itself as failed when any tests in the CI has failed.\r\n\r\nHowever, \"nothing\" in the PR has failed, only tests for dask-expr which are expected and thus marked green on CI.\r\nhttps://github.com/dask/dask/actions/runs/7567879416/job/20607928150?pr=10824#step:8:28559",
+  "fetched_at": "2026-08-02T06:42:03.496Z",
+  "status": "ok"
+}

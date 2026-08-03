@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10800",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10800,
+  "title": "Deprecate out= and dtype= parameter in most dataframe methods",
+  "body": "- Closes #10777\r\n\r\nNOT deprecated out parameter:\r\n- from_dict\r\n- to_sql\r\n- elementwise ufuncs (e.g. `np.log`)",
+  "fetched_at": "2026-08-02T06:41:29.023Z",
+  "status": "ok"
+}

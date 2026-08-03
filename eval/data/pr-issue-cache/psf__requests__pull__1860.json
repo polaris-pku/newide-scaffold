@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/1860",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 1860,
+  "title": "Use calendar.timegm when calculating cookie expiration",
+  "body": "Fixes #1859\n\nCredit: @lukasa",
+  "fetched_at": "2026-08-02T06:42:45.517Z",
+  "status": "ok"
+}

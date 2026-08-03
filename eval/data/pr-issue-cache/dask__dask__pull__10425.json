@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10425",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10425,
+  "title": "Support multi-column ``groupby`` with ``sort=True`` and ``split_out>1``",
+  "body": "Uses the multi-column `sort_values` support added in https://github.com/dask/dask/pull/8263 to support multi-column groupby aggregations with `sort=True` and `split_out > 1`.",
+  "fetched_at": "2026-08-02T06:41:15.100Z",
+  "status": "ok"
+}

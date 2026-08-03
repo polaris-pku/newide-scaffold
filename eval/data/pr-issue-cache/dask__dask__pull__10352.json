@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10352",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10352,
+  "title": "Deprecate ``DataFrame.first`` and ``Series.first``",
+  "body": "See https://github.com/dask/dask/issues/10347.\r\n\r\nFixes this deprecation:\r\n\r\n```\r\nFAILED dask/dataframe/tests/test_dataframe.py::test_first_and_last[first] - FutureWarning: first is deprecated and will be removed in a future version. Please create a mask and filter using `.loc` instead\r\nFAILED dask/dataframe/tests/test_dataframe.py::test_first_and_last[last] - FutureWarning: first is deprecated and will be removed in a future version. Please create a mask and filter using `.loc` instead\r\n```\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:49.508Z",
+  "status": "ok"
+}

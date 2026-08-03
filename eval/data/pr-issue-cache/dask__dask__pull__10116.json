@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10116",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10116,
+  "title": "Fix `test_null_partition_pyarrow` in `pyarrow` CI build",
+  "body": "Fixed `test_null_partition_pyarrow` that breaks in pyarrow build.\r\n\r\n* Xref https://github.com/apache/arrow/pull/34445.\r\n\r\nThanks a lot to @phofl for the tip.\r\n\r\n```\r\nFAILED dask/dataframe/io/tests/test_parquet.py::test_null_partition_pyarrow[None] - AssertionError: DataFrame.index are different\r\n\r\nAttribute \"dtype\" are different\r\n[left]:  int64\r\n[right]: Int64\r\nFAILED dask/dataframe/io/tests/test_parquet.py::test_null_partition_pyarrow[processes] - AssertionError: DataFrame.index are different\r\n\r\nAttribute \"dtype\" are different\r\n[left]:  int64\r\n[right]: Int64\r\n```\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:31.470Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10115",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10115,
+  "title": "Preserve `dtype` for partitioning columns when read with `pyarrow`",
+  "body": "- [x] Closes #9966\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nThe fastparquet issue is in fastparquet itself, since ``to_pandas`` already returns the wrong dtype.",
+  "fetched_at": "2026-08-02T06:39:54.490Z",
+  "status": "ok"
+}

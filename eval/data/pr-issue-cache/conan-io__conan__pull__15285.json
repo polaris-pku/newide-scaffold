@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15285",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15285,
+  "title": "fix self.info.clear() for python_requires and tool_requires",
+  "body": "Changelog: Bugfix: Make ``self.info.clear()`` and header-only packages to remove ``python_requires`` and ``tool_requires``.\r\nDocs: https://github.com/conan-io/docs/pull/3485",
+  "fetched_at": "2026-08-02T06:36:13.255Z",
+  "status": "ok"
+}

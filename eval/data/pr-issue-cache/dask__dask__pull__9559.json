@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9559",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9559,
+  "title": "Add support for string timedelta in `map_overlap`",
+  "body": "- [x ] Closes #9554\r\n- [x ] Tests added / passed\r\n- [x ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:17.662Z",
+  "status": "ok"
+}

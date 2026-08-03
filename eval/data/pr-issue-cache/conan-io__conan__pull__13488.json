@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13488",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13488,
+  "title": "fix build_folder_vars for editables",
+  "body": "Changelog: Bugfix: Editable packages now also follow ``build_folder_vars`` configuration.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/13485",
+  "fetched_at": "2026-08-02T06:37:08.899Z",
+  "status": "ok"
+}

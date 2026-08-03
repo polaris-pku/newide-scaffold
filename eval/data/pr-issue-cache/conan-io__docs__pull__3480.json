@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3480",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3480,
+  "title": "`<host_version:track ref>` docs",
+  "body": "For https://github.com/conan-io/conan/pull/15274",
+  "fetched_at": "2026-08-02T05:53:51.160Z",
+  "status": "ok"
+}

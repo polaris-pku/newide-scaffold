@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13467",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13467,
+  "title": "trying to recover the deps options default",
+  "body": "Changelog: Fix: Allow again to specify ``self.options[\"mydep\"].someoption=value``, equivalent to ``\"mydep/*\"``.\r\nDocs: Omit\r\n\r\n\r\nClose https://github.com/conan-io/conan/issues/13465\r\nClose https://github.com/conan-io/conan/issues/13417\r\nClose https://github.com/conan-io/conan/issues/13383",
+  "fetched_at": "2026-08-02T06:36:55.816Z",
+  "status": "ok"
+}

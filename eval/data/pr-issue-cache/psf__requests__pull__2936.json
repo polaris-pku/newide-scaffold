@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2936",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2936,
+  "title": "Handle bytes and unicode URLs for netloc",
+  "body": "Spotted this on my local machine running tests on Python 3. Annoyingly, we didn't see this on the CI rig because the Jenkins box doesn't have a netrc file, so it never gets that far in the function.\n\nHowever, tests preparing bytes URLs fail here on Python 3 because the splitter is the wrong type. This change ensures that we use the appropriate type.\n\nFeels like this is safe for 2.9.1.",
+  "fetched_at": "2026-08-02T06:42:48.347Z",
+  "status": "ok"
+}

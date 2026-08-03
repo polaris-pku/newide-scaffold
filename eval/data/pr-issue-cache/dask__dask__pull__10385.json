@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10385",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10385,
+  "title": "Fix typo in `_clean_ipython_traceback`",
+  "body": "Regression from #10354 - exception types of unhandled exceptions in ipython contexts were mangled and always set to `type`.\r\n\r\nTo reproduce, run the following in a jupyter notebook cell with dask 2023.6.1:\r\n\r\n```python\r\nimport dask\r\nraise TypeError(\"wat\")\r\n```\r\n\r\nThen, observe the websocket connection to jupyter; the message with `msg_type=\"error\"` looks like this:\r\n\r\n![image](https://github.com/dask/dask/assets/5778/088f3a13-de7f-4430-a01a-63fc9e6ac3ec)\r\n\r\nNotice `content[\"ename\"]` is set to `\"type\"`.\r\n\r\nWith dask 2023.6.0, `content[\"ename\"]` is properly set to `\"TypeError\"`:\r\n\r\n![image](https://github.com/dask/dask/assets/5778/095b740b-5a54-4ebd-8ae4-781bcd143b45)\r\n\r\nThese values aren't inconsequential - they end up being serialized into the `ipynb` file, and cause hard to debug issues.\r\n\r\n(nb: I would prefer if this kind of issue was not something that can be caused by `import dask`, by opting in to this functionality by configuration or actively registering the hook functions)\r\n\r\n- [ ] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nThanks to @matbryan52 for the help debugging this.",
+  "fetched_at": "2026-08-02T06:41:03.523Z",
+  "status": "ok"
+}

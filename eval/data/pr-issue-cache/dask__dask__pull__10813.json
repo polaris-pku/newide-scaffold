@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10813",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10813,
+  "title": "Misc Adjust remaining tests in dask/dask",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:42:08.525Z",
+  "status": "ok"
+}

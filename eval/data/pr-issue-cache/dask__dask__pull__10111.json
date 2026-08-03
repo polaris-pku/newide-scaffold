@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10111",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10111,
+  "title": "Avoid deprecated `GroupBy.dtypes`",
+  "body": "Following this change in upstream:\r\n\r\n* https://github.com/pandas-dev/pandas/pull/51997\r\n\r\nXref https://github.com/dask/dask/issues/10089.\r\n\r\nFixes this failure in upstream build:\r\n\r\n```\r\nFutureWarning: DataFrameGroupBy.dtypes is deprecated and will be removed in a future version. Check the dtypes on the base object instead\r\n```\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:48.733Z",
+  "status": "ok"
+}

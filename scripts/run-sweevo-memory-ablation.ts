@@ -160,11 +160,15 @@ baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ??= 'hash';
 if (baseEnv.NEWIDE_B_EMBEDDING_PROVIDER === 'hash') {
   baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ??= '32';
 }
+// SWE-EVO paper alignment: deny WebFetch/WebSearch and network Bash at ACP permission gate.
+// Override with NEWIDE_SWE_EVO_BLOCK_INTERNET=0 only for debugging.
+baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET ??= '1';
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
 log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
+log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
 
 const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> = [];
 
@@ -304,6 +308,7 @@ async function runOneInstance(input: {
       outRoot: path.join(armDir, 'worktrees', runKey),
     });
     row.worktree_path = prepared.worktreePath;
+    await writeEvalOfflineClaudeSettings(prepared.worktreePath);
 
     const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
       prompt: buildPrompt(instance),
@@ -432,6 +437,12 @@ function buildPrompt(instance: SweEvoInstance): string {
     'Produce a minimal correct patch that addresses the problem statement.',
     'Do not modify benchmark tests or add test files; the harness injects its own hidden test patch.',
     '',
+    'Offline evaluation constraints (SWE-EVO paper alignment):',
+    '- You have NO internet access. Do not use WebFetch, WebSearch, or any browser tool.',
+    '- Do not use shell/network commands (curl, wget, gh, Invoke-WebRequest, etc.) to reach GitHub or any remote host.',
+    '- URLs in the problem statement are citations only; reason from the provided text and the local workspace at base_commit.',
+    '- Do not fetch or apply remote PR patches; solve from the local tree + problem statement alone.',
+    '',
     `Repository: ${instance.repo}`,
     `Instance: ${instance.instance_id}`,
     `Base commit: ${instance.base_commit}`,
@@ -439,6 +450,32 @@ function buildPrompt(instance: SweEvoInstance): string {
     'Problem statement:',
     instance.problem_statement,
   ].join('\n');
+}
+
+/** Defense-in-depth Claude Code deny list for SWE-EVO offline eval. */
+async function writeEvalOfflineClaudeSettings(worktreePath: string): Promise<void> {
+  if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET !== '1') return;
+  const claudeDir = path.join(worktreePath, '.claude');
+  await fs.mkdir(claudeDir, { recursive: true });
+  const settings = {
+    permissions: {
+      deny: [
+        'WebFetch',
+        'WebSearch',
+        'WebFetch(*)',
+        'Bash(curl *)',
+        'Bash(wget *)',
+        'Bash(gh *)',
+        'Bash(Invoke-WebRequest *)',
+        'Bash(iwr *)',
+      ],
+    },
+  };
+  await fs.writeFile(
+    path.join(claudeDir, 'settings.json'),
+    `${JSON.stringify(settings, null, 2)}\n`,
+    'utf-8',
+  );
 }
 
 function emptyTokenUsage(

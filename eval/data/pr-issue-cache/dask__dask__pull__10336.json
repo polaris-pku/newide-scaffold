@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10336",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10336,
+  "title": "Validate that rechunking is possible earlier in graph generation",
+  "body": "This PR consolidates (almost) all validation and moves it to an earlier point in graph generation to avoid duplication between task-based and P2P-based rechunking (https://github.com/dask/distributed/pull/7856/files#r1205195557)\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:41.974Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15257",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15257,
+  "title": "[command][cache path] Raising error if folder path does not exist",
+  "body": "Changelog: Feature: `conan cache path xxx --folder xxxx` raises an error if the folder requested does not exist.\r\nDocs: omit",
+  "fetched_at": "2026-08-02T06:01:38.953Z",
+  "status": "ok"
+}

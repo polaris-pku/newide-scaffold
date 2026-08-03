@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3120",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3120,
+  "title": "document ``self.options.update()`` for ``init()`` base class extension",
+  "body": "Docs for https://github.com/conan-io/conan/pull/13487",
+  "fetched_at": "2026-08-02T06:36:54.365Z",
+  "status": "ok"
+}

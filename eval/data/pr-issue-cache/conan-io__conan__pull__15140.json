@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15140",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15140,
+  "title": "Try to address NMakeDeps quoting issues",
+  "body": "Changelog: Bugfix: Fix NMakeDeps quoting issues.\r\nDocs: Omit\r\n\r\nThis is a first try, need to double check with @uilianries (Thanks to @danimtb for checking this locally for me!)\r\n\r\ncc @SpaceIm \r\n\r\nhttps://learn.microsoft.com/en-us/cpp/build/reference/d-preprocessor-definitions?view=msvc-170#remarks\r\n\r\nCloses #13603",
+  "fetched_at": "2026-08-02T06:36:22.793Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2187",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2187,
+  "title": "Document Timeout behaviour",
+  "body": "Adds better documentation of `timeout` behavior\n- \"How long to wait for the server to send data before giving up, as a float, or a (connect timeout, read timeout) tuple.\" was as short as I could get to accurately describe the behavior.\n- Sphinx puts the description of timeouts on the line below the parameter name, but this is not true for other parameters. I'm curious why this is but I can't see any differences.\n- We don't use the `stream` parameter anywhere in the `adapters.send` method, so I removed the \"Behavior\" section that described the behavior of requests incorrectly. May also want to remove the parameter description from the documentation, or state that it's not actually used anywhere.",
+  "fetched_at": "2026-08-02T06:42:35.480Z",
+  "status": "ok"
+}

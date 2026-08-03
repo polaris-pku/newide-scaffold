@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10380",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10380,
+  "title": "Catch exceptions when attempting to load CLI entry points",
+  "body": "- [x] Closes #10379\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:02.263Z",
+  "status": "ok"
+}

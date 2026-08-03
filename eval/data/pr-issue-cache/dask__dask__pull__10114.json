@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10114",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10114,
+  "title": "Make `dask.compatibility` private",
+  "body": "xref https://github.com/dask/dask/pull/10113#pullrequestreview-1354876683\r\n\r\nIn `dask-kubernetes` we were using `dask.compatibility.entry_points` which were recently removed (#10070) and restored again (#10113). @jrbourbeau mentioned that `dask.compatibility` is not intended to be used outside of `dask` so opening this PR to rename it to `dask._compatibility` with a fallback shim and deprecation warning.\r\n\r\n_Side note: This could probably be done for a bunch of code throughout `dask` and `distributed` to reduce maintenance burden and avoid future breakages. If other folks think this would be helpful I'd be happy to help with this effort._",
+  "fetched_at": "2026-08-02T06:40:34.224Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10377",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10377,
+  "title": "Add clarification about output shape and reshaping in rechunk documentation",
+  "body": "- [] Closes #10361\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:07.587Z",
+  "status": "ok"
+}

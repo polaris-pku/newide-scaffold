@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10190",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10190,
+  "title": "Add `python-cityhash` to CI environments",
+  "body": "Now that `python-cityhash` is on conda-forge, we should be good to add this to our CI environments along with the other hasher libraries.\r\n\r\n- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:07.320Z",
+  "status": "ok"
+}

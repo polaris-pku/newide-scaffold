@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10191",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10191,
+  "title": "Update `dataframe.convert_string` to `dataframe.convert-string`",
+  "body": "Cosmetic change, just to be consistent with the rest of the config settings.\r\n\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:06.071Z",
+  "status": "ok"
+}

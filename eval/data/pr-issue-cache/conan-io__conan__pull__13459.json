@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13459",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13459,
+  "title": "Add tools.android:cmake_legacy_toolchain config",
+  "body": "Changelog: Feature: Add `tools.android:cmake_legacy_toolchain` configuration useful when building CMake projects for Android. If defined, this will set the value of `ANDROID_USE_LEGACY_TOOLCHAIN_FILE`. It may be useful to set this to `False` if compiler flags are defined via `tools.build:cflags` or `tools.build:cxxflags` to prevent Android's legacy CMake toolchain from overriding the values.\r\n\r\nDocs: https://github.com/conan-io/docs/pull/3146\r\n\r\nClose https://github.com/conan-io/conan/issues/13374",
+  "fetched_at": "2026-08-02T06:36:46.012Z",
+  "status": "ok"
+}

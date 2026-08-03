@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/6028",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 6028,
+  "title": "Fix auth parsing for proxies",
+  "body": "Thanks to @adamp01 and @racam for quickly helping us find this. Moving from `urlparse` to `parse_url` has led to Requests dropping the `auth` portion of proxy URLs. This patch will manually add it if present, returning us to our previous behavior.\r\n\r\nThis closes #6027.",
+  "fetched_at": "2026-08-02T06:42:34.143Z",
+  "status": "ok"
+}

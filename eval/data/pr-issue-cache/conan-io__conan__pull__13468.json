@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13468",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13468,
+  "title": "fix [system_tools] profile composition",
+  "body": "Changelog: Bugfix: Fix ``[system_tools]`` profile composition.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/13460",
+  "fetched_at": "2026-08-02T06:37:10.174Z",
+  "status": "ok"
+}

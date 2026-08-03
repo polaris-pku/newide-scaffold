@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10819",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10819,
+  "title": "np.unique(): inverse is shaped in numpy 2",
+  "body": "- Part of #10593",
+  "fetched_at": "2026-08-02T06:42:06.009Z",
+  "status": "ok"
+}

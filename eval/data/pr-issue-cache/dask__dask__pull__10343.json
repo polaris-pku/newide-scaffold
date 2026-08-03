@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10343",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10343,
+  "title": "Add rechunk config values to yaml",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:00.994Z",
+  "status": "ok"
+}

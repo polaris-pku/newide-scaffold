@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10804",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10804,
+  "title": "Improve tests for `to_numeric`",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:42:17.835Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10173",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10173,
+  "title": "Fix failing tests under copy-on-write",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\nSmall updates. ChainedIndexing will stop working with CoW in all cases",
+  "fetched_at": "2026-08-02T06:40:12.575Z",
+  "status": "ok"
+}

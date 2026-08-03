@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2210",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2210,
+  "title": "Fix #2207",
+  "body": "@Lukasa wrote the fix in #2207 \n\nWith this, the expected behaviour is restored (a `TooManyRedirects` error);\n\n``` pycon\n>>> import requests\n>>> r = requests.get('http://www.dx.com/p/-268479')\nTraceback (most recent call last):\n  File \"<stdin>\", line 1, in <module>\n  File \"./requests/api.py\", line 59, in get\n    return request('get', url, **kwargs)\n  File \"./requests/api.py\", line 48, in request\n    return session.request(method=method, url=url, **kwargs)\n  File \"./requests/sessions.py\", line 451, in request\n    resp = self.send(prep, **send_kwargs)\n  File \"./requests/sessions.py\", line 583, in send\n    history = [resp for resp in gen] if allow_redirects else []\n  File \"./requests/sessions.py\", line 583, in <listcomp>\n    history = [resp for resp in gen] if allow_redirects else []\n  File \"./requests/sessions.py\", line 111, in resolve_redirects\n    raise TooManyRedirects('Exceeded %s redirects.' % self.max_redirects)\nrequests.exceptions.TooManyRedirects: Exceeded 30 redirects.\n```",
+  "fetched_at": "2026-08-02T06:42:43.129Z",
+  "status": "ok"
+}

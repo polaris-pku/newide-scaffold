@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/11023",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 11023,
+  "title": "Fix value_counts raising if branch exists of nans only",
+  "body": "- [x] Closes #11011\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:42:25.310Z",
+  "status": "ok"
+}

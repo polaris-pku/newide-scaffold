@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10354",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10354,
+  "title": "Cleanup remote tracebacks",
+  "body": "Adds a utility function `shorten_traceback`, and wraps `sys.excepthook` to apply it to unhandled exceptions.\r\n\r\nThe behavior of the function is controlled by several settings:\r\n\r\n* `admin.traceback.shorten.when`\r\n* `admin.traceback.shorten.what`\r\n\r\nIf both are non-empty,  and any of the stack frames match a pattern listed in `admin.traceback.shorten.when`, stack trace is shortened. Frames that match a pattern listed in `admin.traceback.shorten.what` are omitted. The method always preserves the first and last stack frame though.\r\n\r\nFor `IPython`, instead of `sys.excepthook`,  a custom exception handler is provided.\r\n\r\nThe second part - adding worker info to the remote exception - is implemented in https://github.com/dask/distributed/pull/7847.\r\n\r\nIssue: https://github.com/dask/distributed/issues/4880.\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nAs discussed with @crusaderky.",
+  "fetched_at": "2026-08-02T06:40:38.276Z",
+  "status": "ok"
+}

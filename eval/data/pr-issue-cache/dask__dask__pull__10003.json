@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10003",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10003,
+  "title": "Switch to `Generator` for random number generation in `dask.array`",
+  "body": "Use ``Generator`` internally instead of ``RandomState`` for random number generation. ``Generator`` based random number generation was introduced via e2c74 and brings improvements compared to now-maintenance-only `RandomState` class. Basically we\r\n- use `da.random.default_rng()` to create a `Generator` based random number generator\r\n- make sure we use the correct distribution names for the new `Generator` class (`randint` -> `integers` and so on)\r\n\r\nSee https://numpy.org/doc/stable/reference/random/index.html for further details.\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:15.142Z",
+  "status": "ok"
+}

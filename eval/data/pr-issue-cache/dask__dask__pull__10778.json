@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10778",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10778,
+  "title": "Updates to deployment docs",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\nFollow-up to https://github.com/dask/dask/pull/10680\r\n\r\ncc @jrbourbeau @mrocklin",
+  "fetched_at": "2026-08-02T06:42:13.544Z",
+  "status": "ok"
+}

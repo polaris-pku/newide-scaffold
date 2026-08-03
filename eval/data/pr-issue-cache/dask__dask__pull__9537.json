@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9537",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9537,
+  "title": "Update Parquet best practice",
+  "body": "This was pretty old.  This shifts the language to think more about speed/storage/consistency tradeoffs rather than ease of parallel loading (which was true regardless).  We also drop the mention to Impala (somewhat dated).",
+  "fetched_at": "2026-08-02T06:39:29.608Z",
+  "status": "ok"
+}

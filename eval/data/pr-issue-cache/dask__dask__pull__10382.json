@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10382",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10382,
+  "title": "Do not derive from ``scipy.stats.chisquare`` docstring",
+  "body": "- [x] Closes #10381 \r\n- ~[x] Tests added / passed~\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\n`scipy.stats.chisquare` recently started using a `doi` Sphinx directive that exists in their repo but it's not importable. This is breaking dask docs generation. We can just point folks to that docstring instead of deriving from it.\r\n\r\nfor reference here is the PR in scipy: https://github.com/scipy/scipy/pull/17682",
+  "fetched_at": "2026-08-02T06:41:12.551Z",
+  "status": "ok"
+}

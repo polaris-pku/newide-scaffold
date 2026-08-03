@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10798",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10798,
+  "title": "Fix test-report cache key indent",
+  "body": "Follow up to #10783 \r\nThink the `key` indent went bad during a commit of suggestion.",
+  "fetched_at": "2026-08-02T06:42:19.066Z",
+  "status": "ok"
+}

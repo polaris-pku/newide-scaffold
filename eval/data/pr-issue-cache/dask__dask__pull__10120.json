@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10120",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10120,
+  "title": "Maintain annotations in `DataFrame.categorize`",
+  "body": "Sibling to https://github.com/dask/distributed/pull/7708\r\n\r\n- [x] Closes #10118 \r\n- [ ] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:59.443Z",
+  "status": "ok"
+}

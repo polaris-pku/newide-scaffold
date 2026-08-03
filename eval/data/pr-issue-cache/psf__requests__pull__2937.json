@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2937",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2937,
+  "title": "Release 2.9.1",
+  "body": "This release is scheduled for Monday. I'm aiming to set this up now so that it's an easy release to push on Monday.\n\n@shazow, what are the odds that we can get a urllib3 patch release 1.13.1 containing the fix for shazow/urllib3#761 by Monday? I'd owe you lots of :custard: if we could get it! :heart:",
+  "fetched_at": "2026-08-02T06:42:49.604Z",
+  "status": "ok"
+}

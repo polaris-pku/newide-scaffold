@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10371",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10371,
+  "title": "Remove no longer supported ``clip_lower`` and ``clip_upper``",
+  "body": "- [x] Passes `pre-commit run --all-files`\r\n\r\nThese have been removed ages ago (pandas 1.0 or even earlier). They don't work anymore, so no need to keep them around\r\n\r\nSame for ``get_dtype_counts`` and ``get_ftype_counts``",
+  "fetched_at": "2026-08-02T06:40:35.542Z",
+  "status": "ok"
+}

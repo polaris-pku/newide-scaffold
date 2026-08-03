@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3484",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3484,
+  "title": "Add `core:warnings_as_errors` conf docs",
+  "body": "For https://github.com/conan-io/conan/pull/15149",
+  "fetched_at": "2026-08-02T06:18:21.262Z",
+  "status": "ok"
+}

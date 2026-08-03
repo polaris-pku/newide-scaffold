@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13496",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13496,
+  "title": "fix python-requires in remote for export-pkg",
+  "body": "Changelog: Bugfix: Fix ``python-requires`` in remotes when running ``conan export-pkg``.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/13495",
+  "fetched_at": "2026-08-02T06:37:07.557Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13470",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13470,
+  "title": "Add basic package filter for conan list html output",
+  "body": "Changelog: Feature: Add filtering for options and settings in conan list html output.\r\nDocs: omit\r\n\r\nThis is also passing the arguments from the cli to show the input in the top navbar in the html\r\n\r\n![image](https://user-images.githubusercontent.com/5045666/225901759-514caf02-4cac-4882-9c72-167e0bd82225.png)",
+  "fetched_at": "2026-08-02T06:36:43.336Z",
+  "status": "ok"
+}

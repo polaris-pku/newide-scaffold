@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/11027",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 11027,
+  "title": "Fix ci for upstream pandas changes",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:42:24.052Z",
+  "status": "ok"
+}

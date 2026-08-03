@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10313",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10313,
+  "title": "Warn consistently for ``inplace`` in ``Series.rename``",
+  "body": "The previous warning seemed very inconsistent",
+  "fetched_at": "2026-08-02T06:41:06.191Z",
+  "status": "ok"
+}

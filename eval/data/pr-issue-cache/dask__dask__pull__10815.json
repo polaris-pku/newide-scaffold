@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10815",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10815,
+  "title": "Filter warnings from std test",
+  "body": "- [x] Closes #10651\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\nThese warnings should be caught in pandas already but something is off in our test suite, so just ignore those in our test suite",
+  "fetched_at": "2026-08-02T06:42:11.016Z",
+  "status": "ok"
+}

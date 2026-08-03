@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/6029",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 6029,
+  "title": "v2.27.1",
+  "body": "2.27.1 (2022-01-05)\r\n-------------------\r\n\r\n**Bugfixes**\r\n\r\n- Fixed parsing issue that resulted in the `auth` component being\r\n  dropped from proxy URLs. (#6028)",
+  "fetched_at": "2026-08-02T06:42:32.741Z",
+  "status": "ok"
+}

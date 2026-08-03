@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10814",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10814,
+  "title": "Restrict test to Arrow only",
+  "body": "- [ ] Closes #8062\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:42:09.817Z",
+  "status": "ok"
+}

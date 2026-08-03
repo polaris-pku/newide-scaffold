@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3492",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3492,
+  "title": "cmakedeps_legacy",
+  "body": "Docs for https://github.com/conan-io/conan/pull/15207",
+  "fetched_at": "2026-08-02T06:06:05.950Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15207",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15207,
+  "title": "Feature/cmakedeps legacy adapter",
+  "body": "Changelog: Feature: Make ``CMakeDeps`` generator create a ``conandeps.cmake`` that aggregates all direct dependencies in a ``cmake``-like generator style.\r\nDocs: https://github.com/conan-io/docs/pull/3492\r\n\r\n\r\nClose https://github.com/conan-io/conan/issues/14623",
+  "fetched_at": "2026-08-02T06:04:59.284Z",
+  "status": "ok"
+}

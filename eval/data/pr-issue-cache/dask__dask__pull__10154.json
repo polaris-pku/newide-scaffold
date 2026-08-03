@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10154",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10154,
+  "title": "Updates for `Index` supporting `numpy` numeric dtypes",
+  "body": "Fix for upstream failures on Windows related to index dtype changes in `pandas>=2`.\r\n\r\nThe failures are related to `dtype`, not platform, but only show up on Windows in our test suite because `np.random` is an `int32` there.\r\n\r\nXref https://github.com/pandas-dev/pandas/pull/51139.\r\n\r\n- [x] Closes https://github.com/dask/dask/issues/10146\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:53.257Z",
+  "status": "ok"
+}

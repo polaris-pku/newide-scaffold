@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15153",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15153,
+  "title": "proposal for source() buildenv discussion",
+  "body": "Changelog: Feature: Allow ``tool-requires`` to be used in ``source()`` method injecting environment.\r\nDocs: https://github.com/conan-io/docs/pull/3493\r\n\r\nClose https://github.com/conan-io/conan/issues/15152",
+  "fetched_at": "2026-08-02T06:12:46.607Z",
+  "status": "ok"
+}

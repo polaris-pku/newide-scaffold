@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9988",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9988,
+  "title": "Drop distributed pack",
+  "body": "Counterpart to https://github.com/dask/distributed/pull/7564",
+  "fetched_at": "2026-08-02T06:40:32.917Z",
+  "status": "ok"
+}

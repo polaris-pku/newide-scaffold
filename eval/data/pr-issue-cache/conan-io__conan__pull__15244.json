@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15244",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15244,
+  "title": "fix deploy absolute folders",
+  "body": "Changelog: Bugfix: Do not relativize absolute paths in ``deployers``.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/15242",
+  "fetched_at": "2026-08-02T06:36:17.095Z",
+  "status": "ok"
+}

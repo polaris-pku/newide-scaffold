@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15174",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15174,
+  "title": "Removed conan migration compatibility warning",
+  "body": "Changelog: Feature: Removed a warning about a potential issue with conan migration that would print every time a build failed.\r\nDocs: Omit\r\n\r\nRemoved the corresponding test that was checking that the error would print.\r\n\r\nCloses #15161",
+  "fetched_at": "2026-08-02T06:09:26.256Z",
+  "status": "ok"
+}

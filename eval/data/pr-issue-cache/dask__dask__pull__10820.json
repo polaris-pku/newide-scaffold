@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10820",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10820,
+  "title": "Pin ``test_split_adaptive_files`` to pyarrow engine",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\nThis is another test that is failing occasionally with fast parquet, so lets just pin to pyarrow",
+  "fetched_at": "2026-08-02T06:42:07.242Z",
+  "status": "ok"
+}

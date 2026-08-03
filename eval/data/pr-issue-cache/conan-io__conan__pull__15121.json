@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15121",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15121,
+  "title": "Add `stderr` capture argument to conanfile's `run()` method",
+  "body": "Changelog: Feature: Add `stderr` capture argument to conanfile's `run()` method.\r\nDocs: https://github.com/conan-io/docs/pull/3482\r\n\r\nTo discuss with the team if we want this feature, but it was so simple to implement that I decided to create the PR before discussing it (Not sold on the test, I would like a better method to test stderr that does not rely on descriptor copying)\r\n\r\nAdded as a last argument because I'm afraid some users are relying on the order of the parameters so it did not feel right to add it after stdout\r\n\r\nCloses #15118",
+  "fetched_at": "2026-08-02T06:22:48.252Z",
+  "status": "ok"
+}

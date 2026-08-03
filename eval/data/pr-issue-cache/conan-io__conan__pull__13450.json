@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13450",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13450,
+  "title": "fix meson cpp_std for VS2019 and 2022 c++20.",
+  "body": "Changelog: Fix: Generate `cpp_std=vc++20` for c++20 with meson with VS2019 and VS2022, rather than `vc++latest`.\r\nDocs: Omit\r\n\r\nFixes #13424\r\n\r\nNote meson 1.0.1 is required for it (meson) to accept `vc++20` with clang-cl.\r\n\r\nGiven the comment about `_msvc_supported_cppstd` in the issue, I've made a slight change from the version there. It looks like `_msvc_supported_cppstd` reports VS2019 as only supporting up to c++20, so I've kept c++23 as VS2022 only in this version.\r\n\r\nThanks",
+  "fetched_at": "2026-08-02T06:36:57.100Z",
+  "status": "ok"
+}

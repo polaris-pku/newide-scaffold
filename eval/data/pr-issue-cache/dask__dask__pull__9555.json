@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9555",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9555,
+  "title": "Fix array copy not being a no-op",
+  "body": "- [x] Closes #9533\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nSee #9533 for details. This reverts the logic implemented in #3754 which was a fix for #3751.\r\n\r\nCC @DPeterK who made the original #3751 issue.\r\n\r\nThe summary is that users shouldn't assume anything about a dask Array's memory allocation or usage. Doing an `Array.copy` may return the same block of allocated memory once computed as its `from_array` input or it may return a newly allocated block of memory. Dask has the possibility of using memory however it deems is the most efficient or at least that's the idea. The thing that should be consistent is that doing a no-op operation (like `.copy` is currently documented as) should not add additional tasks to the dask graph.\r\n\r\n```\r\n    x = np.arange(10)\r\n    y = da.from_array(x, chunks=chunks)\r\n    y_c = y.copy()\r\n    assert y.name == y_c.name\r\n```",
+  "fetched_at": "2026-08-02T06:39:16.366Z",
+  "status": "ok"
+}

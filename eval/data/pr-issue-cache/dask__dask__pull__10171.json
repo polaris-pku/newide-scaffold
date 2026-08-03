@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10171",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10171,
+  "title": "`GroupBy.cov` raising for non-numeric grouping column",
+  "body": "- [ ] Closes #xxxx\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nCame across this when looking into non nano support in groupby",
+  "fetched_at": "2026-08-02T06:39:52.008Z",
+  "status": "ok"
+}

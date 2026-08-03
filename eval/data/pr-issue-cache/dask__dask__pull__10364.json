@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10364",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10364,
+  "title": "Use general `kwargs` in `pyarrow_table_dispatch` functions",
+  "body": "Follow-up to https://github.com/dask/dask/pull/10312, where we added `to`/`from_pyarrow_table_dispatch`.\r\n\r\nIn that PR, we decided to be explicit about the specific set of key-word arguments to support within the new pyarrow-conversion functions. However, https://github.com/dask/distributed/pull/7896 quickly demonstrated (to me) that we are probably going to end up wasting a lot of time adding key-word arguments one-by-one to `dask/dask` as the p2p algorithm evolves in `dask/distributed`.\r\n\r\nIn this PR, I propose that we go back to using  `kwargs`, and simply require any non-pandas backends to account for the fact that `pyarrow.Table.to_pandas` and `pyarrow.Table.to_pandas` key-word arguments are \"allowed\".",
+  "fetched_at": "2026-08-02T06:40:53.209Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3495",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3495,
+  "title": "Docs for replace_requires, replace_tool_requires, platform_requires and platform_tool_requires profile sections",
+  "body": "Docs for https://github.com/conan-io/conan/pull/15136 and https://github.com/conan-io/conan/pull/14871",
+  "fetched_at": "2026-08-02T06:21:41.541Z",
+  "status": "ok"
+}

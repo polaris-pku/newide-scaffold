@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10797",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10797,
+  "title": "Rename shuffle to shuffle_method in remaining methods",
+  "body": "- [x] Closes #10782\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\n---\r\n\r\nIs there suppose to be a deprecation period before this renaming?",
+  "fetched_at": "2026-08-02T06:41:31.671Z",
+  "status": "ok"
+}

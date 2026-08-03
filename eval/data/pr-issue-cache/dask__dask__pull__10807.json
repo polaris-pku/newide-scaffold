@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10807",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10807,
+  "title": "Unblock documentation build",
+  "body": "- [ ] Part of #10805 \r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nJust restricting the newish slew of releases from sphinxcontrib which made the `sphinx>=5` start failing. Feel free to merge this now, while I still poke at who's causing the <=4.5.0 restriction.\r\n\r\n---\r\n\r\nCaused by `dask-sphinx-theme` pinned to `sphinx-book-theme==0.2.0` which requires sphinx<5.\r\nxref https://github.com/dask/dask-sphinx-theme/issues/68",
+  "fetched_at": "2026-08-02T06:42:14.828Z",
+  "status": "ok"
+}

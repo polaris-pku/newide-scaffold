@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9936",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9936,
+  "title": "Add a CLI command to `list` and `get` a value from dask config",
+  "body": "Adds two cli commands, `git config get` to get a value from dask config:\r\n\r\n```yaml\r\n> dask config get distributed.scheduler.dashboard\r\nbokeh-application:\r\n  allow_websocket_origin:\r\n  - '*'\r\n  check_unused_sessions_milliseconds: 500\r\n  keep_alive_milliseconds: 500\r\nstatus:\r\n  task-stream-length: 1000\r\ntasks:\r\n  task-stream-length: 100000\r\ntls:\r\n  ca-file: null\r\n  cert: null\r\n  key: null\r\n```\r\n\r\nor `git config list` to print the whole config:\r\n\r\n```yaml\r\n> dask config list\r\narray:\r\n  backend: numpy\r\n  slicing:\r\n    split-large-chunks: null\r\n  svg:\r\n    size: 120\r\ncoiled:\r\n...\r\n```\r\n\r\nPartially implements #9746.\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:46.219Z",
+  "status": "ok"
+}

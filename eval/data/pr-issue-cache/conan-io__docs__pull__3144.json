@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3144",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3144,
+  "title": "Docs for conan remove *#!latest",
+  "body": "Docs for https://github.com/conan-io/conan/pull/13505",
+  "fetched_at": "2026-08-02T06:36:39.173Z",
+  "status": "ok"
+}

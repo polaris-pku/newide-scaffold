@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3137",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3137,
+  "title": "add conanfile arg to cmd_wrapper()",
+  "body": "Docs for https://github.com/conan-io/conan/pull/13564",
+  "fetched_at": "2026-08-02T06:37:03.266Z",
+  "status": "ok"
+}

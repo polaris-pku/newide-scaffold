@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10863",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10863,
+  "title": "Refactor: move tests for tokenize() to its own module",
+  "body": "Tokenization is a complicated matter.\nReorganize all the tests for tokenize() and its helper normalize_token() into their own separate test module.\nThis PR is a verbatim cut+paste.",
+  "fetched_at": "2026-08-02T06:41:36.840Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10312",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10312,
+  "title": "Add dispatching mechanisms for `pyarrow.Table` conversion",
+  "body": "Supports https://github.com/dask/distributed/pull/7743\r\n\r\nThe \"p2p\" shuffling algorithm is very useful for pandas-backed collections. However, it does not support cudf-backed collections, because it uses pandas-specific logic to convert between `DataFrame` and `pyarrow.Table` objects. This approach was likely motivated by the fact that dask does not provide any dispatching mechanisms for this kind of conversion. This PR proposes such a mechanism.\r\n\r\n**NOTE**: Although it is relatively simple to dispatch `DataFrame`-to-`pyarrow.Table` conversion, the reverse logic is much less obvious. If a task/worker only has access to a `pyarrow.Table` object, there is no way for the `pyarrow.Table` type alone to dictate which `from_pyarrow_table_dispatch` function should be used to create a `DataFrame` object. ~The solution proposed in this PR is to convert to `pd.DataFrame` by default, but to use the path defined in the tables metadata for the `b\"dataframe_backend\"` field (when present).~ [**EDIT**: Since the p2p algorithm now passes in a `meta` object to the `shuffle_unpack` function, we no longer need to use custom pyarrow metadata to label the backend dataframe library]",
+  "fetched_at": "2026-08-02T06:40:39.529Z",
+  "status": "ok"
+}

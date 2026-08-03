@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2195",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2195,
+  "title": "Add betterssl extra",
+  "body": "Fixes #1995",
+  "fetched_at": "2026-08-02T06:42:39.251Z",
+  "status": "ok"
+}

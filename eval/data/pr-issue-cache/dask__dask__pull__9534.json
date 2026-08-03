@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9534",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9534,
+  "title": "Fix project CSV columns when selecting",
+  "body": "- [x] Closes #9518\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:28.286Z",
+  "status": "ok"
+}

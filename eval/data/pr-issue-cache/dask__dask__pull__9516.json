@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9516",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9516,
+  "title": "Groupby median",
+  "body": "Implements groupby/median, both as a single function and as a dictionary-based agg spec. We take a similar approach to groupby/apply, in that we shuffle based on the group keys before performing an embarassingly parallel groupby/agg. \r\n\r\nThis is similar to #9302, but with the important difference that the initial aggregation cannot actually do any aggregation, since we must have the full group together to perform an exact group-wise aggregation. On the other hand, we can't do a naive groupby/apply due to needing to specifically handle the `observed` keyword for grouping by categoricals. So instead the initial aggregation is replaced by an initial set-index, with special handling for `observed` to make sure the unobserved keys show up as expected. This is not the only possible approach, but does the job.\r\n\r\n- [x] Closes #9489 \r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:15.048Z",
+  "status": "ok"
+}

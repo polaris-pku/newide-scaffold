@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13564",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13564,
+  "title": "cmd_wrapper must get the conanfile argument",
+  "body": "Changelog: Bugfix: ``cmd_wrapper`` added missing parameter ``conanfile``.\r\nDocs: https://github.com/conan-io/docs/pull/3137",
+  "fetched_at": "2026-08-02T06:37:01.831Z",
+  "status": "ok"
+}

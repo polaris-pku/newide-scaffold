@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2199",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2199,
+  "title": "Open README and HISTORY as utf-8 encoded files (fixes #2196)",
+  "body": "This is a fix for #2196 where if you tried running setup.py with some LANG it would throws an exception when reading HISTORY with non-ascii characters.\n\nTry it with\n\n```\nLANG=C python setup.py\n```",
+  "fetched_at": "2026-08-02T06:42:40.476Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10309",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10309,
+  "title": "Fix `H5FD_lock` error when writing to hdf with distributed client",
+  "body": "When writing a single HDF with multiple datasets, it is possible to get a concurrency error even when locking is enabled (`lock=True`), if the cluster is using processes. When we have a distributed client with processes, it feels logical that a lock from `multiprocessing` should be used. I don't have enough experience in this area of code, so I may be missing something here.\r\n\r\n- [x] Closes https://github.com/dask/dask/issues/9972\r\n- [x] Closes https://github.com/dask/dask/issues/10315\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:45.755Z",
+  "status": "ok"
+}

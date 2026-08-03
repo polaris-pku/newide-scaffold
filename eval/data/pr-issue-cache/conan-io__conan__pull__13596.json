@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13596",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13596,
+  "title": "fixing cached var find_library()",
+  "body": "Changelog: Bugfix: Fixed ``CMakeDeps`` not clearing ``CONAN_SHARED_FOUND_LIBRARY`` var in ``find_library()``.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/13512",
+  "fetched_at": "2026-08-02T06:36:58.962Z",
+  "status": "ok"
+}

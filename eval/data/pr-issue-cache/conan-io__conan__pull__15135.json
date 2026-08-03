@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15135",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15135,
+  "title": "fix migration lru",
+  "body": "Changelog: Bugfix: Fix the 2.0.14 migration to add LRU data to the cache when ``storage_path`` conf is defined.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/pull/15130\r\nClose https://github.com/conan-io/conan/issues/15129",
+  "fetched_at": "2026-08-02T06:36:24.109Z",
+  "status": "ok"
+}

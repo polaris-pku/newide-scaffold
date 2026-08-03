@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10404",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10404,
+  "title": "Add ``_Frame.enforce_runtime_divisions`` method",
+  "body": "Adds a new `_Frame` method to validate that the min and max value of each partition is consistent with the `divisions` metadata at run time. Note that I decided to use \"enforce\" instead of \"ensure\", since ensure suggests that we will be able to somehow fix/adjust the divisions at run time (which we cannot do).\r\n\r\n- [x] Closes #10378\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\n**Other Notes**:\r\n- This functionality feels similar to the `enforce_metadata` argument used by `_Frame.map_partitions`. Perhaps we should add a `enforce_divisions=False` kwarg to `map_partitions`? If so, `_Frame.enforce_runtime_divisions` could simply return a no-op `map_partitions` call with `enforce_divisions=True`.\r\n- I noticed that rules are a little bit tricky for the last partition. For this special cases, the upper division is often set to be **equal** to the maximum value in the partition (rather than being strictly **less than** the upper divisions).",
+  "fetched_at": "2026-08-02T06:41:16.350Z",
+  "status": "ok"
+}

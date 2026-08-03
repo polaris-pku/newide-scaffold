@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2193",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2193,
+  "title": "Capture and re-raise urllib3 ProtocolError",
+  "body": "Fixes #2192",
+  "fetched_at": "2026-08-02T06:42:38.020Z",
+  "status": "ok"
+}

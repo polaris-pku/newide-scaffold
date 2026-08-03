@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10443",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10443,
+  "title": "Enable file mode=\"x\" with a single_file=True for dask dataframe to_csv",
+  "body": "- [x] Closes https://github.com/dask/dask/issues/10442\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nIssue https://github.com/dask/dask/issues/10442 describes two closely related issues.\r\nThis PR addresses the second issue, using file `mode=\"x\"` with a `single_file=True` in dask dataframe `to_csv()`\r\n\r\n@hendrikmakait provides a test demonstrating the problem in the issue, and points out the problematic line here:\r\n> (See https://github.com/dask/dask/pull/10441#discussion_r1293437311 for a pointer to where the problem might be.) cc @benrutter",
+  "fetched_at": "2026-08-02T06:41:17.669Z",
+  "status": "ok"
+}

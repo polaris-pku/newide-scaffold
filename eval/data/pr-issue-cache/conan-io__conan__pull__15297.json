@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15297",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15297,
+  "title": "Make `core:warnings_as_errors` accept a list",
+  "body": "Changelog: Fix: Make `core:warnings_as_errors` accept a list\r\nDocs: Omit\r\n\r\nWIP, uploading to get it out as soon as it's done :)",
+  "fetched_at": "2026-08-02T06:29:28.929Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15170",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15170,
+  "title": "Fix `conan graph info --format=text` being printed to stderr",
+  "body": "Changelog: Fix: Make `conan graph info --format=text` print to stdout.\r\nDocs: Omit\r\n\r\nI've also taken the time to ensure that no other formatter has the same issue - this seems to have been the last remnant.\r\n\r\nCloses #15162",
+  "fetched_at": "2026-08-02T06:36:08.983Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10330",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10330,
+  "title": "Restore ``numba`` in ``upstream`` build",
+  "body": "https://github.com/numba/numba/issues/8615 is closed, so let's see if the `upstream` build works with `numba` included now",
+  "fetched_at": "2026-08-02T06:40:58.175Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3496",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3496,
+  "title": "lock remove",
+  "body": "Docs for https://github.com/conan-io/conan/pull/15284",
+  "fetched_at": "2026-08-02T05:50:30.841Z",
+  "status": "ok"
+}

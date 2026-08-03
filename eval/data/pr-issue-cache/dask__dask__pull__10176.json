@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10176",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10176,
+  "title": "Allow `pyarrow` CI to fail",
+  "body": "This is a follow-up to https://github.com/dask/dask/pull/10097. Now that `pandas=2.0` is out we can now run our `dataframe.convert-string=True` CI build without `continue-on-error: ${{ matrix.extra == 'pyarrow' }}`. Previously we allowed failures in this build because (prior to the `pandas=2.0` release) we needed to use the nightly `pandas` wheel and would pull encounter unrelated failures due to, for example, some non-`pyarrow` related deprecations. \r\n\r\ncc @j-bennet @phofl for visibility",
+  "fetched_at": "2026-08-02T06:40:13.857Z",
+  "status": "ok"
+}

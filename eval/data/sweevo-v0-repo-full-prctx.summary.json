@@ -1,0 +1,111 @@
+{
+  "subset_id": "v0-repo-full",
+  "source_jsonl": "D:\\Code\\NewIDE\\SWE-EVO\\hf_out\\hf_jsonl\\test.jsonl",
+  "out_jsonl": "D:\\Code\\NewIDE\\newide-scaffold\\eval\\data\\sweevo-v0-repo-full-prctx.jsonl",
+  "cache_dir": "D:\\Code\\NewIDE\\newide-scaffold\\eval\\data\\pr-issue-cache",
+  "unique_refs": 257,
+  "fetched_this_run": 0,
+  "cache_hits": 257,
+  "failures": 0,
+  "auth": "token",
+  "instances": [
+    {
+      "instance_id": "conan-io__conan_2.0.14_2.0.15",
+      "refs": 56,
+      "context_ok": 56,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "conan-io__conan_2.0.2_2.0.3",
+      "refs": 30,
+      "context_ok": 30,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2022.9.2_2022.10.0",
+      "refs": 25,
+      "context_ok": 25,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2023.3.2_2023.4.0",
+      "refs": 39,
+      "context_ok": 39,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2023.6.0_2023.6.1",
+      "refs": 21,
+      "context_ok": 21,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2023.6.1_2023.7.0",
+      "refs": 9,
+      "context_ok": 9,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2023.8.0_2023.8.1",
+      "refs": 6,
+      "context_ok": 6,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2023.9.2_2023.9.3",
+      "refs": 4,
+      "context_ok": 4,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2024.1.0_2024.1.1",
+      "refs": 43,
+      "context_ok": 43,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "dask__dask_2024.3.1_2024.4.0",
+      "refs": 9,
+      "context_ok": 9,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "psf__requests_v2.12.2_v2.12.3",
+      "refs": 0,
+      "context_ok": 0,
+      "context_missing": 0,
+      "mode": "release_note_only"
+    },
+    {
+      "instance_id": "psf__requests_v2.27.0_v2.27.1",
+      "refs": 3,
+      "context_ok": 3,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "psf__requests_v2.4.0_v2.4.1",
+      "refs": 8,
+      "context_ok": 8,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    },
+    {
+      "instance_id": "psf__requests_v2.9.0_v2.9.1",
+      "refs": 4,
+      "context_ok": 4,
+      "context_missing": 0,
+      "mode": "release_note_plus_pr_issue"
+    }
+  ]
+}

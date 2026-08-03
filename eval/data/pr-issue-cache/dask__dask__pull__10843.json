@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10843",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10843,
+  "title": "Rename numpy version constants to match pandas",
+  "body": "",
+  "fetched_at": "2026-08-02T06:41:45.704Z",
+  "status": "ok"
+}

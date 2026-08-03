@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15272",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15272,
+  "title": "adding tools.microsoft:winsdk_version conf",
+  "body": "Changelog: Feature: Adding ``tools.microsoft:winsdk_version`` conf to make ``VCVars`` generator to use the given ``winsdk_version``.\r\nDocs: https://github.com/conan-io/docs/pull/3487\r\n\r\nClose https://github.com/conan-io/conan/issues/14383",
+  "fetched_at": "2026-08-02T05:54:57.993Z",
+  "status": "ok"
+}

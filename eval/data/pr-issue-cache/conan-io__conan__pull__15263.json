@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15263",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15263,
+  "title": "add CONAN_LOG_LEVEL env-var",
+  "body": "Changelog: Feature: Define ``CONAN_LOG_LEVEL`` env-var to be able to change verbosity at a global level.\r\nDocs: https://github.com/conan-io/docs/pull/3490\r\n\r\nClose https://github.com/conan-io/conan/issues/14693",
+  "fetched_at": "2026-08-02T05:59:25.569Z",
+  "status": "ok"
+}

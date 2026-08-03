@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13994",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13994,
+  "title": "global cpp_info can be used to initialize components",
+  "body": "Changelog: Feature: Global ``cpp_info`` can be used to initialize components values.\r\nDocs: omit\r\n\r\nThis is a long standing issue, where users that define ``self.cpp_info.includedirs = [\"myinclude\"]`` are surprised that individual components will not use the ``myinclude`` folder too.\r\n\r\nThere could be different approaches to this, I have implemented the following:\r\n\r\n- Components are initialized at first instantiation from the values of the global ``cpp_info``\r\n- That means that later changes to ``self.cpp_info`` are not taken into account.",
+  "fetched_at": "2026-08-02T06:28:22.263Z",
+  "status": "ok"
+}

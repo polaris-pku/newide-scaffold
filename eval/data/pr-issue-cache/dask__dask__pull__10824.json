@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10824",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10824,
+  "title": "Remove circular import when dask-expr enabled",
+  "body": "Reload dask.dataframe on ImportError\r\n\r\n- [x] Closes https://github.com/dask-contrib/dask-expr/issues/706\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\n---\r\n\r\nEdit, woops, duplicate of https://github.com/dask/dask/pull/10822",
+  "fetched_at": "2026-08-02T06:42:02.224Z",
+  "status": "ok"
+}

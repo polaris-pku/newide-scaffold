@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15116",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15116,
+  "title": "Removed useless distutils import",
+  "body": "Changelog: Bugfix: `pyinstaller.py` was broken for Python 3.12 due to a useless `distutils` import.\r\nDocs: omit\r\nCloses: https://github.com/conan-io/conan/issues/15114",
+  "fetched_at": "2026-08-02T06:36:26.921Z",
+  "status": "ok"
+}

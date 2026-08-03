@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13571",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13571,
+  "title": "conf dict updates",
+  "body": "Changelog: Feature: Introduce the ``conf`` dictionary update semantics with ``*=`` operator.\r\nDocs: https://github.com/conan-io/docs/pull/3141\r\n\r\nClose https://github.com/conan-io/conan/issues/13535",
+  "fetched_at": "2026-08-02T06:36:32.279Z",
+  "status": "ok"
+}

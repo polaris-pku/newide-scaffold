@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10138",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10138,
+  "title": "Fix documentation build with `pandas` 2.0",
+  "body": "Our documentation build is currently failing since the `pandas=2.0` release came out earlier today (see [this build](https://readthedocs.org/projects/dask/builds/20000850/)). This is because a few methods in the DataFrame API were removed\r\n\r\n```\r\n/home/docs/checkouts/readthedocs.org/user_builds/dask/checkouts/10137/docs/source/dataframe-api.rst:9: WARNING: autosummary: failed to import DataFrame.append.\r\nPossible hints:\r\n* AttributeError: type object 'DataFrame' has no attribute 'append'\r\n* ModuleNotFoundError: No module named 'dask.dataframe.DataFrame'\r\n* ModuleNotFoundError: No module named 'DataFrame'\r\n* KeyError: 'DataFrame'\r\n* ImportError: \r\n/home/docs/checkouts/readthedocs.org/user_builds/dask/checkouts/10137/docs/source/dataframe-api.rst:148: WARNING: autosummary: failed to import Series.append.\r\nPossible hints:\r\n* ModuleNotFoundError: No module named 'dask.dataframe.Series'\r\n* KeyError: 'Series'\r\n* AttributeError: type object 'Series' has no attribute 'append'\r\n* ModuleNotFoundError: No module named 'Series'\r\n* ImportError: \r\n/home/docs/checkouts/readthedocs.org/user_builds/dask/checkouts/10137/docs/source/dataframe-api.rst:148: WARNING: autosummary: failed to import Series.iteritems.\r\nPossible hints:\r\n* ModuleNotFoundError: No module named 'dask.dataframe.Series'\r\n* KeyError: 'Series'\r\n* ModuleNotFoundError: No module named 'Series'\r\n* ImportError: \r\n* AttributeError: type object 'Series' has no attribute 'iteritems'\r\n```\r\n\r\nThis PR removes those corresponding methods from our API docs. \r\n\r\ncc @j-bennet @phofl",
+  "fetched_at": "2026-08-02T06:40:21.511Z",
+  "status": "ok"
+}

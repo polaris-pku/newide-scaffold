@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10844",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10844,
+  "title": "pandas 2.2: Fix failing doctest",
+  "body": "",
+  "fetched_at": "2026-08-02T06:41:49.533Z",
+  "status": "ok"
+}

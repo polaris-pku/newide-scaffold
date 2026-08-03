@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10391",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10391,
+  "title": "Add ``level`` to ``create_merge_tree``",
+  "body": "- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:11.293Z",
+  "status": "ok"
+}

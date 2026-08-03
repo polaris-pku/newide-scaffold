@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/11012",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 11012,
+  "title": "[Docs] Add Hugging Face `hf://` to the list of `fsspec` compatible remote services",
+  "body": "There are 120k+ open datasets at https://huggingface.co/datasets that people can load using Dask.\r\n\r\nFor example to loadthe  [wikimedia/wikipedia](https://huggingface.co/datasets/wikimedia/wikipedia) dataset:\r\n\r\n```python\r\nimport dask.dataframe as dd\r\ndf = dd.read_parquet(\"hf://datasets/wikimedia/wikipedia/20231101.en\")\r\n```\r\n\r\nBtw we plan to show code snippets on dataset pages on HF on how to load with Dask !",
+  "fetched_at": "2026-08-02T06:42:30.339Z",
+  "status": "ok"
+}

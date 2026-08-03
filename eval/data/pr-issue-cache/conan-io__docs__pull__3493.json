@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3493",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3493,
+  "title": "Docs for source_buildenv",
+  "body": "Just documenting the opt-out attribute here.\r\n\r\nMaybe we can add an example to show the usage of tool requires in the source method?\r\n\r\nDocs for https://github.com/conan-io/conan/pull/15153",
+  "fetched_at": "2026-08-02T06:13:53.343Z",
+  "status": "ok"
+}

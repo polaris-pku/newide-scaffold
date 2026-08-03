@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9542",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9542,
+  "title": "Add dependabot for GitHub actions",
+  "body": "This is a companion PR to https://github.com/dask/distributed/pull/7101. With the changes here, on a weekly cadence, dependabot will check for new versions of the various GitHub actions we use and, if there are new releases, will open a PR updating to the latest release. \r\n\r\ncc @jacobtomlinson as this seems like the kind of thing you might like : )",
+  "fetched_at": "2026-08-02T06:39:41.192Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/11013",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 11013,
+  "title": "Enable custom expressions in ``dask_cudf``",
+  "body": "Right now it is not always possible for down-stream libraries to implement/use their own `Expr` classes with dask/dask-expr. This is because `is_dask_collection` [includes a hack](https://github.com/dask/dask/blob/f9310c440b661f1ae96ffd8726404d3c3fe32edc/dask/base.py#L238) to avoid graph materialization only when the package starts with `dask_expr`. Materializing the graph is obviously a performance issue. However, it is also impossible to do for \"abstract\" expressions that have yet to be lowered/optimized.\r\n\r\nCould we temporarily include `\"dask_cudf\"` as a package for which we will avoid materialization? I realize we need a more general solution in the long run, but since the current solution is already a hack, I'm hoping we can unblock dask-cudf by doing something simple like this.",
+  "fetched_at": "2026-08-02T06:42:26.563Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/11008",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 11008,
+  "title": "Add HypersSpy to ecosystem.rst",
+  "body": "Add HyperSpy to array section of the ecosystem listing.\r\n\r\n- [n/a ] Closes #xxxx\r\n- [n/a] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n- [x] Renders correctly at https://dask--11008.org.readthedocs.build/en/11008/ecosystem.html",
+  "fetched_at": "2026-08-02T06:42:29.067Z",
+  "status": "ok"
+}

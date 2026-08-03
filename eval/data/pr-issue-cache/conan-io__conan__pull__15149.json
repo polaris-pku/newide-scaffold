@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15149",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15149,
+  "title": "Add `core:warnings_as_errors` configuration option",
+  "body": "Changelog: Feature: Add `core:warnings_as_errors` configuration option to make Conan raise on warnings and errors.\r\nDocs: https://github.com/conan-io/docs/pull/3484\r\n\r\nFirst try for `core:warnings_as_errors`. It worries me that people might want to have Conan stop processing on errors in this case (We mostly do that now when we print proper errors as they are next to raised exceptions), but I'm not quite sure if I should just raise here too. Any opinions are welcomed :)\r\n\r\nCloses #14909",
+  "fetched_at": "2026-08-02T06:17:14.061Z",
+  "status": "ok"
+}

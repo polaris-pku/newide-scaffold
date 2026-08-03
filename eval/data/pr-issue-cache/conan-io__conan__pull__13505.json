@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13505",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13505,
+  "title": "Tests/remove",
+  "body": "Changelog: Feature: Introduce the ``conan remove *#!latest`` (also for package-revisions), to remove all revisions except the latest one.\r\nDocs: https://github.com/conan-io/docs/pull/3144\r\n\r\nClose https://github.com/conan-io/conan/issues/13475\r\n\r\nAlso some minor refactors to a test, removing unnecessary ``with populated_client.mocked_servers():``",
+  "fetched_at": "2026-08-02T06:36:37.729Z",
+  "status": "ok"
+}

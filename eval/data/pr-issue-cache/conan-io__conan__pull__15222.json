@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15222",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15222,
+  "title": "Fix range escaping in conflict reports involving ranges",
+  "body": "Changelog: Fix: Fix range escaping in conflict reports involving ranges.\r\nDocs: Omit\r\n\r\nCloses https://github.com/conan-io/conan/issues/14793\r\n\r\nThis makes it so that the string is parsed to json which escapes the ranges to unicode codes before having a chance to be automatically HTML escaped by Jinja2.\r\n\r\n\r\n<img width=\"394\" alt=\"Captura de pantalla 2023-12-06 a las 0 05 15\" src=\"https://github.com/conan-io/conan/assets/5364255/f3a2500e-e294-40e5-ad7f-ae07fb2a57b1\">",
+  "fetched_at": "2026-08-02T06:31:42.469Z",
+  "status": "ok"
+}

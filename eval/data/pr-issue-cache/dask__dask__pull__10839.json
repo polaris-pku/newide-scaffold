@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10839",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10839,
+  "title": "Adjust tests for median support in dask-expr",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:52.104Z",
+  "status": "ok"
+}

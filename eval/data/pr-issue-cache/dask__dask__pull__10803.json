@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10803",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10803,
+  "title": "Deprecate `axis` in DataFrame.rolling",
+  "body": "- [x] Closes #10793 \r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:27.701Z",
+  "status": "ok"
+}

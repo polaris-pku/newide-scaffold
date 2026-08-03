@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15192",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15192,
+  "title": "Add environment information to CMakePresets",
+  "body": "Changelog: Feature: Add build environment information to CMake configure preset and run environment information to CMake test presets.\r\nDocs: https://github.com/conan-io/docs/pull/3488\r\n\r\nCloses: https://github.com/conan-io/conan/issues/15012\r\nCloses: https://github.com/conan-io/conan/issues/14271",
+  "fetched_at": "2026-08-02T06:07:12.851Z",
+  "status": "ok"
+}

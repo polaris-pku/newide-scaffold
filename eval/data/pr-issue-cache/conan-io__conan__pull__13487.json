@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13487",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13487,
+  "title": "add test with python_requires options values example",
+  "body": "Changelog: Fix: Define a way to update ``default_options`` in ``python_requires_extend`` extension.\r\nDocs: https://github.com/conan-io/docs/pull/3120\r\n\r\nClose https://github.com/conan-io/conan/issues/13486",
+  "fetched_at": "2026-08-02T06:36:52.959Z",
+  "status": "ok"
+}

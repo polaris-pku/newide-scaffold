@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10796",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10796,
+  "title": "Deprecate `axis` in GroupBy cumulative transformers",
+  "body": "- [x] Closes #10786 \r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:30.276Z",
+  "status": "ok"
+}

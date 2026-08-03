@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9947",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9947,
+  "title": "Handle string-based engine argument to `read_json`",
+  "body": "~**TODO**: Still haven't tested this locally with a pandas nightly~\r\n\r\n- [x] Closes https://github.com/dask/dask/issues/9943\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:47.495Z",
+  "status": "ok"
+}

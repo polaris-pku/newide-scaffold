@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3145",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3145,
+  "title": "Add documentation for `conan cache clean`",
+  "body": "Docs for https://github.com/conan-io/conan/pull/13581",
+  "fetched_at": "2026-08-02T06:36:30.857Z",
+  "status": "ok"
+}

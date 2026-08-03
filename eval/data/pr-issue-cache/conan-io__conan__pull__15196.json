@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15196",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15196,
+  "title": "Fix `conan graph info --format=html` reporting misleading conflicting nodes",
+  "body": "Changelog: Bugfix: Fix `conan graph info --format=html` reporting misleading conflicting nodes.\r\nDocs: Omit\r\n\r\n\r\nThe tests didn't catch this because I only tested with one level, which left the ids the same!\r\n\r\nDon't merge yet, will add a test to ensure this keeps working in the future",
+  "fetched_at": "2026-08-02T06:36:20.011Z",
+  "status": "ok"
+}

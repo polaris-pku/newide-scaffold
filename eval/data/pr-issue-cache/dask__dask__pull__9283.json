@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9283",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9283,
+  "title": "Add new CLI that is extensible",
+  "body": "New CLI discussed at SciPy sprint\r\n\r\nThis creates a new `dask` command line tool that can be augmented by external packages (e.g. distributed)  with a `[dask_cli]` entry point. The new tool can be used with either\r\n```\r\n$ dask\r\n```\r\nor\r\n```\r\n$ python -m dask\r\n```\r\n\r\nAdding an entry point is pretty straightforward; we'll use distributed as an example:\r\n\r\nIn an external-to-dask module at the location: `distributed.cli.dask_scheduler` with a function called `main` we can add to `pyproject.toml` (PEP-621):\r\n\r\n```toml\r\n[project.entry-points.\"dask_cli\"]\r\nscheduler = \"distributed.cli.dask_scheduler.main\"\r\n```\r\n\r\nor an \"old school\" `setup.py` or `setup.cfg`\r\n\r\n```ini\r\n[options.entry_points]\r\ndask_cli =\r\n    scheduler = distributed.cli.dask_scheduler:main\r\n```\r\n\r\nThe function needs to be a click command:\r\n\r\n```python\r\n# in a distributed/distributed/cli/dask_scheduler.py file\r\n\r\n@click.command(name=\"scheduler\")\r\n@click.option(...)\r\n@click.option(...)\r\ndef main():\r\n    ...\r\n```\r\n\r\nSince the `scheduler = ...` entry point under the `dask_cli` section is defined in the distributed package; upon import of `dask.cli` the `run_cli` function will discover the external `scheduler` command. This allows use of\r\n```\r\n$ dask scheduler\r\n```\r\nor\r\n```\r\n$ python -m dask scheduler\r\n```\r\n\r\nRelated PRs in distributed: \r\n- https://github.com/dask/distributed/pull/6735\r\n- https://github.com/dask/distributed/pull/6738",
+  "fetched_at": "2026-08-02T06:39:13.684Z",
+  "status": "ok"
+}

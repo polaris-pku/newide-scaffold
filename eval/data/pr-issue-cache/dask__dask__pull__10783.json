@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10783",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10783,
+  "title": "Add test-report workflow",
+  "body": "- [x] Will close https://github.com/dask/dask/issues/10732\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nChecks out the distributed repo, and runs the `test_report.py` script to generate the report for dask/dask.\r\n\r\nDepends on https://github.com/dask/distributed/pull/8450",
+  "fetched_at": "2026-08-02T06:42:20.314Z",
+  "status": "ok"
+}

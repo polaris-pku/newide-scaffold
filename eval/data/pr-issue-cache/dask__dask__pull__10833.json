@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10833",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10833,
+  "title": "Activate query_planning when exporting tests",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:57.129Z",
+  "status": "ok"
+}

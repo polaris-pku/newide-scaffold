@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3482",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3482,
+  "title": "`stderr` argument in Conanfile's `run` method docs",
+  "body": "For https://github.com/conan-io/conan/pull/15121",
+  "fetched_at": "2026-08-02T06:23:55.361Z",
+  "status": "ok"
+}

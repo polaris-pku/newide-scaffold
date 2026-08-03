@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15126",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15126,
+  "title": "fix export-pkg metadata",
+  "body": "Changelog: Bugfix: Fix definition of ``package_metadata_folder`` for ``conan export-pkg`` command.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/15091",
+  "fetched_at": "2026-08-02T06:36:25.580Z",
+  "status": "ok"
+}

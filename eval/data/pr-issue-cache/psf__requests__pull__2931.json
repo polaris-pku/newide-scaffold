@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/psf/requests/pull/2931",
+  "owner": "psf",
+  "repo": "requests",
+  "kind": "pull",
+  "number": 2931,
+  "title": "Fix regression from #2844 regarding binary bodies.",
+  "body": "Resolves #2930.",
+  "fetched_at": "2026-08-02T06:42:46.969Z",
+  "status": "ok"
+}

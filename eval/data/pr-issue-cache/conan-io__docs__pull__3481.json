@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3481",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3481,
+  "title": "`in` support for `self.dependencies` docs",
+  "body": "For https://github.com/conan-io/conan/pull/15221",
+  "fetched_at": "2026-08-02T06:03:52.582Z",
+  "status": "ok"
+}

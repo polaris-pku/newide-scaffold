@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10126",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10126,
+  "title": "Fix `valid_divisions` when passed a `tuple`",
+  "body": "- [ ] Closes #xxxx\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\n`pd.isnull(tuple)` returns a bool not a series so the valid_divisions function fails with the following error if a tuple is passed.\r\n\r\n```\r\nif pd.isnull(divisions).any():\r\n    AttributeError: 'bool' object has no attribute 'any'\r\n```",
+  "fetched_at": "2026-08-02T06:39:58.194Z",
+  "status": "ok"
+}

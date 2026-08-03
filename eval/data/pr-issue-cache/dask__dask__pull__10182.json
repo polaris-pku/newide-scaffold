@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10182",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10182,
+  "title": "Revert `grouper`-related changes",
+  "body": "Follow-up for https://github.com/dask/dask/pull/10154.\r\n\r\n`grouper` accessor is not supported by `dask-cudf`, see https://github.com/dask/dask/pull/10181.\r\n\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\n\r\ncc @galipremsagar, does this fix your problem?",
+  "fetched_at": "2026-08-02T06:39:50.526Z",
+  "status": "ok"
+}

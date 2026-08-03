@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10123",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10123,
+  "title": "Maintain annotations in `DataFrame.to_hdf`",
+  "body": "Sibling to dask/distributed#7708\r\n\r\n- [ ] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:55.725Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9531",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9531,
+  "title": "Don't allow Array slice `np.nan` assignment with integer dtypes",
+  "body": "- [x] Closes #9526\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:24.385Z",
+  "status": "ok"
+}

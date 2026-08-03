@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10817",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10817,
+  "title": "Implement deterministic tokenization for hlg",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\n\r\nThis is something we would need for dask-expr, is the approach in this PR sensible?",
+  "fetched_at": "2026-08-02T06:41:35.445Z",
+  "status": "ok"
+}

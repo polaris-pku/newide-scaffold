@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/14694",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 14694,
+  "title": "New conan graph explain command to search, compare and explain missing binaries",
+  "body": "Changelog: Feature: New ``conan graph explain`` command to search, compare and explain missing binaries.\r\nDocs: https://github.com/conan-io/docs/pull/3486\r\nClose https://github.com/conan-io/conan/issues/14464\r\nClose https://github.com/conan-io/conan/issues/14810\r\nClose https://github.com/conan-io/conan/issues/4089\r\nClose https://github.com/conan-io/conan/issues/6770",
+  "fetched_at": "2026-08-02T06:26:08.952Z",
+  "status": "ok"
+}

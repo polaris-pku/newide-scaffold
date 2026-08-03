@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10342",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10342,
+  "title": "Support ``DataFrame.set_index(..., sort=False)``",
+  "body": "Ability to avoid repartitioning and new divisions when setting index.\r\n\r\n- [x] Closes #10333 \r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:36.890Z",
+  "status": "ok"
+}

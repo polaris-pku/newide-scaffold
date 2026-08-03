@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3485",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3485,
+  "title": "clarify info.clear() behavior",
+  "body": "Docs for https://github.com/conan-io/conan/pull/15285",
+  "fetched_at": "2026-08-02T06:36:14.539Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13574",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13574,
+  "title": "do not add same remote multiple times",
+  "body": "Changelog: Bugfix: Do not allow adding more than 1 remote with the same remote name.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/13569",
+  "fetched_at": "2026-08-02T06:37:00.405Z",
+  "status": "ok"
+}

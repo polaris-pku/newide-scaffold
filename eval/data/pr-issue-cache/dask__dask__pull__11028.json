@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/11028",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 11028,
+  "title": "Remove xfail tracebacks from testsuite",
+  "body": "- [x] Closes #10986\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`\r\n\r\nsee https://docs.pytest.org/en/latest/changelog.html#id34",
+  "fetched_at": "2026-08-02T06:42:22.847Z",
+  "status": "ok"
+}

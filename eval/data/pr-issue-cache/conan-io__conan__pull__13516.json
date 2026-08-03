@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13516",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13516,
+  "title": "Fix subcommands from commands with underscores",
+  "body": "Changelog: Bugfix: Fix subcommands names when the parent command has underscores.\r\nDocs: omit\r\n\r\nWhen implementing a custom command that has something like:\r\n\r\n```\r\n@conan_command(group=\"Custom commands\")\r\ndef build_info(conan_api: ConanAPI, parser, *args):\r\n...\r\n\r\n@conan_subcommand()\r\ndef build_info_create(conan_api: ConanAPI, parser, subparser, *args):\r\n...\r\n```\r\nI noticed that the subcommand name was not properly formed, it appeared as `info-create` instead of `create`.\r\n\r\nMaybe we want to get rid of the restriction of being the main command the start of the subcommand names and just use:\r\n\r\n```\r\n@conan_command(group=\"Custom commands\")\r\ndef build_info(conan_api: ConanAPI, parser, *args):\r\n...\r\n\r\n@conan_subcommand()\r\ndef create(conan_api: ConanAPI, parser, subparser, *args):\r\n...\r\n```",
+  "fetched_at": "2026-08-02T06:37:06.106Z",
+  "status": "ok"
+}

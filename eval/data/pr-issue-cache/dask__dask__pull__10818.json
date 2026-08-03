@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10818",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10818,
+  "title": "Fix more tests to use `pytest.warns()`",
+  "body": "Fix more tests to use `pytest.warns()` to assert for warnings rather than incorrect `pytest.raises()`.  More specifically, the latter does not work when `-Werror` is not used.  In Gentoo, we avoid `-Werror` since it tends to cause irrelevant test suite failures when old versions are tested against newer dependencies.\r\n\r\n- [ ] Closes #xxxx\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:42:04.772Z",
+  "status": "ok"
+}

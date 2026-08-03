@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10854",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10854,
+  "title": "numpy 2.0: fix slicing by uint64 array",
+  "body": "- Part of #10593",
+  "fetched_at": "2026-08-02T06:41:44.438Z",
+  "status": "ok"
+}

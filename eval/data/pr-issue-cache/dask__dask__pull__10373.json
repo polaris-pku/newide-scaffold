@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10373",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10373,
+  "title": "Fix ``test_first_and_last`` to accommodate deprecated ``last``",
+  "body": "This fixes \r\n\r\n```\r\nFAILED dask/dataframe/tests/test_dataframe.py::test_first_and_last[last] - FutureWarning: last is deprecated and will be removed in a future version. Please create a mask and filter using `.loc` instead\r\n```\r\n\r\nwhich we're currently seeing in the upstream build (xref https://github.com/dask/dask/issues/10347). \r\n\r\nNote that we were already emitting a `FutureWarning` for `DataFrame.last`, so this is a tests-only PR \r\n\r\ncc @j-bennet @phofl",
+  "fetched_at": "2026-08-02T06:41:10.090Z",
+  "status": "ok"
+}

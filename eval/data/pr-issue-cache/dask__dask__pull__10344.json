@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10344",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10344,
+  "title": "Choose P2P as shuffle default even if fusion is enabled",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:40.743Z",
+  "status": "ok"
+}

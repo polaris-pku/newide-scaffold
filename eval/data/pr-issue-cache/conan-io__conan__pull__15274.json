@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15274",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15274,
+  "title": "Add different ref tracking syntax for  `<host_version>`",
+  "body": "Changelog: Feature: Add tracking syntax in `<host_version>` for different references.\r\nDocs: https://github.com/conan-io/docs/pull/3480\r\n\r\nClose https://github.com/conan-io/conan/issues/15265\r\n\r\nI don't like the current approach, so opening the PR so that I can get some ideas from the team",
+  "fetched_at": "2026-08-02T05:52:44.344Z",
+  "status": "ok"
+}

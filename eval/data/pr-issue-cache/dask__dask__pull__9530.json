@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9530",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9530,
+  "title": "Run mypy on Windows and Linux",
+  "body": "Run mypy for Windows-specific issues.\r\nAlign pre-commit config to dask/distributed.\r\nTwin of https://github.com/dask/distributed/pull/7094",
+  "fetched_at": "2026-08-02T06:39:42.439Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10177",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10177,
+  "title": "Drop `bokeh<3` restriction",
+  "body": "Companion PR to https://github.com/dask/distributed/pull/7413",
+  "fetched_at": "2026-08-02T06:40:11.329Z",
+  "status": "ok"
+}

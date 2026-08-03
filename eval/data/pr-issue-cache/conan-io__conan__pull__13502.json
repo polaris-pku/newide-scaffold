@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13502",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13502,
+  "title": "feature conan cache check-integrity",
+  "body": "Changelog: Feature: New ``conan cache check-integrity`` command to replace 1.X legacy ``conan upload --skip-upload --check``.\r\nDocs: https://github.com/conan-io/docs/pull/3147\r\n\r\n\r\nClose https://github.com/conan-io/conan/issues/13499",
+  "fetched_at": "2026-08-02T06:36:40.466Z",
+  "status": "ok"
+}

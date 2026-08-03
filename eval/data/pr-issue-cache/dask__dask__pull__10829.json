@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10829",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10829,
+  "title": "Fail dask-expr ci if tests fail",
+  "body": "- [ ] Closes #xxxx\r\n- [ ] Tests added / passed\r\n- [ ] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:41:55.907Z",
+  "status": "ok"
+}

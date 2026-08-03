@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13458",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13458,
+  "title": "default tools.files.download:download_cache to core.xxx equivalent",
+  "body": "Changelog: Feature: Default ``tools.files.download:download_cache`` to ``core.download:download_cache``, so it is only necessary to define one.\r\nDocs: Omit",
+  "fetched_at": "2026-08-02T06:36:48.756Z",
+  "status": "ok"
+}

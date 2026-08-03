@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15284",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15284,
+  "title": "new lock remove command",
+  "body": "Changelog: Feature: New ``conan lock remove`` command to remove requires from lockfiles.\r\nDocs: https://github.com/conan-io/docs/pull/3496\r\n\r\nI am proposing this PR to close:\r\n\r\nClose https://github.com/conan-io/conan/issues/14523\r\nClose https://github.com/conan-io/conan/issues/14524\r\n\r\nThe idea is that updates are equivalent to something like:\r\n```bash\r\n$ conan remove --requires=zlib/* && conan add --requires=zlib/1.2.11\r\n```\r\nBut it will allow us to first iterate and learn about the logic of removal of versions from lockfiles, because ``conan remove`` makes sense in isolation, even without ``lock update`` or ``lock add``, like for example using it before resolving it to latest with ``--lockfile-partial``. When we have clear what is the UX and UI for the removal, we can do a single command ``conan update`` or ``conan add`` with extra arguments",
+  "fetched_at": "2026-08-02T05:49:24.048Z",
+  "status": "ok"
+}

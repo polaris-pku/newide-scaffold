@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9540",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9540,
+  "title": "Ensure pickle-able binops in `delayed`",
+  "body": "Avoid un-pickle-able local functions in delayed. Adds a new CI check to avoid breaking this.\r\n\r\n- [x] Closes #9536 \r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:39:27.003Z",
+  "status": "ok"
+}

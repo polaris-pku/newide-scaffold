@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/15127",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 15127,
+  "title": "avoid cmake warning due to policy var unused",
+  "body": "Changelog: Fix: Avoid warning in CMake output due to `CMAKE_POLICY_DEFAULT_CMP0091` unused variable.\r\nDocs: Omit",
+  "fetched_at": "2026-08-02T06:36:10.459Z",
+  "status": "ok"
+}

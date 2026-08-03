@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/docs/pull/3488",
+  "owner": "conan-io",
+  "repo": "docs",
+  "kind": "pull",
+  "number": 3488,
+  "title": "Add environment information to CMakePresets docs",
+  "body": "Docs for https://github.com/conan-io/conan/pull/15192",
+  "fetched_at": "2026-08-02T06:08:19.507Z",
+  "status": "ok"
+}

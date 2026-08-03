@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/conan-io/conan/pull/13526",
+  "owner": "conan-io",
+  "repo": "conan",
+  "kind": "pull",
+  "number": 13526,
+  "title": "relocatable full_deploy CMake",
+  "body": "Changelog: Feature: The ``full_deploy`` deployer together with ``CMakeDeps`` generator learned to create relative paths deploys, so they are relocatable.\r\nDocs: Omit\r\n\r\nClose https://github.com/conan-io/conan/issues/13511",
+  "fetched_at": "2026-08-02T06:36:36.413Z",
+  "status": "ok"
+}

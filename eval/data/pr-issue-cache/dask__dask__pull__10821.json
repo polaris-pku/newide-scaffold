@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10821",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10821,
+  "title": "numpy 2: deprecations in n-dimensional fft functions",
+  "body": "- Part of #10593 \r\n- XREF https://github.com/numpy/numpy/issues/25605",
+  "fetched_at": "2026-08-02T06:41:59.723Z",
+  "status": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/9538",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 9538,
+  "title": "Stable demo column projection",
+  "body": "- [x] Closes #9535, closes #9514 \r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nThis fix should result in making the timeseries dataset lose a lot of the benefit of column projection. However, I thought that correctness was more important than performance here, and I don't think we have a more reliable way of advancing the random state.",
+  "fetched_at": "2026-08-02T06:39:25.715Z",
+  "status": "ok"
+}

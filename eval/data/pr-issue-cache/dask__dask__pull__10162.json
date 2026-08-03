@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10162",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10162,
+  "title": "Fix flaky `modf` operation in `test_arithmetic`",
+  "body": "Possibly fix an intermittent failure:\r\n\r\n`FAILED dask/array/tests/test_array_core.py::test_arithmetic - RuntimeWarning: invalid value encountered in modf`\r\n\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:17.746Z",
+  "status": "ok"
+}

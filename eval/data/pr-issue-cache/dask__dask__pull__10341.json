@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10341",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10341,
+  "title": "Fix for `total_mem_usage` of `bag.map`",
+  "body": "- [x] Closes https://github.com/dask/dask/issues/10338\r\n- [x] Tests added / passed\r\n- [x] Passes `pre-commit run --all-files`\r\n\r\nRelaxing the check to `Iterable` fixes the problem. `itertools.chain` is also an `Iterable`.",
+  "fetched_at": "2026-08-02T06:40:46.981Z",
+  "status": "ok"
+}

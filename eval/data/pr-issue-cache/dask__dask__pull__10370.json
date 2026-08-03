@@ -1,0 +1,11 @@
+{
+  "url": "https://github.com/dask/dask/pull/10370",
+  "owner": "dask",
+  "repo": "dask",
+  "kind": "pull",
+  "number": 10370,
+  "title": "Remove deprecated `numpy.compat`",
+  "body": "Fixes deprecation with numpy.compat:\r\n\r\n```\r\ndask/array/tests/test_array_core.py: DeprecationWarning: `np.compat`, which was used during the Python 2 to 3 transition, is deprecated since 1.26.0, and will be removed\r\n```\r\n\r\nSee https://github.com/dask/dask/issues/10347.\r\n\r\n- [x] Passes `pre-commit run --all-files`",
+  "fetched_at": "2026-08-02T06:40:50.741Z",
+  "status": "ok"
+}
