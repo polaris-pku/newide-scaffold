@@ -29,6 +29,7 @@ export * from './aggregator';
 export * from './mock-gate';
 export * from './runner';
 export * from './scheduler';
+export * from './output-parser';
 export * from './command-runner';
 export * from './prompt-runner';
 export * from './composite-runner';

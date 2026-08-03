@@ -5,6 +5,7 @@ import {
   PriorityGateScheduler,
   type GateDecision,
   type GateDefinition,
+  type GateOutputFormat,
   type GateRequest,
   type GateResult,
   type GateScheduler,
@@ -375,6 +376,12 @@ export class HookEngine {
    */
   private toGateDefinition(config: HookConfig['gates'][string]): GateDefinition {
     const outputConfig: GateDefinition['outputConfig'] = {};
+    if (config.output?.format) {
+      const raw = config.output.format;
+      if (isGateOutputFormat(raw)) {
+        outputConfig.format = raw;
+      }
+    }
     if (config.severity_map) {
       outputConfig.severity_map = config.severity_map;
     }
@@ -508,4 +515,18 @@ export function createHookEvent(
     created_at: nowTimestamp(),
     schema_version: SCHEMA_VERSION,
   };
+}
+
+// ── Internal helpers ──────────────────────────────
+
+const VALID_GATE_OUTPUT_FORMATS = new Set<string>([
+  'sarif',
+  'junit',
+  'json',
+  'text',
+  'coverage_json',
+]);
+
+function isGateOutputFormat(value: string): value is GateOutputFormat {
+  return VALID_GATE_OUTPUT_FORMATS.has(value);
 }
