@@ -87,6 +87,11 @@ export { LlmSkillPromotion } from './adapters/llm-skill-promotion';
 export { NullContextCleaner } from './adapters/null-context-cleaner';
 export { RuleBasedExperienceExtractor } from './adapters/rule-based-experience-extractor';
 export { ruleBasedSkillPromotion } from './services/skill-promotion';
+export {
+  reviewSkill,
+  type ReviewSkillInput,
+  type SkillReviewDecision,
+} from './services/skill-review';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,
