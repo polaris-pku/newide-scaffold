@@ -19,7 +19,8 @@ import { HashEmbeddingProvider } from '../adapters/hash-embedding-provider';
 import { ruleBasedSkillPromotion } from '../services/skill-promotion';
 import { reviewSkill } from '../services/skill-review';
 import { retrieveMemoriesForTask } from '../adapters/memory-retrieval';
-import type { AgentTaskRequest, ExperienceRecord } from '../schemas';
+import type { ExperienceRecord } from '../schemas';
+import type { AgentTaskRequest } from '../agent-types';
 
 const ROLE_ID = 'role_fe';
 const REVIEWER = 'human-ops';
