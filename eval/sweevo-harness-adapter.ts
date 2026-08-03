@@ -1,5 +1,5 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { loadManifest, resolveDatasetJsonl, resolveRunDir, resolveSweEvoRoot } from './paths';
 import { getInstanceOrThrow, indexDatasetById, loadDataset } from './load-dataset';
@@ -73,16 +73,8 @@ export function toWslPath(pathLike: string): string {
   return rest ? `/mnt/${drive}/${rest}` : `/mnt/${drive}`;
 }
 
-function resolveSweEvoPython(sweEvoRoot?: string): string {
-  const configured = process.env.NEWIDE_SWE_EVO_PYTHON?.trim();
-  if (configured) return configured;
-  if (sweEvoRoot) {
-    const venvRoot = join(sweEvoRoot, 'SWE-bench', '.venv-swebench');
-    const candidates = [join(venvRoot, 'bin', 'python'), join(venvRoot, 'Scripts', 'python.exe')];
-    const localPython = candidates.find((candidate) => existsSync(candidate));
-    if (localPython) return localPython;
-  }
-  return 'python';
+function resolveSweEvoPython(): string {
+  return process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python';
 }
 
 function resolveSweEvoWslDistro(): string {
@@ -99,7 +91,7 @@ export function buildSweEvoHarnessCommand(input: {
   trajectoryDir: string;
   maxWorkers: number;
 }): SweEvoHarnessAdapterResult['command'] {
-  const python = resolveSweEvoPython(input.sweEvoRoot);
+  const python = resolveSweEvoPython();
   const scriptPath = join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py');
   const viaWsl = python.toLowerCase() === 'wsl';
   const trajectoriesPath = viaWsl
@@ -158,32 +150,6 @@ export function writeHarnessReport(path: string, report: SweBenchHarnessReport):
   writeJson(path, report);
 }
 
-function collectHarnessReport(
-  workDir: string,
-  trajectoryDir: string,
-  predictions: SweBenchPrediction[],
-): SweBenchHarnessReport {
-  const runName = basename(trajectoryDir);
-  const report: SweBenchHarnessReport = {};
-  for (const prediction of predictions) {
-    const reportPath = join(
-      workDir,
-      'logs',
-      'run_evaluation',
-      runName,
-      runName,
-      prediction.instance_id,
-      'report.json',
-    );
-    if (!existsSync(reportPath)) continue;
-    Object.assign(
-      report,
-      JSON.parse(readFileSync(reportPath, 'utf-8')) as SweBenchHarnessReport,
-    );
-  }
-  return report;
-}
-
 export async function runSweEvoHarnessAdapter(
   options: SweEvoHarnessAdapterOptions,
 ): Promise<SweEvoHarnessAdapterResult> {
@@ -218,7 +184,7 @@ export async function runSweEvoHarnessAdapter(
     predictions_path: options.predictionsPath,
     trajectory_path: trajectoryPath,
     output_final_dir: outputFinalDir,
-    swe_evo_python: resolveSweEvoPython(sweEvoRoot),
+    swe_evo_python: resolveSweEvoPython(),
     note: 'Run this command in the SWE-EVO environment. On Windows, set NEWIDE_SWE_EVO_PYTHON=wsl to invoke via WSL. Pass --report-source when a harness report is available to normalize it into harness-report.json.',
   });
 
@@ -240,10 +206,6 @@ export async function runSweEvoHarnessAdapter(
     });
     if (completed.status !== 0) {
       throw new Error(`SWE-EVO harness exited with status ${completed.status ?? 'unknown'}`);
-    }
-    const collectedReport = collectHarnessReport(workDir, trajectoryDir, predictions);
-    if (Object.keys(collectedReport).length > 0) {
-      writeHarnessReport(harnessReportPath, collectedReport);
     }
   }
 

@@ -81,25 +81,6 @@ external dependencies are explicit:
 - a real semantic embedding provider for non-degraded memory evaluation. Setting
   `NEWIDE_B_EMBEDDING_PROVIDER=hash` is an explicit local/degraded mode.
 
-### One-command Council benchmark
-
-For the current delivery baseline, copy `.env.example` to `.env.local` and set only the paths that
-differ on the evaluator's machine. The backend automatically loads the real ACP model credentials
-from `${ACP_DRIVER_RUNNER_DIR}/.env`; the default runner directory is the sibling
-`../acp-client-prototype`. `NEWIDE_B_EMBEDDING_PROVIDER=hash` requires no embedding model or API
-key.
-
-```bash
-pnpm eval:council:smoke
-```
-
-This command always runs the real Council path with the `B2` memory policy on
-`psf__requests_v2.27.0_v2.27.1`, collects the produced patch, and invokes the real SWE-EVO harness.
-Configure `NEWIDE_B_DATABASE_URL` and `NEWIDE_SWE_EVO_ROOT` in `.env.local`; set
-`ACP_DRIVER_RUNNER_DIR` only when the ACP checkout is not the default sibling. Results are written
-under `.newide/eval/`; `summary.json` identifies the backend Run, Council usage, timing, tokens,
-harness result, and the explicit `degraded_non_semantic` embedding quality.
-
 ## F Eval Real Harness Setup
 
 The F-eval TypeScript pipeline is committed in this repository. SWE-EVO lives

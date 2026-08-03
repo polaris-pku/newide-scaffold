@@ -4,15 +4,12 @@
 
 ## Summary 必填字段
 
-后端 run 目录下的 `summary.json`（Integration v0 或生产 TaskLoop 的后端摘要）至少包含：
+后端 run 目录下的 `summary.json`（`IntegrationV0Summary`）至少包含：
 
 | 字段              | 用途                                                                                          |
 | ----------------- | --------------------------------------------------------------------------------------------- |
 | `worktree_path`   | eval `--backend-summary` 唯一强依赖；须为**绝对或可解析**路径                                 |
 | `memory_ablation` | 可选；`B0`–`B3`。写入 summary / `memory.context_pack_built` 事件，供与 eval `--ablation` 对齐 |
-
-生产 TaskLoop 的摘要由终态输出发布器写入。它只投影已经持久化的运行结果；如果没有真实
-`worktree_path`，字段不会被补成占位目录，契约校验会拒绝该摘要。
 
 ## Worktree 规则（能力向）
 
