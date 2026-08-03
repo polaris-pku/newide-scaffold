@@ -146,6 +146,16 @@ export class PersistentMailboxService {
     });
   }
 
+  recordDeliveryAttempt(
+    deliveryId: string,
+    error?: PersistedMailboxError,
+  ): PersistedMailboxDelivery {
+    return this.store.recordMailboxDeliveryAttempt(deliveryId, {
+      attempted_at: this.now(),
+      ...(error ? { error } : {}),
+    });
+  }
+
   ack(deliveryId: string, recipientRoleId: string): PersistedMailboxDelivery {
     const envelope = this.requireDelivery(deliveryId);
     this.assertRecipient(envelope.delivery, recipientRoleId);
@@ -202,6 +212,18 @@ export class PersistentMailboxService {
 
   async replayPendingDeliveries(): Promise<PersistedMailboxEnvelope[]> {
     return this.store.listReplayableMailboxDeliveries();
+  }
+
+  getEnvelope(deliveryId: string): PersistedMailboxEnvelope {
+    return this.requireDelivery(deliveryId);
+  }
+
+  findLatestSession(
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
+  ): string | undefined {
+    return this.store.findLatestMailboxSession(taskId, workspacePath, recipientRoleId);
   }
 
   private validateSend(input: Omit<MailboxSendInput, 'thread_id'> & { thread_id?: string }): void {

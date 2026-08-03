@@ -340,6 +340,23 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
     return row ? this.readMailboxEnvelope(deliveryId) : undefined;
   }
 
+  findLatestMailboxSession(
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
+  ): string | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT recipient_session_id FROM deliveries
+         WHERE task_id = ? AND workspace_path = ? AND recipient_role_id = ?
+           AND recipient_session_id IS NOT NULL
+         ORDER BY injected_at DESC, updated_at DESC, delivery_id DESC
+         LIMIT 1`,
+      )
+      .get(taskId, workspacePath, recipientRoleId);
+    return row ? readString(row, 'recipient_session_id') : undefined;
+  }
+
   listMailboxThread(threadId: string): PersistedMailboxMessage[] {
     return this.database
       .prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at, message_id')

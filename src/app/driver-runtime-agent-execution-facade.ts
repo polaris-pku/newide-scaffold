@@ -28,6 +28,15 @@ import {
   type MemoryRepository,
   type ToolCallingClient,
 } from '../memory';
+import {
+  MailboxSendTool,
+  expectsMailboxReply,
+  isAgentMessageType,
+  type MailboxSendToolInput,
+  type MailboxToolOutcome,
+  type PersistedMailboxEnvelope,
+  type PersistentMailboxService,
+} from '../mailbox';
 import type {
   AgentExecutionFacade,
   AgentExecutionOptions,
@@ -35,10 +44,6 @@ import type {
   AgentExecutionResult,
   AgentExecutionStatus,
 } from '../protocol/agent-execution';
-import type {
-  AgentMailboxWakePort,
-  AgentMailboxWakeRequestV1,
-} from '../protocol/agent-mailbox-wake';
 import type {
   DriverRunResult,
   DriverRunStatus,
@@ -66,11 +71,17 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   embedding?: EmbeddingProvider;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
+  mailbox?: {
+    service: PersistentMailboxService;
+    allowedRoleIds: readonly string[];
+    defaultDeadlineSeconds?: number;
+  };
 }
 
 interface InvocationContext {
   task_id: string;
   run_id: string;
+  role_id: string;
   instruction: string;
   workspace_path?: string;
   session_id?: string;
@@ -80,6 +91,10 @@ interface InvocationContext {
   retrieval: MemoryRetrievalResult;
   driver_invocation_context?: DriverRuntimeInvokerInput['driver_context'];
   agent_system_prompt_sha256?: string;
+  inbound_mailbox?: PersistedMailboxEnvelope;
+  mailbox_outcomes: MailboxToolOutcome[];
+  mailbox_sequence: number;
+  collaboration_brief?: string;
   driver_attempts: number;
   abortObserved: boolean;
 }
@@ -89,10 +104,9 @@ const TOP_LEVEL_MEMORY_ITEM_LIMIT = 5;
 const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
 const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
 const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
+const DEFAULT_MAILBOX_DEADLINE_SECONDS = 300;
 
-export class DriverRuntimeAgentExecutionFacade
-  implements AgentExecutionFacade, AgentMailboxWakePort
-{
+export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly manager: Promise<AgentManager>;
   private readonly roleReady = new Map<string, Promise<AgentManager>>();
   private readonly invalidatedRoles = new Set<string>();
@@ -110,13 +124,19 @@ export class DriverRuntimeAgentExecutionFacade
   }
 
   private createManager(): Promise<AgentManager> {
+    const tools = [
+      new InvokeDriverTool((task) => this.invokeDriver(task)),
+      ...(this.options.mailbox
+        ? [new MailboxSendTool((input) => this.sendMailbox(input))]
+        : []),
+    ];
     return AgentManager.create(this.options.repository, this.options.bufferRepository, {
       tools: {
         llm: {
           completeWithTools: (input) => this.completeWithTools(input),
         },
-        tools: [new InvokeDriverTool((task) => this.invokeDriver(task))],
-        maxToolCalls: 4,
+        tools,
+        maxToolCalls: this.options.mailbox ? 6 : 4,
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
     });
@@ -124,12 +144,6 @@ export class DriverRuntimeAgentExecutionFacade
 
   async ensureAgent(agentId: string): Promise<void> {
     await this.ensureRole(agentId);
-  }
-
-  async wakeAgent(request: AgentMailboxWakeRequestV1): Promise<void> {
-    const agentId = request.recipient_agent_id ?? request.recipient_role_id;
-    if (!agentId) throw new Error('Mailbox wake requires an Agent or role recipient');
-    await this.ensureAgent(agentId);
   }
 
   async collectCompetitionClaims(
@@ -177,6 +191,9 @@ export class DriverRuntimeAgentExecutionFacade
       call_id: createId('call'),
       source_driver: this.options.driver.driver_id,
     };
+    const inboundMailbox = input.mailbox_delivery_id
+      ? this.requireInboundMailbox(input)
+      : undefined;
     return runWithMemoryAblationPolicy(ablationPolicy, async () => {
       const retrieval = await withAbort(
         repositoryRetrieveMemoryForTask(
@@ -201,10 +218,14 @@ export class DriverRuntimeAgentExecutionFacade
       const invocation: InvocationContext = {
         task_id: input.task_id,
         run_id: input.run_id,
+        role_id: runtimeRoleId,
         instruction: input.instruction,
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
+        ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
+        mailbox_outcomes: [],
+        mailbox_sequence: 0,
         driver_attempts: 0,
         abortObserved: false,
         ...(options?.signal ? { signal: options.signal } : {}),
@@ -241,6 +262,7 @@ export class DriverRuntimeAgentExecutionFacade
         invocation.driver_attempts,
         invocation.driver_invocation_context,
         invocation.agent_system_prompt_sha256,
+        invocation.mailbox_outcomes,
       );
     });
   }
@@ -285,14 +307,169 @@ export class DriverRuntimeAgentExecutionFacade
       if (systemPromptSha256) {
         invocation.agent_system_prompt_sha256 ??= systemPromptSha256;
       }
+      invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
       return await withAbort(
-        this.options.llm.completeWithTools(withTopLevelMemoryContext(input, invocation.retrieval)),
+        this.options.llm.completeWithTools(
+          withTopLevelExecutionContext(
+            input,
+            invocation.retrieval,
+            invocation.collaboration_brief,
+          ),
+        ),
         invocation.signal,
       );
     } catch (error) {
       if (invocation.signal?.aborted) invocation.abortObserved = true;
       throw error;
     }
+  }
+
+  private requireInboundMailbox(input: AgentExecutionRequest): PersistedMailboxEnvelope {
+    const mailbox = this.options.mailbox;
+    if (!mailbox || !input.mailbox_delivery_id) {
+      throw new Error('Mailbox delivery execution requires configured Mailbox runtime');
+    }
+    const envelope = mailbox.service.getEnvelope(input.mailbox_delivery_id);
+    if (
+      envelope.message.task_id !== input.task_id ||
+      envelope.delivery.task_id !== input.task_id ||
+      envelope.delivery.recipient_role_id !== input.role_id ||
+      !input.workspace_path ||
+      path.resolve(envelope.message.workspace_path) !== path.resolve(input.workspace_path) ||
+      path.resolve(envelope.delivery.workspace_path) !== path.resolve(input.workspace_path)
+    ) {
+      throw new Error('Mailbox delivery does not match the Agent invocation scope');
+    }
+    return envelope;
+  }
+
+  private async sendMailbox(input: MailboxSendToolInput): Promise<MailboxToolOutcome> {
+    const mailbox = this.options.mailbox;
+    const invocation = this.invocationContext.getStore();
+    if (!mailbox || !invocation) {
+      throw new Error('mailbox.send was called outside a configured Agent invocation');
+    }
+    if (
+      !input.to_role_id?.trim() ||
+      !isAgentMessageType(input.type) ||
+      !isRecord(input.payload)
+    ) {
+      throw new Error('mailbox.send requires to_role_id, type and object payload');
+    }
+    if (!invocation.workspace_path) {
+      throw new Error('mailbox.send requires a workspace-bound Agent invocation');
+    }
+    if (!mailbox.allowedRoleIds.includes(input.to_role_id)) {
+      throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
+    }
+    invocation.mailbox_sequence += 1;
+    const idempotencyKey = `${invocation.run_id}:mailbox:${String(invocation.mailbox_sequence)}`;
+    const deadlineSeconds =
+      mailbox.defaultDeadlineSeconds ?? DEFAULT_MAILBOX_DEADLINE_SECONDS;
+
+    if (invocation.inbound_mailbox) {
+      const inbound = invocation.inbound_mailbox;
+      if (input.to_role_id !== inbound.message.from_role_id) {
+        throw new Error(
+          `Mailbox reply must target the sender role ${inbound.message.from_role_id}`,
+        );
+      }
+      const sessionId = invocation.execution?.session_id ?? invocation.session_id;
+      if (!sessionId) {
+        throw new Error('Invoke the driver before replying so the target Session is known');
+      }
+      const source = mailbox.service.markInjected(
+        inbound.delivery.delivery_id,
+        invocation.role_id,
+        sessionId,
+      );
+      const reply = await mailbox.service.reply({
+        source_delivery_id: source.delivery_id,
+        from_role_id: invocation.role_id,
+        type: input.type,
+        payload: { ...input.payload },
+        requires_ack: expectsMailboxReply(input.type),
+        ...(expectsMailboxReply(input.type) ? { deadline_seconds: deadlineSeconds } : {}),
+        idempotency_key: idempotencyKey,
+      });
+      const replyDelivery = reply.reply.deliveries[0];
+      if (!replyDelivery) throw new Error('Mailbox reply did not create a Delivery');
+      const outcome: MailboxToolOutcome = {
+        kind: 'reply',
+        message_id: reply.reply.message.message_id,
+        delivery_id: replyDelivery.delivery_id,
+        thread_id: reply.reply.message.thread_id,
+        from_role_id: invocation.role_id,
+        to_role_id: replyDelivery.recipient_role_id,
+        status: replyDelivery.status === 'injected' ? 'injected' : 'pending',
+        source_delivery_id: source.delivery_id,
+      };
+      invocation.mailbox_outcomes.push(outcome);
+      return outcome;
+    }
+
+    const sent = await mailbox.service.send({
+      task_id: invocation.task_id,
+      workspace_path: invocation.workspace_path,
+      thread_id: createId('thread'),
+      from_role_id: invocation.role_id,
+      to_role_id: input.to_role_id,
+      type: input.type,
+      payload: { ...input.payload },
+      requires_ack: expectsMailboxReply(input.type),
+      ...(expectsMailboxReply(input.type) ? { deadline_seconds: deadlineSeconds } : {}),
+      idempotency_key: idempotencyKey,
+    });
+    const delivery = sent.deliveries[0];
+    if (!delivery) throw new Error('Mailbox send did not create a Delivery');
+    const outcome: MailboxToolOutcome = {
+      kind: 'request',
+      message_id: sent.message.message_id,
+      delivery_id: delivery.delivery_id,
+      thread_id: sent.message.thread_id,
+      from_role_id: invocation.role_id,
+      to_role_id: delivery.recipient_role_id,
+      status: 'pending',
+    };
+    invocation.mailbox_outcomes.push(outcome);
+    return outcome;
+  }
+
+  private async buildCollaborationBrief(invocation: InvocationContext): Promise<string> {
+    const mailbox = this.options.mailbox;
+    if (!mailbox) return '';
+    const allowed = new Set(mailbox.allowedRoleIds);
+    const roleIds = (await this.options.repository.listAgentIds()).filter((roleId) =>
+      allowed.has(roleId),
+    );
+    const members = await Promise.all(
+      roleIds.map((roleId) => this.options.repository.getAgent(roleId)),
+    );
+    const inbound = invocation.inbound_mailbox;
+    return [
+      'Collaboration brief:',
+      `- Current role: ${invocation.role_id}`,
+      `- Task: ${invocation.task_id}`,
+      `- Workspace: ${invocation.workspace_path ?? '(not bound)'}`,
+      '- Available teammate roles:',
+      ...members.map(
+        (member) =>
+          `  - ${member.role_id} (${member.name}, ${member.status}): ${truncate(member.persona.summary, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}`,
+      ),
+      '- Communication: use mailbox_send(to_role_id, type, payload).',
+      ...(inbound
+        ? [
+            'Inbound mailbox envelope:',
+            `- delivery_id: ${inbound.delivery.delivery_id}`,
+            `- message_id: ${inbound.message.message_id}`,
+            `- thread_id: ${inbound.message.thread_id}`,
+            `- from_role_id: ${inbound.message.from_role_id}`,
+            `- type: ${inbound.message.type}`,
+            `- payload: ${JSON.stringify(inbound.message.payload)}`,
+            '- Process the request through invoke_driver first, then reply with mailbox_send to the sender role.',
+          ]
+        : []),
+    ].join('\n');
   }
 
   private async invokeDriver(task: DriverTask) {
@@ -360,6 +537,7 @@ export class DriverRuntimeAgentExecutionFacade
     driverAttempts: number,
     driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
     agentSystemPromptSha256: string | undefined,
+    mailboxOutcomes: readonly MailboxToolOutcome[],
   ): Promise<AgentExecutionResult> {
     const memoryMaintenance = await this.processMemoryMaintenance(
       input,
@@ -375,6 +553,7 @@ export class DriverRuntimeAgentExecutionFacade
         agentSystemPromptSha256,
         workspaceArtifacts,
         memoryMaintenance,
+        mailboxOutcomes,
       );
     }
 
@@ -421,6 +600,9 @@ export class DriverRuntimeAgentExecutionFacade
         },
         promotion: dispatched.cycle.promotion.check,
         agent_runtime: agentRuntime,
+        ...(mailboxOutcomes.length > 0
+          ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
+          : {}),
         ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
@@ -445,6 +627,7 @@ export class DriverRuntimeAgentExecutionFacade
     agentSystemPromptSha256: string | undefined,
     workspaceArtifacts: ArtifactRef[],
     memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
+    mailboxOutcomes: readonly MailboxToolOutcome[],
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     const errorCode = `B_${dispatched.status.toUpperCase()}`;
@@ -497,6 +680,9 @@ export class DriverRuntimeAgentExecutionFacade
           skills: dispatched.cycle.retrieval.skills.length,
         },
         agent_runtime: agentRuntime,
+        ...(mailboxOutcomes.length > 0
+          ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
+          : {}),
         ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
@@ -733,12 +919,14 @@ function withRetrievedMemory(
   };
 }
 
-function withTopLevelMemoryContext(
+function withTopLevelExecutionContext(
   input: Parameters<ToolCallingClient['completeWithTools']>[0],
   retrieval: MemoryRetrievalResult,
+  collaborationBrief: string,
 ): Parameters<ToolCallingClient['completeWithTools']>[0] {
   const memoryContext = renderTopLevelMemoryContext(retrieval);
-  if (!memoryContext) return input;
+  const context = [memoryContext, collaborationBrief].filter(Boolean).join('\n\n');
+  if (!context) return input;
 
   let injected = false;
   return {
@@ -746,7 +934,7 @@ function withTopLevelMemoryContext(
     messages: input.messages.map((message) => {
       if (injected || message.role !== 'user' || message.content === null) return message;
       injected = true;
-      return { ...message, content: `${message.content}\n\n${memoryContext}` };
+      return { ...message, content: `${message.content}\n\n${context}` };
     }),
   };
 }
@@ -792,6 +980,10 @@ function renderMemorySection(
 function truncate(value: string, limit: number): string {
   if (value.length <= limit) return value;
   return `${value.slice(0, Math.max(0, limit - 3))}...`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function delegationContext(original: string, delegated: string) {

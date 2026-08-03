@@ -104,6 +104,11 @@ export interface MailboxStateStore {
     input: { attempted_at: Timestamp; error?: PersistedMailboxError },
   ): PersistedMailboxDelivery;
   getMailboxEnvelope(deliveryId: string): PersistedMailboxEnvelope | undefined;
+  findLatestMailboxSession(
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
+  ): string | undefined;
   listMailboxThread(threadId: string): PersistedMailboxMessage[];
   listReplayableMailboxDeliveries(scope?: {
     task_id?: string;

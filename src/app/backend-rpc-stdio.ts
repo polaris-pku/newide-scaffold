@@ -177,6 +177,14 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
     const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    const configuredDatabasePath =
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
+    const databasePath =
+      configuredDatabasePath === ':memory:'
+        ? configuredDatabasePath
+        : path.resolve(configuredDatabasePath);
+    coordinationStore = new SqliteCoordinationStore(databasePath);
+    const mailboxService = new PersistentMailboxService(coordinationStore);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       repository: bCapabilities.repository,
@@ -187,6 +195,10 @@ export async function createProductionBackendService(
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),
+      mailbox: {
+        service: mailboxService,
+        allowedRoleIds: bRuntime.market_agent_ids,
+      },
     });
     const selectAgentHandler = new SelectAgentHandler({
       projectionSource: new BAgentProjectionAdapter({
@@ -233,14 +245,6 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
 
-    const configuredDatabasePath =
-      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
-    const databasePath =
-      configuredDatabasePath === ':memory:'
-        ? configuredDatabasePath
-        : path.resolve(configuredDatabasePath);
-    coordinationStore = new SqliteCoordinationStore(databasePath);
-    const mailboxService = new PersistentMailboxService(coordinationStore);
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
       mailboxStore: coordinationStore,
