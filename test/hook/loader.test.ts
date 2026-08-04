@@ -26,7 +26,7 @@ version: "hook-0.1"
 gates:
   test_gate:
     type: command
-    run: "echo ok"
+    command: "echo ok"
 hooks:
   task.completed:
     - gate: test_gate
@@ -98,24 +98,47 @@ version: "hook-0.1"
 gates:
   full_gate:
     type: prompt
-    run: "Check this code for issues"
+    prompt: "Check this code for issues"
     model: claude-sonnet-5
     timeout: 60
     retry_threshold: 5
     output:
       format: json
-    severity_map:
-      error: deny
-      warning: ask
+      severity_map:
+        error: deny
+        warning: ask
 `);
     const gate = config.gates['full_gate']!;
     expect(gate.type).toBe('prompt');
-    expect(gate.run).toBe('Check this code for issues');
+    expect(gate.prompt).toBe('Check this code for issues');
     expect(gate.model).toBe('claude-sonnet-5');
     expect(gate.timeout).toBe(60);
     expect(gate.retry_threshold).toBe(5);
-    expect(gate.output).toEqual({ format: 'json' });
-    expect(gate.severity_map).toEqual({ error: 'deny', warning: 'ask' });
+    expect(gate.output).toMatchObject({ format: 'json' });
+    expect(gate.output?.severity_map).toEqual({ error: 'deny', warning: 'ask' });
+  });
+
+  it('should parse output config with threshold, on_fail, and on_below_threshold', () => {
+    const config = parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  coverage_gate:
+    type: command
+    command: "pytest --cov"
+    output:
+      format: coverage_json
+      threshold:
+        line: 80
+        branch: 50
+      on_fail: ask
+      on_below_threshold: defer
+`);
+    const gate = config.gates['coverage_gate']!;
+    expect(gate.output).toBeDefined();
+    expect(gate.output!.format).toBe('coverage_json');
+    expect(gate.output!.threshold).toEqual({ line: 80, branch: 50 });
+    expect(gate.output!.on_fail).toBe('ask');
+    expect(gate.output!.on_below_threshold).toBe('defer');
   });
 
   it('should parse composite gate with sub-gate references (YAML `gate` field)', () => {
@@ -165,7 +188,7 @@ version: "hook-0.1"
 gates:
   my_gate:
     type: command
-    run: "echo test"
+    command: "echo test"
 hooks:
   task.completed:
     - name: "my-binding"
@@ -192,10 +215,10 @@ version: "hook-0.1"
 gates:
   gate_a:
     type: command
-    run: "echo a"
+    command: "echo a"
   gate_b:
     type: command
-    run: "echo b"
+    command: "echo b"
 hooks:
   task.created:
     - gate: gate_a
@@ -254,7 +277,7 @@ version: "hook-0.1"
 gates:
   my_gate:
     type: command
-    run: "echo"
+    command: "echo"
 hooks:
   invalid.event.name:
     - gate: my_gate
@@ -269,7 +292,7 @@ version: "hook-0.1"
 gates:
   my_gate:
     type: command
-    run: "echo"
+    command: "echo"
 hooks:
   task.completed:
     - name: "no-gate"
@@ -293,7 +316,7 @@ version: "hook-0.1"
 gates:
   my_gate:
     type: command
-    run: "echo"
+    command: "echo"
 hooks:
   task.completed: "not_an_array"
 `),
@@ -315,9 +338,403 @@ hooks:
     } catch (err) {
       expect(err).toBeInstanceOf(HookConfigValidationError);
       const verr = err as HookConfigValidationError;
-      // Should have at least: unknown event, 2x missing gate ref
-      expect(verr.errors.length).toBeGreaterThanOrEqual(3);
+      // Should have at least: unknown event name, 1x missing gate ref in task.completed
+      expect(verr.errors.length).toBeGreaterThanOrEqual(2);
     }
+  });
+
+  it('should reject invalid output format', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  bad_gate:
+    type: command
+    command: "echo"
+    output:
+      format: xml
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject invalid on_fail decision', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  bad_gate:
+    type: command
+    command: "echo"
+    output:
+      on_fail: reject
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject invalid on_below_threshold decision', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  bad_gate:
+    type: command
+    command: "echo"
+    output:
+      on_below_threshold: maybe
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject invalid severity_map value', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  bad_gate:
+    type: command
+    command: "echo"
+    output:
+      severity_map:
+        critical: block
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject invalid on_failure in hook binding entry', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  my_gate:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: my_gate
+      on_failure: reject
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject command gate without command field', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    timeout: 30
+hooks:
+  task.completed:
+    - gate: lint
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject prompt gate without prompt field', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  reviewer:
+    type: prompt
+    model: claude-sonnet-5
+hooks:
+  task.completed:
+    - gate: reviewer
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject http gate without http field', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  webhook:
+    type: http
+    timeout: 10
+hooks:
+  task.completed:
+    - gate: webhook
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject composite gate without gates field', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  checker:
+    type: composite
+hooks:
+  task.completed:
+    - gate: checker
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject negative gate timeout', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+    timeout: -5
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject negative gate retry_threshold', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+    retry_threshold: -1
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject negative binding timeout', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+      timeout: 0
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should report unknown gate key as error', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    comand: "echo"
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should report unknown binding key as error', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+      prioirty: 100
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should report unknown top-level key as error', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+setings:
+  fail_fast: true
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject non-positive default_timeout in settings', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+settings:
+  default_timeout: 0
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject empty emergency_env_var in settings', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+settings:
+  emergency_env_var: ""
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject fields that are not allowed for the gate type', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+    prompt: "extra"
+hooks:
+  task.completed:
+    - gate: lint
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject non-string severity_map value', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+    output:
+      severity_map:
+        critical: 123
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject threshold line out of [0, 100]', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+    output:
+      threshold:
+        line: 101
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject invalid if expression syntax', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+      if: "this is ! not @ valid # syntax"
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject non-number priority', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+      priority: "100"
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject non-number timeout', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+      timeout: "30"
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject non-string name', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: lint
+      name: 123
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject empty gate reference', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  lint:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: ""
+`),
+    ).toThrow(HookConfigValidationError);
+  });
+
+  it('should reject empty composite sub-gate reference', () => {
+    expect(() =>
+      parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  comp:
+    type: composite
+    gates:
+      - ""
+hooks:
+  task.completed:
+    - gate: comp
+`),
+    ).toThrow(HookConfigValidationError);
   });
 });
 
@@ -327,24 +744,33 @@ hooks:
 
 describe('validateHookConfig — priority clamping', () => {
   it('should clamp priority below 1 to 1', () => {
-    // Negative priority gets clamped — this is a warning, not an error
-    // Since our implementation emits errors for out-of-range but still clamps,
-    // we test that a config with out-of-range priority still parses but
-    // throws with the error message noting the clamp
-    const yaml = `
+    const config = parseHookConfigYaml(`
 version: "hook-0.1"
 gates:
   my_gate:
     type: command
-    run: "echo"
+    command: "echo"
 hooks:
   task.completed:
     - gate: my_gate
       priority: -5
-`;
-    // Out-of-range priority currently produces an error (it's reported as an issue
-    // but not a fatal one). Let's check that the error includes the clamp info.
-    expect(() => parseHookConfigYaml(yaml)).toThrow(HookConfigValidationError);
+`);
+    expect(config.hooks['task.completed']![0]!.priority).toBe(1);
+  });
+
+  it('should clamp priority above 999 to 999', () => {
+    const config = parseHookConfigYaml(`
+version: "hook-0.1"
+gates:
+  my_gate:
+    type: command
+    command: "echo"
+hooks:
+  task.completed:
+    - gate: my_gate
+      priority: 5000
+`);
+    expect(config.hooks['task.completed']![0]!.priority).toBe(999);
   });
 
   it('should accept priority in valid range', () => {
@@ -353,7 +779,7 @@ version: "hook-0.1"
 gates:
   my_gate:
     type: command
-    run: "echo"
+    command: "echo"
 hooks:
   task.completed:
     - gate: my_gate
@@ -378,8 +804,8 @@ describe('mergeHookConfigs', () => {
     version: 'hook-0.1',
     settings: { ...DEFAULT_HOOK_SETTINGS, fail_fast: false, default_timeout: 30 },
     gates: {
-      gate_a: { type: 'command', run: 'echo a' },
-      gate_b: { type: 'command', run: 'echo b' },
+      gate_a: { type: 'command', command: 'echo a' },
+      gate_b: { type: 'command', command: 'echo b' },
     },
     hooks: {
       'task.completed': [{ gate: 'gate_a', priority: 100 }],
@@ -405,13 +831,13 @@ describe('mergeHookConfigs', () => {
       version: 'hook-0.1',
       settings: { ...DEFAULT_HOOK_SETTINGS },
       gates: {
-        gate_a: { type: 'prompt', run: 'updated prompt', model: 'sonnet' },
+        gate_a: { type: 'prompt', prompt: 'updated prompt', model: 'sonnet' },
       },
       hooks: {},
     };
     const merged = mergeHookConfigs(baseConfig, override);
     expect(merged.gates['gate_a']!.type).toBe('prompt');
-    expect(merged.gates['gate_a']!.run).toBe('updated prompt');
+    expect(merged.gates['gate_a']!.prompt).toBe('updated prompt');
     // gate_b is unchanged from base
     expect(merged.gates['gate_b']!.type).toBe('command');
   });
@@ -454,6 +880,20 @@ describe('mergeHookConfigs', () => {
     };
     const merged = mergeHookConfigs(baseConfig, override);
     expect(merged.version).toBe('hook-0.2');
+  });
+
+  it('should re-validate merged config when override invalidates a base gate', () => {
+    const override: HookConfig = {
+      version: 'hook-0.1',
+      settings: { ...DEFAULT_HOOK_SETTINGS },
+      gates: {
+        gate_a: { type: 'command' }, // missing command — invalid
+      },
+      hooks: {},
+    };
+    // baseConfig has a binding that references gate_a. After merge, gate_a is
+    // overridden by an invalid definition, so re-validation must fail.
+    expect(() => mergeHookConfigs(baseConfig, override)).toThrow(HookConfigValidationError);
   });
 });
 
@@ -545,7 +985,7 @@ settings:
 gates:
   project_gate:
     type: command
-    run: "echo project"
+    command: "echo project"
 hooks:
   task.completed:
     - gate: project_gate
@@ -566,7 +1006,7 @@ settings:
 gates:
   user_gate:
     type: command
-    run: "echo user"
+    command: "echo user"
 hooks:
   task.completed:
     - gate: user_gate

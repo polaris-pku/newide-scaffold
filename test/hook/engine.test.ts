@@ -10,7 +10,7 @@ import type { HookConfig, HookSettings } from '../../src/hook/config';
 // ══════════════════════════════════════════════
 
 const EMERGENCY_ENV = 'TEST_EMERGENCY_SKIP';
-const SENTINEL = 'AGENT_EMERGENCY_SKIP';
+const SENTINEL = '1';
 
 /** Default settings used by most tests. */
 const defaultSettings: HookSettings = {
@@ -34,7 +34,7 @@ function makeConfig(overrides: {
     version: 'hook-0.1',
     settings: { ...defaultSettings, ...overrides.settings },
     gates: overrides.gates ?? {
-      'allow-gate': { type: 'command', run: 'true', retry_threshold: 1 },
+      'allow-gate': { type: 'command', command: 'true', retry_threshold: 1 },
     },
     hooks: overrides.hooks ?? {
       'task.completed': [{ gate: 'allow-gate', priority: 100 }],
@@ -158,18 +158,25 @@ describe('gate execution', () => {
 // ══════════════════════════════════════════════
 
 describe('emergency skip', () => {
-  it('skips when env var is set to the sentinel value AGENT_EMERGENCY_SKIP', async () => {
+  it('skips when env var is set to the sentinel enabling value', async () => {
     process.env[EMERGENCY_ENV] = SENTINEL;
     const engine = makeEngine({ settings: { emergency_env_var: EMERGENCY_ENV } });
     const result = await engine.handleEvent(makeEvent());
     expectSkipped(result);
   });
 
-  it('skips when env var is set to any truthy value', async () => {
-    process.env[EMERGENCY_ENV] = 'some_other_value';
+  it('skips when env var is set to an enabling value', async () => {
+    process.env[EMERGENCY_ENV] = 'true';
     const engine = makeEngine({ settings: { emergency_env_var: EMERGENCY_ENV } });
     const result = await engine.handleEvent(makeEvent());
     expectSkipped(result);
+  });
+
+  it('does NOT skip when env var is a non-enabling truthy string', async () => {
+    process.env[EMERGENCY_ENV] = 'some_other_value';
+    const engine = makeEngine({ settings: { emergency_env_var: EMERGENCY_ENV } });
+    const result = await engine.handleEvent(makeEvent());
+    expectExecuted(result);
   });
 
   it('does NOT skip when env var is empty string', async () => {
@@ -191,6 +198,13 @@ describe('emergency skip', () => {
     const result = await engine.handleEvent(makeEvent());
     expectExecuted(result);
   });
+
+  it('does NOT skip when env var is set to a disabled value like "false"', async () => {
+    process.env[EMERGENCY_ENV] = 'false';
+    const engine = makeEngine({ settings: { emergency_env_var: EMERGENCY_ENV } });
+    const result = await engine.handleEvent(makeEvent());
+    expectExecuted(result);
+  });
 });
 
 // ══════════════════════════════════════════════
@@ -207,13 +221,13 @@ settings:
 gates:
   gate_low:
     type: command
-    run: "true"
+    command: "true"
   gate_mid:
     type: command
-    run: "true"
+    command: "true"
   gate_high:
     type: command
-    run: "false"
+    command: "false"
 hooks:
   task.completed:
     - gate: gate_low
@@ -267,8 +281,8 @@ describe('if-condition filtering', () => {
   it('excludes gates whose if condition evaluates false', async () => {
     const engine = makeEngine({
       gates: {
-        'allow-gate': { type: 'command', run: 'true', retry_threshold: 1 },
-        'deny-gate': { type: 'command', run: 'false', retry_threshold: 1 },
+        'allow-gate': { type: 'command', command: 'true', retry_threshold: 1 },
+        'deny-gate': { type: 'command', command: 'false', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [
@@ -306,9 +320,9 @@ describe('parallel mode', () => {
     const engine = makeEngine({
       settings: { parallel: true },
       gates: {
-        'gate-1': { type: 'command', run: 'true', retry_threshold: 1 },
-        'gate-2': { type: 'command', run: 'true', retry_threshold: 1 },
-        'gate-3': { type: 'command', run: 'true', retry_threshold: 1 },
+        'gate-1': { type: 'command', command: 'true', retry_threshold: 1 },
+        'gate-2': { type: 'command', command: 'true', retry_threshold: 1 },
+        'gate-3': { type: 'command', command: 'true', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [
@@ -327,8 +341,8 @@ describe('parallel mode', () => {
     const engine = makeEngine({
       settings: { parallel: true, fail_fast: true },
       gates: {
-        'gate-deny': { type: 'command', run: 'false', retry_threshold: 1 },
-        'gate-allow': { type: 'command', run: 'true', retry_threshold: 1 },
+        'gate-deny': { type: 'command', command: 'false', retry_threshold: 1 },
+        'gate-allow': { type: 'command', command: 'true', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [
@@ -352,8 +366,8 @@ describe('fail-fast', () => {
     const engine = makeEngine({
       settings: { fail_fast: true },
       gates: {
-        'gate-deny': { type: 'command', run: 'false', retry_threshold: 1 },
-        'gate-allow': { type: 'command', run: 'true', retry_threshold: 1 },
+        'gate-deny': { type: 'command', command: 'false', retry_threshold: 1 },
+        'gate-allow': { type: 'command', command: 'true', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [
@@ -372,8 +386,8 @@ describe('fail-fast', () => {
     const engine = makeEngine({
       settings: { fail_fast: false },
       gates: {
-        'gate-deny': { type: 'command', run: 'false', retry_threshold: 1 },
-        'gate-allow': { type: 'command', run: 'true', retry_threshold: 1 },
+        'gate-deny': { type: 'command', command: 'false', retry_threshold: 1 },
+        'gate-allow': { type: 'command', command: 'true', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [
@@ -395,8 +409,8 @@ describe('decision aggregation', () => {
   it('aggregates multiple allow decisions to allow', async () => {
     const engine = makeEngine({
       gates: {
-        'gate-a': { type: 'command', run: 'true', retry_threshold: 1 },
-        'gate-b': { type: 'command', run: 'true', retry_threshold: 1 },
+        'gate-a': { type: 'command', command: 'true', retry_threshold: 1 },
+        'gate-b': { type: 'command', command: 'true', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [
@@ -412,8 +426,8 @@ describe('decision aggregation', () => {
   it('aggregates to deny when any gate denies', async () => {
     const engine = makeEngine({
       gates: {
-        'gate-allow': { type: 'command', run: 'true', retry_threshold: 1 },
-        'gate-deny': { type: 'command', run: 'false', retry_threshold: 1 },
+        'gate-allow': { type: 'command', command: 'true', retry_threshold: 1 },
+        'gate-deny': { type: 'command', command: 'false', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [
@@ -434,6 +448,74 @@ describe('decision aggregation', () => {
       makeEvent({ event_type: 'task.completed' }),
     );
     expect(result.final_decision).toBe('allow');
+  });
+});
+
+// ═══════════════════════════════════════════════
+// Gate execution failure & on_failure fallback
+// ═══════════════════════════════════════════════
+
+describe('gate execution failure', () => {
+  it('uses on_failure decision when gate execution throws', async () => {
+    const engine = new HookEngine({
+      config: {
+        version: 'hook-0.1',
+        settings: defaultSettings,
+        gates: {},
+        hooks: {
+          'task.completed': [
+            { gate: 'unknown-gate', priority: 100, on_failure: 'deny' },
+          ],
+        },
+      },
+    });
+    const result = await engine.handleEvent(makeEvent());
+    expect(result.matched).toBe(true);
+    expect(result.gate_requests).toHaveLength(1);
+    expect(result.gate_results).toHaveLength(1);
+    expect(result.gate_results[0]!.decision).toBe('deny');
+    expect(result.gate_results[0]!.reason).toContain('Gate execution failed');
+    expect(result.final_decision).toBe('deny');
+  });
+
+  it('defaults to allow when gate execution throws and on_failure is unset', async () => {
+    const engine = new HookEngine({
+      config: {
+        version: 'hook-0.1',
+        settings: defaultSettings,
+        gates: {},
+        hooks: {
+          'task.completed': [{ gate: 'unknown-gate', priority: 100 }],
+        },
+      },
+    });
+    const result = await engine.handleEvent(makeEvent());
+    expect(result.matched).toBe(true);
+    expect(result.gate_results).toHaveLength(1);
+    expect(result.gate_results[0]!.decision).toBe('allow');
+    expect(result.final_decision).toBe('allow');
+  });
+
+  it('stops early on fail_fast when fallback decision is deny', async () => {
+    const engine = new HookEngine({
+      config: {
+        version: 'hook-0.1',
+        settings: { ...defaultSettings, fail_fast: true },
+        gates: {
+          'allow-gate': { type: 'command', command: 'true', retry_threshold: 1 },
+        },
+        hooks: {
+          'task.completed': [
+            { gate: 'unknown-gate', priority: 100, on_failure: 'deny' },
+            { gate: 'allow-gate', priority: 50 },
+          ],
+        },
+      },
+    });
+    const result = await engine.handleEvent(makeEvent());
+    expect(result.gate_results).toHaveLength(1);
+    expect(result.gate_results[0]!.decision).toBe('deny');
+    expect(result.final_decision).toBe('deny');
   });
 });
 
@@ -481,8 +563,8 @@ describe('multiple event types', () => {
   it('matches gates against the correct event type bindings', async () => {
     const engine = makeEngine({
       gates: {
-        'gate-a': { type: 'command', run: 'true', retry_threshold: 1 },
-        'gate-b': { type: 'command', run: 'true', retry_threshold: 1 },
+        'gate-a': { type: 'command', command: 'true', retry_threshold: 1 },
+        'gate-b': { type: 'command', command: 'true', retry_threshold: 1 },
       },
       hooks: {
         'task.completed': [{ gate: 'gate-a', priority: 100 }],
