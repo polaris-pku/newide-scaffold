@@ -827,8 +827,11 @@ export class NewideBackendService {
         delivery_id: sourceDeliveryId,
         run_id: context.run_id,
       });
-      if (handled.status !== 'replied') return;
-      reply = mailbox.getEnvelope(handled.reply!.delivery_id);
+      reply =
+        handled.status === 'replied' && handled.reply
+          ? mailbox.getEnvelope(handled.reply.delivery_id)
+          : mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+      if (!reply) return;
     }
     await this.startRun(
       {
