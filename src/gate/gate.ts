@@ -36,6 +36,14 @@ export interface GateResult {
 
 export type GateOutputFormat = 'sarif' | 'junit' | 'json' | 'text' | 'coverage_json';
 
+export const VALID_GATE_OUTPUT_FORMATS = new Set<string>([
+  'sarif',
+  'junit',
+  'json',
+  'text',
+  'coverage_json',
+]);
+
 export interface GateOutputConfig {
   /** Output format for parsing command stdout. When unset, only exit code is checked. */
   format?: GateOutputFormat;
