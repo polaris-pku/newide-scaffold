@@ -95,6 +95,7 @@ describe('NewideBackendService', () => {
         prompt: 'Build RPC',
         workspace_path: process.cwd(),
         session_id: 'session_existing',
+        memory_ablation: 'B0',
       }),
     ).resolves.toEqual({
       run_id: 'run_1',
@@ -104,6 +105,7 @@ describe('NewideBackendService', () => {
     expect(receivedRequest).toMatchObject({
       workspace_path: process.cwd(),
       session_id: 'session_existing',
+      memoryAblation: 'B0',
     });
     expect(service.getSnapshot('run_1')).toMatchObject({
       status: 'running',

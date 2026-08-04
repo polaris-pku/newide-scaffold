@@ -28,6 +28,7 @@ export interface PersistedRunRequest {
   project_id?: string;
   client_task_id?: string;
   title?: string;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   restarted_from_run_id?: string;
   created_at: Timestamp;
 }
@@ -236,6 +237,8 @@ function isPersistedRunRequest(value: unknown): value is PersistedRunRequest {
     typeof record.prompt === 'string' &&
     typeof record.workspace_path === 'string' &&
     (record.task_request === undefined || isTaskCreateRequest(record.task_request)) &&
+    (record.memory_ablation === undefined ||
+      ['B0', 'B1', 'B2', 'B3'].includes(String(record.memory_ablation))) &&
     asRunMode(record.mode) !== undefined
   );
 }

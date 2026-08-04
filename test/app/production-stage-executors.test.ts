@@ -3,15 +3,23 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
+import {
+  SCHEMA_VERSION,
+  nowTimestamp,
+  type ArtifactRef,
+  type Event,
+} from '../../src/core';
 import { completionCriterionId } from '../../src/coordinator/completion-criteria-evaluator';
 import { createProductionStageExecutors } from '../../src/app/production-stage-executors';
+import type { AgentExecutionRequest } from '../../src/protocol/agent-execution';
 
 describe('production stage executors', () => {
   it('connects real selection, Agent, Gate, manifest and idempotent Deliver boundaries', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
     const workspace = path.join(root, 'workspace');
     const criterion = 'output.txt is delivered';
+    let receivedAgentRequest: AgentExecutionRequest | undefined;
+    const emittedEvents: Event[] = [];
     const artifact: ArtifactRef = {
       artifact_id: 'artifact_output',
       type: 'file',
@@ -64,7 +72,9 @@ describe('production stage executors', () => {
         }),
       },
       agentExecutionFacade: {
-        runAgent: async () => ({
+        runAgent: async (request) => {
+          receivedAgentRequest = request;
+          return {
           agent_run_id: 'agent_run_1',
           agent_id: 'role_ts_engineer',
           role_id: 'role_ts_engineer',
@@ -85,7 +95,8 @@ describe('production stage executors', () => {
           status: 'completed',
           created_at: nowTimestamp(),
           schema_version: SCHEMA_VERSION,
-        }),
+          };
+        },
       },
       councilProvider: {
         runCouncilRound: async () => {
@@ -130,6 +141,8 @@ describe('production stage executors', () => {
       mode: 'single_agent' as const,
       task_request: taskRequest,
       workspace_path: workspace,
+      memory_ablation: 'B0' as const,
+      on_event: (event: Event) => emittedEvents.push(event),
     };
 
     const selected = await executors.select_agent.execute({
@@ -140,6 +153,10 @@ describe('production stage executors', () => {
       ...common,
       cursor_input: { cursor: 'execute_agent', winner_agent_id: selected.winner_agent_id },
     });
+    expect(receivedAgentRequest).toMatchObject({ memory_ablation: 'B0' });
+    expect(
+      emittedEvents.find((event) => event.event_type === 'memory.context_pack_built')?.payload,
+    ).toMatchObject({ ablation: 'B0' });
     const gated = await executors.gate.execute({
       ...common,
       cursor_input: {

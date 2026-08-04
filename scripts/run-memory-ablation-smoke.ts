@@ -2,7 +2,7 @@
  * §1 memory ablation smoke: B0 / B1 / B2 × 3 sequential related tasks.
  *
  * Uses production backend (real ACP driver + Postgres B memory).
- * Artifacts default to D:\Code\NewIDE\.newide-experiments\memory-ablation\<ts>\.
+ * Artifacts default to ../.newide-experiments/memory-ablation/<ts>/.
  *
  * Usage:
  *   pnpm exec tsx scripts/run-memory-ablation-smoke.ts
@@ -12,6 +12,10 @@ import { promises as fs } from 'node:fs';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import {
+  prepareAblationArmIsolation,
+  waitForRunMaintenance,
+} from './ablation-arm-isolation';
 
 type MemoryAblation = 'B0' | 'B1' | 'B2';
 
@@ -34,7 +38,8 @@ const repoRoot = process.cwd();
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
-  process.env.NEWIDE_ABLATION_ROOT ?? 'D:\\Code\\NewIDE\\.newide-experiments\\memory-ablation',
+  process.env.NEWIDE_ABLATION_ROOT ??
+    path.join(repoRoot, '..', '.newide-experiments', 'memory-ablation'),
   stamp,
 );
 const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 600_000);
@@ -86,14 +91,21 @@ for (const ablation of ABLATIONS) {
   const workspace = path.join(armDir, 'workspace');
   await fs.mkdir(workspace, { recursive: true });
   const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const isolation = await prepareAblationArmIsolation({
+    experiment_root: experimentRoot,
+    arm: ablation,
+    database_url: dbUrl,
+  });
+  await fs.mkdir(isolation.state_root, { recursive: true });
   log('');
   log(`=== arm ${ablation} db=${dbUrl.replace(/:[^:@]+@/, ':***@')} ===`);
+  log(`state root: ${isolation.state_root}`);
+  log(`database schema: ${isolation.database_schema}`);
 
   const backend = await startBackend(ablation, {
     ...baseEnv,
-    NEWIDE_B_DATABASE_URL: dbUrl,
-    // Keep runs under the arm directory when possible.
-    NEWIDE_RUNS_ROOT: path.join(armDir, 'runs'),
+    NEWIDE_B_DATABASE_URL: isolation.database_url,
+    NEWIDE_STATE_ROOT: isolation.state_root,
   });
 
   const taskResults: unknown[] = [];
@@ -110,13 +122,37 @@ for (const ablation of ABLATIONS) {
       });
       await backend.request('run.subscribe', { run_id: created.run_id });
       const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
+      let maintenance:
+        | {
+            maintenance_ref: string;
+            status: string;
+          }
+        | undefined;
       if (ablation !== 'B0') {
-        await sleep(maintenanceWaitMs);
+        maintenance = await waitForRunMaintenance(
+          backend.request,
+          created.run_id,
+          maintenanceWaitMs,
+        );
+        if (maintenance.status !== 'completed') {
+          throw new Error(
+            `Memory maintenance ${maintenance.maintenance_ref} ended as ${maintenance.status}`,
+          );
+        }
       }
       const afterFiles = await listWorkspaceFiles(workspace);
       const memory = await captureMemory(backend);
-      const summaryPath = path.join(repoRoot, '.newide', 'runs', created.run_id, 'summary.json');
+      const summaryPath = path.join(isolation.state_root, 'runs', created.run_id, 'summary.json');
       const summary = await readJsonIfExists(summaryPath);
+      const summaryAblation =
+        summary && typeof summary === 'object'
+          ? (summary as { memory_ablation?: unknown }).memory_ablation
+          : undefined;
+      if (summaryAblation !== ablation) {
+        throw new Error(
+          `Backend summary ablation mismatch: expected ${ablation}, got ${String(summaryAblation)}`,
+        );
+      }
       const row = {
         ablation,
         task_id: task.id,
@@ -127,6 +163,12 @@ for (const ablation of ABLATIONS) {
           summary && typeof summary === 'object'
             ? (summary as { memory_ablation?: string }).memory_ablation
             : undefined,
+        ...(maintenance
+          ? {
+              maintenance_ref: maintenance.maintenance_ref,
+              maintenance_status: maintenance.status,
+            }
+          : {}),
         files_changed: diffFiles(beforeFiles, afterFiles),
         memory,
         snapshot_diagnostics: extractDiagnostics(snapshot),
@@ -145,7 +187,12 @@ for (const ablation of ABLATIONS) {
     await backend.close();
   }
 
-  const armSummary = { ablation, tasks: taskResults };
+  const armSummary = {
+    ablation,
+    state_root: isolation.state_root,
+    database_schema: isolation.database_schema,
+    tasks: taskResults,
+  };
   armReports.push(armSummary);
   await fs.writeFile(path.join(armDir, 'arm-summary.json'), JSON.stringify(armSummary, null, 2));
 }

@@ -44,6 +44,19 @@ describe('TaskExecutionLoop', () => {
     );
   });
 
+  it('propagates memory ablation to every production stage context', async () => {
+    const fixture = createFixture();
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    await fixture.loop.run({
+      task_id: 'task_loop',
+      run_id: 'run_loop',
+      memory_ablation: 'B0',
+    });
+
+    expect(fixture.memoryAblations).toEqual(['B0', 'B0', 'B0', 'B0']);
+  });
+
   it('refuses a legacy cursor projection that has no matching typed input', async () => {
     const fixture = createFixture();
     begin(fixture.processor, selectInput, 'single_agent');
@@ -310,6 +323,7 @@ function createFixture(options: FixtureOptions = {}): {
   evidenceStore: MemoryEvidenceStore;
   calls: string[];
   inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>>;
+  memoryAblations: Array<string | undefined>;
 } {
   const store = new SqliteCoordinationStore(':memory:');
   let conflictInjected = false;
@@ -326,13 +340,19 @@ function createFixture(options: FixtureOptions = {}): {
   const processor = new TaskProcessor(interceptingStore, deterministicClock());
   const calls: string[] = [];
   const inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>> = {};
+  const memoryAblations: Array<string | undefined> = [];
   const execute = <TInput extends TaskCursorInput, TResult>(
     cursor: TInput['cursor'],
     result: TResult,
   ) =>
-    vi.fn(async (context: { cursor_input: TInput }): Promise<TResult> => {
+    vi.fn(
+      async (context: {
+        cursor_input: TInput;
+        memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+      }): Promise<TResult> => {
       calls.push(cursor);
       inputs[cursor] = context.cursor_input;
+      memoryAblations.push(context.memory_ablation);
       if (cursor === 'execute_agent' && options.overrideDuringExecute) {
         processor.setCouncilOverride('run_loop');
       }
@@ -377,6 +397,7 @@ function createFixture(options: FixtureOptions = {}): {
       execute: vi.fn(async (context) => {
         calls.push('deliver');
         inputs.deliver = context.cursor_input;
+        memoryAblations.push(context.memory_ablation);
         return {
           final_output: {
             artifact_ref: context.cursor_input.changeset_ref,
@@ -401,6 +422,7 @@ function createFixture(options: FixtureOptions = {}): {
     }),
     calls,
     inputs,
+    memoryAblations,
   };
 }
 

@@ -84,7 +84,7 @@ function cacheKey(ref: GhRef): string {
   return `${ref.owner}__${ref.repo}__${ref.kind}__${ref.number}`;
 }
 
-function collectRefs(problemStatement: string, defaultRepo: string): GhRef[] {
+function collectRefs(problemStatement: string, defaultRepo: string): Map<string, GhRef> {
   const out = new Map<string, GhRef>();
   const text = problemStatement ?? '';
 
@@ -256,7 +256,7 @@ async function main(): Promise<void> {
   const allRefs = new Map<string, GhRef>();
   const perInstance = new Map<string, GhRef[]>();
   for (const id of subset.instance_ids) {
-    const inst = getInstanceOrThrow(instancesById, id) as Record<string, unknown>;
+    const inst = getInstanceOrThrow(instancesById, id) as unknown as Record<string, unknown>;
     const refMap = collectRefs(String(inst.problem_statement ?? ''), String(inst.repo ?? ''));
     addRefsFromPrMeta(inst.PRs, refMap);
     const refs = [...refMap.values()];
@@ -303,7 +303,7 @@ async function main(): Promise<void> {
   const lines: string[] = [];
   const summaryRows: Array<Record<string, unknown>> = [];
   for (const id of subset.instance_ids) {
-    const inst = getInstanceOrThrow(instancesById, id) as Record<string, unknown>;
+    const inst = getInstanceOrThrow(instancesById, id) as unknown as Record<string, unknown>;
     const refs = perInstance.get(id) ?? [];
     const sections: string[] = [];
     let ok = 0;

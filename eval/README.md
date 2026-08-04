@@ -220,7 +220,7 @@ pnpm eval:sweevo-ablation -- --subset v0-smoke --run-harness
 pnpm eval:sweevo-ablation -- --subset v0-repo-full --ablations "B0,B1,B2" --run-harness
 ```
 
-方向一批跑默认开启 `NEWIDE_SWE_EVO_BLOCK_INTERNET=1`（对齐 SWE-EVO 论文：生成阶段禁止外网检索）。实现为 ACP 权限门拒绝 `WebFetch`/`WebSearch`/出网 Bash，并在 ephemeral worktree 写入 `.claude/settings.json` deny 列表。数据集 `PRs[].patch_without_test` **不会**注入 prompt（避免泄漏金标 patch）。注意：PowerShell 下逗号参数需加引号 `"B0,B1,B2"`。
+方向一批跑默认开启 `NEWIDE_SWE_EVO_BLOCK_INTERNET=1`（对齐 SWE-EVO 论文：生成阶段禁止外网检索）。实现为 ACP 权限门拒绝 `WebFetch`/`WebSearch`/出网 Bash，并在 ephemeral worktree 写入 `.claude/settings.json` deny 列表。工作区是只含 `base_commit` 的单提交浅克隆，不共享 mirror 的 tags、refs 或对象库，并在启动 Agent 前删除 remote，避免通过目标 release tag 提取 gold delta。数据集 `PRs[].patch_without_test` **不会**注入 prompt（避免泄漏金标 patch）。注意：PowerShell 下逗号参数需加引号 `"B0,B1,B2"`。
 
 ### 离线 PR/Issue context（论文默认设定）
 
@@ -236,7 +236,7 @@ pnpm eval:build-pr-context -- --subset v0-repo-full
 pnpm eval:sweevo-ablation -- --subset v0-repo-full-prctx --ablations "B0,B1,B2" --run-harness
 ```
 
-产物：`D:\Code\NewIDE\.newide-experiments\sweevo-ablation\<ts>\`（可用 `NEWIDE_SWEEVO_ABLATION_ROOT` 改根）。后端 `summary.worktree_path` 在传入 `workspace_path` 时绑定 agent 的 git 树；评测用 `--allow-dirty-worktree` 从该树相对 `base_commit` 收集 patch。契约见 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)。
+产物：`../.newide-experiments/sweevo-ablation/<ts>/`（可用 `NEWIDE_SWEEVO_ABLATION_ROOT` 改根）。后端 `summary.worktree_path` 在传入 `workspace_path` 时绑定 agent 的 git 树；评测用 `--allow-dirty-worktree` 从该树相对 `base_commit` 收集 patch。契约见 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)。
 
 ## 怎么理解这套系统
 

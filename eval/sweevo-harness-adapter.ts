@@ -1,5 +1,5 @@
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { loadManifest, resolveDatasetJsonl, resolveRunDir, resolveSweEvoRoot } from './paths';
 import { getInstanceOrThrow, indexDatasetById, loadDataset } from './load-dataset';
@@ -150,6 +150,59 @@ export function writeHarnessReport(path: string, report: SweBenchHarnessReport):
   writeJson(path, report);
 }
 
+/**
+ * Collect per-instance `report.json` files written by SWE-EVO's
+ * `evaluate_instance.py` under `<workDir>/logs/run_evaluation/<run>/<run>/<instance_id>/`.
+ * Returns a merged harness report keyed by instance_id.
+ */
+export function collectSweEvoInstanceReports(input: {
+  workDir: string;
+  trajectoryDir: string;
+  instanceIds: string[];
+}): { report: SweBenchHarnessReport; missing: string[] } {
+  const runName = basename(input.trajectoryDir);
+  const primaryDir = join(input.workDir, 'logs', 'run_evaluation', runName, runName);
+  const searchRoot = join(input.workDir, 'logs', 'run_evaluation');
+  const report: SweBenchHarnessReport = {};
+  const missing: string[] = [];
+
+  for (const instanceId of input.instanceIds) {
+    let reportPath: string | undefined = join(primaryDir, instanceId, 'report.json');
+    if (!existsSync(reportPath)) {
+      reportPath = findInstanceReport(searchRoot, instanceId);
+    }
+    if (!reportPath) {
+      missing.push(instanceId);
+      continue;
+    }
+    const parsed = JSON.parse(readFileSync(reportPath, 'utf-8')) as SweBenchHarnessReport;
+    const entry = parsed[instanceId] ?? Object.values(parsed)[0];
+    if (entry) {
+      report[instanceId] = entry;
+    } else {
+      missing.push(instanceId);
+    }
+  }
+  return { report, missing };
+}
+
+function findInstanceReport(searchRoot: string, instanceId: string): string | undefined {
+  if (!existsSync(searchRoot)) return undefined;
+  const wanted = `${sep}${instanceId}${sep}report.json`;
+  try {
+    const entries = readdirSync(searchRoot, { recursive: true }) as string[];
+    for (const entry of entries) {
+      const candidate = String(entry);
+      if (candidate.endsWith('report.json') && `${sep}${candidate}`.includes(wanted)) {
+        return join(searchRoot, candidate);
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 export async function runSweEvoHarnessAdapter(
   options: SweEvoHarnessAdapterOptions,
 ): Promise<SweEvoHarnessAdapterResult> {
@@ -188,12 +241,11 @@ export async function runSweEvoHarnessAdapter(
     note: 'Run this command in the SWE-EVO environment. On Windows, set NEWIDE_SWE_EVO_PYTHON=wsl to invoke via WSL. Pass --report-source when a harness report is available to normalize it into harness-report.json.',
   });
 
+  let report: SweBenchHarnessReport = {};
   if (options.reportSource) {
-    const report = JSON.parse(readFileSync(options.reportSource, 'utf-8')) as SweBenchHarnessReport;
-    writeHarnessReport(harnessReportPath, report);
-  } else {
-    writeHarnessReport(harnessReportPath, {});
+    report = JSON.parse(readFileSync(options.reportSource, 'utf-8')) as SweBenchHarnessReport;
   }
+  writeHarnessReport(harnessReportPath, report);
 
   if (!options.dryRun) {
     const viaWsl = command.command === 'wsl';
@@ -206,6 +258,28 @@ export async function runSweEvoHarnessAdapter(
     });
     if (completed.status !== 0) {
       throw new Error(`SWE-EVO harness exited with status ${completed.status ?? 'unknown'}`);
+    }
+
+    // Fold the per-instance report.json files the harness just produced into
+    // harness-report.json; otherwise downstream resolved/applied counts stay 0.
+    const collected = collectSweEvoInstanceReports({
+      workDir,
+      trajectoryDir,
+      instanceIds: predictions.map((prediction) => prediction.instance_id),
+    });
+    report = { ...report, ...collected.report };
+    writeHarnessReport(harnessReportPath, report);
+    if (Object.keys(report).length === 0 && predictions.length > 0) {
+      throw new Error(
+        `SWE-EVO harness completed but no per-instance report.json was found under ` +
+          `${join(workDir, 'logs', 'run_evaluation')} (missing: ${collected.missing.join(', ')}). ` +
+          'Refusing to score this run as all-unresolved; inspect harness logs.',
+      );
+    }
+    if (collected.missing.length > 0) {
+      console.warn(
+        `[sweevo-harness] missing report.json for: ${collected.missing.join(', ')}`,
+      );
     }
   }
 

@@ -160,6 +160,9 @@ export function createProductionStageExecutors(
       emit(context, 'agent.execution_requested', context.run_id, {
         role_id: context.cursor_input.winner_agent_id,
         workspace_path: executionWorkspace,
+        ...(context.memory_ablation
+          ? { ablation: context.memory_ablation }
+          : {}),
       });
       const result = await dependencies.agentExecutionFacade.runAgent(
         {
@@ -171,6 +174,9 @@ export function createProductionStageExecutors(
           input_artifact_refs: [],
           context_policy: 'production_task_loop',
           schema_version: SCHEMA_VERSION,
+          ...(context.memory_ablation
+            ? { memory_ablation: context.memory_ablation }
+            : {}),
           ...(context.session_id ? { session_id: context.session_id } : {}),
         },
         {
@@ -260,6 +266,9 @@ export function createProductionStageExecutors(
         context_pack_ref: result.context_pack_ref,
         memory_buffer_ref: result.memory_buffer_ref,
         diagnostics: result.diagnostics,
+        ...(context.memory_ablation
+          ? { ablation: context.memory_ablation }
+          : {}),
       });
       emit(context, 'agent.execution_completed', result.agent_run_id, {
         agent_id: result.agent_id ?? result.role_id,
