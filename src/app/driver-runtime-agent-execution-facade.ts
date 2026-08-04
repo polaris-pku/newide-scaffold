@@ -253,7 +253,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         await this.recoverRole(runtimeRoleId);
         throwIfAborted(invocation.signal);
       }
-      return this.buildResult(
+      const result = await this.buildResult(
         input,
         dispatched,
         runtimeRoleId,
@@ -264,6 +264,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         invocation.agent_system_prompt_sha256,
         invocation.mailbox_outcomes,
       );
+      if (inboundMailbox && result.status === 'completed') {
+        this.finishInboundMailbox(inboundMailbox, result, invocation.mailbox_outcomes);
+      }
+      return result;
     });
   }
 
@@ -306,6 +310,24 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const systemPromptSha256 = hashSystemPrompt(input.messages);
       if (systemPromptSha256) {
         invocation.agent_system_prompt_sha256 ??= systemPromptSha256;
+      }
+      const pendingReply = invocation.mailbox_outcomes.find(
+        (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
+      );
+      const completedReply = invocation.mailbox_outcomes.find(
+        (outcome) => outcome.kind === 'reply',
+      );
+      if (pendingReply) {
+        return {
+          content: `Mailbox request ${pendingReply.message_id} persisted; waiting for ${pendingReply.to_role_id}. [done]`,
+          tool_calls: undefined,
+        };
+      }
+      if (completedReply) {
+        return {
+          content: `Mailbox reply ${completedReply.message_id} persisted. [done]`,
+          tool_calls: undefined,
+        };
       }
       invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
       return await withAbort(
@@ -363,11 +385,23 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
     invocation.mailbox_sequence += 1;
+    const waitForReply = expectsMailboxReply(input.type);
+    if (
+      waitForReply &&
+      invocation.mailbox_outcomes.some(
+        (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
+      )
+    ) {
+      throw new Error('An Agent turn can wait for only one Mailbox reply');
+    }
     const idempotencyKey = `${invocation.run_id}:mailbox:${String(invocation.mailbox_sequence)}`;
     const deadlineSeconds =
       mailbox.defaultDeadlineSeconds ?? DEFAULT_MAILBOX_DEADLINE_SECONDS;
 
-    if (invocation.inbound_mailbox) {
+    if (
+      invocation.inbound_mailbox &&
+      envelopeExpectsReply(invocation.inbound_mailbox)
+    ) {
       const inbound = invocation.inbound_mailbox;
       if (input.to_role_id !== inbound.message.from_role_id) {
         throw new Error(
@@ -388,8 +422,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         from_role_id: invocation.role_id,
         type: input.type,
         payload: { ...input.payload },
-        requires_ack: expectsMailboxReply(input.type),
-        ...(expectsMailboxReply(input.type) ? { deadline_seconds: deadlineSeconds } : {}),
+        requires_ack: false,
         idempotency_key: idempotencyKey,
       });
       const replyDelivery = reply.reply.deliveries[0];
@@ -402,10 +435,16 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         from_role_id: invocation.role_id,
         to_role_id: replyDelivery.recipient_role_id,
         status: replyDelivery.status === 'injected' ? 'injected' : 'pending',
+        wait_for_reply: false,
         source_delivery_id: source.delivery_id,
       };
       invocation.mailbox_outcomes.push(outcome);
       return outcome;
+    }
+    if (invocation.inbound_mailbox && !invocation.execution) {
+      throw new Error(
+        'Process the inbound Mailbox delivery with invoke_driver before sending another message',
+      );
     }
 
     const sent = await mailbox.service.send({
@@ -430,9 +469,38 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       from_role_id: invocation.role_id,
       to_role_id: delivery.recipient_role_id,
       status: 'pending',
+      wait_for_reply: waitForReply,
     };
     invocation.mailbox_outcomes.push(outcome);
     return outcome;
+  }
+
+  private finishInboundMailbox(
+    inbound: PersistedMailboxEnvelope,
+    result: AgentExecutionResult,
+    outcomes: readonly MailboxToolOutcome[],
+  ): void {
+    const mailbox = this.options.mailbox;
+    if (!mailbox) return;
+    const current = mailbox.service.getEnvelope(inbound.delivery.delivery_id).delivery;
+    const injected =
+      current.status === 'pending'
+        ? mailbox.service.markInjected(
+            current.delivery_id,
+            current.recipient_role_id,
+            result.session_id,
+          )
+        : current;
+    const replied = outcomes.some(
+      (outcome) =>
+        outcome.kind === 'reply' && outcome.source_delivery_id === injected.delivery_id,
+    );
+    if (
+      injected.status === 'injected' &&
+      (!envelopeExpectsReply(inbound) || replied)
+    ) {
+      mailbox.service.ack(injected.delivery_id, injected.recipient_role_id);
+    }
   }
 
   private async buildCollaborationBrief(invocation: InvocationContext): Promise<string> {
@@ -459,6 +527,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       '- Communication: use mailbox_send(to_role_id, type, payload).',
       ...(inbound
         ? [
+            '- Inbound delivery takes precedence over the original Task wording; do not repeat the original outbound request.',
+          ]
+        : []),
+      ...(inbound
+        ? [
             'Inbound mailbox envelope:',
             `- delivery_id: ${inbound.delivery.delivery_id}`,
             `- message_id: ${inbound.message.message_id}`,
@@ -466,7 +539,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             `- from_role_id: ${inbound.message.from_role_id}`,
             `- type: ${inbound.message.type}`,
             `- payload: ${JSON.stringify(inbound.message.payload)}`,
-            '- Process the request through invoke_driver first, then reply with mailbox_send to the sender role.',
+            ...(envelopeExpectsReply(inbound)
+              ? [
+                  '- Process the request through invoke_driver first, then reply with mailbox_send to the sender role.',
+                ]
+              : [
+                  '- Process this message through invoke_driver and continue the Task; no Mailbox acknowledgement tool call is required.',
+                ]),
           ]
         : []),
     ].join('\n');
@@ -630,6 +709,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     mailboxOutcomes: readonly MailboxToolOutcome[],
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
+    const mailboxWait = mailboxOutcomes.find(
+      (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
+    );
     const errorCode = `B_${dispatched.status.toUpperCase()}`;
     const errorMessage = dispatched.cycle.buffer_snapshot.driver_return.summary;
     const transcript: ArtifactRef = {
@@ -660,18 +742,24 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       artifact_refs: [...workspaceArtifacts],
       transcript_ref: transcript,
       session_id: this.options.driver.session_id,
-      response: '',
+      response: mailboxWait
+        ? `Waiting for Mailbox reply from ${mailboxWait.to_role_id}.`
+        : '',
       tool_events: [],
       diagnostics: {
         driver_id: this.options.driver.driver_id,
-        driver_status: 'failed',
+        driver_status: mailboxWait ? 'not_invoked' : 'failed',
         dispatch_status: dispatched.status,
-        driver_error_code: errorCode,
-        driver_error: {
-          code: errorCode,
-          message: errorMessage,
-          retryable: dispatched.status === 'blocked',
-        },
+        ...(mailboxWait
+          ? { mailbox_wait: true }
+          : {
+              driver_error_code: errorCode,
+              driver_error: {
+                code: errorCode,
+                message: errorMessage,
+                retryable: dispatched.status === 'blocked',
+              },
+            }),
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],
         buffer_seq: dispatched.cycle.buffer_seq,
@@ -687,7 +775,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
       },
-      status: dispatched.status === 'cancelled' ? 'cancelled' : 'failed',
+      status: mailboxWait
+        ? 'completed'
+        : dispatched.status === 'cancelled'
+          ? 'cancelled'
+          : 'failed',
       memory_buffer_ref: contextEvidence.memory_buffer_ref,
       created_at,
       schema_version: SCHEMA_VERSION,
@@ -832,6 +924,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     });
     return rejectWhileQueued(running, signal, () => started);
   }
+}
+
+function envelopeExpectsReply(envelope: PersistedMailboxEnvelope): boolean {
+  return (
+    !envelope.message.reply_to_message_id &&
+    expectsMailboxReply(envelope.message.type)
+  );
 }
 
 function hashSystemPrompt(

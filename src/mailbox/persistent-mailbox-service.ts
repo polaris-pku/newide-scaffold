@@ -226,6 +226,24 @@ export class PersistentMailboxService {
     return this.store.findLatestMailboxSession(taskId, workspacePath, recipientRoleId);
   }
 
+  findReplyDelivery(
+    sourceDeliveryId: string,
+    recipientRoleId: string,
+  ): PersistedMailboxEnvelope | undefined {
+    const source = this.requireDelivery(sourceDeliveryId);
+    return this.store
+      .listMailboxInbox(
+        source.message.task_id,
+        source.message.workspace_path,
+        recipientRoleId,
+      )
+      .find(
+        (candidate) =>
+          candidate.message.reply_to_message_id === source.message.message_id &&
+          candidate.message.thread_id === source.message.thread_id,
+      );
+  }
+
   private validateSend(input: Omit<MailboxSendInput, 'thread_id'> & { thread_id?: string }): void {
     if (input.requires_ack && input.deadline_seconds === undefined) {
       throw new MailboxValidationError('requires_ack messages must set deadline_seconds');

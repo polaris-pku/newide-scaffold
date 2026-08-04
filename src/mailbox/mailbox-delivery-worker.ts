@@ -4,7 +4,7 @@ import type {
   AgentExecutionOptions,
   AgentExecutionResult,
 } from '../protocol/agent-execution';
-import type { MailboxToolOutcome } from './mailbox-send-tool';
+import { expectsMailboxReply, type MailboxToolOutcome } from './mailbox-send-tool';
 import type { PersistedMailboxDelivery } from './mailbox-state-store';
 import type { PersistentMailboxService } from './persistent-mailbox-service';
 
@@ -31,7 +31,10 @@ export class MailboxDeliveryWorker {
 
   async process(input: ProcessMailboxDeliveryInput): Promise<ProcessMailboxDeliveryResult> {
     const envelope = this.mailbox.getEnvelope(input.delivery_id);
-    if (envelope.delivery.status !== 'pending') {
+    if (
+      envelope.delivery.status !== 'pending' &&
+      envelope.delivery.status !== 'injected'
+    ) {
       return {
         status: envelope.delivery.status === 'acknowledged' ? 'acknowledged' : 'retryable_failure',
         source_delivery: envelope.delivery,
@@ -86,6 +89,14 @@ export class MailboxDeliveryWorker {
       if (reply) {
         return { status: 'replied', source_delivery: this.mailbox.getEnvelope(injected.delivery_id).delivery, recipient_result: result, reply };
       }
+      if (expectsBusinessReply(envelope)) {
+        return {
+          status: 'retryable_failure',
+          source_delivery: injected,
+          recipient_result: result,
+          error: 'Recipient Agent completed without a required business reply',
+        };
+      }
       const acknowledged =
         injected.status === 'injected'
           ? this.mailbox.ack(injected.delivery_id, injected.recipient_role_id)
@@ -117,9 +128,20 @@ function renderMailboxInstruction(
     `Handle Mailbox delivery ${envelope.delivery.delivery_id} from ${envelope.message.from_role_id}.`,
     `Type: ${envelope.message.type}`,
     `Payload: ${JSON.stringify(envelope.message.payload)}`,
-    'Use invoke_driver to assess the request, then reply to the sender with mailbox_send.',
+    expectsBusinessReply(envelope)
+      ? 'Use invoke_driver to assess the request, then reply to the sender with mailbox_send.'
+      : 'Use invoke_driver to consume this reply and continue the Task; do not send an acknowledgement message.',
     'Do not modify workspace files unless the message explicitly asks for an implementation handoff.',
   ].join('\n');
+}
+
+function expectsBusinessReply(
+  envelope: ReturnType<PersistentMailboxService['getEnvelope']>,
+): boolean {
+  return (
+    !envelope.message.reply_to_message_id &&
+    expectsMailboxReply(envelope.message.type)
+  );
 }
 
 function findReplyOutcome(
@@ -141,7 +163,8 @@ function isMailboxToolOutcome(value: unknown): value is MailboxToolOutcome {
   const outcome = value as Partial<MailboxToolOutcome>;
   return (
     (outcome.kind === 'request' || outcome.kind === 'reply') &&
-    typeof outcome.message_id === 'string' &&
-    typeof outcome.delivery_id === 'string'
+      typeof outcome.message_id === 'string' &&
+    typeof outcome.delivery_id === 'string' &&
+    typeof outcome.wait_for_reply === 'boolean'
   );
 }

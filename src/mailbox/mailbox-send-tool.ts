@@ -15,6 +15,7 @@ export interface MailboxToolOutcome {
   from_role_id: string;
   to_role_id: string;
   status: 'pending' | 'injected';
+  wait_for_reply: boolean;
   source_delivery_id?: string;
 }
 

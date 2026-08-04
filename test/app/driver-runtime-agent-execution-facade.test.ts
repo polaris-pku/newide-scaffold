@@ -66,6 +66,10 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           status: 'pending',
         },
       ]);
+      expect(sender).toMatchObject({
+        status: 'completed',
+        diagnostics: { driver_status: 'not_invoked', mailbox_wait: true },
+      });
       expect(observedPrompts[0]).toContain('role_reviewer (Reviewer');
 
       const deliveryId = sends[0]?.delivery_id;
@@ -90,6 +94,22 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           status: 'pending',
         },
       });
+      const replyDeliveryId = handled.reply?.delivery_id;
+      expect(replyDeliveryId).toBeTruthy();
+
+      const continued = await facade.runAgent({
+        ...request('task_mailbox_agent', 'role_sender', workspace),
+        run_id: 'run_task_mailbox_agent_continued',
+        mailbox_delivery_id: replyDeliveryId,
+      });
+      expect(continued).toMatchObject({
+        status: 'completed',
+        role_id: 'role_sender',
+        diagnostics: { driver_status: 'succeeded' },
+      });
+      expect(mailbox.getEnvelope(replyDeliveryId as string).delivery.status).toBe(
+        'acknowledged',
+      );
     } finally {
       store.close();
       await fs.rm(workspace, { recursive: true, force: true });
@@ -1087,14 +1107,15 @@ function invokeDriverLlm(): ToolCallingClient {
 }
 
 function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
-  let calls = 0;
   return {
     async completeWithTools(input) {
-      calls += 1;
-      observedPrompts.push(
-        input.messages.find((message) => message.role === 'user')?.content ?? '',
-      );
-      if (calls === 1) {
+      const userPrompt =
+        input.messages.find((message) => message.role === 'user')?.content ?? '';
+      observedPrompts.push(userPrompt);
+      const lastMessage = input.messages.at(-1);
+      const inboundRequest = userPrompt.includes('- type: review_request');
+      const inboundResponse = userPrompt.includes('- type: decision_response');
+      if (!userPrompt.includes('Inbound mailbox envelope:') && lastMessage?.role !== 'tool') {
         return {
           content: null,
           tool_calls: [
@@ -1113,10 +1134,22 @@ function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
           ],
         };
       }
-      if (calls === 2 || calls === 4) {
-        return driverToolCalls(`mailbox_driver_${String(calls)}`);
+      if (
+        (inboundRequest || inboundResponse) &&
+        lastMessage?.role !== 'tool'
+      ) {
+        return driverToolCalls(`mailbox_driver_${String(observedPrompts.length)}`);
       }
-      if (calls === 5) {
+      if (
+        inboundRequest &&
+        lastMessage?.role === 'tool' &&
+        input.messages.some((message) =>
+          message.tool_calls?.some((call) => call.function.name === 'invoke_driver'),
+        ) &&
+        !input.messages.some((message) =>
+          message.tool_calls?.some((call) => call.function.name === 'mailbox_send'),
+        )
+      ) {
         return {
           content: null,
           tool_calls: [

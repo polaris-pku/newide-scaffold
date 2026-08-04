@@ -61,7 +61,8 @@ export type BeginTaskRunIntent =
       type: 'checkpoint_resume';
       strategy: 'from_checkpoint' | 'restart_from_beginning';
     }
-  | { type: 'council_refinement' };
+  | { type: 'council_refinement' }
+  | { type: 'mailbox_continuation'; source_delivery_id: string };
 
 export interface StartTaskStageInput {
   run_id: string;
@@ -135,6 +136,15 @@ export interface TaskResumeContext extends TaskLaunchContext {
   interrupted_run_id: string;
 }
 
+export interface TaskMailboxWaitContext extends TaskLaunchContext {
+  task_id: string;
+  run_id: string;
+  mode: PersistedRunMode;
+  sender_role_id: string;
+  delivery_ids: string[];
+  waiting_reason: string;
+}
+
 export class TaskProcessorTaskNotFoundError extends Error {
   constructor(readonly taskId: string) {
     super(`Task ${taskId} was not found in the coordination store`);
@@ -174,13 +184,16 @@ export class TaskProcessor {
   private readonly createEventId: () => string;
   private readonly runsRoot: string;
   private readonly mailboxStore?:
-    | Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>
+    | Pick<MailboxStateStore, 'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'>
     | undefined;
 
   constructor(
     private readonly store: CoordinationStateStore,
     options: TaskProcessorOptions & {
-      mailboxStore?: Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>;
+      mailboxStore?: Pick<
+        MailboxStateStore,
+        'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'
+      >;
     } = {},
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
@@ -206,6 +219,7 @@ export class TaskProcessor {
       cursorInput,
       runIntent,
       existing ? this.store.getLatestCheckpoint(input.task_id) : undefined,
+      this.mailboxStore,
     );
 
     const timestamp = this.now();
@@ -596,6 +610,116 @@ export class TaskProcessor {
         ? { restarted_from_run_id: run.restarted_from_run_id }
         : {}),
     };
+  }
+
+  completeRunForMailboxWait(runId: string): TaskStageCommitResult {
+    const aggregate = this.requireAggregateForRun(runId);
+    const run = requireRun(aggregate, runId);
+    assertActiveRunOwnership(aggregate, run);
+    const cursorInput = aggregate.runtime_state.cursor_input;
+    if (cursorInput?.cursor !== 'mailbox_wait' || cursorInput.delivery_ids.length === 0) {
+      throw new Error(`Run ${runId} is not waiting on a Mailbox Delivery`);
+    }
+    assertTaskStatusTransition(aggregate.task.status, 'waiting_help');
+    const timestamp = this.now();
+    const reason = cursorInput.waiting_reason;
+    const interruptState = {
+      type: 'mailbox_wait',
+      reason,
+      delivery_ids: [...cursorInput.delivery_ids],
+      interrupted_run_id: runId,
+    };
+    const runCompleted = this.createEvent(
+      'run.completed',
+      runId,
+      aggregate.task.task_id,
+      runId,
+      { status: 'completed', outcome: 'mailbox_wait' },
+    );
+    const taskWaiting = this.createEvent(
+      'task.waiting_help',
+      aggregate.task.task_id,
+      aggregate.task.task_id,
+      runId,
+      { reason, delivery_ids: [...cursorInput.delivery_ids] },
+    );
+    const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } =
+      aggregate.runtime_state;
+    const committed = this.store.commitState({
+      expected_task_revision: aggregate.task.revision,
+      task: {
+        ...aggregate.task,
+        status: 'waiting_help',
+        revision: aggregate.task.revision + 1,
+        updated_at: timestamp,
+      },
+      run: {
+        ...run,
+        status: 'completed',
+        revision: run.revision + 1,
+        completed_at: timestamp,
+        updated_at: timestamp,
+      },
+      runtime_state: {
+        ...runtimeWithoutCurrentRun,
+        waiting_on: cursorInput.delivery_ids.map((deliveryId) => ({
+          kind: 'mailbox_reply',
+          delivery_id: deliveryId,
+        })),
+        interrupt_state: interruptState,
+        diagnostics: {
+          ...aggregate.runtime_state.diagnostics,
+          mailbox_wait_run_id: runId,
+        },
+        updated_at: timestamp,
+      },
+      events: [runCompleted, taskWaiting],
+    });
+    return {
+      snapshot: this.getTaskSnapshot(aggregate.task.task_id),
+      committed_events: committed,
+    };
+  }
+
+  listMailboxWaitContexts(): TaskMailboxWaitContext[] {
+    return this.store.listTaskAggregates().flatMap((aggregate) => {
+      const cursorInput = aggregate.runtime_state.cursor_input;
+      const runId = readPayloadString(
+        aggregate.runtime_state.interrupt_state ?? {},
+        'interrupted_run_id',
+      ) ?? aggregate.runtime_state.current_run_id;
+      const run = runId
+        ? aggregate.runs.find((candidate) => candidate.run_id === runId)
+        : undefined;
+      if (
+        cursorInput?.cursor !== 'mailbox_wait' ||
+        cursorInput.delivery_ids.length === 0 ||
+        !run ||
+        !aggregate.task.owner_agent_id ||
+        !['running', 'waiting_help', 'blocked'].includes(aggregate.task.status)
+      ) {
+        return [];
+      }
+      return [{
+        task_id: aggregate.task.task_id,
+        task_request: {
+          spec: aggregate.task.spec,
+          ...(aggregate.task.role_id ? { role_id: aggregate.task.role_id } : {}),
+          ...(aggregate.task.parent_id ? { parent_task_id: aggregate.task.parent_id } : {}),
+          risk_level: aggregate.task.risk_level,
+          affected_paths: [...aggregate.task.affected_paths],
+          completion_criteria: [...aggregate.task.completion_criteria],
+          ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
+        },
+        workspace_path: aggregate.task.workspace_path,
+        ...(run.session_id ? { session_id: run.session_id } : {}),
+        run_id: run.run_id,
+        mode: run.mode,
+        sender_role_id: aggregate.task.owner_agent_id,
+        delivery_ids: [...cursorInput.delivery_ids],
+        waiting_reason: cursorInput.waiting_reason,
+      }];
+    });
   }
 
   setCouncilOverride(runId: string): TaskStageCommitResult {
@@ -1232,7 +1356,7 @@ function isActiveRun(run: PersistedRunState): boolean {
 
 const CURSOR_TRANSITIONS: Readonly<Record<TaskResumeCursor, readonly TaskResumeCursor[]>> = {
   select_agent: ['execute_agent'],
-  execute_agent: ['council', 'gate'],
+  execute_agent: ['council', 'gate', 'mailbox_wait'],
   council: ['gate'],
   gate: ['deliver'],
   deliver: ['done'],
@@ -1282,6 +1406,9 @@ function assertBeginRunIntent(
   cursorInput: TaskCursorInput,
   intent: BeginTaskRunIntent,
   latestCheckpoint: PersistedFullCheckpoint | undefined,
+  mailboxStore:
+    | Pick<MailboxStateStore, 'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'>
+    | undefined,
 ): void {
   parseTaskCursorInput(cursorInput);
   if (intent.type === 'create') {
@@ -1315,6 +1442,49 @@ function assertBeginRunIntent(
       input.restarted_from_run_id
     ) {
       throw new Error('Council refinement cannot include checkpoint resume lineage');
+    }
+    return;
+  }
+
+  if (intent.type === 'mailbox_continuation') {
+    assertTaskRunStartTransition(existing.task.status, intent.type);
+    const waitingInput = existing.runtime_state.cursor_input;
+    if (
+      waitingInput?.cursor !== 'mailbox_wait' ||
+      !waitingInput.delivery_ids.includes(intent.source_delivery_id)
+    ) {
+      throw new Error('Mailbox continuation must match the persisted mailbox_wait cursor');
+    }
+    if (
+      cursorInput.cursor !== 'execute_agent' ||
+      !cursorInput.mailbox_delivery_id ||
+      cursorInput.winner_agent_id !== existing.task.owner_agent_id
+    ) {
+      throw new Error('Mailbox continuation must resume the waiting sender Agent');
+    }
+    const sourceRun = input.restarted_from_run_id
+      ? existing.runs.find((candidate) => candidate.run_id === input.restarted_from_run_id)
+      : undefined;
+    if (!sourceRun || (sourceRun.status !== 'completed' && sourceRun.status !== 'interrupted')) {
+      throw new Error('Mailbox continuation requires a completed or interrupted source Run');
+    }
+    if (input.mode !== sourceRun.mode) {
+      throw new Error('Mailbox continuation must preserve the source Run mode');
+    }
+    if (input.resume_checkpoint_id || input.requested_resume_cursor) {
+      throw new Error('Mailbox continuation cannot claim checkpoint recovery');
+    }
+    const source = requireMailboxEnvelope(mailboxStore, intent.source_delivery_id);
+    const reply = requireMailboxEnvelope(mailboxStore, cursorInput.mailbox_delivery_id);
+    if (
+      source.message.task_id !== input.task_id ||
+      source.message.workspace_path !== input.workspace_path ||
+      reply.message.task_id !== input.task_id ||
+      reply.message.workspace_path !== input.workspace_path ||
+      reply.message.reply_to_message_id !== source.message.message_id ||
+      reply.delivery.recipient_role_id !== existing.task.owner_agent_id
+    ) {
+      throw new Error('Mailbox continuation reply does not match the waiting Task and sender');
     }
     return;
   }
@@ -1354,6 +1524,18 @@ function assertBeginRunIntent(
       `Checkpoint resume cursor does not match strategy ${intent.strategy}`,
     );
   }
+}
+
+function requireMailboxEnvelope(
+  mailboxStore: Pick<MailboxStateStore, 'getMailboxEnvelope'> | undefined,
+  deliveryId: string,
+) {
+  if (!mailboxStore) {
+    throw new Error(`Mailbox Delivery ${deliveryId} cannot be validated without a store`);
+  }
+  const envelope = mailboxStore.getMailboxEnvelope(deliveryId);
+  if (!envelope) throw new Error(`Mailbox Delivery ${deliveryId} was not found`);
+  return envelope;
 }
 
 function assertFinalOutputEvidence(output: PersistedTaskFinalOutput): void {

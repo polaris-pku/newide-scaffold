@@ -32,6 +32,7 @@ export type TaskCursorInput =
       cursor: 'execute_agent';
       winner_agent_id: string;
       execution_evidence_ref?: string;
+      mailbox_delivery_id?: string;
     }
   | {
       cursor: 'council';
@@ -79,10 +80,15 @@ export function parseTaskCursorInput(value: unknown): TaskCursorInput {
         value.execution_evidence_ref,
         'execution_evidence_ref',
       );
+      const mailboxDeliveryId = optionalString(
+        value.mailbox_delivery_id,
+        'mailbox_delivery_id',
+      );
       return {
         cursor: value.cursor,
         winner_agent_id: requireString(value.winner_agent_id, 'winner_agent_id'),
         ...(executionEvidenceRef ? { execution_evidence_ref: executionEvidenceRef } : {}),
+        ...(mailboxDeliveryId ? { mailbox_delivery_id: mailboxDeliveryId } : {}),
       };
     }
     case 'council': {

@@ -38,7 +38,7 @@ import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
 import { TaskExecutionLoop, TaskProcessor } from '../coordination';
-import { PersistentMailboxService } from '../mailbox';
+import { MailboxDeliveryWorker, PersistentMailboxService } from '../mailbox';
 import { createProductionBRuntime, type BackendBRuntime } from './production-b-runtime';
 import {
   BMemoryMaintenanceRunner,
@@ -288,7 +288,7 @@ export async function createProductionBackendService(
         readiness: 'host_managed',
       },
     });
-    return new NewideBackendService(
+    const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
@@ -302,7 +302,10 @@ export async function createProductionBackendService(
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
       systemStatusService,
+      new MailboxDeliveryWorker(mailboxService, agentExecutionFacade),
     );
+    await service.recoverMailboxWaits();
+    return service;
   } catch (error) {
     await closeRuntime().catch(() => undefined);
     throw error;

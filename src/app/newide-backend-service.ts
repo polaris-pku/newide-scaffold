@@ -56,6 +56,7 @@ import {
   type TaskExecutionLoop,
 } from '../coordination';
 import type {
+  MailboxDeliveryWorker,
   PersistentMailboxService,
   MailboxReplyInput,
   MailboxSendInput,
@@ -219,7 +220,20 @@ export class NewideBackendService {
     private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new NoopDriverStreamAuditWriter(),
     private readonly taskExecutionLoop?: TaskExecutionLoop,
     private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
+    private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
   ) {}
+
+  async recoverMailboxWaits(): Promise<void> {
+    await this.mailboxRecovery;
+    if (!this.taskProcessor || !this.mailboxDeliveryWorker || !this.mailboxService) return;
+    for (const context of this.taskProcessor.listMailboxWaitContexts()) {
+      await this.continueMailboxWait(context.task_id).catch((error: unknown) => {
+        process.stderr.write(
+          `[mailbox] recovery failed for ${context.task_id}: ${toError(error).message}\n`,
+        );
+      });
+    }
+  }
 
   getSystemLiveness(): SystemLivenessV1 {
     return this.systemStatusService.liveness();
@@ -701,6 +715,38 @@ export class NewideBackendService {
       });
       const projected = processor.getRunSnapshot(input.identity.run_id);
       if (!projected) throw new Error(`Run ${input.identity.run_id} has no persistent projection`);
+      const executionState = processor.getRunExecutionState(input.identity.run_id);
+      if (executionState.resume_cursor === 'mailbox_wait') {
+        const waiting = processor.completeRunForMailboxWait(input.identity.run_id);
+        for (const event of waiting.committed_events) {
+          this.mirrorTaskAuthorityEvent({
+            event_id: event.event_id,
+            sequence: event.sequence,
+            run_id: input.identity.run_id,
+            task_id: input.identity.task_id,
+            type: event.event_type,
+            source: 'coordinator',
+            created_at: event.created_at,
+            payload: event.payload,
+            schema_version: event.schema_version,
+          });
+        }
+        const waitingProjection = processor.getRunSnapshot(input.identity.run_id);
+        if (waitingProjection) {
+          this.registry.setProjectedSnapshot(input.identity.run_id, waitingProjection);
+        }
+        this.registry.complete(input.identity.run_id);
+        await this.driverStreamAuditWriter.flush(input.identity.run_id);
+        await this.auditWriter.flush(input.identity.run_id);
+        await this.terminalWriter.finalize(this.registry.getSnapshot(input.identity.run_id));
+        await this.auditWriter.flush(input.identity.run_id).catch(() => undefined);
+        await this.continueMailboxWait(input.identity.task_id).catch((error: unknown) => {
+          process.stderr.write(
+            `[mailbox] continuation failed for ${input.identity.task_id}: ${toError(error).message}\n`,
+          );
+        });
+        return;
+      }
       if (taskSnapshot.task.status === 'completed') {
         this.registry.complete(input.identity.run_id);
       } else if (taskSnapshot.task.status === 'cancelled') {
@@ -754,6 +800,55 @@ export class NewideBackendService {
         .finalize(this.registry.getSnapshot(input.identity.run_id))
         .catch(() => undefined);
     }
+  }
+
+  private async continueMailboxWait(taskId: string): Promise<void> {
+    const processor = this.taskProcessor;
+    const mailbox = this.mailboxService;
+    const worker = this.mailboxDeliveryWorker;
+    if (!processor || !mailbox || !worker) return;
+    let context = processor
+      .listMailboxWaitContexts()
+      .find((candidate) => candidate.task_id === taskId);
+    if (!context || context.delivery_ids.length !== 1) return;
+    const current = processor.getTaskSnapshot(taskId);
+    if (current.current_run?.run_id === context.run_id) {
+      processor.completeRunForMailboxWait(context.run_id);
+      context = processor
+        .listMailboxWaitContexts()
+        .find((candidate) => candidate.task_id === taskId);
+      if (!context) return;
+    }
+
+    const sourceDeliveryId = context.delivery_ids[0]!;
+    let reply = mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+    if (!reply) {
+      const handled = await worker.process({
+        delivery_id: sourceDeliveryId,
+        run_id: context.run_id,
+      });
+      if (handled.status !== 'replied') return;
+      reply = mailbox.getEnvelope(handled.reply!.delivery_id);
+    }
+    await this.startRun(
+      {
+        prompt: context.task_request.spec,
+        task_id: taskId,
+        task_request: context.task_request,
+        workspace_path: context.workspace_path,
+        mode: context.mode,
+        ...(context.session_id ? { session_id: context.session_id } : {}),
+      },
+      {
+        run_intent: { type: 'mailbox_continuation', source_delivery_id: sourceDeliveryId },
+        restarted_from_run_id: context.run_id,
+        cursor_input: {
+          cursor: 'execute_agent',
+          winner_agent_id: context.sender_role_id,
+          mailbox_delivery_id: reply.delivery.delivery_id,
+        },
+      },
+    );
   }
 
   private mirrorTaskAuthorityEvent(event: AppRunEvent): void {

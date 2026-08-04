@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type Event, type TaskCreateRequest } from '../../src/core';
 import { TaskProcessor } from '../../src/coordination';
+import { PersistentMailboxService } from '../../src/mailbox';
 import { SqliteCoordinationStore, type TaskCursorInput } from '../../src/persistence';
 import type { RunSnapshot } from '../../src/protocol/run-snapshot';
 
@@ -286,6 +287,141 @@ describe('TaskProcessor', () => {
     expect(store.getTaskAggregate('task_stage')?.runtime_state.diagnostics).not.toHaveProperty(
       'active_stage',
     );
+    store.close();
+  });
+
+  it('continues one waiting Task exactly once with the persisted Mailbox reply', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-mailbox-'));
+    temporaryDirectories.push(directory);
+    const store = new SqliteCoordinationStore(path.join(directory, 'coordination.sqlite'));
+    const processor = new TaskProcessor(store, {
+      ...deterministicClock(),
+      mailboxStore: store,
+    });
+    const mailbox = new PersistentMailboxService(store, {
+      createMessageId: (() => {
+        let sequence = 0;
+        return () => `message_${String(++sequence)}`;
+      })(),
+      createDeliveryId: (() => {
+        let sequence = 0;
+        return () => `delivery_${String(++sequence)}`;
+      })(),
+    });
+    processor.beginRun({
+      task_id: 'task_mailbox_continue',
+      run_id: 'run_mailbox_sender',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      cursor_input: selectInput,
+    });
+    processor.startStage({
+      run_id: 'run_mailbox_sender',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_mailbox_select',
+    });
+    processor.advanceStage({
+      run_id: 'run_mailbox_sender',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_mailbox_select',
+      evidence_ref: evidenceRef('mailbox_select'),
+      next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+    });
+    const sent = await mailbox.send({
+      task_id: 'task_mailbox_continue',
+      workspace_path: '/workspace',
+      thread_id: 'thread_mailbox_continue',
+      from_role_id: 'agent_a',
+      to_role_id: 'agent_reviewer',
+      type: 'review_request',
+      payload: { question: 'Review this plan' },
+      requires_ack: true,
+      deadline_seconds: 300,
+      idempotency_key: 'run_mailbox_sender:mailbox:1',
+    });
+    const sourceDeliveryId = sent.deliveries[0]!.delivery_id;
+    processor.startStage({
+      run_id: 'run_mailbox_sender',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_mailbox_execute',
+    });
+    processor.advanceStage({
+      run_id: 'run_mailbox_sender',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_mailbox_execute',
+      evidence_ref: evidenceRef('mailbox_execute'),
+      next_input: {
+        cursor: 'mailbox_wait',
+        delivery_ids: [sourceDeliveryId],
+        waiting_reason: 'Waiting for reviewer',
+      },
+      owner_agent_id: 'agent_a',
+      session_id: 'session_sender',
+    });
+    const waiting = processor.completeRunForMailboxWait('run_mailbox_sender');
+    expect(waiting.snapshot).toMatchObject({
+      task: { status: 'waiting_help' },
+      run_history: [{ run_id: 'run_mailbox_sender', status: 'completed' }],
+      waiting_reason: 'Waiting for reviewer',
+    });
+
+    mailbox.markInjected(sourceDeliveryId, 'agent_reviewer', 'session_reviewer');
+    const replied = await mailbox.reply({
+      source_delivery_id: sourceDeliveryId,
+      from_role_id: 'agent_reviewer',
+      type: 'decision_response',
+      payload: { answer: 'Approved' },
+      requires_ack: false,
+      idempotency_key: 'run_mailbox_sender:reply:1',
+    });
+    const replyDeliveryId = replied.reply.deliveries[0]!.delivery_id;
+    processor.beginRun({
+      task_id: 'task_mailbox_continue',
+      run_id: 'run_mailbox_continuation',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      session_id: 'session_sender',
+      restarted_from_run_id: 'run_mailbox_sender',
+      run_intent: {
+        type: 'mailbox_continuation',
+        source_delivery_id: sourceDeliveryId,
+      },
+      cursor_input: {
+        cursor: 'execute_agent',
+        winner_agent_id: 'agent_a',
+        mailbox_delivery_id: replyDeliveryId,
+      },
+    });
+
+    expect(processor.getRunExecutionState('run_mailbox_continuation')).toMatchObject({
+      task_id: 'task_mailbox_continue',
+      resume_cursor: 'execute_agent',
+      cursor_input: {
+        winner_agent_id: 'agent_a',
+        mailbox_delivery_id: replyDeliveryId,
+      },
+    });
+    expect(() =>
+      processor.beginRun({
+        task_id: 'task_mailbox_continue',
+        run_id: 'run_mailbox_duplicate',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'single_agent',
+        restarted_from_run_id: 'run_mailbox_sender',
+        run_intent: {
+          type: 'mailbox_continuation',
+          source_delivery_id: sourceDeliveryId,
+        },
+        cursor_input: {
+          cursor: 'execute_agent',
+          winner_agent_id: 'agent_a',
+          mailbox_delivery_id: replyDeliveryId,
+        },
+      }),
+    ).toThrow(/active run/i);
     store.close();
   });
 
