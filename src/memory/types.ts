@@ -70,6 +70,16 @@ export interface PromotionOutcome {
 }
 
 /**
+ * Persona 演化操作的完整结果。
+ * 含演化资格检查结论；演化成功时附带新生成的 PersonaDef（version 为旧版 +1）。
+ */
+export interface PersonaEvolutionOutcome {
+  check: PromotionCheckResult;
+  /** 演化成功时返回的新 Persona；未触发/未满足条件时为 undefined */
+  persona?: PersonaDef;
+}
+
+/**
  * runTaskMemoryCycle / Agent.runOnce 的完整返回结果。
  * 涵盖任务前检索、Driver 调用、buffer 写入、经验提取与技能晋升的全链路产物。
  */

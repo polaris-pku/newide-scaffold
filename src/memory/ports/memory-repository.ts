@@ -59,6 +59,8 @@ export interface MemoryRepository {
   saveExperience(role_id: string, experience: ExperienceRecord): Promise<void>;
   /** 持久化一条技能记录 */
   saveSkill(role_id: string, skill: SkillRecord): Promise<void>;
+  /** 覆盖写入当前 Persona 快照（如 Persona 演化后 version+1） */
+  savePersona(role_id: string, persona: PersonaDef): Promise<void>;
   /** 更新已有技能（如消融实验 auto-approve） */
   updateSkill(role_id: string, skill: SkillRecord): Promise<void>;
   /** 更新已有经验（如晋升后写入 promoted_to） */

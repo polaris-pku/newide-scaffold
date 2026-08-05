@@ -132,6 +132,13 @@ export class InMemoryRepository implements MemoryRepository {
     store.metrics.promoted_skill_count += 1;
   }
 
+  async savePersona(role_id: string, persona: PersonaDef): Promise<void> {
+    const store = this.requireStore(role_id);
+    store.persona = persona;
+    // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
+    store.handle = { ...store.handle, persona };
+  }
+
   async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
     const store = this.requireStore(role_id);
     const index = store.skills.findIndex((item) => item.id === skill.id);
