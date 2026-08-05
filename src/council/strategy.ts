@@ -36,9 +36,9 @@ export class ClassicCouncilStrategy implements CouncilStrategy {
 }
 
 /**
- * The adaptive strategy is deliberately conservative: it accepts any local
- * topology but only reports completion when independent candidates, external
- * reviews, a real lead, and a selected artifact are all evidenced.
+ * Adaptive process gaps remain auditable, but they do not override the
+ * Council decision. A selected final artifact is sufficient for completion;
+ * stricter quality attestation can evolve independently.
  */
 export class AdaptiveLeadCouncilStrategy implements CouncilStrategy {
   readonly name = 'adaptive_lead' as const;
@@ -55,8 +55,6 @@ export class AdaptiveLeadCouncilStrategy implements CouncilStrategy {
     const warnings = [...base.warnings, ...unresolved.map((issue) => `adaptive_lead: ${issue}`)];
     const outcome: CouncilOutcome = {
       ...base,
-      status: unresolved.length > 0 ? 'needs_human' : base.status,
-      quality: unresolved.length > 0 ? 'best_effort' : base.quality,
       unresolved_issues: [...base.unresolved_issues, ...unresolved],
       warnings,
     };

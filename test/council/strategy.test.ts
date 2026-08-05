@@ -43,13 +43,13 @@ describe('Council strategy boundary', () => {
     expect(output.outcome?.unresolved_issues).toEqual([]);
   });
 
-  it('does not claim adaptive completion when a candidate lacks external review', async () => {
+  it('completes after selecting a final artifact while preserving adaptive warnings', async () => {
     const result = councilResult();
     const provider = createCouncilStrategyProvider(staticProvider(result), 'adaptive_lead');
 
     const output = await provider.runCouncilRound(baseInput());
 
-    expect(output.outcome?.status).toBe('needs_human');
+    expect(output.outcome?.status).toBe('completed');
     expect(output.outcome?.quality).toBe('best_effort');
     expect(output.outcome?.unresolved_issues).toContain(
       'proposal proposal_b lacks a review by another role_id',
