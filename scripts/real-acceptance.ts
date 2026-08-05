@@ -42,6 +42,9 @@ interface ScenarioReport {
 }
 
 const repoRoot = process.cwd();
+const stateRoot = path.resolve(
+  process.env.NEWIDE_STATE_ROOT?.trim() || path.join(repoRoot, '.newide'),
+);
 const options = parseCli(process.argv.slice(2));
 const startedAt = new Date();
 const acceptanceDir = path.resolve(
@@ -458,7 +461,7 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
     if (options.existingRunId) {
       runId = options.existingRunId;
       const persistedSnapshot = asRecord(
-        await readJsonIfExists(path.join(repoRoot, '.newide', 'runs', runId, 'result.json')),
+        await readJsonIfExists(path.join(stateRoot, 'runs', runId, 'result.json')),
       );
       if (!persistedSnapshot) {
         throw new Error(`persisted Council result not found for ${runId}`);
@@ -498,7 +501,7 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
     const councilResult = asRecord(council.result);
     const proposals = Array.isArray(council.proposals) ? council.proposals : [];
     const participants = Array.isArray(council.participants) ? council.participants : [];
-    const runDir = path.join(repoRoot, '.newide', 'runs', runId);
+    const runDir = path.join(stateRoot, 'runs', runId);
     const councilStagePath = path.join(runDir, 'stages', 'council.json');
     const councilStage = asRecord(await readJsonIfExists(councilStagePath));
     const legacyCouncilDir = path.join(runDir, 'council');
@@ -551,7 +554,7 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
           typeof value === 'string' && value.length > 0 && path.basename(value) === value,
       );
     details.council_role_directories = ['primary', ...participantIds].map((participantId) =>
-      path.join(repoRoot, '.newide', 'council', runId, participantId),
+      path.join(stateRoot, 'council', runId, participantId),
     );
     details.run_dir = runDir;
     details.errors_from_run = snapshot.errors ?? [];
@@ -699,7 +702,7 @@ async function runSubagentScenario(): Promise<ScenarioReport> {
     details.session_id = finalOutput.session_id ?? null;
     details.changed_files = finalOutput.changed_files ?? [];
     details.workspace_changes = workspaceChanges;
-    details.run_dir = path.join(repoRoot, '.newide', 'runs', created.run_id);
+    details.run_dir = path.join(stateRoot, 'runs', created.run_id);
     details.errors_from_run = snapshot.errors ?? [];
     details.note =
       'Evidence above is the raw observable data returned by A. ' +
@@ -800,8 +803,8 @@ async function runRestartScenario(): Promise<ScenarioReport> {
     details.new_session_id = finalOutput.session_id ?? null;
     details.response = finalOutput.response ?? '';
     details.changed_files = finalOutput.changed_files ?? [];
-    details.new_run_dir = path.join(repoRoot, '.newide', 'runs', restarted.run_id);
-    details.original_run_dir = path.join(repoRoot, '.newide', 'runs', originalRunId);
+    details.new_run_dir = path.join(stateRoot, 'runs', restarted.run_id);
+    details.original_run_dir = path.join(stateRoot, 'runs', originalRunId);
     details.errors_from_run = snapshot.errors ?? [];
 
     const proofPath = path.join(options.workspace, 'restart-proof.txt');
@@ -1207,7 +1210,7 @@ async function readContextPack(reference: unknown): Promise<Record<string, unkno
   }
   return asRecord(
     await readJsonIfExists(
-      path.join(repoRoot, '.newide', 'b', 'context-packs', `${reference}.json`),
+      path.join(stateRoot, 'b', 'context-packs', `${reference}.json`),
     ),
   );
 }
