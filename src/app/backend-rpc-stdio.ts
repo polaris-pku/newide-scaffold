@@ -11,6 +11,8 @@ import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runne
 import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
 import {
   AgentBoardCouncilParticipantResolver,
+  createCouncilStrategyProvider,
+  readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
@@ -218,7 +220,7 @@ export async function createProductionBackendService(
         root: path.join(stateRoot, 'market'),
       }),
     });
-    const councilProvider = new SynthesisAgentCouncilProvider({
+    const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
       participantResolver: new AgentBoardCouncilParticipantResolver({
@@ -227,6 +229,10 @@ export async function createProductionBackendService(
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
       }),
     });
+    const councilProvider = createCouncilStrategyProvider(
+      baseCouncilProvider,
+      readCouncilStrategy(env.NEWIDE_COUNCIL_STRATEGY),
+    );
     const gateExecutor =
       dependencies.gateExecutor ??
       new ProductionGateExecutor({
