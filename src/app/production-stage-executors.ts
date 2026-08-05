@@ -388,9 +388,13 @@ export function createProductionStageExecutors(
         created_at: nowTimestamp(),
         schema_version: SCHEMA_VERSION,
       };
+      const strategyName = (
+        dependencies.councilProvider as CouncilProvider & { strategyName?: string }
+      ).strategyName;
       emit(context, 'council.started', context.run_id, {
         trigger: context.cursor_input.trigger,
         candidate_artifact_refs: evidencePack.artifact_refs,
+        ...(strategyName ? { strategy: strategyName } : {}),
       });
       const selector = new ArtifactSelector({
         mode: 'council',
@@ -457,6 +461,8 @@ export function createProductionStageExecutors(
         synthesis: councilRunResult.synthesis,
         output: councilRunResult.output,
         result: councilRunResult.result,
+        outcome: councilRunResult.outcome,
+        ...(strategyName ? { strategy: strategyName } : {}),
       });
       emit(context, 'artifact.selected', selection.manifest_ref, {
         mode: 'council',
@@ -470,6 +476,8 @@ export function createProductionStageExecutors(
           decision: councilRunResult.decision,
           participants: councilRunResult.participants,
           selected_artifact_refs: councilRunResult.selected_artifact_refs,
+          outcome: councilRunResult.outcome,
+          ...(strategyName ? { strategy: strategyName } : {}),
           changeset_ref: selection.manifest_ref,
           expected_sha256: selection.expected_sha256,
         },

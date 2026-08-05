@@ -499,6 +499,7 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
 
     const council = asRecord(snapshot.council) ?? {};
     const councilResult = asRecord(council.result);
+    const councilOutcome = asRecord(council.outcome);
     const proposals = Array.isArray(council.proposals) ? council.proposals : [];
     const participants = Array.isArray(council.participants) ? council.participants : [];
     const runDir = path.join(stateRoot, 'runs', runId);
@@ -531,6 +532,7 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
     details.review_count = Array.isArray(reviews) ? reviews.length : 0;
     details.synthesis = synthesis;
     details.council_result = councilResult ?? persistedCouncilResult;
+    details.council_outcome = councilOutcome ?? null;
     details.selected_artifact_refs = council.selected_artifact_refs ?? [];
     details.response = finalOutput.response ?? '';
     details.session_id = finalOutput.session_id ?? null;
@@ -572,6 +574,9 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
     if (!synthesis) errors.push('Council synthesis was not persisted in the run snapshot');
     if (!councilResult && !persistedCouncilResult) {
       errors.push('CouncilResult was not returned or persisted');
+    }
+    if (!councilOutcome) {
+      errors.push('strategy-independent CouncilOutcome was not returned or persisted');
     }
     const agentRuns = Array.isArray(snapshot.agent_runs) ? snapshot.agent_runs : [];
     const mainAgentRun = agentRuns.find((value) => {
