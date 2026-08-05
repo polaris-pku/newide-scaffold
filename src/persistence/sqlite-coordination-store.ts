@@ -28,7 +28,12 @@ import type {
   SaveMailboxReplyResult,
   MailboxSendPersistenceResult,
   PersistedMailboxError,
+  MailboxMessageKind,
 } from '../mailbox/mailbox-state-store';
+import type {
+  ParticipantSessionBinding,
+  ParticipantSessionPersistence,
+} from '../coordination/participant-session-registry';
 
 const RUN_STATUSES = [
   'created',
@@ -68,10 +73,13 @@ const MAILBOX_DELIVERY_STATUSES = [
   'acknowledged',
   'failed',
 ] as const;
+const MAILBOX_MESSAGE_KINDS = ['request', 'notice'] as const;
 
 type SqlRow = Record<string, unknown>;
 
-export class SqliteCoordinationStore implements CoordinationStateStore, MailboxStateStore {
+export class SqliteCoordinationStore
+  implements CoordinationStateStore, MailboxStateStore, ParticipantSessionPersistence
+{
   private readonly database: DatabaseSync;
 
   constructor(databasePath: string) {
@@ -369,7 +377,9 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
     workspace_path?: string;
     recipient_role_id?: string;
   } = {}): PersistedMailboxEnvelope[] {
-    const clauses = ["status = 'pending'"];
+    // Rows migrated from the pre-scoped mailbox remain audit history only.
+    // Never guess a Task/workspace and redeliver them.
+    const clauses = ["status = 'pending'", "NOT (task_id = 'legacy' AND workspace_path = '.')"];
     const params: SQLInputValue[] = [];
     if (scope.task_id) {
       clauses.push('task_id = ?');
@@ -388,6 +398,48 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
         `SELECT delivery_id FROM deliveries
          WHERE ${clauses.join(' AND ')}
          ORDER BY created_at, delivery_id`,
+      )
+      .all(...params)
+      .map((row) => this.readMailboxEnvelope(readString(row, 'delivery_id')));
+  }
+
+  getMailboxHighWatermark(
+    taskId: string,
+    workspacePath: string,
+  ): { created_at: string; delivery_id: string } | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT created_at, delivery_id FROM deliveries
+         WHERE task_id = ? AND workspace_path = ?
+         ORDER BY created_at DESC, delivery_id DESC
+         LIMIT 1`,
+      )
+      .get(taskId, workspacePath);
+    if (!row) return undefined;
+    return {
+      created_at: readString(row, 'created_at'),
+      delivery_id: readString(row, 'delivery_id'),
+    };
+  }
+
+  listMailboxDeliveriesAfter(
+    taskId: string,
+    workspacePath: string,
+    after?: { created_at: string; delivery_id: string },
+  ): PersistedMailboxEnvelope[] {
+    const params: SQLInputValue[] = [taskId, workspacePath];
+    const cursorClause = after
+      ? 'AND (created_at > ? OR (created_at = ? AND delivery_id > ?))'
+      : '';
+    if (after) params.push(after.created_at, after.created_at, after.delivery_id);
+    return this.database
+      .prepare(
+        `SELECT delivery_id FROM deliveries
+         WHERE task_id = ? AND workspace_path = ?
+           AND NOT (task_id = 'legacy' AND workspace_path = '.')
+           AND status IN ('pending', 'injected')
+           ${cursorClause}
+         ORDER BY created_at ASC, delivery_id ASC`,
       )
       .all(...params)
       .map((row) => this.readMailboxEnvelope(readString(row, 'delivery_id')));
@@ -414,6 +466,70 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
       .all(messageId)
       .map((deliveryRow) => readMailboxDelivery(deliveryRow));
     return { message: readMailboxMessage(messageRow), deliveries };
+  }
+
+  saveParticipantSession(input: ParticipantSessionBinding): void {
+    const now = new Date().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO participant_sessions (
+          task_id, workspace_path, role_id, session_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, workspace_path, role_id) DO UPDATE SET
+          session_id = excluded.session_id,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        input.task_id,
+        input.workspace_path,
+        input.role_id,
+        input.session_id,
+        now,
+        now,
+      );
+  }
+
+  findParticipantSession(
+    taskId: string,
+    workspacePath: string,
+    roleId: string,
+  ): string | undefined {
+    const row = this.database
+      .prepare(
+        `SELECT session_id FROM participant_sessions
+         WHERE task_id = ? AND workspace_path = ? AND role_id = ?`,
+      )
+      .get(taskId, workspacePath, roleId);
+    return row ? readString(row, 'session_id') : undefined;
+  }
+
+  deleteParticipantSession(taskId: string, workspacePath: string, roleId: string): void {
+    this.database
+      .prepare(
+        `DELETE FROM participant_sessions
+         WHERE task_id = ? AND workspace_path = ? AND role_id = ?`,
+      )
+      .run(taskId, workspacePath, roleId);
+  }
+
+  listParticipantSessions(
+    taskId: string,
+    workspacePath: string,
+  ): ParticipantSessionBinding[] {
+    return this.database
+      .prepare(
+        `SELECT task_id, workspace_path, role_id, session_id
+         FROM participant_sessions
+         WHERE task_id = ? AND workspace_path = ?
+         ORDER BY role_id`,
+      )
+      .all(taskId, workspacePath)
+      .map((row) => ({
+        task_id: readString(row, 'task_id'),
+        workspace_path: readString(row, 'workspace_path'),
+        role_id: readString(row, 'role_id'),
+        session_id: readString(row, 'session_id'),
+      }));
   }
 
   close(): void {
@@ -562,6 +678,16 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
           schema_version TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS participant_sessions (
+          task_id TEXT NOT NULL,
+          workspace_path TEXT NOT NULL,
+          role_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (task_id, workspace_path, role_id)
+        );
+
         CREATE INDEX IF NOT EXISTS messages_by_thread
           ON messages(thread_id, created_at, message_id);
         CREATE INDEX IF NOT EXISTS deliveries_by_role_status
@@ -575,6 +701,7 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
         .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
         .run(2, new Date().toISOString());
       migrateMailboxTables(this.database);
+      ensureMailboxMessageContractColumns(this.database);
       this.database.exec(`
         CREATE INDEX IF NOT EXISTS messages_by_thread
           ON messages(thread_id, created_at, message_id);
@@ -708,6 +835,13 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
           ...(checkpoint.session_id ? { session_id: checkpoint.session_id } : {}),
           resume_cursor: checkpoint.resume_cursor,
           ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
+          ...(checkpoint.participant_sessions
+            ? { participant_sessions: checkpoint.participant_sessions }
+            : {}),
+          ...(checkpoint.mailbox_state ? { mailbox_state: checkpoint.mailbox_state } : {}),
+          ...(checkpoint.council_state_ref
+            ? { council_state_ref: checkpoint.council_state_ref }
+            : {}),
           message_thread: checkpoint.message_thread,
         }),
         checkpoint.interrupt_state ? toJson(checkpoint.interrupt_state) : null,
@@ -744,9 +878,9 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
       .prepare(
         `INSERT INTO messages (
           message_id, task_id, workspace_path, thread_id, from_role_id,
-          type, payload_json, artifact_refs_json, requires_ack, reply_to_message_id,
+          kind, content, type, payload_json, artifact_refs_json, requires_ack, reply_to_message_id,
           idempotency_key, created_at, schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         message.message_id,
@@ -754,6 +888,8 @@ export class SqliteCoordinationStore implements CoordinationStateStore, MailboxS
         message.workspace_path,
         message.thread_id,
         message.from_role_id,
+        message.kind ?? null,
+        message.content ?? null,
         message.type,
         toJson(message.payload),
         toJson(message.artifact_refs),
@@ -1046,6 +1182,9 @@ function readCheckpoint(row: SqlRow): PersistedFullCheckpoint {
     session_id?: string;
     resume_cursor: TaskResumeCursor;
     cursor_input?: unknown;
+    participant_sessions?: PersistedFullCheckpoint['participant_sessions'];
+    mailbox_state?: PersistedFullCheckpoint['mailbox_state'];
+    council_state_ref?: string;
     message_thread: PersistedFullCheckpoint['message_thread'];
   }>(row, 'runtime_state_json');
   const interruptState = readOptionalJson<Record<string, unknown>>(row, 'interrupt_state_json');
@@ -1081,6 +1220,13 @@ function readCheckpoint(row: SqlRow): PersistedFullCheckpoint {
       RESUME_CURSORS,
     ),
     ...(cursorInput ? { cursor_input: cursorInput } : {}),
+    ...(runtime.participant_sessions
+      ? { participant_sessions: runtime.participant_sessions }
+      : {}),
+    ...(runtime.mailbox_state ? { mailbox_state: runtime.mailbox_state } : {}),
+    ...(runtime.council_state_ref
+      ? { council_state_ref: runtime.council_state_ref }
+      : {}),
     message_thread: runtime.message_thread,
     mechanical_snapshot: readJson<PersistedFullCheckpoint['mechanical_snapshot']>(
       row,
@@ -1099,14 +1245,23 @@ function readCheckpoint(row: SqlRow): PersistedFullCheckpoint {
 }
 
 function readMailboxMessage(row: SqlRow): PersistedMailboxMessage {
+  const payload = readJson<Record<string, unknown>>(row, 'payload_json');
+  const type = readEnum(row, 'type', MAILBOX_MESSAGE_TYPES);
+  const rawKind = readOptionalString(row, 'kind');
+  const kind = rawKind && MAILBOX_MESSAGE_KINDS.includes(rawKind as MailboxMessageKind)
+    ? (rawKind as MailboxMessageKind)
+    : undefined;
+  const content = readOptionalString(row, 'content');
   return {
     message_id: readString(row, 'message_id'),
     task_id: readString(row, 'task_id'),
     workspace_path: readString(row, 'workspace_path'),
     thread_id: readString(row, 'thread_id'),
     from_role_id: readString(row, 'from_role_id'),
-    type: readEnum(row, 'type', MAILBOX_MESSAGE_TYPES),
-    payload: readJson<Record<string, unknown>>(row, 'payload_json'),
+    ...(kind ? { kind } : {}),
+    ...(content ? { content } : {}),
+    type,
+    payload,
     artifact_refs: readJson<string[]>(row, 'artifact_refs_json'),
     requires_ack: readNumber(row, 'requires_ack') === 1,
     ...(readOptionalString(row, 'reply_to_message_id')
@@ -1262,6 +1417,12 @@ function ensureRuntimeCursorInputColumn(database: DatabaseSync): void {
   if (!columns.includes('cursor_input_json')) {
     database.exec('ALTER TABLE task_runtime_states ADD COLUMN cursor_input_json TEXT');
   }
+}
+
+function ensureMailboxMessageContractColumns(database: DatabaseSync): void {
+  const columns = tableColumns(database, 'messages');
+  if (!columns.has('kind')) database.exec('ALTER TABLE messages ADD COLUMN kind TEXT');
+  if (!columns.has('content')) database.exec('ALTER TABLE messages ADD COLUMN content TEXT');
 }
 
 function migrateMailboxTables(database: DatabaseSync): void {

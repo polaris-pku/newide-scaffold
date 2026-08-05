@@ -3,6 +3,7 @@ import {
   createId,
   type AgentMessageType,
 } from '../core';
+import type { MailboxMessageKind } from './mailbox-state-store';
 import type {
   MailboxStateStore,
   PersistedMailboxDelivery,
@@ -24,10 +25,14 @@ export interface MailboxSendInput {
   thread_id: string;
   from_role_id: string;
   to_role_id: string;
-  type: AgentMessageType;
-  payload: Record<string, unknown>;
+  /** Canonical Agent-facing contract. */
+  kind?: MailboxMessageKind;
+  content?: string;
+  /** Legacy Host RPC compatibility. */
+  type?: AgentMessageType;
+  payload?: Record<string, unknown>;
   artifact_refs?: string[];
-  requires_ack: boolean;
+  requires_ack?: boolean;
   deadline_seconds?: number;
   idempotency_key: string;
 }
@@ -88,19 +93,20 @@ export class PersistentMailboxService {
   }
 
   async send(input: MailboxSendInput): Promise<MailboxSendResult> {
-    this.validateSend(input);
+    const normalized = normalizeSendInput(input);
+    this.validateSend(normalized);
     const existing = this.store.findMailboxSendByIdempotencyKey(
-      input.task_id,
-      input.from_role_id,
-      input.idempotency_key,
+      normalized.task_id,
+      normalized.from_role_id,
+      normalized.idempotency_key,
     );
     if (existing) {
-      this.assertIdempotentReplay(existing, input);
+      this.assertIdempotentReplay(existing, normalized);
       return existing;
     }
     const createdAt = this.now();
-    const message = this.createMessage(input, createdAt);
-    const deliveries = this.createDeliveries(message.message_id, input, createdAt);
+    const message = this.createMessage(normalized, createdAt);
+    const deliveries = this.createDeliveries(message.message_id, normalized, createdAt);
     this.store.saveMailboxMessage(message, deliveries);
     return { message, deliveries };
   }
@@ -168,13 +174,13 @@ export class PersistentMailboxService {
   async reply(input: MailboxReplyInput): Promise<SaveMailboxReplyResult> {
     const source = this.requireDelivery(input.source_delivery_id);
     this.assertRecipient(source.delivery, input.from_role_id);
-    const normalized: MailboxSendInput = {
+    const normalized = normalizeSendInput({
       ...input,
       task_id: source.message.task_id,
       workspace_path: source.message.workspace_path,
       thread_id: source.message.thread_id,
       to_role_id: source.message.from_role_id,
-    };
+    });
     this.validateSend(normalized);
     const existing = this.store.findMailboxSendByIdempotencyKey(
       source.message.task_id,
@@ -244,7 +250,7 @@ export class PersistentMailboxService {
       );
   }
 
-  private validateSend(input: Omit<MailboxSendInput, 'thread_id'> & { thread_id?: string }): void {
+  private validateSend(input: Omit<RequiredMailboxSendInput, 'thread_id'> & { thread_id?: string }): void {
     if (input.requires_ack && input.deadline_seconds === undefined) {
       throw new MailboxValidationError('requires_ack messages must set deadline_seconds');
     }
@@ -256,6 +262,7 @@ export class PersistentMailboxService {
     requireText(input.from_role_id, 'from_role_id');
     requireText(input.to_role_id, 'to_role_id');
     requireText(input.idempotency_key, 'idempotency_key');
+    if (!input.content.trim()) throw new MailboxValidationError('content is required');
     if (input.thread_id !== undefined) requireText(input.thread_id, 'thread_id');
     if (input.from_role_id === input.to_role_id) {
       throw new MailboxValidationError('Mailbox sender and recipient must be different roles');
@@ -263,7 +270,7 @@ export class PersistentMailboxService {
   }
 
   private createMessage(
-    input: MailboxSendInput,
+    input: RequiredMailboxSendInput,
     createdAt: string,
     replyToMessageId?: string,
   ): PersistedMailboxMessage {
@@ -273,6 +280,8 @@ export class PersistentMailboxService {
       workspace_path: input.workspace_path,
       thread_id: input.thread_id,
       from_role_id: input.from_role_id,
+      kind: input.kind,
+      content: input.content,
       type: input.type,
       payload: { ...input.payload },
       artifact_refs: [...(input.artifact_refs ?? [])],
@@ -287,7 +296,7 @@ export class PersistentMailboxService {
   private createDeliveries(
     messageId: string,
     input: Pick<
-      MailboxSendInput,
+      RequiredMailboxSendInput,
       'task_id' | 'workspace_path' | 'to_role_id' | 'deadline_seconds'
     >,
     createdAt: string,
@@ -327,7 +336,7 @@ export class PersistentMailboxService {
 
   private assertIdempotentReplay(
     existing: MailboxSendPersistenceResult,
-    input: Omit<MailboxSendInput, 'thread_id'> & { thread_id?: string },
+    input: Omit<RequiredMailboxSendInput, 'thread_id'> & { thread_id?: string },
   ): void {
     const delivery = existing.deliveries[0];
     const expectedDeadline = input.deadline_seconds
@@ -339,6 +348,8 @@ export class PersistentMailboxService {
       existing.message.workspace_path !== input.workspace_path ||
       (input.thread_id !== undefined && existing.message.thread_id !== input.thread_id) ||
       existing.message.from_role_id !== input.from_role_id ||
+      existing.message.kind !== input.kind ||
+      existing.message.content !== input.content ||
       existing.message.type !== input.type ||
       JSON.stringify(existing.message.payload) !== JSON.stringify(input.payload) ||
       JSON.stringify(existing.message.artifact_refs) !==
@@ -354,4 +365,50 @@ export class PersistentMailboxService {
 
 function requireText(value: string, field: string): void {
   if (!value.trim()) throw new MailboxValidationError(`${field} is required`);
+}
+
+interface RequiredMailboxSendInput
+  extends Omit<MailboxSendInput, 'kind' | 'content' | 'type' | 'payload' | 'requires_ack'> {
+  kind: MailboxMessageKind;
+  content: string;
+  type: AgentMessageType;
+  payload: Record<string, unknown>;
+  requires_ack: boolean;
+}
+
+/**
+ * Normalize the public Agent contract and the historical Host RPC contract
+ * into one persisted shape. New callers must provide kind/content; old rows
+ * keep their type/payload values for replay and audit compatibility.
+ */
+function normalizeSendInput(input: MailboxSendInput): RequiredMailboxSendInput {
+  const kind = input.kind ?? legacyKind(input.type);
+  const content = input.content ?? legacyContent(input.payload);
+  const type = input.type ?? (kind === 'request' ? 'ask_help' : 'status_update');
+  const payload = input.payload ?? { content };
+  const requires_ack = input.requires_ack ?? kind === 'request';
+  if (!kind) throw new MailboxValidationError('kind is required');
+  if (!content) throw new MailboxValidationError('content is required');
+  return {
+    ...input,
+    kind,
+    content,
+    type,
+    payload,
+    requires_ack,
+  };
+}
+
+function legacyKind(type: AgentMessageType | undefined): MailboxMessageKind | undefined {
+  if (!type) return undefined;
+  return type === 'ask_help' || type === 'review_request' || type === 'proposal' || type === 'decision_request'
+    ? 'request'
+    : 'notice';
+}
+
+function legacyContent(payload: Record<string, unknown> | undefined): string | undefined {
+  if (!payload) return undefined;
+  const candidate = payload.content;
+  if (typeof candidate === 'string' && candidate.trim()) return candidate;
+  return JSON.stringify(payload);
 }

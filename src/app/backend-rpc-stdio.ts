@@ -37,7 +37,11 @@ import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
-import { TaskExecutionLoop, TaskProcessor } from '../coordination';
+import {
+  PersistentParticipantSessionRegistry,
+  TaskExecutionLoop,
+  TaskProcessor,
+} from '../coordination';
 import { MailboxDeliveryWorker, PersistentMailboxService } from '../mailbox';
 import { createProductionBRuntime, type BackendBRuntime } from './production-b-runtime';
 import {
@@ -185,6 +189,7 @@ export async function createProductionBackendService(
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
     const mailboxService = new PersistentMailboxService(coordinationStore);
+    const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       repository: bCapabilities.repository,
@@ -198,6 +203,7 @@ export async function createProductionBackendService(
       mailbox: {
         service: mailboxService,
         allowedRoleIds: bRuntime.market_agent_ids,
+        sessionRegistry: participantSessions,
       },
     });
     const selectAgentHandler = new SelectAgentHandler({
@@ -302,7 +308,7 @@ export async function createProductionBackendService(
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
       systemStatusService,
-      new MailboxDeliveryWorker(mailboxService, agentExecutionFacade),
+      new MailboxDeliveryWorker(mailboxService, agentExecutionFacade, participantSessions),
     );
     await service.recoverMailboxWaits();
     return service;

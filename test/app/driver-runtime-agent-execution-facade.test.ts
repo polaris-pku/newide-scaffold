@@ -31,6 +31,7 @@ import {
   type MailboxToolOutcome,
 } from '../../src/mailbox';
 import { SqliteCoordinationStore } from '../../src/persistence';
+import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
   it('lets one real B Agent tool turn send and another role reply through Mailbox', async () => {
@@ -40,6 +41,13 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     await repository.initializeAgent({ role_id: 'role_reviewer', name: 'Reviewer' });
     const store = new SqliteCoordinationStore(':memory:');
     const mailbox = new PersistentMailboxService(store);
+    const sessions = new InMemoryParticipantSessionRegistry();
+    sessions.register({
+      task_id: 'task_mailbox_agent',
+      workspace_path: workspace,
+      role_id: 'role_reviewer',
+      session_id: 'session_reviewer',
+    });
     const observedPrompts: string[] = [];
     const facade = new DriverRuntimeAgentExecutionFacade({
       driver: new CapturingDriver('succeeded'),
@@ -49,6 +57,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       mailbox: {
         service: mailbox,
         allowedRoleIds: ['role_sender', 'role_reviewer'],
+        sessionRegistry: sessions,
       },
     });
 
@@ -74,7 +83,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
 
       const deliveryId = sends[0]?.delivery_id;
       expect(deliveryId).toBeTruthy();
-      const worker = new MailboxDeliveryWorker(mailbox, facade);
+      const worker = new MailboxDeliveryWorker(mailbox, facade, sessions);
       const handled = await worker.process({
         delivery_id: deliveryId as string,
         run_id: 'run_task_mailbox_agent',
@@ -85,7 +94,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         source_delivery: {
           status: 'acknowledged',
           recipient_role_id: 'role_reviewer',
-          recipient_session_id: 'session_001',
+          recipient_session_id: 'session_reviewer',
         },
         reply: {
           kind: 'reply',
@@ -722,10 +731,10 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     const second = facade.runAgent(request('task_queue_cleanup_2', 'proposer', workspace));
     try {
       await vi.waitFor(() => expect(driver.prompts).toHaveLength(1));
-      expect(queues.size).toBe(2);
+      expect(queues.size).toBe(1);
       driver.releaseNext();
       await vi.waitFor(() => expect(driver.prompts).toHaveLength(2));
-      expect(queues.size).toBe(2);
+      expect(queues.size).toBe(1);
       driver.releaseNext();
       await Promise.all([first, second]);
       await vi.waitFor(() => expect(queues.size).toBe(0));
@@ -755,7 +764,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     ]);
   });
 
-  it('serializes different roles that target the same workspace', async () => {
+  it('runs different roles that target the same workspace in parallel', async () => {
     const driver = new ConcurrentDriver();
     const { facade } = createFacade(driver);
     const workspace = '/tmp/newide-shared-workspace';
@@ -765,7 +774,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       facade.runAgent(request('task_shared_b', 'reviewer', workspace)),
     ]);
 
-    expect(driver.maxActive).toBe(1);
+    expect(driver.maxActive).toBe(2);
   });
 
   it('reuses one logical role and buffer sequence across different workspaces', async () => {
@@ -1113,8 +1122,8 @@ function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
         input.messages.find((message) => message.role === 'user')?.content ?? '';
       observedPrompts.push(userPrompt);
       const lastMessage = input.messages.at(-1);
-      const inboundRequest = userPrompt.includes('- type: review_request');
-      const inboundResponse = userPrompt.includes('- type: decision_response');
+      const inboundRequest = userPrompt.includes('- kind: request');
+      const inboundResponse = userPrompt.includes('Mailbox reply') || userPrompt.includes('- kind: notice');
       if (!userPrompt.includes('Inbound mailbox envelope:') && lastMessage?.role !== 'tool') {
         return {
           content: null,
@@ -1122,13 +1131,13 @@ function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
             {
               id: 'mailbox_request',
               type: 'function',
-              function: {
-                name: 'mailbox_send',
-                arguments: JSON.stringify({
-                  to_role_id: 'role_reviewer',
-                  type: 'review_request',
-                  payload: { question: 'Please assess this plan.' },
-                }),
+                function: {
+                  name: 'mailbox_send',
+                  arguments: JSON.stringify({
+                    to_role_id: 'role_reviewer',
+                    kind: 'request',
+                    content: 'Please assess this plan.',
+                  }),
               },
             },
           ],
@@ -1156,13 +1165,13 @@ function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
             {
               id: 'mailbox_reply',
               type: 'function',
-              function: {
-                name: 'mailbox_send',
-                arguments: JSON.stringify({
-                  to_role_id: 'role_sender',
-                  type: 'decision_response',
-                  payload: { answer: 'The plan is sound.' },
-                }),
+                function: {
+                  name: 'mailbox_send',
+                  arguments: JSON.stringify({
+                    to_role_id: 'role_sender',
+                    kind: 'notice',
+                    content: 'The plan is sound.',
+                  }),
               },
             },
           ],

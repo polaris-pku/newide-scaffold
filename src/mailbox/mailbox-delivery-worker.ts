@@ -7,6 +7,7 @@ import type {
 import { expectsMailboxReply, type MailboxToolOutcome } from './mailbox-send-tool';
 import type { PersistedMailboxDelivery } from './mailbox-state-store';
 import type { PersistentMailboxService } from './persistent-mailbox-service';
+import type { ParticipantSessionRegistry } from '../coordination/participant-session-registry';
 
 export interface ProcessMailboxDeliveryInput {
   delivery_id: string;
@@ -27,6 +28,7 @@ export class MailboxDeliveryWorker {
   constructor(
     private readonly mailbox: PersistentMailboxService,
     private readonly agents: AgentExecutionFacade,
+    private readonly sessions?: ParticipantSessionRegistry,
   ) {}
 
   async process(input: ProcessMailboxDeliveryInput): Promise<ProcessMailboxDeliveryResult> {
@@ -43,11 +45,24 @@ export class MailboxDeliveryWorker {
           : {}),
       };
     }
-    const sessionId = this.mailbox.findLatestSession(
+    const sessionId = this.sessions?.get(
+      envelope.message.task_id,
+      envelope.message.workspace_path,
+      envelope.delivery.recipient_role_id,
+    ) ?? this.mailbox.findLatestSession(
       envelope.message.task_id,
       envelope.message.workspace_path,
       envelope.delivery.recipient_role_id,
     );
+    if (!sessionId) {
+      return {
+        status: 'retryable_failure',
+        source_delivery: envelope.delivery,
+        error:
+          'COLLABORATION_DEADLOCK: recipient Session is not explicitly provisioned; ' +
+          'register the role Session before delivering the request',
+      };
+    }
     const options: AgentExecutionOptions | undefined = input.signal
       ? { signal: input.signal }
       : undefined;
@@ -59,7 +74,7 @@ export class MailboxDeliveryWorker {
           role_id: envelope.delivery.recipient_role_id,
           instruction: renderMailboxInstruction(envelope),
           workspace_path: envelope.message.workspace_path,
-          ...(sessionId ? { session_id: sessionId } : {}),
+          session_id: sessionId,
           mailbox_delivery_id: envelope.delivery.delivery_id,
           input_artifact_refs: [...envelope.message.artifact_refs],
           context_policy: 'mailbox_delivery',
@@ -82,7 +97,7 @@ export class MailboxDeliveryWorker {
           ? this.mailbox.markInjected(
               current.delivery_id,
               current.recipient_role_id,
-              result.session_id,
+              sessionId,
             )
           : current;
       const reply = findReplyOutcome(result, injected.delivery_id);
@@ -126,8 +141,11 @@ function renderMailboxInstruction(
 ): string {
   return [
     `Handle Mailbox delivery ${envelope.delivery.delivery_id} from ${envelope.message.from_role_id}.`,
-    `Type: ${envelope.message.type}`,
-    `Payload: ${JSON.stringify(envelope.message.payload)}`,
+    `Kind: ${envelope.message.kind ?? legacyMailboxKind(envelope.message.type) ?? 'notice'}`,
+    `Content: ${envelope.message.content ?? legacyMailboxContent(envelope.message.payload) ?? JSON.stringify(envelope.message.payload)}`,
+    ...(envelope.message.artifact_refs.length > 0
+      ? [`Artifact refs: ${JSON.stringify(envelope.message.artifact_refs)}`]
+      : []),
     expectsBusinessReply(envelope)
       ? 'Use invoke_driver to assess the request, then reply to the sender with mailbox_send.'
       : 'Use invoke_driver to consume this reply and continue the Task; do not send an acknowledgement message.',
@@ -140,8 +158,22 @@ function expectsBusinessReply(
 ): boolean {
   return (
     !envelope.message.reply_to_message_id &&
-    expectsMailboxReply(envelope.message.type)
+    expectsMailboxReply(legacyMailboxKind(envelope.message.type, envelope.message.kind))
   );
+}
+
+function legacyMailboxKind(
+  type: Parameters<typeof expectsMailboxReply>[0],
+  kind?: 'request' | 'notice',
+): 'request' | 'notice' {
+  if (kind) return kind;
+  return type === 'request' || type === 'notice' || expectsMailboxReply(type) ? 'request' : 'notice';
+}
+
+function legacyMailboxContent(payload: Record<string, unknown> | undefined): string | undefined {
+  if (!payload) return undefined;
+  if (typeof payload.content === 'string' && payload.content.trim()) return payload.content;
+  return JSON.stringify(payload);
 }
 
 function findReplyOutcome(
@@ -162,7 +194,7 @@ function isMailboxToolOutcome(value: unknown): value is MailboxToolOutcome {
   if (typeof value !== 'object' || value === null) return false;
   const outcome = value as Partial<MailboxToolOutcome>;
   return (
-    (outcome.kind === 'request' || outcome.kind === 'reply') &&
+    (outcome.kind === 'request' || outcome.kind === 'notice' || outcome.kind === 'reply') &&
       typeof outcome.message_id === 'string' &&
     typeof outcome.delivery_id === 'string' &&
     typeof outcome.wait_for_reply === 'boolean'

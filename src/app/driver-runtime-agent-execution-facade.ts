@@ -3,7 +3,13 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../core';
+import {
+  SCHEMA_VERSION,
+  createId,
+  nowTimestamp,
+  type AgentMessageType,
+  type ArtifactRef,
+} from '../core';
 import {
   diffWorkspaceFiles,
   snapshotWorkspaceFiles,
@@ -31,7 +37,6 @@ import {
 import {
   MailboxSendTool,
   expectsMailboxReply,
-  isAgentMessageType,
   type MailboxSendToolInput,
   type MailboxToolOutcome,
   type PersistedMailboxEnvelope,
@@ -44,6 +49,7 @@ import type {
   AgentExecutionResult,
   AgentExecutionStatus,
 } from '../protocol/agent-execution';
+import type { ParticipantSessionRegistry } from '../coordination/participant-session-registry';
 import type {
   DriverRunResult,
   DriverRunStatus,
@@ -75,6 +81,7 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
     service: PersistentMailboxService;
     allowedRoleIds: readonly string[];
     defaultDeadlineSeconds?: number;
+    sessionRegistry?: ParticipantSessionRegistry;
   };
 }
 
@@ -92,6 +99,7 @@ interface InvocationContext {
   driver_invocation_context?: DriverRuntimeInvokerInput['driver_context'];
   agent_system_prompt_sha256?: string;
   inbound_mailbox?: PersistedMailboxEnvelope;
+  notice_mailboxes: PersistedMailboxEnvelope[];
   mailbox_outcomes: MailboxToolOutcome[];
   mailbox_sequence: number;
   collaboration_brief?: string;
@@ -161,17 +169,48 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const normalizedInput = input.workspace_path
       ? { ...input, workspace_path: path.resolve(input.workspace_path) }
       : input;
-    const runtimeRoleId = normalizedInput.role_id;
+    const boundSession =
+      normalizedInput.workspace_path && this.options.mailbox?.sessionRegistry
+        ? this.options.mailbox.sessionRegistry.get(
+            normalizedInput.task_id,
+            normalizedInput.workspace_path,
+            normalizedInput.role_id,
+          )
+        : undefined;
+    const scopedInput =
+      normalizedInput.session_id || !boundSession
+        ? normalizedInput
+        : { ...normalizedInput, session_id: boundSession };
+    const runtimeRoleId = scopedInput.role_id;
+    // Mailbox semantics serialize one logical role, while different roles
+    // remain runnable in parallel even when they share a workspace.
     const queueKeys = [
       `role:${runtimeRoleId}`,
-      ...(normalizedInput.workspace_path ? [`workspace:${normalizedInput.workspace_path}`] : []),
     ];
     return this.enqueue(
       queueKeys,
       async () => {
         throwIfAborted(options?.signal);
         const manager = await this.ensureRole(runtimeRoleId);
-        return this.execute(manager, normalizedInput, runtimeRoleId, options);
+        const result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+        const effectiveSessionId = scopedInput.session_id ?? result.session_id;
+        if (
+          effectiveSessionId &&
+          scopedInput.workspace_path &&
+          this.options.mailbox?.sessionRegistry &&
+          result.status === 'completed'
+        ) {
+          this.options.mailbox.sessionRegistry.register({
+            task_id: scopedInput.task_id,
+            workspace_path: scopedInput.workspace_path,
+            role_id: scopedInput.role_id,
+            session_id: effectiveSessionId,
+          });
+        }
+        if (result.status === 'completed' && scopedInput.workspace_path) {
+          this.finishNoticeMailbox(scopedInput, result);
+        }
+        return result;
       },
       options?.signal,
     );
@@ -194,6 +233,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const inboundMailbox = input.mailbox_delivery_id
       ? this.requireInboundMailbox(input)
       : undefined;
+    const noticeMailboxes =
+      !input.mailbox_delivery_id && input.workspace_path && this.options.mailbox
+        ? this.options.mailbox.service
+            .inbox(input.task_id, input.workspace_path, input.role_id)
+            .filter(
+              (envelope) =>
+                isMailboxDeliveryAvailable(envelope) && !envelopeExpectsReply(envelope),
+            )
+        : [];
     return runWithMemoryAblationPolicy(ablationPolicy, async () => {
       const retrieval = await withAbort(
         repositoryRetrieveMemoryForTask(
@@ -224,6 +272,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
         ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
+        notice_mailboxes: noticeMailboxes,
         mailbox_outcomes: [],
         mailbox_sequence: 0,
         driver_attempts: 0,
@@ -265,7 +314,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         invocation.mailbox_outcomes,
       );
       if (inboundMailbox && result.status === 'completed') {
-        this.finishInboundMailbox(inboundMailbox, result, invocation.mailbox_outcomes);
+        this.finishInboundMailbox(
+          inboundMailbox,
+          result,
+          invocation.mailbox_outcomes,
+          input.session_id,
+        );
       }
       return result;
     });
@@ -371,12 +425,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (!mailbox || !invocation) {
       throw new Error('mailbox.send was called outside a configured Agent invocation');
     }
-    if (
-      !input.to_role_id?.trim() ||
-      !isAgentMessageType(input.type) ||
-      !isRecord(input.payload)
-    ) {
-      throw new Error('mailbox.send requires to_role_id, type and object payload');
+    const kind = input.kind ?? legacyMailboxKind(input.type);
+    const content = input.content ?? legacyMailboxContent(input.payload);
+    if (!input.to_role_id?.trim() || !kind || !content) {
+      throw new Error('mailbox_send requires to_role_id, kind and content');
     }
     if (!invocation.workspace_path) {
       throw new Error('mailbox.send requires a workspace-bound Agent invocation');
@@ -385,7 +437,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
     invocation.mailbox_sequence += 1;
-    const waitForReply = expectsMailboxReply(input.type);
+    const waitForReply = expectsMailboxReply(kind);
     if (
       waitForReply &&
       invocation.mailbox_outcomes.some(
@@ -420,8 +472,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const reply = await mailbox.service.reply({
         source_delivery_id: source.delivery_id,
         from_role_id: invocation.role_id,
-        type: input.type,
-        payload: { ...input.payload },
+        kind: kind === 'request' ? 'notice' : kind,
+        content,
+        ...(input.type ? { type: input.type } : {}),
+        ...(input.payload ? { payload: { ...input.payload } } : {}),
+        ...(input.artifact_refs ? { artifact_refs: [...input.artifact_refs] } : {}),
         requires_ack: false,
         idempotency_key: idempotencyKey,
       });
@@ -453,16 +508,19 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       thread_id: createId('thread'),
       from_role_id: invocation.role_id,
       to_role_id: input.to_role_id,
-      type: input.type,
-      payload: { ...input.payload },
-      requires_ack: expectsMailboxReply(input.type),
-      ...(expectsMailboxReply(input.type) ? { deadline_seconds: deadlineSeconds } : {}),
+      kind,
+      content,
+      ...(input.type ? { type: input.type } : {}),
+      ...(input.payload ? { payload: { ...input.payload } } : {}),
+      ...(input.artifact_refs ? { artifact_refs: [...input.artifact_refs] } : {}),
+      requires_ack: waitForReply,
+      ...(waitForReply ? { deadline_seconds: deadlineSeconds } : {}),
       idempotency_key: idempotencyKey,
     });
     const delivery = sent.deliveries[0];
     if (!delivery) throw new Error('Mailbox send did not create a Delivery');
     const outcome: MailboxToolOutcome = {
-      kind: 'request',
+      kind: waitForReply ? 'request' : 'notice',
       message_id: sent.message.message_id,
       delivery_id: delivery.delivery_id,
       thread_id: sent.message.thread_id,
@@ -479,16 +537,17 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     inbound: PersistedMailboxEnvelope,
     result: AgentExecutionResult,
     outcomes: readonly MailboxToolOutcome[],
+    boundSessionId?: string,
   ): void {
     const mailbox = this.options.mailbox;
     if (!mailbox) return;
     const current = mailbox.service.getEnvelope(inbound.delivery.delivery_id).delivery;
     const injected =
       current.status === 'pending'
-        ? mailbox.service.markInjected(
+      ? mailbox.service.markInjected(
             current.delivery_id,
             current.recipient_role_id,
-            result.session_id,
+            boundSessionId ?? result.session_id,
           )
         : current;
     const replied = outcomes.some(
@@ -524,7 +583,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         (member) =>
           `  - ${member.role_id} (${member.name}, ${member.status}): ${truncate(member.persona.summary, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}`,
       ),
-      '- Communication: use mailbox_send(to_role_id, type, payload).',
+      '- Communication: use mailbox_send(to_role_id, kind, content, artifact_refs?).',
       ...(inbound
         ? [
             '- Inbound delivery takes precedence over the original Task wording; do not repeat the original outbound request.',
@@ -537,8 +596,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             `- message_id: ${inbound.message.message_id}`,
             `- thread_id: ${inbound.message.thread_id}`,
             `- from_role_id: ${inbound.message.from_role_id}`,
-            `- type: ${inbound.message.type}`,
-            `- payload: ${JSON.stringify(inbound.message.payload)}`,
+            `- kind: ${inbound.message.kind ?? legacyMailboxKind(inbound.message.type) ?? 'notice'}`,
+            `- content: ${inbound.message.content ?? legacyMailboxContent(inbound.message.payload) ?? JSON.stringify(inbound.message.payload)}`,
+            ...(inbound.message.artifact_refs.length > 0
+              ? [`- artifact_refs: ${JSON.stringify(inbound.message.artifact_refs)}`]
+              : []),
             ...(envelopeExpectsReply(inbound)
               ? [
                   '- Process the request through invoke_driver first, then reply with mailbox_send to the sender role.',
@@ -548,7 +610,47 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
                 ]),
           ]
         : []),
+      ...(invocation.notice_mailboxes.length > 0
+        ? [
+            'Durable notices available on this natural turn:',
+            ...invocation.notice_mailboxes.map(
+              (notice) =>
+                `- delivery_id: ${notice.delivery.delivery_id}; from_role_id: ${notice.message.from_role_id}; ` +
+                `content: ${notice.message.content ?? legacyMailboxContent(notice.message.payload) ?? JSON.stringify(notice.message.payload)}` +
+                (notice.message.artifact_refs.length > 0
+                  ? `; artifact_refs: ${JSON.stringify(notice.message.artifact_refs)}`
+                  : ''),
+            ),
+          ]
+        : []),
     ].join('\n');
+  }
+
+  private finishNoticeMailbox(
+    input: AgentExecutionRequest,
+    result: AgentExecutionResult,
+  ): void {
+    const mailbox = this.options.mailbox;
+    if (!mailbox || !input.workspace_path) return;
+    const notices = mailbox.service
+      .inbox(input.task_id, input.workspace_path, input.role_id)
+      .filter(
+        (envelope) => isMailboxDeliveryAvailable(envelope) && !envelopeExpectsReply(envelope),
+      );
+    for (const notice of notices) {
+      const current = mailbox.service.getEnvelope(notice.delivery.delivery_id).delivery;
+      const injected =
+        current.status === 'pending'
+          ? mailbox.service.markInjected(
+              current.delivery_id,
+              current.recipient_role_id,
+              input.session_id ?? result.session_id,
+            )
+          : current;
+      if (injected.status === 'injected') {
+        mailbox.service.ack(injected.delivery_id, injected.recipient_role_id);
+      }
+    }
   }
 
   private async invokeDriver(task: DriverTask) {
@@ -929,8 +1031,25 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
 function envelopeExpectsReply(envelope: PersistedMailboxEnvelope): boolean {
   return (
     !envelope.message.reply_to_message_id &&
-    expectsMailboxReply(envelope.message.type)
+    expectsMailboxReply(envelope.message.kind ?? legacyMailboxKind(envelope.message.type) ?? 'notice')
   );
+}
+
+function isMailboxDeliveryAvailable(envelope: PersistedMailboxEnvelope): boolean {
+  return envelope.delivery.status === 'pending' || envelope.delivery.status === 'injected';
+}
+
+function legacyMailboxKind(
+  type: AgentMessageType | undefined,
+): 'request' | 'notice' | undefined {
+  if (!type) return undefined;
+  return expectsMailboxReply(type) ? 'request' : 'notice';
+}
+
+function legacyMailboxContent(payload: Record<string, unknown> | undefined): string | undefined {
+  if (!payload) return undefined;
+  if (typeof payload.content === 'string' && payload.content.trim()) return payload.content;
+  return JSON.stringify(payload);
 }
 
 function hashSystemPrompt(

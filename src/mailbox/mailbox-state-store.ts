@@ -1,6 +1,9 @@
 /** Mailbox-owned persistence port. SQLite remains an application adapter. */
 import type { AgentMessageType, SchemaVersion, Timestamp } from '../core';
 
+/** The only business semantics exposed to an Agent through Mailbox. */
+export type MailboxMessageKind = 'request' | 'notice';
+
 export type PersistedMailboxDeliveryStatus =
   | 'pending'
   | 'injected'
@@ -19,6 +22,11 @@ export interface PersistedMailboxMessage {
   workspace_path: string;
   thread_id: string;
   from_role_id: string;
+  /** Canonical Agent-facing message kind. Optional only for pre-contract rows. */
+  kind?: MailboxMessageKind;
+  /** Canonical human-readable message body. Optional only for pre-contract rows. */
+  content?: string;
+  /** Legacy fields retained for Host RPC and historical audit compatibility. */
   type: AgentMessageType;
   payload: Record<string, unknown>;
   artifact_refs: string[];
@@ -115,6 +123,17 @@ export interface MailboxStateStore {
     workspace_path?: string;
     recipient_role_id?: string;
   }): PersistedMailboxEnvelope[];
+  /** Latest durable delivery position for a Task/workspace checkpoint. */
+  getMailboxHighWatermark(
+    taskId: string,
+    workspacePath: string,
+  ): { created_at: Timestamp; delivery_id: string } | undefined;
+  /** Pending/injected deliveries committed after a checkpoint watermark. */
+  listMailboxDeliveriesAfter(
+    taskId: string,
+    workspacePath: string,
+    after?: { created_at: Timestamp; delivery_id: string },
+  ): PersistedMailboxEnvelope[];
   findMailboxSendByIdempotencyKey(
     taskId: string,
     fromRoleId: string,

@@ -111,7 +111,7 @@ describe('SqliteCoordinationStore persistent mailbox', () => {
     store.close();
   });
 
-  it('migrates legacy Agent-addressed deliveries back to honest pending role deliveries', () => {
+  it('keeps legacy unscoped deliveries as audit history without redelivery', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-mailbox-legacy-'));
     temporaryDirectories.push(directory);
     const databasePath = path.join(directory, 'coordination.sqlite');
@@ -143,12 +143,7 @@ describe('SqliteCoordinationStore persistent mailbox', () => {
     legacy.close();
 
     const migrated = new SqliteCoordinationStore(databasePath);
-    expect(migrated.listReplayableMailboxDeliveries()).toMatchObject([
-      {
-        message: { from_role_id: 'role_legacy_sender' },
-        delivery: { recipient_role_id: 'role_legacy_receiver', status: 'pending' },
-      },
-    ]);
+    expect(migrated.listReplayableMailboxDeliveries()).toEqual([]);
     migrated.close();
   });
 });

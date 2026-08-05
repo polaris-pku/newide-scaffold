@@ -827,6 +827,16 @@ export class NewideBackendService {
         delivery_id: sourceDeliveryId,
         run_id: context.run_id,
       });
+      if (
+        handled.status === 'retryable_failure' &&
+        handled.error?.startsWith('COLLABORATION_DEADLOCK')
+      ) {
+        processor.blockMailboxDeadlock(
+          taskId,
+          handled.error,
+        );
+        return;
+      }
       reply =
         handled.status === 'replied' && handled.reply
           ? mailbox.getEnvelope(handled.reply.delivery_id)

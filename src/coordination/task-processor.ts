@@ -681,6 +681,71 @@ export class TaskProcessor {
     };
   }
 
+  /**
+   * Move a Mailbox-waiting Task to blocked when no explicitly provisioned
+   * recipient Session can execute the outstanding request. The cursor and
+   * delivery refs remain intact so an operator can provision the Session and
+   * resume; this is never treated as a successful wait or a fresh Run.
+   */
+  blockMailboxDeadlock(taskId: string, reason: string): TaskSnapshot {
+    const aggregate = this.store.getTaskAggregate(taskId);
+    if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
+    const code = 'collaboration_deadlock';
+    if (
+      aggregate.task.status === 'blocked' &&
+      aggregate.task.error?.code === code
+    ) {
+      return projectAggregate(aggregate, this.runsRoot);
+    }
+    assertTaskStatusTransition(aggregate.task.status, 'blocked');
+
+    const runId =
+      readPayloadString(aggregate.runtime_state.diagnostics, 'mailbox_wait_run_id') ??
+      readPayloadString(aggregate.runtime_state.interrupt_state ?? {}, 'interrupted_run_id') ??
+      aggregate.runs.at(-1)?.run_id;
+    if (!runId || !aggregate.runs.some((run) => run.run_id === runId)) {
+      throw new Error(`Cannot block mailbox deadlock for ${taskId}: no associated Run`);
+    }
+    const timestamp = this.now();
+    const interruptState = {
+      type: 'collaboration_deadlock',
+      code,
+      reason,
+      ...(aggregate.runtime_state.cursor_input?.cursor === 'mailbox_wait'
+        ? { delivery_ids: [...aggregate.runtime_state.cursor_input.delivery_ids] }
+        : {}),
+    };
+    const taskBlocked = this.createEvent(
+      'task.blocked',
+      taskId,
+      taskId,
+      runId,
+      { code, reason },
+    );
+    this.store.commitState({
+      expected_task_revision: aggregate.task.revision,
+      task: {
+        ...aggregate.task,
+        status: 'blocked',
+        error: { code, message: reason },
+        revision: aggregate.task.revision + 1,
+        updated_at: timestamp,
+      },
+      runtime_state: {
+        ...aggregate.runtime_state,
+        interrupt_state: interruptState,
+        diagnostics: {
+          ...aggregate.runtime_state.diagnostics,
+          collaboration_deadlock: true,
+          collaboration_deadlock_code: code,
+        },
+        updated_at: timestamp,
+      },
+      events: [taskBlocked],
+    });
+    return this.getTaskSnapshot(taskId);
+  }
+
   listMailboxWaitContexts(): TaskMailboxWaitContext[] {
     return this.store.listTaskAggregates().flatMap((aggregate) => {
       const cursorInput = aggregate.runtime_state.cursor_input;

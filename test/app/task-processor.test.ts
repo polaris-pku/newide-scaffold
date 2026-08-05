@@ -425,6 +425,62 @@ describe('TaskProcessor', () => {
     store.close();
   });
 
+  it('blocks a mailbox wait as collaboration_deadlock when no recipient Session is runnable', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({
+      task_id: 'task_mailbox_deadlock',
+      run_id: 'run_mailbox_deadlock',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      cursor_input: selectInput,
+    });
+    processor.startStage({
+      run_id: 'run_mailbox_deadlock',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_deadlock_select',
+    });
+    processor.advanceStage({
+      run_id: 'run_mailbox_deadlock',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_deadlock_select',
+      evidence_ref: evidenceRef('deadlock_select'),
+      next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+    });
+    processor.startStage({
+      run_id: 'run_mailbox_deadlock',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_deadlock_execute',
+    });
+    processor.advanceStage({
+      run_id: 'run_mailbox_deadlock',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_deadlock_execute',
+      evidence_ref: evidenceRef('deadlock_execute'),
+      next_input: {
+        cursor: 'mailbox_wait',
+        delivery_ids: ['delivery_missing_session'],
+        waiting_reason: 'Waiting for reviewer',
+      },
+      owner_agent_id: 'agent_a',
+      session_id: 'session_sender',
+    });
+    processor.completeRunForMailboxWait('run_mailbox_deadlock');
+
+    const blocked = processor.blockMailboxDeadlock(
+      'task_mailbox_deadlock',
+      'COLLABORATION_DEADLOCK: recipient Session is not explicitly provisioned',
+    );
+    expect(blocked).toMatchObject({
+      task: { status: 'blocked' },
+      waiting_reason: 'COLLABORATION_DEADLOCK: recipient Session is not explicitly provisioned',
+    });
+    expect(store.getTaskAggregate('task_mailbox_deadlock')?.task.error).toMatchObject({
+      code: 'collaboration_deadlock',
+    });
+    store.close();
+  });
+
   it('records legacy events without projecting the cursor while a handler is active', () => {
     const { processor, store } = createProcessor();
     processor.beginRun({

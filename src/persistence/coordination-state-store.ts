@@ -251,6 +251,19 @@ export interface PersistedCheckpointMessage {
   created_at: string;
 }
 
+export interface PersistedCheckpointParticipantSession {
+  role_id: string;
+  session_id: string;
+}
+
+export interface PersistedCheckpointMailboxState {
+  high_watermark?: {
+    created_at: string;
+    delivery_id: string;
+  };
+  waiting_delivery_ids: string[];
+}
+
 export interface PersistedFullCheckpoint {
   checkpoint_id: string;
   parent_checkpoint_id?: string;
@@ -262,6 +275,10 @@ export interface PersistedFullCheckpoint {
   resume_cursor: TaskResumeCursor;
   /** Optional: persisted for from_checkpoint resume; older rows may omit it. */
   cursor_input?: TaskCursorInput;
+  /** Stable role/session references; no driver transcript is embedded. */
+  participant_sessions?: PersistedCheckpointParticipantSession[];
+  mailbox_state?: PersistedCheckpointMailboxState;
+  council_state_ref?: string;
   message_thread: PersistedCheckpointMessage[];
   mechanical_snapshot: {
     base_commit: string;

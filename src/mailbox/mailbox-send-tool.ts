@@ -1,14 +1,20 @@
 import type { AgentMessageType } from '../core';
 import type { Tool } from '../memory';
+import type { MailboxMessageKind } from './mailbox-state-store';
 
 export interface MailboxSendToolInput {
   to_role_id: string;
-  type: AgentMessageType;
-  payload: Record<string, unknown>;
+  /** Canonical Agent-facing contract. */
+  kind: MailboxMessageKind;
+  content: string;
+  artifact_refs?: string[];
+  /** Accepted by the Host adapter only while older prompts are replayed. */
+  type?: AgentMessageType;
+  payload?: Record<string, unknown>;
 }
 
 export interface MailboxToolOutcome {
-  kind: 'request' | 'reply';
+  kind: 'request' | 'notice' | 'reply';
   message_id: string;
   delivery_id: string;
   thread_id: string;
@@ -44,7 +50,8 @@ export class MailboxSendTool implements Tool<MailboxSendToolInput, MailboxToolOu
   readonly name = MAILBOX_SEND_TOOL_NAME;
   readonly description =
     'Send one task-scoped message to a visible teammate role. ' +
-    'When handling an inbound Mailbox message, use the same tool to reply to its sender.';
+    'Use kind=request when a response is needed and kind=notice for durable information. ' +
+    'When handling an inbound request, use the same tool to reply to its sender.';
   readonly inputSchema = {
     type: 'object',
     additionalProperties: false,
@@ -54,18 +61,23 @@ export class MailboxSendTool implements Tool<MailboxSendToolInput, MailboxToolOu
         minLength: 1,
         description: 'Recipient role_id from the collaboration brief.',
       },
-      type: {
+      kind: {
         type: 'string',
-        enum: MESSAGE_TYPES,
-        description: 'Business message type.',
+        enum: ['request', 'notice'],
+        description: 'request waits for one business reply; notice is durable and non-waking.',
       },
-      payload: {
-        type: 'object',
-        additionalProperties: true,
-        description: 'Structured message content.',
+      content: {
+        type: 'string',
+        minLength: 1,
+        description: 'Human-readable message body.',
+      },
+      artifact_refs: {
+        type: 'array',
+        items: { type: 'string', minLength: 1 },
+        description: 'Optional artifact IDs or URIs needed by the recipient.',
       },
     },
-    required: ['to_role_id', 'type', 'payload'],
+    required: ['to_role_id', 'kind', 'content'],
   };
 
   constructor(private readonly handler: MailboxSendToolHandler) {}
@@ -75,7 +87,9 @@ export class MailboxSendTool implements Tool<MailboxSendToolInput, MailboxToolOu
   }
 }
 
-export function expectsMailboxReply(type: AgentMessageType): boolean {
+export function expectsMailboxReply(type: AgentMessageType | MailboxMessageKind): boolean {
+  if (type === 'request') return true;
+  if (type === 'notice') return false;
   return (
     type === 'ask_help' ||
     type === 'review_request' ||
