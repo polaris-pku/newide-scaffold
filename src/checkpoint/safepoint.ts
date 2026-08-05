@@ -2,12 +2,14 @@ import { SCHEMA_VERSION, createId } from '../core';
 import { projectRunEventSource } from '../protocol/run-event';
 import type {
   PersistedFullCheckpoint,
+  MailboxStateStore,
   PersistedTaskAggregate,
   TaskCursorInput,
   TaskResumeCursor,
 } from '../persistence';
 import { captureFileAnchor } from './file-anchor';
 import { synthesizeCursorInput } from './resume-package';
+import type { ParticipantSessionRegistry } from '../coordination/participant-session-registry';
 
 export type SafepointTrigger = PersistedFullCheckpoint['trigger'];
 
@@ -30,6 +32,8 @@ export interface BuildSafepointCheckpointInput {
    * points at, so inheriting it is both safer and more faithful than re-capturing.
    */
   inherit_mechanical_snapshot?: PersistedFullCheckpoint['mechanical_snapshot'];
+  mailboxStore?: Partial<Pick<MailboxStateStore, 'getMailboxHighWatermark'>>;
+  participantSessions?: ParticipantSessionRegistry;
 }
 
 /**
@@ -75,6 +79,23 @@ export function buildSafepointCheckpoint(
     aggregate.task.owner_agent_id ??
     aggregate.task.role_id ??
     'coordinator';
+  const highWatermark = input.mailboxStore?.getMailboxHighWatermark?.(
+    aggregate.task.task_id,
+    aggregate.task.workspace_path,
+  );
+  const waitingDeliveryIds =
+    aggregate.runtime_state.cursor_input?.cursor === 'mailbox_wait'
+      ? [...aggregate.runtime_state.cursor_input.delivery_ids]
+      : [];
+  const participantSessions = [
+    ...collectParticipantSessions(aggregate),
+    ...(input.participantSessions?.list?.(
+      aggregate.task.task_id,
+      aggregate.task.workspace_path,
+    ) ?? []).map(({ role_id, session_id }) => ({ role_id, session_id })),
+  ].filter((value, index, values) =>
+    values.findIndex((candidate) => candidate.role_id === value.role_id) === index,
+  );
 
   return {
     checkpoint_id: checkpointId,
@@ -86,6 +107,11 @@ export function buildSafepointCheckpoint(
     trigger: input.trigger,
     resume_cursor: resumeCursor,
     ...(cursorInput ? { cursor_input: cursorInput } : {}),
+    ...(participantSessions.length > 0 ? { participant_sessions: participantSessions } : {}),
+    mailbox_state: {
+      ...(highWatermark ? { high_watermark: highWatermark } : {}),
+      waiting_delivery_ids: waitingDeliveryIds,
+    },
     message_thread: aggregate.events.map((event, index) => ({
       message_id: event.event_id,
       role: projectRunEventSource(event.event_type),
@@ -124,6 +150,30 @@ export function buildSafepointCheckpoint(
     created_at: timestamp,
     schema_version: SCHEMA_VERSION,
   };
+}
+
+function collectParticipantSessions(
+  aggregate: PersistedTaskAggregate,
+): Array<{ role_id: string; session_id: string }> {
+  const result = new Map<string, string>();
+  for (const run of aggregate.runs) {
+    if (run.session_id && aggregate.task.role_id) {
+      result.set(aggregate.task.role_id, run.session_id);
+    }
+  }
+  for (const event of aggregate.events) {
+    const payload = event.payload;
+    if (!payload || typeof payload !== 'object') continue;
+    const roleId = readString(payload, 'role_id') ?? readString(payload, 'agent_id');
+    const sessionId = readString(payload, 'session_id');
+    if (roleId && sessionId) result.set(roleId, sessionId);
+  }
+  return [...result.entries()].map(([role_id, session_id]) => ({ role_id, session_id }));
+}
+
+function readString(payload: Record<string, unknown>, key: string): string | undefined {
+  const value = payload[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
 function readLatestAgentId(aggregate: PersistedTaskAggregate): string | undefined {

@@ -31,11 +31,13 @@ import { taskSnapshotSchema, type TaskSnapshot } from '../protocol/task-snapshot
 import type { AppRunEvent } from '../app/run-registry';
 import { projectPersistedRunSnapshot } from '../app/task-run-snapshot-projector';
 import { projectTaskSnapshot, type TaskRunFact } from '../app/task-snapshot-projector';
+import type { ParticipantSessionRegistry } from './participant-session-registry';
 
 export interface TaskProcessorOptions {
   now?: () => string;
   createEventId?: () => string;
   runsRoot?: string;
+  participantSessions?: ParticipantSessionRegistry;
 }
 
 export interface BeginTaskRunInput {
@@ -184,21 +186,22 @@ export class TaskProcessor {
   private readonly createEventId: () => string;
   private readonly runsRoot: string;
   private readonly mailboxStore?:
-    | Pick<MailboxStateStore, 'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'>
+    | (Pick<MailboxStateStore, 'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'> &
+        Partial<Pick<MailboxStateStore, 'getMailboxHighWatermark' | 'listMailboxDeliveriesAfter'>>)
     | undefined;
+  private readonly participantSessions?: ParticipantSessionRegistry;
 
   constructor(
     private readonly store: CoordinationStateStore,
     options: TaskProcessorOptions & {
-      mailboxStore?: Pick<
-        MailboxStateStore,
-        'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'
-      >;
+      mailboxStore?: Pick<MailboxStateStore, 'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'> &
+        Partial<Pick<MailboxStateStore, 'getMailboxHighWatermark' | 'listMailboxDeliveriesAfter'>>;
     } = {},
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.createEventId = options.createEventId ?? (() => createId('event'));
     this.runsRoot = options.runsRoot ?? '.newide/runs';
+    if (options.participantSessions) this.participantSessions = options.participantSessions;
     this.mailboxStore = options.mailboxStore;
   }
 
@@ -1098,6 +1101,8 @@ export class TaskProcessor {
       aggregate,
       checkpoint,
       ...(this.mailboxStore ? { mailboxStore: this.mailboxStore } : {}),
+      ...(this.participantSessions ? { participantSessions: this.participantSessions } : {}),
+      ...(this.participantSessions ? { participantSessions: this.participantSessions } : {}),
     });
   }
 
@@ -1163,6 +1168,8 @@ export class TaskProcessor {
       trigger,
       ...(latestCheckpoint ? { parent_checkpoint_id: latestCheckpoint.checkpoint_id } : {}),
       ...(interruptState ? { interrupt_state: interruptState } : {}),
+      ...(this.mailboxStore ? { mailboxStore: this.mailboxStore } : {}),
+      ...(this.participantSessions ? { participantSessions: this.participantSessions } : {}),
       now: this.now(),
     });
     const checkpointSaved = this.createEvent(
@@ -1249,6 +1256,8 @@ export class TaskProcessor {
             inherit_mechanical_snapshot: latestCheckpoint.mechanical_snapshot,
           }
         : {}),
+      ...(this.mailboxStore ? { mailboxStore: this.mailboxStore } : {}),
+      ...(this.participantSessions ? { participantSessions: this.participantSessions } : {}),
       interrupt_state: interruptState,
       now: timestamp,
     });

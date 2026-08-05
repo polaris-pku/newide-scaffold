@@ -10,9 +10,12 @@ import type {
 } from '../persistence';
 import { parseTaskCursorInput } from '../persistence';
 import type { FileAnchor } from './file-anchor';
+import type { ParticipantSessionRegistry } from '../coordination/participant-session-registry';
 
 export interface ResumePackageMailbox {
   pending_deliveries: PersistedMailboxDelivery[];
+  waiting_delivery_ids: string[];
+  high_watermark?: { created_at: string; delivery_id: string };
 }
 
 export interface ResumePackage {
@@ -27,6 +30,8 @@ export interface ResumePackage {
   artifact_refs: string[];
   message_thread: PersistedCheckpointMessage[];
   mailbox: ResumePackageMailbox;
+  participant_sessions: Array<{ role_id: string; session_id: string }>;
+  council_state_ref?: string;
   file_anchor: FileAnchor;
   interrupt_state?: Record<string, unknown>;
   task_request: {
@@ -43,7 +48,9 @@ export interface ResumePackage {
 export interface BuildResumePackageInput {
   aggregate: PersistedTaskAggregate;
   checkpoint: PersistedFullCheckpoint;
-  mailboxStore?: Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'>;
+  mailboxStore?: Pick<MailboxStateStore, 'listReplayableMailboxDeliveries'> &
+    Partial<Pick<MailboxStateStore, 'listMailboxDeliveriesAfter'>>;
+  participantSessions?: ParticipantSessionRegistry;
 }
 
 export class ResumePackageError extends Error {
@@ -72,10 +79,40 @@ export function buildResumePackage(input: BuildResumePackageInput): ResumePackag
   }
 
   const cursorInput = resolveResumeCursorInput(aggregate, checkpoint);
-  const pendingDeliveries =
-    input.mailboxStore
-      ?.listReplayableMailboxDeliveries()
-      .map((envelope) => envelope.delivery) ?? [];
+  const participantSessions = [...(checkpoint.participant_sessions ?? [])];
+  for (const participant of participantSessions) {
+    const bound = input.participantSessions?.get(
+      aggregate.task.task_id,
+      aggregate.task.workspace_path,
+      participant.role_id,
+    );
+    if (input.participantSessions && bound !== participant.session_id) {
+      throw new ResumePackageError(
+        `Participant Session ${participant.role_id}/${participant.session_id} is not recoverable`,
+      );
+    }
+  }
+  const mailboxState = checkpoint.mailbox_state;
+  const replayAfter = mailboxState?.high_watermark
+    ? input.mailboxStore?.listMailboxDeliveriesAfter?.(
+        aggregate.task.task_id,
+        aggregate.task.workspace_path,
+        mailboxState.high_watermark,
+      )
+    : input.mailboxStore?.listMailboxDeliveriesAfter?.(
+        aggregate.task.task_id,
+        aggregate.task.workspace_path,
+      );
+  const replayable = [
+    ...(input.mailboxStore?.listReplayableMailboxDeliveries({
+      task_id: aggregate.task.task_id,
+      workspace_path: aggregate.task.workspace_path,
+    }) ?? []),
+    ...(replayAfter ?? []),
+  ];
+  const pendingDeliveries = deduplicateDeliveries(replayable).map(
+    (envelope) => envelope.delivery,
+  );
 
   const mechanical = checkpoint.mechanical_snapshot;
   // recoverable means workspace content can actually be restored, so a usable
@@ -96,7 +133,17 @@ export function buildResumePackage(input: BuildResumePackageInput): ResumePackag
     workspace_path: aggregate.task.workspace_path,
     artifact_refs: [...checkpoint.artifact_refs],
     message_thread: checkpoint.message_thread.map((entry) => ({ ...entry })),
-    mailbox: { pending_deliveries: pendingDeliveries },
+    mailbox: {
+      pending_deliveries: pendingDeliveries,
+      waiting_delivery_ids: [...(mailboxState?.waiting_delivery_ids ?? [])],
+      ...(mailboxState?.high_watermark
+        ? { high_watermark: { ...mailboxState.high_watermark } }
+        : {}),
+    },
+    participant_sessions: participantSessions,
+    ...(checkpoint.council_state_ref
+      ? { council_state_ref: checkpoint.council_state_ref }
+      : {}),
     file_anchor: {
       base_commit: mechanical.base_commit,
       ...(mechanical.snapshot_commit ? { snapshot_commit: mechanical.snapshot_commit } : {}),
@@ -118,6 +165,17 @@ export function buildResumePackage(input: BuildResumePackageInput): ResumePackag
   };
 }
 
+function deduplicateDeliveries(
+  envelopes: Array<{ delivery: PersistedMailboxDelivery }>,
+): Array<{ delivery: PersistedMailboxDelivery }> {
+  const seen = new Set<string>();
+  return envelopes.filter((envelope) => {
+    if (seen.has(envelope.delivery.delivery_id)) return false;
+    seen.add(envelope.delivery.delivery_id);
+    return true;
+  });
+}
+
 export function resolveResumeCursorInput(
   aggregate: PersistedTaskAggregate,
   checkpoint: PersistedFullCheckpoint,
@@ -125,6 +183,13 @@ export function resolveResumeCursorInput(
   const candidates: Array<TaskCursorInput | undefined> = [
     checkpoint.cursor_input,
     aggregate.runtime_state.cursor_input,
+    checkpoint.mailbox_state && checkpoint.resume_cursor === 'mailbox_wait'
+      ? {
+          cursor: 'mailbox_wait',
+          delivery_ids: [...checkpoint.mailbox_state.waiting_delivery_ids],
+          waiting_reason: 'resume_from_checkpoint',
+        }
+      : undefined,
     synthesizeCursorInput(checkpoint.resume_cursor, aggregate, checkpoint.run_id),
   ];
   for (const candidate of candidates) {
@@ -132,6 +197,9 @@ export function resolveResumeCursorInput(
     try {
       const parsed = parseTaskCursorInput(candidate);
       if (parsed.cursor !== checkpoint.resume_cursor) {
+        continue;
+      }
+      if (parsed.cursor === 'mailbox_wait' && parsed.delivery_ids.length === 0) {
         continue;
       }
       return parsed;
