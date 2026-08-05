@@ -52,6 +52,7 @@ import {
   TaskProcessorRunNotFoundError,
   TaskProcessorTaskNotFoundError,
   type BeginTaskRunIntent,
+  type ParticipantSessionProvisioner,
   type TaskProcessor,
   type TaskExecutionLoop,
 } from '../coordination';
@@ -221,6 +222,7 @@ export class NewideBackendService {
     private readonly taskExecutionLoop?: TaskExecutionLoop,
     private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
     private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
+    private readonly participantSessionProvisioner?: ParticipantSessionProvisioner,
   ) {}
 
   async recoverMailboxWaits(): Promise<void> {
@@ -823,6 +825,24 @@ export class NewideBackendService {
     const sourceDeliveryId = context.delivery_ids[0]!;
     let reply = mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
     if (!reply) {
+      if (this.participantSessionProvisioner) {
+        const source = mailbox.getEnvelope(sourceDeliveryId);
+        try {
+          await this.participantSessionProvisioner({
+            task_id: source.message.task_id,
+            workspace_path: source.message.workspace_path,
+            role_id: source.delivery.recipient_role_id,
+            run_id: context.run_id,
+          });
+        } catch (cause) {
+          const message = cause instanceof Error ? cause.message : String(cause);
+          processor.blockMailboxDeadlock(
+            taskId,
+            `COLLABORATION_DEADLOCK: SESSION_PROVISION_FAILED: ${message}`,
+          );
+          return;
+        }
+      }
       const handled = await worker.process({
         delivery_id: sourceDeliveryId,
         run_id: context.run_id,

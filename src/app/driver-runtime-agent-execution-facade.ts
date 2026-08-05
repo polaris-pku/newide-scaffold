@@ -49,7 +49,10 @@ import type {
   AgentExecutionResult,
   AgentExecutionStatus,
 } from '../protocol/agent-execution';
-import type { ParticipantSessionRegistry } from '../coordination/participant-session-registry';
+import type {
+  ParticipantSessionProvisionRequest,
+  ParticipantSessionRegistry,
+} from '../coordination/participant-session-registry';
 import type {
   DriverRunResult,
   DriverRunStatus,
@@ -119,6 +122,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly roleReady = new Map<string, Promise<AgentManager>>();
   private readonly invalidatedRoles = new Set<string>();
   private readonly executionQueues = new Map<string, Promise<void>>();
+  private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
   private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
 
@@ -154,6 +158,61 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.ensureRole(agentId);
   }
 
+  async provisionParticipantSession(input: ParticipantSessionProvisionRequest): Promise<string> {
+    const workspacePath = path.resolve(input.workspace_path);
+    const existing = this.options.mailbox?.sessionRegistry?.get(
+      input.task_id,
+      workspacePath,
+      input.role_id,
+    );
+    if (existing) return existing;
+    const key = `${input.task_id}\u0000${workspacePath}\u0000${input.role_id}`;
+    const pending = this.sessionProvisioning.get(key);
+    if (pending) return pending;
+    const provisioning = this.createParticipantSession({
+      ...input,
+      workspace_path: workspacePath,
+    }).finally(() => this.sessionProvisioning.delete(key));
+    this.sessionProvisioning.set(key, provisioning);
+    return provisioning;
+  }
+
+  private async createParticipantSession(
+    input: ParticipantSessionProvisionRequest,
+  ): Promise<string> {
+    await this.ensureRole(input.role_id);
+    const result = await this.options.driver.sendPrompt({
+      task_id: input.task_id,
+      run_id: `${input.run_id}:session-provision:${input.role_id}`,
+      prompt: [
+        'NewIDE session initialization only.',
+        `Register this ACP session for collaboration role ${input.role_id}.`,
+        'Do not modify files, call tools, or solve the task. Reply with SESSION_READY and stop.',
+      ].join('\n'),
+      workspace_path: input.workspace_path,
+      created_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    });
+    if (
+      result.status !== 'succeeded' ||
+      !result.session_id ||
+      result.session_id === this.options.driver.session_id ||
+      result.session_id === 'session-unavailable'
+    ) {
+      const detail = result.error?.message ?? result.diagnostics.notes.join('; ');
+      throw new Error(
+        `ACP did not create a usable Session for ${input.role_id} (status=${result.status}${detail ? `, detail=${detail}` : ''})`,
+      );
+    }
+    this.options.mailbox?.sessionRegistry?.register({
+      task_id: input.task_id,
+      workspace_path: input.workspace_path,
+      role_id: input.role_id,
+      session_id: result.session_id,
+    });
+    return result.session_id;
+  }
+
   async collectCompetitionClaims(
     task: AgentTaskRequest,
     options?: CollectCompetitionClaimsOptions,
@@ -169,7 +228,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const normalizedInput = input.workspace_path
       ? { ...input, workspace_path: path.resolve(input.workspace_path) }
       : input;
-    const boundSession =
+    let boundSession =
       normalizedInput.workspace_path && this.options.mailbox?.sessionRegistry
         ? this.options.mailbox.sessionRegistry.get(
             normalizedInput.task_id,
@@ -177,6 +236,19 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             normalizedInput.role_id,
           )
         : undefined;
+    if (
+      !normalizedInput.session_id &&
+      !boundSession &&
+      normalizedInput.workspace_path &&
+      this.options.mailbox?.sessionRegistry
+    ) {
+      boundSession = await this.provisionParticipantSession({
+        task_id: normalizedInput.task_id,
+        workspace_path: normalizedInput.workspace_path,
+        role_id: normalizedInput.role_id,
+        run_id: normalizedInput.run_id,
+      });
+    }
     const scopedInput =
       normalizedInput.session_id || !boundSession
         ? normalizedInput
@@ -843,7 +915,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       driver_run_result_id: createId('driver_result'),
       artifact_refs: [...workspaceArtifacts],
       transcript_ref: transcript,
-      session_id: this.options.driver.session_id,
+      session_id: input.session_id ?? this.options.driver.session_id,
       response: mailboxWait
         ? `Waiting for Mailbox reply from ${mailboxWait.to_role_id}.`
         : '',
@@ -1198,10 +1270,6 @@ function renderMemorySection(
 function truncate(value: string, limit: number): string {
   if (value.length <= limit) return value;
   return `${value.slice(0, Math.max(0, limit - 3))}...`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function delegationContext(original: string, delegated: string) {

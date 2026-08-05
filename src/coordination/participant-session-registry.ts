@@ -26,6 +26,17 @@ export interface ParticipantSessionBinding {
   session_id: string;
 }
 
+export interface ParticipantSessionProvisionRequest {
+  task_id: string;
+  workspace_path: string;
+  role_id: string;
+  run_id: string;
+}
+
+export type ParticipantSessionProvisioner = (
+  input: ParticipantSessionProvisionRequest,
+) => Promise<string>;
+
 export class InMemoryParticipantSessionRegistry implements ParticipantSessionRegistry {
   private readonly sessions = new Map<string, string>();
 

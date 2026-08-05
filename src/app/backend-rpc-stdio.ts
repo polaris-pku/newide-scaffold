@@ -315,7 +315,12 @@ export async function createProductionBackendService(
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
       systemStatusService,
-      new MailboxDeliveryWorker(mailboxService, agentExecutionFacade, participantSessions),
+      new MailboxDeliveryWorker(
+        mailboxService,
+        agentExecutionFacade,
+        participantSessions,
+      ),
+      (input) => agentExecutionFacade.provisionParticipantSession(input),
     );
     await service.recoverMailboxWaits();
     return service;
