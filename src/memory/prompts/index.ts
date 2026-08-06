@@ -9,3 +9,4 @@ export { PLANNER_SYSTEM_PROMPT } from './planner';
 export { CONTEXT_CLEANER_SYSTEM_PROMPT } from './context-cleaner';
 export { EXTRACTOR_SYSTEM_PROMPT } from './experience-extractor';
 export { PROMOTER_SYSTEM_PROMPT } from './skill-promotion';
+export { PERSONA_INDUCER_SYSTEM_PROMPT } from './persona-inducer';
