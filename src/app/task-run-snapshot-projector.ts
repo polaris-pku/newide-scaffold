@@ -303,7 +303,7 @@ function asRunOutcome(value: unknown): RunOutcome | undefined {
   const record = asRecord(value);
   if (
     !record ||
-    !['verified', 'best_effort', 'failed', 'blocked', 'cancelled'].includes(
+    !['completed', 'verified', 'best_effort', 'failed', 'blocked', 'cancelled'].includes(
       String(record.status),
     ) ||
     typeof record.reason !== 'string' ||

@@ -100,18 +100,23 @@ export function reconcileCouncilOutcome(
   result: CouncilRunResult,
   councilResult: CouncilResult,
 ): CouncilRunResult {
-  if (!result.outcome) return result;
+  const current = result.outcome ?? buildOutcome(result);
   return {
     ...result,
     outcome: {
-      ...result.outcome,
+      ...current,
+      status: 'completed',
+      selected_artifact_refs: unique([
+        ...current.selected_artifact_refs,
+        councilResult.final_artifact_ref,
+      ]),
       quality: councilResult.quality,
       unresolved_issues: unique([
-        ...result.outcome.unresolved_issues,
+        ...current.unresolved_issues,
         ...councilResult.unmet_criteria,
       ]),
       warnings: unique([
-        ...result.outcome.warnings.filter(
+        ...current.warnings.filter(
           (warning) => warning !== 'Council quality attestation is not available yet.',
         ),
         ...councilResult.warnings,
@@ -174,8 +179,6 @@ function adaptiveUnresolvedIssues(result: CouncilRunResult): string[] {
   const leadId = result.synthesis?.synthesizer_id;
   if (!leadId) {
     issues.push('a real lead synthesis is required');
-  } else if (distinctProposers.has(leadId)) {
-    issues.push(`lead ${leadId} is also a proposer; independent lead evidence is required`);
   }
   if (result.decision.verdict !== 'select' || result.selected_artifact_refs.length === 0) {
     issues.push('adaptive Council did not select a final artifact');

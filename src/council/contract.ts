@@ -55,6 +55,7 @@ export interface Review {
 }
 
 export interface CouncilResult {
+  /** @deprecated Audit metadata only; Task completion is based on final artifact convergence. */
   quality: 'verified' | 'best_effort';
   final_artifact_ref: ArtifactId;
   final_artifact_sha256: string;
@@ -75,6 +76,7 @@ export interface CouncilOutcome {
   participant_role_ids: string[];
   selected_artifact_refs: ArtifactId[];
   decision_summary: string;
+  /** @deprecated Audit metadata only; it never controls Council or Task status. */
   quality: 'verified' | 'best_effort';
   unresolved_issues: string[];
   warnings: string[];

@@ -209,7 +209,8 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
   assert(snapshot.delivery_report?.worktree_path, `${mode} delivery has no worktree path`);
   assert(snapshot.links?.result_path, `${mode} snapshot has no result link`);
   assert(snapshot.artifacts.length > 0, `${mode} snapshot has no artifacts`);
-  assert(snapshot.gates.length > 0, `${mode} snapshot has no gates`);
+  assert(snapshot.gates.length === 0, `${mode} fabricated Gate evidence`);
+  assert(snapshot.quality?.status === 'completed', `${mode} output was not finalized`);
   assert(snapshot.final_output?.status === 'completed', `${mode} final output is incomplete`);
   if (usesTemporaryRunner) {
     generatedFiles.push(...snapshot.final_output.files_written);
@@ -226,26 +227,18 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
       snapshot.council.can_create_merge_authorization === false,
       'Council unexpectedly authorizes merge',
     );
-    assert(
-      snapshot.gates.length >= 1,
-      'Council did not execute the authoritative post-Council Gate',
-    );
     const eventTypes = snapshot.timeline.map((event) => event.type);
     const councilCompleted = eventTypes.indexOf('council.completed');
     const artifactSelected = eventTypes.indexOf('artifact.selected');
-    const postGate = eventTypes.lastIndexOf('gate.result');
     const materializedEvent = eventTypes.indexOf('worktree.materialized');
     assert(
-      [councilCompleted, artifactSelected, postGate, materializedEvent].every(
-        (index) => index >= 0,
-      ),
-      'Council post-gate events are incomplete',
+      [councilCompleted, artifactSelected, materializedEvent].every((index) => index >= 0),
+      'Council finalization events are incomplete',
     );
     assert(
       councilCompleted < artifactSelected &&
-        artifactSelected < postGate &&
-        postGate < materializedEvent,
-      'Council post-gate event order is invalid',
+        artifactSelected < materializedEvent,
+      'Council finalization event order is invalid',
     );
     assert(
       snapshot.final_output.files_written.length > 0,

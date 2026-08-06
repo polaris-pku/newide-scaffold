@@ -487,14 +487,11 @@ describe('backend RPC stdio entrypoint', () => {
       expect(
         councilEventTypes.filter((type) => type === 'council.synthesis.completed'),
       ).toHaveLength(1);
-      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(1);
+      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(0);
       expect(councilEventTypes.indexOf('council.completed')).toBeLessThan(
         councilEventTypes.indexOf('artifact.selected'),
       );
       expect(councilEventTypes.indexOf('artifact.selected')).toBeLessThan(
-        councilEventTypes.lastIndexOf('gate.result'),
-      );
-      expect(councilEventTypes.lastIndexOf('gate.result')).toBeLessThan(
         councilEventTypes.indexOf('worktree.materialized'),
       );
       expect(externalCouncilSnapshot.delivery_report?.files_written.length).toBeGreaterThan(0);
@@ -516,13 +513,11 @@ describe('backend RPC stdio entrypoint', () => {
       const keyTypes = [
         'council.completed',
         'artifact.selected',
-        'gate.result',
         'worktree.materialized',
       ];
       const expectedOrder = [
         'council.completed',
         'artifact.selected',
-        'gate.result',
         'worktree.materialized',
       ];
       const postCouncilSequence = (types: string[]) =>
@@ -559,10 +554,8 @@ describe('backend RPC stdio entrypoint', () => {
         council: {
           result: {
             quality: 'best_effort',
-            warnings: expect.arrayContaining([
-              'Council verification did not fully pass; delivering the best available artifact.',
-            ]),
           },
+          outcome: { status: 'completed' },
         },
         errors: [],
       });

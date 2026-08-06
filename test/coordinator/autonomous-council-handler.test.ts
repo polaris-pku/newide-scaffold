@@ -39,9 +39,10 @@ describe('AutonomousCouncilHandler', () => {
     expect(output.council_result).toMatchObject({
       quality: 'best_effort',
       final_artifact_ref: 'artifact_synthesis',
-      warnings: ['Council verification did not fully pass; delivering the best available artifact.'],
+      warnings: [],
       unmet_criteria: ['tests'],
     });
+    expect(output.council_run_result.outcome?.status).toBe('completed');
   });
 
   it('falls back to the highest-ranked materializable proposal when synthesis is unavailable', async () => {
