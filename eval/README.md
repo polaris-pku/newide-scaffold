@@ -198,9 +198,9 @@ pnpm eval:instance -- --instance-id <instance-id> --mode real --model <name> `
 
 ## 方向一：SWE-EVO 记忆消融批跑（agent 直写 worktree）
 
-能力向闭环：**按需懒 clone mirror（D 盘）→ ephemeral worktree @ `base_commit` → agent 直接改盘 → 结束后 `git diff` 收 patch → predictions（可选 harness）**。
+能力向闭环：**按需懒 clone mirror → ephemeral worktree @ `base_commit` → agent 直接改盘 → 结束后 `git diff` 收 patch → predictions（可选 harness）**。
 
-不默认「先把 subset 里所有 repo 一次缓存满」。Mirror 根目录默认 `D:\newide-sweevo-mirrors`（`NEWIDE_SWE_MIRRORS_ROOT` 可改）。同 repo 多 instance / 多 ablation 共用 mirror；每任务另开 ephemeral，跑完默认删除 worktree。
+不默认「先把 subset 里所有 repo 一次缓存满」。Mirror 根目录默认 `.newide/eval-mirrors`（`NEWIDE_SWE_MIRRORS_ROOT` 可改）。同 repo 多 instance / 多 ablation 共用 mirror；每任务另开 ephemeral，跑完默认删除 worktree。
 
 ```powershell
 # 可选：只预热当前要跑的那一条（不要对整个 subset 盲拉）

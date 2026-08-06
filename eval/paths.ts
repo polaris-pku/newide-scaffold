@@ -63,8 +63,7 @@ export function resolveRunDir(runId: string, outRoot?: string): string {
 export function resolveSweEvoRoot(): string | undefined {
   const fromEnv = process.env.NEWIDE_SWE_EVO_ROOT?.trim();
   if (fromEnv) {
-    return fromEnv;
+    return resolve(getScaffoldRoot(), fromEnv);
   }
-  const sibling = resolve(getScaffoldRoot(), '..', 'SWE-EVO');
-  return sibling;
+  return resolve(getScaffoldRoot(), '..', 'SWE-EVO');
 }

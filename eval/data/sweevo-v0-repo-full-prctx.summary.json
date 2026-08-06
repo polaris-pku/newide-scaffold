@@ -1,8 +1,8 @@
 {
   "subset_id": "v0-repo-full",
-  "source_jsonl": "D:\\Code\\NewIDE\\SWE-EVO\\hf_out\\hf_jsonl\\test.jsonl",
-  "out_jsonl": "D:\\Code\\NewIDE\\newide-scaffold\\eval\\data\\sweevo-v0-repo-full-prctx.jsonl",
-  "cache_dir": "D:\\Code\\NewIDE\\newide-scaffold\\eval\\data\\pr-issue-cache",
+  "source_jsonl": "../SWE-EVO/hf_out/hf_jsonl/test.jsonl",
+  "out_jsonl": "eval/data/sweevo-v0-repo-full-prctx.jsonl",
+  "cache_dir": "eval/data/pr-issue-cache",
   "unique_refs": 257,
   "fetched_this_run": 0,
   "cache_hits": 257,

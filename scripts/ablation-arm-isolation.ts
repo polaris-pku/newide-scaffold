@@ -25,9 +25,16 @@ export async function prepareAblationArmIsolation(input: {
   });
   try {
     await pool.query('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public');
-    // No IF NOT EXISTS on purpose: a colliding schema name means the arm would
-    // share state with an earlier run, which silently breaks isolation.
-    await pool.query(`CREATE SCHEMA ${quoteIdentifier(databaseSchema)}`);
+    // Default: fail on collision so arms never silently share an earlier schema.
+    // Resume/rerun of the same experiment arm may set NEWIDE_ABLATION_ALLOW_EXISTING_SCHEMA=1.
+    const allowExisting =
+      process.env.NEWIDE_ABLATION_ALLOW_EXISTING_SCHEMA === '1' ||
+      process.env.NEWIDE_ABLATION_ALLOW_EXISTING_SCHEMA === 'true';
+    if (allowExisting) {
+      await pool.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(databaseSchema)}`);
+    } else {
+      await pool.query(`CREATE SCHEMA ${quoteIdentifier(databaseSchema)}`);
+    }
   } finally {
     await pool.end();
   }

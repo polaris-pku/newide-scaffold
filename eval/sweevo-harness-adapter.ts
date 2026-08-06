@@ -81,8 +81,17 @@ function resolveSweEvoWslDistro(): string {
   return process.env.NEWIDE_SWE_EVO_WSL_DISTRO?.trim() || 'Ubuntu-22.04';
 }
 
-function resolveSweEvoWslPython(): string {
-  return process.env.NEWIDE_SWE_EVO_WSL_PYTHON?.trim() || 'python3';
+function resolveSweEvoWslPython(sweEvoRoot?: string): string {
+  const raw = process.env.NEWIDE_SWE_EVO_WSL_PYTHON?.trim();
+  if (!raw || raw === 'python3' || raw === 'python') {
+    return raw || 'python3';
+  }
+  // Already a WSL/POSIX absolute interpreter path.
+  if (raw.startsWith('/mnt/') || (raw.startsWith('/') && !/^[A-Za-z]:/.test(raw))) {
+    return raw;
+  }
+  const root = sweEvoRoot ?? resolveSweEvoRoot() ?? process.cwd();
+  return toWslPath(resolve(root, raw));
 }
 
 export function buildSweEvoHarnessCommand(input: {
@@ -116,7 +125,7 @@ export function buildSweEvoHarnessCommand(input: {
         '--cd',
         toWslPath(input.workDir),
         '--',
-        resolveSweEvoWslPython(),
+        resolveSweEvoWslPython(input.sweEvoRoot),
         toWslPath(scriptPath),
         ...scriptArgs,
       ],

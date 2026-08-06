@@ -364,9 +364,9 @@ async function main(): Promise<void> {
     `${JSON.stringify(
       {
         subset_id: subsetId,
-        source_jsonl: datasetPath,
-        out_jsonl: outJsonl,
-        cache_dir: cacheDir,
+        source_jsonl: path.relative(repoRoot, datasetPath) || datasetPath,
+        out_jsonl: path.relative(repoRoot, outJsonl) || outJsonl,
+        cache_dir: path.relative(repoRoot, cacheDir) || cacheDir,
         unique_refs: allRefs.size,
         fetched_this_run: fetched,
         cache_hits: cachedHits,

@@ -52,6 +52,36 @@ describe('FileRunTerminalOutputWriter', () => {
     });
   });
 
+  it('writes memory_ablation from agent.execution_requested when context_pack is missing', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events = [
+      {
+        event_id: 'run_event_req',
+        sequence: 1,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'agent.execution_requested',
+        source: 'agent',
+        created_at: '2026-07-11T08:00:00.000Z',
+        payload: { role_id: 'role_ts_engineer', ablation: 'B2' },
+        schema_version: 'v0',
+      },
+      ...snapshot.events,
+    ];
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(snapshot);
+
+    await expect(
+      readJson(path.join(runsRoot, 'run_failed', 'summary.json')),
+    ).resolves.toMatchObject({
+      run_id: 'run_failed',
+      status: 'failed',
+      memory_ablation: 'B2',
+    });
+  });
+
   it('does not overwrite richer integration outputs', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
     tempDirs.push(runsRoot);

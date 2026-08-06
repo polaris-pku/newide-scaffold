@@ -29,7 +29,10 @@ import type {
   Proposal,
   Review,
 } from '../contract';
-import { prepareCouncilWorkspace } from '../council-workspace';
+import {
+  councilRunWorkspaceRoot,
+  prepareCouncilWorkspace,
+} from '../council-workspace';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -99,7 +102,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       .sort((left, right) => left.seat_index - right.seat_index);
     const reviewerParticipant = requireSeat(participants, 'reviewer');
     const synthesizerParticipant = requireSeat(participants, 'synthesizer');
-    const councilDir = path.join(this.councilRoot, executionRunId);
+    const councilDir = councilRunWorkspaceRoot(this.councilRoot, executionRunId);
     const generatedResults: AgentExecutionResult[] = [];
     const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];
@@ -290,6 +293,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           input_artifact_refs: inputArtifactRefs,
           context_policy: `council_${participant.seat}`,
           schema_version: SCHEMA_VERSION,
+          ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         },
         options?.signal || options?.onDriverEvent
           ? {

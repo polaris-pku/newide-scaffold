@@ -74,10 +74,7 @@ function buildBackendSummary(
   const filesWritten = finalOutput?.files_written ?? delivery?.files_written ?? [];
   const changedFiles = finalOutput?.changed_files ?? delivery?.changed_files ?? [];
   const artifactRefs = finalOutput?.artifact_refs ?? [];
-  const memoryAblation = projected.timeline
-    .filter((event) => event.type === 'memory.context_pack_built')
-    .map((event) => event.payload.ablation)
-    .find((value): value is string => typeof value === 'string');
+  const memoryAblation = resolveMemoryAblation(projected.timeline);
   const outcome =
     finalOutput?.outcome ??
     delivery?.outcome ??
@@ -104,6 +101,30 @@ function buildBackendSummary(
     audit_path: paths.audit_path,
     frontend_snapshot_path: paths.frontend_snapshot_path,
   };
+}
+
+/**
+ * Prefer context_pack_built, but fall back to earlier ablation-tagged events.
+ * Council rescue paths may skip context_pack_built when primary status !== completed.
+ */
+function resolveMemoryAblation(
+  timeline: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>,
+): string | undefined {
+  const preferredTypes = [
+    'memory.context_pack_built',
+    'agent.execution_requested',
+    'agent.execution_completed',
+  ];
+  for (const type of preferredTypes) {
+    const value = timeline
+      .filter((event) => event.type === type)
+      .map((event) => event.payload.ablation ?? event.payload.memory_ablation)
+      .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+    if (value) return value;
+  }
+  return timeline
+    .map((event) => event.payload.ablation ?? event.payload.memory_ablation)
+    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
 }
 
 async function writeJsonIfMissing(filePath: string, value: unknown): Promise<void> {

@@ -21,7 +21,10 @@ import type { SelectAgentHandler } from '../coordinator/handlers/select-agent-ha
 import { AutonomousCouncilHandler } from '../coordinator/handlers/autonomous-council-handler';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import type { CouncilProvider, CouncilRunResult, EvidencePack } from '../council';
-import { prepareCouncilWorkspace } from '../council/council-workspace';
+import {
+  councilRunWorkspaceRoot,
+  prepareCouncilWorkspace,
+} from '../council/council-workspace';
 import type { GateResult } from '../gate';
 import type { TaskResumeCursor } from '../persistence';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../protocol/agent-execution';
@@ -150,7 +153,7 @@ export function createProductionStageExecutors(
       context.signal?.throwIfAborted();
       const executionWorkspace =
         context.mode === 'council'
-          ? path.join(dependencies.councilRoot, context.run_id, 'primary')
+          ? path.join(councilRunWorkspaceRoot(dependencies.councilRoot, context.run_id), 'primary')
           : context.workspace_path;
       if (context.mode === 'council') {
         await prepareCouncilWorkspace(context.workspace_path, executionWorkspace);
@@ -205,6 +208,19 @@ export function createProductionStageExecutors(
           context.task_id,
           { primary: { result }, selection },
         );
+        // Keep ablation on the timeline even when primary fails so fallback
+        // summary writers (and --backend-summary checks) still see B0–B3.
+        emit(context, 'memory.context_pack_built', result.context_pack_ref, {
+          agent_id: result.agent_id ?? result.role_id,
+          role_id: result.role_id,
+          context_pack_ref: result.context_pack_ref,
+          memory_buffer_ref: result.memory_buffer_ref,
+          diagnostics: result.diagnostics,
+          primary_status: result.status,
+          ...(context.memory_ablation
+            ? { ablation: context.memory_ablation }
+            : {}),
+        });
         emit(context, 'agent.execution_completed', result.agent_run_id, {
           agent_id: result.agent_id ?? result.role_id,
           role_id: result.role_id,
@@ -217,6 +233,9 @@ export function createProductionStageExecutors(
           memory_buffer_ref: result.memory_buffer_ref,
           driver_run_result_id: result.driver_run_result_id,
           diagnostics: result.diagnostics,
+          ...(context.memory_ablation
+            ? { ablation: context.memory_ablation }
+            : {}),
         });
         return {
           changeset_ref: selection.manifest_ref,
@@ -355,6 +374,7 @@ export function createProductionStageExecutors(
           evidence_pack: evidencePack,
           question: context.task_request.spec,
           workspace_path: context.workspace_path,
+          ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
         },
         {
           ...(context.signal ? { signal: context.signal } : {}),
@@ -470,7 +490,10 @@ export function createProductionStageExecutors(
         user_workspace_path: context.workspace_path,
         ...(context.mode === 'council'
           ? {
-              council_workspace_path: path.join(dependencies.councilRoot, context.run_id),
+              council_workspace_path: councilRunWorkspaceRoot(
+                dependencies.councilRoot,
+                context.run_id,
+              ),
             }
           : {}),
       });

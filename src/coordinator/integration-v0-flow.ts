@@ -48,6 +48,7 @@ import {
 } from './worktree-materializer';
 import {
   MockCouncil,
+  councilRunWorkspaceRoot,
   type CouncilDecision,
   type CouncilResult,
   type CouncilProvider,
@@ -440,7 +441,10 @@ export async function runIntegrationV0Flow(
   let driverResult: DriverRunResult;
   if (options?.agentExecutionFacade) {
     const executionWorkspace = options.enableCouncil
-      ? path.join(options.councilRoot ?? '.newide/council', run.run_id, 'primary')
+      ? path.join(
+          councilRunWorkspaceRoot(options.councilRoot ?? '.newide/council', run.run_id),
+          'primary',
+        )
       : options.workspacePath;
     const agentExecutionRequest = {
       task_id: task.task_id,
@@ -744,6 +748,7 @@ export async function runIntegrationV0Flow(
       evidence_pack: evidencePack,
       question: task.spec,
       ...(options?.workspacePath ? { workspace_path: options.workspacePath } : {}),
+      ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     },
     {
       ...(options?.signal ? { signal: options.signal } : {}),

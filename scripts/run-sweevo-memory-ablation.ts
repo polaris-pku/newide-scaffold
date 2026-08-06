@@ -3,11 +3,11 @@
  *
  * Agent writes directly into an ephemeral git worktree @ base_commit.
  * After the run, eval collects the patch via git diff (collectWorktreePatch).
- * Repo mirrors are lazy-cloned under D:\newide-sweevo-mirrors (NEWIDE_SWE_MIRRORS_ROOT).
+ * Repo mirrors are lazy-cloned under .newide/eval-mirrors (NEWIDE_SWE_MIRRORS_ROOT).
  *
  * Usage:
+ *   pnpm eval:sweevo-ablation -- --subset v0-requests-3-prctx --mode council --ablations B0,B1,B2 --run-harness
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
- *   pnpm eval:sweevo-ablation -- --subset v0-smoke
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, promises as fs, readFileSync } from 'node:fs';
@@ -93,24 +93,24 @@ interface InstanceRow {
 const repoRoot = process.cwd();
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
-const experimentRoot = path.resolve(
-  process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
-    path.join(repoRoot, '..', '.newide-experiments', 'sweevo-ablation'),
-  stamp,
-);
 // Load dotenv before reading timeout knobs so .env.local actually applies.
 const fileEnv = {
   ...loadEnvFile(path.join(repoRoot, '.env')),
   ...loadEnvFile(path.join(repoRoot, '.env.local')),
 };
 // Agent budget: 45 minutes (paper-aligned). ACCEPTANCE_RUN_TIMEOUT_MS overrides.
-const runTimeoutMs = readPositiveInt(
-  process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? fileEnv.ACCEPTANCE_RUN_TIMEOUT_MS,
-  2_700_000,
-);
+// Set ACCEPTANCE_RUN_TIMEOUT_MS=0 for no wall-clock cancel (wait until terminal).
+const runTimeoutRaw = process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? fileEnv.ACCEPTANCE_RUN_TIMEOUT_MS;
+const unlimitedRunTimeout = runTimeoutRaw === '0';
+const runTimeoutMs = unlimitedRunTimeout
+  ? 0
+  : readPositiveInt(runTimeoutRaw, 2_700_000);
 // Wait slightly longer than the driver budget so the driver timeout (clean
 // terminal state) fires before this script force-cancels the run.
-const runWaitMs = runTimeoutMs + 300_000;
+// Unlimited: never force-cancel; driver still needs a finite ACP_DRIVER_TIMEOUT_MS.
+const runWaitMs = unlimitedRunTimeout ? Number.POSITIVE_INFINITY : runTimeoutMs + 300_000;
+/** Driver timeout when run budget is unlimited (7d). Backend requires a positive int. */
+const unlimitedDriverTimeoutMs = 7 * 24 * 60 * 60 * 1000;
 const maintenanceWaitMs = readPositiveInt(
   process.env.ABLATION_MAINTENANCE_WAIT_MS ?? fileEnv.ABLATION_MAINTENANCE_WAIT_MS,
   45_000,
@@ -121,10 +121,20 @@ const subsetId = readFlag('--subset') ?? 'v0-smoke';
 const instanceIdFilter = readFlag('--instance-id');
 const ablations = parseAblations(readFlag('--ablations') ?? 'B0,B1,B2');
 const modelName = readFlag('--model') ?? 'claude-acp-real';
+const runMode = parseRunMode(readFlag('--mode') ?? 'single_agent');
 const runHarness = hasFlag('--run-harness');
 const harnessDryRun = hasFlag('--harness-dry-run');
 const skipEval = hasFlag('--skip-eval');
 const keepWorktree = hasFlag('--keep-worktree');
+const experimentDirOverride = readFlag('--experiment-dir');
+const experimentRoot = experimentDirOverride
+  ? path.resolve(repoRoot, experimentDirOverride)
+  : path.resolve(
+      repoRoot,
+      process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
+        path.join('..', '.newide-experiments', 'sweevo-ablation'),
+      stamp,
+    );
 
 await fs.mkdir(experimentRoot, { recursive: true });
 
@@ -143,22 +153,40 @@ for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
 
+const driverRunnerRaw =
+  process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
+const driverEnvFileRaw = process.env.ACP_DRIVER_ENV_FILE ?? fileEnv.ACP_DRIVER_ENV_FILE;
+const sweEvoRootRaw = process.env.NEWIDE_SWE_EVO_ROOT ?? fileEnv.NEWIDE_SWE_EVO_ROOT;
 const baseEnv = {
   ...process.env,
   ...fileEnv,
-  ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ??
-    fileEnv.ACP_DRIVER_RUNNER_DIR ??
-    path.resolve(repoRoot, '..', 'acp-client-prototype'),
+  ACP_DRIVER_RUNNER_DIR: path.resolve(
+    repoRoot,
+    driverRunnerRaw ?? path.join('..', 'acp-client-prototype'),
+  ),
+  ...(driverEnvFileRaw
+    ? { ACP_DRIVER_ENV_FILE: path.resolve(repoRoot, driverEnvFileRaw) }
+    : {}),
+  ...(sweEvoRootRaw ? { NEWIDE_SWE_EVO_ROOT: path.resolve(repoRoot, sweEvoRootRaw) } : {}),
 };
 // Driver timeout must not undercut the run budget, or the agent is silently
 // killed early and the arm comparison becomes a timeout comparison.
-baseEnv.ACP_DRIVER_TIMEOUT_MS ??= String(runTimeoutMs);
-if (readPositiveInt(baseEnv.ACP_DRIVER_TIMEOUT_MS, runTimeoutMs) < runTimeoutMs) {
-  log(
-    `warn: ACP_DRIVER_TIMEOUT_MS=${String(baseEnv.ACP_DRIVER_TIMEOUT_MS)} < run budget ${String(runTimeoutMs)}ms; raising to match`,
-  );
-  baseEnv.ACP_DRIVER_TIMEOUT_MS = String(runTimeoutMs);
+if (unlimitedRunTimeout) {
+  baseEnv.ACP_DRIVER_TIMEOUT_MS ??= String(unlimitedDriverTimeoutMs);
+  if (readPositiveInt(baseEnv.ACP_DRIVER_TIMEOUT_MS, unlimitedDriverTimeoutMs) < unlimitedDriverTimeoutMs) {
+    log(
+      `warn: ACP_DRIVER_TIMEOUT_MS=${String(baseEnv.ACP_DRIVER_TIMEOUT_MS)} too low for unlimited run; raising to ${String(unlimitedDriverTimeoutMs)}ms`,
+    );
+    baseEnv.ACP_DRIVER_TIMEOUT_MS = String(unlimitedDriverTimeoutMs);
+  }
+} else {
+  baseEnv.ACP_DRIVER_TIMEOUT_MS ??= String(runTimeoutMs);
+  if (readPositiveInt(baseEnv.ACP_DRIVER_TIMEOUT_MS, runTimeoutMs) < runTimeoutMs) {
+    log(
+      `warn: ACP_DRIVER_TIMEOUT_MS=${String(baseEnv.ACP_DRIVER_TIMEOUT_MS)} < run budget ${String(runTimeoutMs)}ms; raising to match`,
+    );
+    baseEnv.ACP_DRIVER_TIMEOUT_MS = String(runTimeoutMs);
+  }
 }
 // SWE-EVO paper alignment: deny WebFetch/WebSearch and network Bash at ACP permission gate.
 // Override with NEWIDE_SWE_EVO_BLOCK_INTERNET=0 only for debugging.
@@ -166,9 +194,11 @@ baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET ??= '1';
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
-log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')}`);
+log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
-log(`ACCEPTANCE_RUN_TIMEOUT_MS: ${String(runTimeoutMs)}`);
+log(
+  `ACCEPTANCE_RUN_TIMEOUT_MS: ${unlimitedRunTimeout ? '0 (unlimited)' : String(runTimeoutMs)}`,
+);
 log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
 log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
 const permissionBuildPath = path.join(
@@ -263,7 +293,10 @@ for (const ablation of ablations) {
 }
 
 const finishedAt = new Date();
-const metricsRows = armReports.flatMap((arm) => arm.instances);
+// Merge sibling arm-summary.json files so parallel --ablations B0|B1|B2
+// processes writing into the same --experiment-dir still produce one summary.
+const mergedArms = await loadMergedArmReports(experimentRoot, armReports);
+const metricsRows = mergedArms.flatMap((arm) => arm.instances);
 const metricsPath = path.join(experimentRoot, 'metrics.jsonl');
 await fs.writeFile(
   metricsPath,
@@ -281,7 +314,8 @@ const summary = {
   mirrors_root: mirrorsRoot,
   subset_id: subsetId,
   instance_ids: instanceIds,
-  ablations,
+  ablations: [...new Set([...ablations, ...mergedArms.map((arm) => arm.ablation)])],
+  run_mode: runMode,
   model_name: modelName,
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
@@ -289,7 +323,7 @@ const summary = {
   metrics_path: metricsPath,
   timing_totals: timingTotals,
   token_totals: tokenTotals,
-  arms: armReports,
+  arms: mergedArms,
 };
 const summaryPath = path.join(experimentRoot, 'summary.json');
 await fs.writeFile(summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
@@ -300,7 +334,7 @@ log(
   `totals wall_ms=${String(timingTotals.wall_ms)} driver_ms=${String(timingTotals.driver_duration_ms)} tokens=${String(tokenTotals.total_tokens)} (in=${String(tokenTotals.total_input_tokens)} out=${String(tokenTotals.output_tokens)})`,
 );
 
-const failed = armReports.some((arm) => arm.instances.some((row) => row.status === 'failed'));
+const failed = mergedArms.some((arm) => arm.instances.some((row) => row.status === 'failed'));
 if (failed) process.exitCode = 1;
 
 // ---------------------------------------------------------------------------
@@ -352,7 +386,7 @@ async function runOneInstance(input: {
 
     const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
       prompt: buildPrompt(instance),
-      mode: 'single_agent',
+      mode: runMode,
       workspace_path: prepared.worktreePath,
       memory_ablation: ablation,
       title: `${ablation}-${instance.instance_id}`,
@@ -781,7 +815,8 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
   return {
     request,
     waitForTerminal: async (runId, timeoutMs) => {
-      const deadline = Date.now() + timeoutMs;
+      const unlimited = !Number.isFinite(timeoutMs) || timeoutMs <= 0;
+      const deadline = unlimited ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         const snapshot = await request<Record<string, unknown>>('run.getSnapshot', {
           run_id: runId,
@@ -843,6 +878,40 @@ function parseAblations(raw: string): MemoryAblation[] {
   }
   if (out.length === 0) throw new Error('At least one ablation is required.');
   return out;
+}
+
+function parseRunMode(raw: string): 'single_agent' | 'council' {
+  if (raw === 'single_agent' || raw === 'council') return raw;
+  throw new Error(`Invalid --mode "${raw}". Expected single_agent|council.`);
+}
+
+async function loadMergedArmReports(
+  root: string,
+  localArms: Array<{
+    ablation: MemoryAblation;
+    state_root: string;
+    database_schema: string;
+    scored_count: number;
+    resolved_count: number;
+    applied_count: number;
+    p2p_regression_count: number;
+    instances: InstanceRow[];
+  }>,
+): Promise<typeof localArms> {
+  const byAblation = new Map(localArms.map((arm) => [arm.ablation, arm]));
+  for (const ablation of ['B0', 'B1', 'B2', 'B3'] as MemoryAblation[]) {
+    if (byAblation.has(ablation)) continue;
+    const candidate = path.join(root, ablation, 'arm-summary.json');
+    const parsed = await readJsonIfExists(candidate);
+    if (!parsed || typeof parsed !== 'object') continue;
+    const arm = parsed as (typeof localArms)[number];
+    if (arm.ablation === ablation && Array.isArray(arm.instances)) {
+      byAblation.set(ablation, arm);
+    }
+  }
+  return [...byAblation.values()].sort((left, right) =>
+    left.ablation.localeCompare(right.ablation),
+  );
 }
 
 function sanitizeFileName(value: string): string {

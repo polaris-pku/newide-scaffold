@@ -1,6 +1,7 @@
 export * from './contract';
 export * from './council-participant';
 export * from './council-participant-resolver';
+export * from './council-workspace';
 export * from './mock-council';
 export * from './council-run-output';
 export * from './proposal-adapter';

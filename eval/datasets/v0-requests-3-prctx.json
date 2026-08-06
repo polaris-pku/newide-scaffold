@@ -1,0 +1,17 @@
+{
+  "subset_id": "v0-requests-3-prctx",
+  "description": "First 3 psf/requests instances from v0-repo-full, with offline PR/Issue context.",
+  "source_dataset_version": "hf_out-v1-prctx",
+  "source_jsonl": "eval/data/sweevo-v0-repo-full-prctx.jsonl",
+  "selection_rule": "v0-repo-full requests pack order, first 3: v2.12.2, v2.27.0, v2.4.0 (exclude v2.9.0).",
+  "environment_notes": [
+    "Single-repo slice for memory ablation with cross-instance accumulation.",
+    "Requires eval/data/sweevo-v0-repo-full-prctx.jsonl (pnpm eval:build-pr-context -- --subset v0-repo-full).",
+    "Use with NEWIDE_SWE_EVO_BLOCK_INTERNET=1."
+  ],
+  "instance_ids": [
+    "psf__requests_v2.12.2_v2.12.3",
+    "psf__requests_v2.27.0_v2.27.1",
+    "psf__requests_v2.4.0_v2.4.1"
+  ]
+}

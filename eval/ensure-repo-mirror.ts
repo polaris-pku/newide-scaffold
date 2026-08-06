@@ -6,8 +6,11 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 100 * 1024 * 1024;
 
-/** Default mirror cache root on D: (override with NEWIDE_SWE_MIRRORS_ROOT). */
-export const DEFAULT_SWE_MIRRORS_ROOT = 'D:\\newide-sweevo-mirrors';
+/**
+ * Default mirror cache: `<cwd>/.newide/eval-mirrors`
+ * (override with NEWIDE_SWE_MIRRORS_ROOT or --mirrors-root).
+ */
+export const DEFAULT_SWE_MIRRORS_ROOT_SEGMENTS = ['.newide', 'eval-mirrors'] as const;
 
 export interface EnsureRepoMirrorOptions {
   /** GitHub-style repo id, e.g. `conan-io/conan`. */
@@ -26,12 +29,16 @@ export interface EnsuredRepoMirror {
   cloned: boolean;
 }
 
+export function defaultSweMirrorsRoot(cwd: string = process.cwd()): string {
+  return path.resolve(cwd, ...DEFAULT_SWE_MIRRORS_ROOT_SEGMENTS);
+}
+
 export function resolveMirrorsRoot(override?: string): string {
   const fromArg = override?.trim();
   if (fromArg) return path.resolve(fromArg);
   const fromEnv = process.env.NEWIDE_SWE_MIRRORS_ROOT?.trim();
   if (fromEnv) return path.resolve(fromEnv);
-  return path.resolve(DEFAULT_SWE_MIRRORS_ROOT);
+  return defaultSweMirrorsRoot();
 }
 
 export function repoMirrorSlug(repo: string): string {
