@@ -64,6 +64,23 @@ export interface CouncilResult {
   decision_record_ref: string;
 }
 
+export type CouncilOutcomeStatus = 'completed' | 'needs_human' | 'failed';
+
+/**
+ * Stable result envelope for callers that do not need to know the Council
+ * strategy's internal proposal/review topology.
+ */
+export interface CouncilOutcome {
+  status: CouncilOutcomeStatus;
+  participant_role_ids: string[];
+  selected_artifact_refs: ArtifactId[];
+  decision_summary: string;
+  quality: 'verified' | 'best_effort';
+  unresolved_issues: string[];
+  warnings: string[];
+  audit_refs: string[];
+}
+
 export interface EvidencePack {
   evidence_pack_id: string;
   task_id: TaskId;
@@ -146,6 +163,7 @@ export interface CouncilRunResult {
   generated_artifact_refs: ArtifactRef[];
   selected_artifact_refs: ArtifactId[];
   result?: CouncilResult;
+  outcome?: CouncilOutcome;
   diagnostic_refs?: string[];
   comparison_refs?: string[];
   created_at: Timestamp;

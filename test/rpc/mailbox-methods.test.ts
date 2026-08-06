@@ -4,7 +4,6 @@ import {
   type MailboxReplyInput,
   type MailboxSendInput,
 } from '../../src/mailbox';
-import type { MessageRecipient } from '../../src/core';
 import type {
   PersistedMailboxDelivery,
   PersistedMailboxEnvelope,
@@ -20,10 +19,15 @@ describe('MailboxRpcMethods', () => {
       deliveries: [envelope().delivery],
     }));
     const listMailboxInbox = vi.fn(
-      async (_recipient: MessageRecipient, _afterDeliveryId?: string) => [envelope()],
+      async (
+        _taskId: string,
+        _workspacePath: string,
+        _recipientRoleId: string,
+        _afterDeliveryId?: string,
+      ) => [envelope()],
     );
     const acknowledgeMailboxDelivery = vi.fn(
-      async (_deliveryId: string, _recipient: MessageRecipient) => ({
+      async (_deliveryId: string, _recipientRoleId: string) => ({
         ...envelope().delivery,
         status: 'acknowledged' as const,
       }),
@@ -51,21 +55,24 @@ describe('MailboxRpcMethods', () => {
         id: 1,
         method: 'mailbox.send',
         params: {
+          task_id: 'task_1',
+          workspace_path: '/workspace',
           thread_id: 'thread_1',
-          from_agent_id: 'agent_source',
-          to: [{ agent_id: 'agent_target' }],
+          from_role_id: 'role_source',
+          to_role_id: 'role_target',
           type: 'ask_help',
           payload: { question: 'Review?' },
           requires_ack: true,
           deadline_seconds: 60,
+          idempotency_key: 'send_1',
         },
       }),
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":2,"method":"mailbox.inbox","params":{"agent_id":"agent_target","after_delivery_id":"delivery_previous"}}',
+      '{"jsonrpc":"2.0","id":2,"method":"mailbox.inbox","params":{"task_id":"task_1","workspace_path":"/workspace","role_id":"role_target","after_delivery_id":"delivery_previous"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":3,"method":"mailbox.ack","params":{"delivery_id":"delivery_1","agent_id":"agent_target"}}',
+      '{"jsonrpc":"2.0","id":3,"method":"mailbox.ack","params":{"delivery_id":"delivery_1","role_id":"role_target"}}',
     );
     await session.handleLine(
       JSON.stringify({
@@ -74,17 +81,16 @@ describe('MailboxRpcMethods', () => {
         method: 'mailbox.reply',
         params: {
           source_delivery_id: 'delivery_1',
-          source_recipient: { agent_id: 'agent_target' },
-          from_agent_id: 'agent_target',
-          to: [{ agent_id: 'agent_source' }],
+          from_role_id: 'role_target',
           type: 'decision_response',
           payload: { answer: 'Approved' },
           requires_ack: false,
+          idempotency_key: 'reply_1',
         },
       }),
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":5,"method":"mailbox.inbox","params":{"agent_id":"a","role_id":"r"}}',
+      '{"jsonrpc":"2.0","id":5,"method":"mailbox.inbox","params":{"role_id":"role_target"}}',
     );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
@@ -95,7 +101,9 @@ describe('MailboxRpcMethods', () => {
       { id: 5, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(listMailboxInbox).toHaveBeenCalledWith(
-      { agent_id: 'agent_target' },
+      'task_1',
+      '/workspace',
+      'role_target',
       'delivery_previous',
     );
   });
@@ -110,7 +118,7 @@ describe('MailboxRpcMethods', () => {
     const session = sessionWith(service, output);
 
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":1,"method":"mailbox.ack","params":{"delivery_id":"delivery_missing","agent_id":"agent_target"}}',
+      '{"jsonrpc":"2.0","id":1,"method":"mailbox.ack","params":{"delivery_id":"delivery_missing","role_id":"role_target"}}',
     );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
@@ -152,10 +160,13 @@ function envelope(): PersistedMailboxEnvelope {
   const delivery: PersistedMailboxDelivery = {
     delivery_id: 'delivery_1',
     message_id: 'message_1',
-    recipient_agent_id: 'agent_target',
-    status: 'delivered',
+    task_id: 'task_1',
+    workspace_path: '/workspace',
+    recipient_role_id: 'role_target',
+    recipient_session_id: 'session_target',
+    status: 'injected',
     retry_count: 1,
-    delivered_at: '2026-07-19T08:00:01.000Z',
+    injected_at: '2026-07-19T08:00:01.000Z',
     created_at: '2026-07-19T08:00:00.000Z',
     updated_at: '2026-07-19T08:00:01.000Z',
     schema_version: 'v0',
@@ -163,12 +174,15 @@ function envelope(): PersistedMailboxEnvelope {
   return {
     message: {
       message_id: 'message_1',
+      task_id: 'task_1',
+      workspace_path: '/workspace',
       thread_id: 'thread_1',
-      from_agent_id: 'agent_source',
+      from_role_id: 'role_source',
       type: 'ask_help',
       payload: { question: 'Review?' },
       artifact_refs: [],
       requires_ack: true,
+      idempotency_key: 'send_1',
       created_at: '2026-07-19T08:00:00.000Z',
       schema_version: 'v0',
     },

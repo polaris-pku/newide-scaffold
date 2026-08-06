@@ -17,7 +17,10 @@ export interface TaskStatusTransition {
   next_status: CoordinatorTaskStatus;
 }
 
-export type TaskRunStartReason = 'checkpoint_resume' | 'council_refinement';
+export type TaskRunStartReason =
+  | 'checkpoint_resume'
+  | 'council_refinement'
+  | 'mailbox_continuation';
 
 const TERMINAL_TASK_STATUSES = new Set<CoordinatorTaskStatus>(['completed', 'failed', 'cancelled']);
 
@@ -90,6 +93,15 @@ export function assertTaskRunStartTransition(
   if (reason === 'checkpoint_resume') {
     if (current !== 'blocked') {
       throw new Error(`Checkpoint resume requires a blocked Task; current status is ${current}`);
+    }
+    assertTaskStatusTransition(current, 'running');
+    return;
+  }
+  if (reason === 'mailbox_continuation') {
+    if (current !== 'waiting_help' && current !== 'blocked') {
+      throw new Error(
+        `Mailbox continuation requires a waiting or blocked Task; current status is ${current}`,
+      );
     }
     assertTaskStatusTransition(current, 'running');
     return;

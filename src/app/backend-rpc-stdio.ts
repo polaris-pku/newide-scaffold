@@ -11,6 +11,8 @@ import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runne
 import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
 import {
   AgentBoardCouncilParticipantResolver,
+  createCouncilStrategyProvider,
+  readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
@@ -37,8 +39,12 @@ import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
-import { TaskExecutionLoop, TaskProcessor } from '../coordination';
-import { PersistentMailboxService } from '../mailbox';
+import {
+  PersistentParticipantSessionRegistry,
+  TaskExecutionLoop,
+  TaskProcessor,
+} from '../coordination';
+import { MailboxDeliveryWorker, PersistentMailboxService } from '../mailbox';
 import { createProductionBRuntime, type BackendBRuntime } from './production-b-runtime';
 import {
   BMemoryMaintenanceRunner,
@@ -177,6 +183,15 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
     const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    const configuredDatabasePath =
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
+    const databasePath =
+      configuredDatabasePath === ':memory:'
+        ? configuredDatabasePath
+        : path.resolve(configuredDatabasePath);
+    coordinationStore = new SqliteCoordinationStore(databasePath);
+    const mailboxService = new PersistentMailboxService(coordinationStore);
+    const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       repository: bCapabilities.repository,
@@ -187,6 +202,11 @@ export async function createProductionBackendService(
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),
+      mailbox: {
+        service: mailboxService,
+        allowedRoleIds: bRuntime.market_agent_ids,
+        sessionRegistry: participantSessions,
+      },
     });
     const selectAgentHandler = new SelectAgentHandler({
       projectionSource: new BAgentProjectionAdapter({
@@ -200,7 +220,7 @@ export async function createProductionBackendService(
         root: path.join(stateRoot, 'market'),
       }),
     });
-    const councilProvider = new SynthesisAgentCouncilProvider({
+    const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
       participantResolver: new AgentBoardCouncilParticipantResolver({
@@ -209,6 +229,10 @@ export async function createProductionBackendService(
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
       }),
     });
+    const councilProvider = createCouncilStrategyProvider(
+      baseCouncilProvider,
+      readCouncilStrategy(env.NEWIDE_COUNCIL_STRATEGY),
+    );
     const gateExecutor =
       dependencies.gateExecutor ??
       new ProductionGateExecutor({
@@ -233,17 +257,10 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
 
-    const configuredDatabasePath =
-      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
-    const databasePath =
-      configuredDatabasePath === ':memory:'
-        ? configuredDatabasePath
-        : path.resolve(configuredDatabasePath);
-    coordinationStore = new SqliteCoordinationStore(databasePath);
-    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
       mailboxStore: coordinationStore,
+      participantSessions,
     });
     taskProcessor.recoverInterruptedTasks();
     const taskExecutionLoop = new TaskExecutionLoop({
@@ -284,7 +301,7 @@ export async function createProductionBackendService(
         readiness: 'host_managed',
       },
     });
-    return new NewideBackendService(
+    const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
@@ -298,7 +315,15 @@ export async function createProductionBackendService(
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
       systemStatusService,
+      new MailboxDeliveryWorker(
+        mailboxService,
+        agentExecutionFacade,
+        participantSessions,
+      ),
+      (input) => agentExecutionFacade.provisionParticipantSession(input),
     );
+    await service.recoverMailboxWaits();
+    return service;
   } catch (error) {
     await closeRuntime().catch(() => undefined);
     throw error;

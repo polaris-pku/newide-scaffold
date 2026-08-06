@@ -1,12 +1,13 @@
 import type { ArtifactRef } from '../../core';
-import type {
-  CouncilExecutionOptions,
-  CouncilProvider,
-  CouncilResult,
-  CouncilRunRequest,
-  CouncilRunResult,
-  Proposal,
-  Review,
+import {
+  reconcileCouncilOutcome,
+  type CouncilExecutionOptions,
+  type CouncilProvider,
+  type CouncilResult,
+  type CouncilRunRequest,
+  type CouncilRunResult,
+  type Proposal,
+  type Review,
 } from '../../council';
 import { isMaterializableFileArtifact, readArtifactBytes, sha256 } from '../artifact-content';
 
@@ -82,7 +83,10 @@ export class AutonomousCouncilHandler {
       verification_refs: runResult.reviews.map((review) => review.review_id),
       decision_record_ref: runResult.decision.decision_id,
     };
-    const councilRunResult = { ...runResult, result: councilResult };
+    const councilRunResult = reconcileCouncilOutcome(
+      { ...runResult, result: councilResult },
+      councilResult,
+    );
     return {
       council_run_result: councilRunResult,
       council_result: councilResult,

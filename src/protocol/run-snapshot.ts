@@ -24,6 +24,19 @@ const runOutcomeSchema = z
   })
   .strict();
 
+export const councilOutcomeEvidenceSchema = z
+  .object({
+    status: z.enum(['completed', 'needs_human', 'failed']),
+    participant_role_ids: z.array(z.string().min(1)),
+    selected_artifact_refs: z.array(z.string().min(1)),
+    decision_summary: z.string(),
+    quality: z.enum(['verified', 'best_effort']),
+    unresolved_issues: z.array(z.string()),
+    warnings: z.array(z.string()),
+    audit_refs: z.array(z.string().min(1)),
+  })
+  .strict();
+
 export const runSnapshotSchema = z
   .object({
     contract_version: z.literal('frontend-workflow.v0.1').optional(),
@@ -125,6 +138,7 @@ export const runSnapshotSchema = z
         synthesis: recordSchema.optional(),
         output: recordSchema.optional(),
         result: recordSchema.optional(),
+        outcome: councilOutcomeEvidenceSchema.optional(),
       })
       .strict()
       .optional(),

@@ -25,8 +25,106 @@ import {
   type ToolCallingClient,
 } from '../../src/memory';
 import type { ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
+import {
+  MailboxDeliveryWorker,
+  PersistentMailboxService,
+  type MailboxToolOutcome,
+} from '../../src/mailbox';
+import { SqliteCoordinationStore } from '../../src/persistence';
+import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
+  it('lets one real B Agent tool turn send and another role reply through Mailbox', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-mailbox-agent-'));
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: 'role_sender', name: 'Sender' });
+    await repository.initializeAgent({ role_id: 'role_reviewer', name: 'Reviewer' });
+    const store = new SqliteCoordinationStore(':memory:');
+    const mailbox = new PersistentMailboxService(store);
+    const sessions = new InMemoryParticipantSessionRegistry();
+    sessions.register({
+      task_id: 'task_mailbox_agent',
+      workspace_path: workspace,
+      role_id: 'role_reviewer',
+      session_id: 'session_reviewer',
+    });
+    const observedPrompts: string[] = [];
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository,
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: mailboxConversationLlm(observedPrompts),
+      mailbox: {
+        service: mailbox,
+        allowedRoleIds: ['role_sender', 'role_reviewer'],
+        sessionRegistry: sessions,
+      },
+    });
+
+    try {
+      const sender = await facade.runAgent({
+        ...request('task_mailbox_agent', 'role_sender', workspace),
+        instruction: 'Ask the reviewer to assess the plan, then implement the task.',
+      });
+      const sends = sender.diagnostics.mailbox_outcomes as MailboxToolOutcome[];
+      expect(sends).toMatchObject([
+        {
+          kind: 'request',
+          from_role_id: 'role_sender',
+          to_role_id: 'role_reviewer',
+          status: 'pending',
+        },
+      ]);
+      expect(sender).toMatchObject({
+        status: 'completed',
+        diagnostics: { driver_status: 'not_invoked', mailbox_wait: true },
+      });
+      expect(observedPrompts[0]).toContain('role_reviewer (Reviewer');
+
+      const deliveryId = sends[0]?.delivery_id;
+      expect(deliveryId).toBeTruthy();
+      const worker = new MailboxDeliveryWorker(mailbox, facade, sessions);
+      const handled = await worker.process({
+        delivery_id: deliveryId as string,
+        run_id: 'run_task_mailbox_agent',
+      });
+
+      expect(handled).toMatchObject({
+        status: 'replied',
+        source_delivery: {
+          status: 'acknowledged',
+          recipient_role_id: 'role_reviewer',
+          recipient_session_id: 'session_reviewer',
+        },
+        reply: {
+          kind: 'reply',
+          from_role_id: 'role_reviewer',
+          to_role_id: 'role_sender',
+          status: 'pending',
+        },
+      });
+      const replyDeliveryId = handled.reply?.delivery_id;
+      expect(replyDeliveryId).toBeTruthy();
+
+      const continued = await facade.runAgent({
+        ...request('task_mailbox_agent', 'role_sender', workspace),
+        run_id: 'run_task_mailbox_agent_continued',
+        mailbox_delivery_id: replyDeliveryId,
+      });
+      expect(continued).toMatchObject({
+        status: 'completed',
+        role_id: 'role_sender',
+        diagnostics: { driver_status: 'succeeded' },
+      });
+      expect(mailbox.getEnvelope(replyDeliveryId as string).delivery.status).toBe(
+        'acknowledged',
+      );
+    } finally {
+      store.close();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('projects app-owned B maintenance evidence into execution diagnostics', async () => {
     const requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
     const memoryMaintenance: BMemoryMaintenancePort = {
@@ -311,27 +409,6 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(events).toEqual([
       expect.objectContaining({ event_type: 'agent_message_chunk', role_id: 'reviewer' }),
     ]);
-  });
-
-  it('wakes a sleeping mailbox recipient without dispatching a Driver task', async () => {
-    const driver = new CapturingDriver('succeeded');
-    const { facade } = createFacade(driver);
-
-    await facade.wakeAgent({
-      contract_version: 'agent-mailbox-wake.v1',
-      message_id: 'message_wake',
-      delivery_id: 'delivery_wake',
-      thread_id: 'thread_wake',
-      recipient_role_id: 'role_mailbox_recipient',
-      schema_version: SCHEMA_VERSION,
-    });
-
-    const batch = await facade.collectCompetitionClaims({
-      task_id: 'task_after_wake',
-      spec: 'Confirm the recipient is loaded into the B runtime.',
-    });
-    expect(batch.claims).toEqual([expect.objectContaining({ role_id: 'role_mailbox_recipient' })]);
-    expect(driver.prompts).toHaveLength(0);
   });
 
   it('resolves a relative workspace before crossing the B to A process boundary', async () => {
@@ -654,10 +731,10 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     const second = facade.runAgent(request('task_queue_cleanup_2', 'proposer', workspace));
     try {
       await vi.waitFor(() => expect(driver.prompts).toHaveLength(1));
-      expect(queues.size).toBe(2);
+      expect(queues.size).toBe(1);
       driver.releaseNext();
       await vi.waitFor(() => expect(driver.prompts).toHaveLength(2));
-      expect(queues.size).toBe(2);
+      expect(queues.size).toBe(1);
       driver.releaseNext();
       await Promise.all([first, second]);
       await vi.waitFor(() => expect(queues.size).toBe(0));
@@ -687,7 +764,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     ]);
   });
 
-  it('serializes different roles that target the same workspace', async () => {
+  it('runs different roles that target the same workspace in parallel', async () => {
     const driver = new ConcurrentDriver();
     const { facade } = createFacade(driver);
     const workspace = '/tmp/newide-shared-workspace';
@@ -697,7 +774,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       facade.runAgent(request('task_shared_b', 'reviewer', workspace)),
     ]);
 
-    expect(driver.maxActive).toBe(1);
+    expect(driver.maxActive).toBe(2);
   });
 
   it('reuses one logical role and buffer sequence across different workspaces', async () => {
@@ -1034,6 +1111,73 @@ function invokeDriverLlm(): ToolCallingClient {
           },
         ],
       };
+    },
+  };
+}
+
+function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
+  return {
+    async completeWithTools(input) {
+      const userPrompt =
+        input.messages.find((message) => message.role === 'user')?.content ?? '';
+      observedPrompts.push(userPrompt);
+      const lastMessage = input.messages.at(-1);
+      const inboundRequest = userPrompt.includes('- kind: request');
+      const inboundResponse = userPrompt.includes('Mailbox reply') || userPrompt.includes('- kind: notice');
+      if (!userPrompt.includes('Inbound mailbox envelope:') && lastMessage?.role !== 'tool') {
+        return {
+          content: null,
+          tool_calls: [
+            {
+              id: 'mailbox_request',
+              type: 'function',
+                function: {
+                  name: 'mailbox_send',
+                  arguments: JSON.stringify({
+                    to_role_id: 'role_reviewer',
+                    kind: 'request',
+                    content: 'Please assess this plan.',
+                  }),
+              },
+            },
+          ],
+        };
+      }
+      if (
+        (inboundRequest || inboundResponse) &&
+        lastMessage?.role !== 'tool'
+      ) {
+        return driverToolCalls(`mailbox_driver_${String(observedPrompts.length)}`);
+      }
+      if (
+        inboundRequest &&
+        lastMessage?.role === 'tool' &&
+        input.messages.some((message) =>
+          message.tool_calls?.some((call) => call.function.name === 'invoke_driver'),
+        ) &&
+        !input.messages.some((message) =>
+          message.tool_calls?.some((call) => call.function.name === 'mailbox_send'),
+        )
+      ) {
+        return {
+          content: null,
+          tool_calls: [
+            {
+              id: 'mailbox_reply',
+              type: 'function',
+                function: {
+                  name: 'mailbox_send',
+                  arguments: JSON.stringify({
+                    to_role_id: 'role_sender',
+                    kind: 'notice',
+                    content: 'The plan is sound.',
+                  }),
+              },
+            },
+          ],
+        };
+      }
+      return { content: 'Task completed. [done]', tool_calls: undefined };
     },
   };
 }

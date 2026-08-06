@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { TASK_STATUSES } from '../core';
+import { councilOutcomeEvidenceSchema } from './run-snapshot';
 
 const recordSchema = z.record(z.string(), z.unknown());
 
@@ -78,6 +79,7 @@ const councilEvidenceSchema = z
     decision_id: z.string().min(1).optional(),
     verdict: z.enum(['select', 'needs_human', 'request_revision', 'reject']).optional(),
     result: councilResultEvidenceSchema.optional(),
+    outcome: councilOutcomeEvidenceSchema.optional(),
   })
   .strict();
 

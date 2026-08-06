@@ -37,6 +37,16 @@ const usesTemporaryRunner = configuredRunnerDir === undefined;
 const runnerDir = configuredRunnerDir
   ? path.resolve(configuredRunnerDir)
   : await createFakeAcpRunner();
+const stateRoot = usesTemporaryRunner
+  ? path.join(runnerDir, 'state')
+  : path.resolve(process.env.NEWIDE_STATE_ROOT?.trim() || path.join(process.cwd(), '.newide'));
+const backendEnv = usesTemporaryRunner
+  ? {
+      ...process.env,
+      ACP_DRIVER_RUNNER_DIR: runnerDir,
+      NEWIDE_STATE_ROOT: stateRoot,
+    }
+  : { ...process.env, ACP_DRIVER_RUNNER_DIR: runnerDir };
 const invocationLog = path.join(runnerDir, 'invocations.log');
 const runtime = usesTemporaryRunner
   ? 'production-composition-deterministic-b-llm-fake-acp'
@@ -57,14 +67,14 @@ if (usesTemporaryRunner) {
     input,
     writeLine: (line) => localOutput!.write(`${line}\n`),
     service: await createProductionBackendService(
-      { ...process.env, ACP_DRIVER_RUNNER_DIR: runnerDir },
+      backendEnv,
       {
         agentLlm: invokeDriverLlm(),
         memoryLlm: deterministicMaintenanceLlm(),
         bRuntime: {
           repository: new InMemoryRepository(),
           bufferRepository: new InMemoryBufferRepository(),
-          app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(process.cwd(), '.newide'),
+          app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(stateRoot, 'b'),
           market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
           close: async () => undefined,
         },
@@ -76,7 +86,7 @@ if (usesTemporaryRunner) {
 } else {
   child = spawn('pnpm', ['backend:rpc'], {
     cwd: process.cwd(),
-    env: { ...process.env, ACP_DRIVER_RUNNER_DIR: runnerDir },
+    env: backendEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   backendInput = child.stdin;
@@ -119,7 +129,7 @@ try {
   if (cancelled) await waitForCancellationEffects();
   const driverInvocations = usesTemporaryRunner ? await countDriverInvocations() : undefined;
   if (driverInvocations !== undefined) {
-    const expectedInvocations = smokeMode === 'all' ? 6 : smokeMode === 'single_agent' ? 1 : 5;
+    const expectedInvocations = smokeMode === 'all' ? 12 : smokeMode === 'single_agent' ? 2 : 10;
     assert(
       driverInvocations === expectedInvocations,
       `Expected ${expectedInvocations} driver invocations, received ${driverInvocations}`,
@@ -156,9 +166,11 @@ try {
   }
   if (process.env.RPC_SMOKE_KEEP !== '1') {
     await Promise.all([
-      ...runIds.map((runId) => fs.rm(`.newide/runs/${runId}`, { recursive: true, force: true })),
+      ...runIds.map((runId) =>
+        fs.rm(path.join(stateRoot, 'runs', runId), { recursive: true, force: true }),
+      ),
       ...taskIds.map((taskId) =>
-        fs.rm(`.newide/worktrees/${taskId}`, { recursive: true, force: true }),
+        fs.rm(path.join(stateRoot, 'worktrees', taskId), { recursive: true, force: true }),
       ),
       ...(usesTemporaryRunner
         ? generatedFiles.map((file) => fs.rm(file, { force: true }))
@@ -329,9 +341,9 @@ function readTimeoutMs(): number {
 
 async function assertRunFiles(runId: string): Promise<void> {
   const files = [
-    `.newide/runs/${runId}/audit.jsonl`,
-    `.newide/runs/${runId}/result.json`,
-    `.newide/runs/${runId}/frontend-snapshot.json`,
+    path.join(stateRoot, 'runs', runId, 'audit.jsonl'),
+    path.join(stateRoot, 'runs', runId, 'result.json'),
+    path.join(stateRoot, 'runs', runId, 'frontend-snapshot.json'),
   ];
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
