@@ -96,7 +96,7 @@ describe('ProductionGateExecutor', () => {
     });
   });
 
-  it('continues only as best effort when no command is configured', async () => {
+  it('does not fabricate Gate evidence when no command is configured', async () => {
     const executor = new ProductionGateExecutor({ runsRoot: '/unused', env: {} });
     const result = await executor.execute({
       run_id: 'run_unconfigured',
@@ -109,14 +109,7 @@ describe('ProductionGateExecutor', () => {
 
     expect(result).toMatchObject({
       matched: false,
-      gate_results: [
-        {
-          gate_id: 'best-effort-delivery',
-          decision: 'allow',
-          subject_type: 'task',
-          required_actions: ['configure-production-gate'],
-        },
-      ],
+      gate_results: [],
     });
   });
 });

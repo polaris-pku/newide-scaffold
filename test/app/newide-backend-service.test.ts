@@ -650,7 +650,6 @@ describe('NewideBackendService', () => {
           'driver.session_started',
           'driver.run_result',
           'artifact.registered',
-          'gate.result',
           'council.started',
           'council.decision',
           'council.completed',
@@ -658,6 +657,7 @@ describe('NewideBackendService', () => {
           'run.completed',
         ]),
       );
+      expect(types).not.toContain('gate.result');
       expect(types.filter((type) => type === 'run.completed')).toHaveLength(1);
 
       const externalSnapshot = service.getRunSnapshot(created.run_id);
@@ -673,7 +673,8 @@ describe('NewideBackendService', () => {
         final_output: { status: 'completed' },
       });
       expect(externalSnapshot.artifacts.length).toBeGreaterThan(0);
-      expect(externalSnapshot.gates.length).toBeGreaterThan(0);
+      expect(externalSnapshot.gates).toEqual([]);
+      expect(externalSnapshot.quality?.status).toBe('completed');
       expect(externalSnapshot.checkpoint).toBeDefined();
       expect(service.getSnapshot(created.run_id).snapshot?.links.result_path).toBe(
         path.join(tempRoot, 'runs', created.run_id, 'result.json'),

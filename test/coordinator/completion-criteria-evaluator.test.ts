@@ -35,17 +35,17 @@ describe('evaluateCompletionCriteria', () => {
     });
   });
 
-  it('keeps successful output best_effort when criteria lack scoped evidence', () => {
+  it('completes successful output when criteria lack scoped Gate evidence', () => {
     const result = evaluateCompletionCriteria(baseInput());
 
-    expect(result.outcome.status).toBe('best_effort');
+    expect(result.outcome.status).toBe('completed');
     expect(result.outcome.criteria[0]).toMatchObject({ status: 'unverified' });
   });
 
-  it('blocks completion when required Gate evidence is absent', () => {
+  it('completes when no production Gate is configured', () => {
     const result = evaluateCompletionCriteria({ ...baseInput(), gate_results: [] });
 
-    expect(result.outcome.status).toBe('blocked');
+    expect(result.outcome.status).toBe('completed');
   });
 
   it('fails when a Gate denies the output', () => {

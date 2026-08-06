@@ -28,9 +28,9 @@ export interface CompletionCriteriaEvaluation {
 }
 
 /**
- * Completion criteria are verified only by criterion-scoped Gate evidence.
- * A successful Driver and changed files are useful delivery evidence, but cannot
- * by themselves prove an arbitrary natural-language acceptance criterion.
+ * A materialized final artifact completes the current product flow. When a real
+ * Gate is configured, criterion-scoped evidence may additionally attest it as
+ * verified without changing whether the Task completed.
  */
 export function evaluateCompletionCriteria(
   input: CompletionCriteriaEvaluationInput,
@@ -97,7 +97,6 @@ function determineOutcomeStatus(
   if (!input.execution_succeeded) return 'failed';
   if (input.gate_results.some((result) => result.decision === 'deny')) return 'failed';
   if (
-    input.gate_results.length === 0 ||
     input.gate_results.some(
       (result) => result.decision === 'ask' || result.decision === 'defer',
     )
@@ -120,7 +119,7 @@ function determineOutcomeStatus(
   ) {
     return 'verified';
   }
-  return 'best_effort';
+  return 'completed';
 }
 
 function outcomeReason(
@@ -128,6 +127,8 @@ function outcomeReason(
   criteria: readonly CompletionCriterionResult[],
 ): string {
   switch (status) {
+    case 'completed':
+      return 'The Task produced and materialized its final deliverable.';
     case 'verified':
       return 'All completion criteria have criterion-scoped Gate evidence.';
     case 'best_effort':
