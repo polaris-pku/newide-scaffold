@@ -183,6 +183,7 @@ export async function createProductionBackendService(
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
+        runsRoot,
       });
     try {
       await memoryMaintenance.replayPending();

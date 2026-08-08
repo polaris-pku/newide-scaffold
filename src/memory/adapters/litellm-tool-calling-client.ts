@@ -33,6 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { generateText, jsonSchema, type LanguageModel } from 'ai';
 import { LiteLLMClient } from '../../litellm';
 import type { Tool, ToolCall } from '../../litellm';
+import { recordProxyLlmUsage } from '../../telemetry/llm-usage-ledger';
 import type {
   ToolCallingClient,
   ToolCallMessage,
@@ -315,6 +316,13 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       generateParams.tools = tools;
     }
     const result = await generateText(generateParams as Parameters<typeof generateText>[0]);
+    await recordProxyLlmUsage({
+      input_tokens: result.usage?.inputTokens ?? 0,
+      output_tokens: result.usage?.outputTokens ?? 0,
+      model: modelId,
+      temperature,
+      source: 'proxy',
+    });
     return {
       content: result.text ?? null,
       tool_calls:

@@ -52,6 +52,52 @@ describe('FileRunTerminalOutputWriter', () => {
     });
   });
 
+  it('aggregates proxy.llm_usage_recorded into summary.token_usage', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events = [
+      {
+        event_id: 'run_event_proxy_1',
+        sequence: 1,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'proxy.llm_usage_recorded',
+        source: 'proxy',
+        created_at: '2026-07-11T08:00:00.000Z',
+        payload: { case_id: 'task_failed', input_tokens: 120, output_tokens: 30 },
+        schema_version: 'v0',
+      },
+      {
+        event_id: 'run_event_proxy_2',
+        sequence: 2,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'proxy.llm_usage_recorded',
+        source: 'proxy',
+        created_at: '2026-07-11T08:00:01.000Z',
+        payload: { case_id: 'task_failed', input_tokens: 10, output_tokens: 5 },
+        schema_version: 'v0',
+      },
+      ...snapshot.events,
+    ];
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(snapshot);
+
+    await expect(
+      readJson(path.join(runsRoot, 'run_failed', 'summary.json')),
+    ).resolves.toMatchObject({
+      token_usage: {
+        schema_version: 'newide.token_usage.v1',
+        source: 'proxy',
+        input_tokens: 130,
+        output_tokens: 35,
+        total_tokens: 165,
+        call_count: 2,
+      },
+    });
+  });
+
   it('writes memory_ablation from agent.execution_requested when context_pack is missing', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
     tempDirs.push(runsRoot);

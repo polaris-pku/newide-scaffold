@@ -23,6 +23,10 @@ import {
 import { runEvalInstance } from '../eval/run-instance-core';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
 import {
+  collectClaudeSessionUsage,
+  type RunTokenUsageSummary,
+} from '../src/telemetry';
+import {
   prepareAblationArmIsolation,
   waitForRunMaintenance,
 } from './ablation-arm-isolation';
@@ -42,18 +46,9 @@ interface BackendClient {
   close(): Promise<void>;
 }
 
-interface TokenUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens: number;
-  cache_read_input_tokens: number;
-  /** input + cache_creation + cache_read (Claude billed input-ish total). */
-  total_input_tokens: number;
-  total_tokens: number;
+interface TokenUsage extends RunTokenUsageSummary {
+  /** Backward-compatible alias of call_count for Claude assistant turns. */
   assistant_messages: number;
-  source: 'claude_session_jsonl' | 'unavailable';
-  session_path?: string;
-  session_id?: string;
 }
 
 interface InstanceRow {
@@ -443,7 +438,8 @@ async function runOneInstance(input: {
       }
     }
 
-    row.token_usage = await collectClaudeTokenUsage({
+    row.token_usage = await resolveInstanceTokenUsage({
+      summary,
       sessionId: row.session_id,
       worktreePath: prepared.worktreePath,
     });
@@ -564,147 +560,56 @@ async function writeEvalOfflineClaudeSettings(worktreePath: string): Promise<voi
   );
 }
 
-function emptyTokenUsage(
-  source: TokenUsage['source'] = 'unavailable',
-  extras: Partial<TokenUsage> = {},
-): TokenUsage {
+function toAblationTokenUsage(summary: RunTokenUsageSummary): TokenUsage {
   return {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-    total_input_tokens: 0,
-    total_tokens: 0,
-    assistant_messages: 0,
-    source,
-    ...extras,
+    ...summary,
+    assistant_messages: summary.call_count,
   };
 }
 
-/**
- * Claude Code encodes a project path by replacing every non-alphanumeric
- * character with '-' (e.g. `D:\Code\x` -> `D--Code-x`). Keep the legacy
- * variant (colon stripped) as a fallback for older session layouts.
- */
-function encodeClaudeProjectDirCandidates(worktreePath: string): string[] {
-  const resolved = path.resolve(worktreePath);
-  const claudeStyle = resolved.replace(/[^a-zA-Z0-9]/g, '-');
-  const legacy = resolved.replaceAll(':', '').replaceAll('\\', '-').replaceAll('/', '-');
-  return [...new Set([claudeStyle, legacy])];
-}
-
-async function collectClaudeTokenUsage(input: {
-  sessionId?: string;
-  worktreePath: string;
-}): Promise<TokenUsage> {
-  const claudeRoot = path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.claude');
-  if (!claudeRoot || !existsSync(claudeRoot)) return emptyTokenUsage();
-
-  const projectDirs = encodeClaudeProjectDirCandidates(input.worktreePath).map((encoded) =>
-    path.join(claudeRoot, 'projects', encoded),
-  );
-  const candidates: string[] = [];
-  if (input.sessionId) {
-    for (const projectDir of projectDirs) {
-      candidates.push(path.join(projectDir, `${input.sessionId}.jsonl`));
-    }
-    candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
-  }
-
-  // Fallback: newest jsonl under the encoded project dir (useful if session_id mapping drifts).
-  for (const projectDir of projectDirs) {
-    if (!existsSync(projectDir)) continue;
-    try {
-      const files = (await fs.readdir(projectDir))
-        .filter((name) => name.endsWith('.jsonl'))
-        .map((name) => path.join(projectDir, name));
-      const ranked = await Promise.all(
-        files.map(async (filePath) => ({
-          filePath,
-          mtimeMs: (await fs.stat(filePath)).mtimeMs,
-        })),
-      );
-      ranked.sort((a, b) => b.mtimeMs - a.mtimeMs);
-      for (const entry of ranked.slice(0, 3)) {
-        if (!candidates.includes(entry.filePath)) candidates.push(entry.filePath);
-      }
-    } catch {
-      // ignore listing failures
-    }
-  }
-
-  for (const candidate of candidates) {
-    if (!existsSync(candidate) || !candidate.endsWith('.jsonl')) continue;
-    try {
-      const usage = await sumUsageFromClaudeJsonl(candidate, input.sessionId);
-      if (usage.assistant_messages > 0) return usage;
-    } catch {
-      // try next candidate
-    }
-  }
-  return emptyTokenUsage('unavailable', {
-    session_id: input.sessionId,
+function readSummaryTokenUsage(summary: unknown): TokenUsage | undefined {
+  if (!summary || typeof summary !== 'object') return undefined;
+  const tokenUsage = (summary as { token_usage?: unknown }).token_usage;
+  if (!tokenUsage || typeof tokenUsage !== 'object') return undefined;
+  const obj = tokenUsage as Partial<RunTokenUsageSummary>;
+  const totalTokens = Number(obj.total_tokens ?? 0);
+  const callCount = Number(obj.call_count ?? 0);
+  if (!Number.isFinite(totalTokens) || !Number.isFinite(callCount)) return undefined;
+  if (totalTokens <= 0 && callCount <= 0) return undefined;
+  return toAblationTokenUsage({
+    schema_version: 'newide.token_usage.v1',
+    source: (obj.source as RunTokenUsageSummary['source']) ?? 'mixed',
+    input_tokens: Number(obj.input_tokens ?? 0),
+    output_tokens: Number(obj.output_tokens ?? 0),
+    cache_creation_input_tokens: Number(obj.cache_creation_input_tokens ?? 0),
+    cache_read_input_tokens: Number(obj.cache_read_input_tokens ?? 0),
+    total_input_tokens: Number(obj.total_input_tokens ?? 0),
+    total_tokens: totalTokens,
+    call_count: callCount,
+    sources: Array.isArray(obj.sources)
+      ? (obj.sources as RunTokenUsageSummary['sources'])
+      : [],
+    by_source:
+      obj.by_source && typeof obj.by_source === 'object'
+        ? (obj.by_source as RunTokenUsageSummary['by_source'])
+        : {},
+    ...(typeof obj.session_id === 'string' ? { session_id: obj.session_id } : {}),
+    ...(typeof obj.session_path === 'string' ? { session_path: obj.session_path } : {}),
   });
 }
 
-async function sumUsageFromClaudeJsonl(
-  filePath: string,
-  expectedSessionId?: string,
-): Promise<TokenUsage> {
-  const text = await fs.readFile(filePath, 'utf-8');
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheCreation = 0;
-  let cacheRead = 0;
-  let assistantMessages = 0;
-  let matchedSessionId = expectedSessionId;
-
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let obj: {
-      type?: string;
-      sessionId?: string;
-      message?: { usage?: Record<string, unknown> };
-      usage?: Record<string, unknown>;
-    };
-    try {
-      obj = JSON.parse(line) as typeof obj;
-    } catch {
-      continue;
-    }
-    if (expectedSessionId && obj.sessionId && obj.sessionId !== expectedSessionId) continue;
-    if (obj.sessionId) matchedSessionId = obj.sessionId;
-    const usage = obj.message?.usage ?? obj.usage;
-    if (!usage || typeof usage !== 'object') continue;
-    if (obj.type !== 'assistant' && !obj.message?.usage) continue;
-
-    const nextInput = Number(usage.input_tokens ?? 0);
-    const nextOutput = Number(usage.output_tokens ?? 0);
-    const nextCacheCreation = Number(usage.cache_creation_input_tokens ?? 0);
-    const nextCacheRead = Number(usage.cache_read_input_tokens ?? 0);
-    if (![nextInput, nextOutput, nextCacheCreation, nextCacheRead].every(Number.isFinite)) {
-      continue;
-    }
-    inputTokens += nextInput;
-    outputTokens += nextOutput;
-    cacheCreation += nextCacheCreation;
-    cacheRead += nextCacheRead;
-    assistantMessages += 1;
-  }
-
-  const totalInput = inputTokens + cacheCreation + cacheRead;
-  return {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    cache_creation_input_tokens: cacheCreation,
-    cache_read_input_tokens: cacheRead,
-    total_input_tokens: totalInput,
-    total_tokens: totalInput + outputTokens,
-    assistant_messages: assistantMessages,
-    source: assistantMessages > 0 ? 'claude_session_jsonl' : 'unavailable',
-    session_path: filePath,
-    session_id: matchedSessionId,
-  };
+async function resolveInstanceTokenUsage(input: {
+  summary: unknown;
+  sessionId?: string;
+  worktreePath: string;
+}): Promise<TokenUsage> {
+  const fromSummary = readSummaryTokenUsage(input.summary);
+  if (fromSummary) return fromSummary;
+  const scraped = await collectClaudeSessionUsage({
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    worktreePath: input.worktreePath,
+  });
+  return toAblationTokenUsage(scraped);
 }
 
 function summarizeTiming(rows: InstanceRow[]): {
@@ -731,7 +636,12 @@ function summarizeTokens(rows: InstanceRow[]): {
   instances_with_tokens: number;
   instances: number;
 } {
-  const withTokens = rows.filter((row) => row.token_usage?.source === 'claude_session_jsonl');
+  const withTokens = rows.filter(
+    (row) =>
+      row.token_usage &&
+      row.token_usage.source !== 'unavailable' &&
+      (row.token_usage.total_tokens > 0 || row.token_usage.call_count > 0),
+  );
   return {
     input_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.input_tokens ?? 0), 0),
     output_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.output_tokens ?? 0), 0),
