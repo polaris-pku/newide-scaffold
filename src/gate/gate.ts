@@ -34,7 +34,19 @@ export interface GateResult {
   schema_version: SchemaVersion;
 }
 
+export type GateOutputFormat = 'sarif' | 'junit' | 'json' | 'text' | 'coverage_json';
+
+export const VALID_GATE_OUTPUT_FORMATS = new Set<string>([
+  'sarif',
+  'junit',
+  'json',
+  'text',
+  'coverage_json',
+]);
+
 export interface GateOutputConfig {
+  /** Output format for parsing command stdout. When unset, only exit code is checked. */
+  format?: GateOutputFormat;
   severity_map?: Record<string, 'deny' | 'ask' | 'defer' | 'allow'>;
   threshold?: {
     line?: number;
@@ -42,6 +54,28 @@ export interface GateOutputConfig {
   };
   on_fail?: 'deny' | 'ask' | 'defer' | 'allow';
   on_below_threshold?: 'deny' | 'ask' | 'defer' | 'allow';
+}
+
+/** A single finding extracted from command output (lint, test, audit, etc.). */
+export interface Finding {
+  severity: string;
+  message: string;
+  file?: string;
+  line?: number;
+  column?: number;
+}
+
+/** Coverage metrics extracted from coverage report output. */
+export interface CoverageData {
+  line: number;
+  branch: number;
+}
+
+/** Parsed output from a gate command. */
+export interface ParsedGateOutput {
+  findings?: Finding[];
+  coverage?: CoverageData;
+  raw_summary?: string;
 }
 
 export interface SubGateRef {

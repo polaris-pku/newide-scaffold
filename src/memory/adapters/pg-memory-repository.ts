@@ -260,6 +260,26 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  async savePersona(role_id: string, persona: PersonaDef): Promise<void> {
+    await this.ensureSchema();
+    PersonaDefSchema.parse(persona);
+
+    // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
+    const handle = await this.getAgent(role_id);
+    const nextHandle = { ...handle, persona };
+
+    const result = await this.pool.query(
+      `UPDATE memory_agents
+       SET persona = $2::jsonb, handle = $3::jsonb
+       WHERE role_id = $1`,
+      [role_id, JSON.stringify(persona), JSON.stringify(nextHandle)],
+    );
+
+    if (result.rowCount === 0) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
   async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
     await this.ensureSchema();
     const stored = await this.withDescriptionEmbedding(skill);

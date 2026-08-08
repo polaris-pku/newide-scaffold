@@ -3,18 +3,15 @@ import { SCHEMA_VERSION, createId, nowTimestamp, type Event } from '../core';
 import {
   DecisionAggregator,
   PriorityGateScheduler,
+  VALID_GATE_OUTPUT_FORMATS,
   type GateDecision,
   type GateDefinition,
+  type GateOutputFormat,
   type GateRequest,
   type GateResult,
   type GateScheduler,
 } from '../gate';
 import {
-  type AgentHookPoint,
-  type TaskHookPoint,
-  type CouncilHookPoint,
-  type LifecycleHookPoint,
-  type SystemHookPoint,
   type HookPoint,
   PHASE_1_HOOK_POINTS,
   DEFAULT_HOOK_VERSION,
@@ -37,8 +34,8 @@ export type {
   LifecycleHookPoint,
   SystemHookPoint,
   HookPoint,
-};
-export { PHASE_1_HOOK_POINTS };
+} from './constants';
+export { PHASE_1_HOOK_POINTS } from './constants';
 
 // ──────────────────────────────────────────────
 // Secure expression parser for `if` conditions
@@ -180,6 +177,14 @@ function safeScope(event: HookEvent): Record<string, unknown> {
     if (seen.has(value as object)) return value;
     seen.add(value as object);
 
+    // Arrays are commonly used as the RHS of the `in` operator (e.g.
+    // `value in ['a', 'b']`). Wrapping them in a Proxy can interfere with
+    // `in` checks, so we keep the array identity and only recursively wrap
+    // its elements.
+    if (Array.isArray(value)) {
+      return value.map((item) => wrap(item));
+    }
+
     return new Proxy(value as Record<string, unknown>, {
       get(_target, prop, receiver) {
         if (typeof prop === 'symbol') return undefined;
@@ -210,16 +215,50 @@ const DANGEROUS_MEMBER_RE =
   /\.\s*(constructor|__proto__|prototype)\s*(?=[.[\s()+\-*/%^?:!=>|<&]|$)/;
 
 /**
+ * Remove string literals from an expression so that safety checks only look
+ * at code tokens, not literal content.  Handles both single and double quoted
+ * strings with escaped quotes.
+ */
+function stripStringLiterals(expression: string): string {
+  return expression
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+}
+
+/**
  * Throw if `expression` attempts member-access to a blocked prototype
  * property.  Called before the expression ever reaches the parser so that
  * even parser-level quirks cannot bypass the proxy defence.
+ *
+ * String literals are stripped first so that legitimate content like
+ * `payload.path matches '.constructor'` is not rejected.
  */
 function validateExpressionSafety(expression: string): void {
-  if (DANGEROUS_MEMBER_RE.test(expression)) {
-    const match = DANGEROUS_MEMBER_RE.exec(expression);
+  const withoutStrings = stripStringLiterals(expression);
+  if (DANGEROUS_MEMBER_RE.test(withoutStrings)) {
+    const match = DANGEROUS_MEMBER_RE.exec(withoutStrings);
     throw new Error(
       `Forbidden property access ".${match![1]}" in condition expression`,
     );
+  }
+}
+
+/**
+ * Validate that an `if` condition expression is syntactically valid and
+ * does not contain forbidden property accesses. Returns the normalized error
+ * message on failure, or `undefined` on success.
+ *
+ * This is exported so the configuration loader can surface syntax errors at
+ * load time rather than deferring them to runtime.
+ */
+export function validateConditionSyntax(expression: string): string | undefined {
+  try {
+    validateExpressionSafety(expression);
+    const normalized = preprocessExpression(expression);
+    conditionParser.parse(normalized);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
   }
 }
 
@@ -286,8 +325,8 @@ export class HookEngine {
   }
 
   async handleEvent(event: HookEvent): Promise<HookResult> {
-    // Emergency skip — if the configured env var is set, bypass all gates
-    if (this.settings.emergency_env_var && process.env[this.settings.emergency_env_var]) {
+    // Emergency skip — if the configured env var is set to an enabling value, bypass all gates
+    if (this.isEmergencySkipEnabled()) {
       return {
         hook_point: event.event_type,
         matched: false,
@@ -338,17 +377,24 @@ export class HookEngine {
     // Execute gates — parallel or sequential based on settings
     const gateResults: GateResult[] = [];
     if (this.settings.parallel) {
-      // Send all gate requests concurrently via Promise.all.
+      // Send all gate requests concurrently via Promise.allSettled so that
+      // per-binding on_failure can be applied without failing the whole batch.
       // Note: fail_fast has no early-termination effect in parallel mode
       // since all gates are already in-flight.
-      const results = await Promise.all(
-        gateRequests.map((request) => this.scheduler.insert(request)),
+      const settled = await Promise.allSettled(
+        gateRequests.map((request, index) =>
+          this.executeGate(request, matchingEntries[index]!),
+        ),
       );
-      gateResults.push(...results);
+      for (const result of settled) {
+        if (result.status === 'fulfilled') {
+          gateResults.push(result.value);
+        }
+      }
     } else {
       // Execute gates sequentially, respecting priority order and fail_fast
-      for (const request of gateRequests) {
-        const result = await this.scheduler.insert(request);
+      for (let i = 0; i < gateRequests.length; i++) {
+        const result = await this.executeGate(gateRequests[i]!, matchingEntries[i]!);
         gateResults.push(result);
         // Stop early when fail_fast is enabled and a gate denies
         if (this.settings.fail_fast && result.decision === 'deny') {
@@ -362,7 +408,9 @@ export class HookEngine {
       matched: true,
       gate_requests: gateRequests,
       gate_results: gateResults,
-      final_decision: this.aggregator.aggregate(gateResults).decision,
+      final_decision: gateResults.length > 0
+        ? this.aggregator.aggregate(gateResults).decision
+        : 'allow',
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
@@ -371,12 +419,58 @@ export class HookEngine {
   // ── Private helpers ──────────────────────────────
 
   /**
+   * Execute a single gate request, falling back to the binding's `on_failure`
+   * decision if the scheduler throws an execution error.
+   */
+  private executeGate(
+    request: GateRequest,
+    entry: HookBindingEntry,
+  ): Promise<GateResult> {
+    return this.scheduler.insert(request).catch((error: unknown) => {
+      const fallbackDecision = entry.on_failure ?? 'allow';
+      const reason = error instanceof Error ? error.message : String(error);
+      const result: GateResult = {
+        gate_result_id: createId('gate_result'),
+        gate_id: request.gate_id,
+        gate_point: request.gate_point,
+        request_id: request.request_id,
+        decision: fallbackDecision,
+        reason: `Gate execution failed: ${reason}`,
+        required_actions: [],
+        created_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      };
+      if (request.subject_id !== undefined) {
+        result.subject_id = request.subject_id;
+      }
+      return result;
+    });
+  }
+
+  /**
+   * Check whether the configured emergency bypass env var is set to an
+   * explicitly enabling value (case-insensitive).
+   */
+  private isEmergencySkipEnabled(): boolean {
+    const envVar = this.settings.emergency_env_var;
+    if (!envVar) return false;
+    const value = process.env[envVar];
+    if (!value) return false;
+    return ['1', 'true', 'yes', 'on', 'enabled'].includes(value.toLowerCase());
+  }
+
+  /**
    * Convert a YAML GateConfig into a GateDefinition suitable for the scheduler.
    */
   private toGateDefinition(config: HookConfig['gates'][string]): GateDefinition {
+    // Copy output config; format needs validation, other fields are pre-validated at parse time
     const outputConfig: GateDefinition['outputConfig'] = {};
-    if (config.severity_map) {
-      outputConfig.severity_map = config.severity_map;
+    if (config.output) {
+      const { format, ...fields } = config.output;
+      if (format && isGateOutputFormat(format)) {
+        outputConfig.format = format;
+      }
+      Object.assign(outputConfig, fields);
     }
 
     const def: GateDefinition = {
@@ -387,16 +481,17 @@ export class HookEngine {
 
     if (config.timeout !== undefined) def.timeout = config.timeout;
 
+    // Map typed fields directly (no more polymorphic `run`)
     switch (config.type) {
       case 'command':
-        if (config.run !== undefined) def.command = config.run;
+        if (config.command !== undefined) def.command = config.command;
         break;
       case 'prompt':
         if (config.model !== undefined) def.model = config.model;
-        if (config.run !== undefined) def.prompt = config.run;
+        if (config.prompt !== undefined) def.prompt = config.prompt;
         break;
       case 'http':
-        if (config.run !== undefined) def.input = config.run;
+        if (config.http !== undefined) def.http = config.http;
         break;
       case 'composite':
         if (config.gates !== undefined) def.gates = config.gates;
@@ -490,7 +585,7 @@ export function createDefaultHookEngine(): HookEngine {
       gates: {
         [mockGateId]: {
           type: 'command',
-          run: 'node -e "process.exit(0)"',
+          command: 'node -e "process.exit(0)"',
           retry_threshold: 1,
         },
       },
@@ -508,4 +603,10 @@ export function createHookEvent(
     created_at: nowTimestamp(),
     schema_version: SCHEMA_VERSION,
   };
+}
+
+// ── Internal helpers ──────────────────────────────
+
+function isGateOutputFormat(value: string): value is GateOutputFormat {
+  return VALID_GATE_OUTPUT_FORMATS.has(value);
 }

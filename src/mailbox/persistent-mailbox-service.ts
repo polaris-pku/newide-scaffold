@@ -2,18 +2,17 @@ import {
   SCHEMA_VERSION,
   createId,
   type AgentMessageType,
-  type MessageRecipient,
 } from '../core';
+import type { MailboxMessageKind } from './mailbox-state-store';
 import type {
   MailboxStateStore,
   PersistedMailboxDelivery,
   PersistedMailboxEnvelope,
   PersistedMailboxError,
   PersistedMailboxMessage,
+  MailboxSendPersistenceResult,
   SaveMailboxReplyResult,
 } from './mailbox-state-store';
-import type { AgentMailboxWakePort } from '../protocol/agent-mailbox-wake';
-
 export interface PersistentMailboxServiceOptions {
   now?: () => string;
   createMessageId?: () => string;
@@ -21,14 +20,21 @@ export interface PersistentMailboxServiceOptions {
 }
 
 export interface MailboxSendInput {
+  task_id: string;
+  workspace_path: string;
   thread_id: string;
-  from_agent_id: string;
-  to: MessageRecipient[];
-  type: AgentMessageType;
-  payload: Record<string, unknown>;
+  from_role_id: string;
+  to_role_id: string;
+  /** Canonical Agent-facing contract. */
+  kind?: MailboxMessageKind;
+  content?: string;
+  /** Legacy Host RPC compatibility. */
+  type?: AgentMessageType;
+  payload?: Record<string, unknown>;
   artifact_refs?: string[];
-  requires_ack: boolean;
+  requires_ack?: boolean;
   deadline_seconds?: number;
+  idempotency_key: string;
 }
 
 export interface MailboxSendResult {
@@ -36,9 +42,9 @@ export interface MailboxSendResult {
   deliveries: PersistedMailboxDelivery[];
 }
 
-export interface MailboxReplyInput extends Omit<MailboxSendInput, 'thread_id'> {
+export interface MailboxReplyInput
+  extends Omit<MailboxSendInput, 'task_id' | 'workspace_path' | 'thread_id' | 'to_role_id'> {
   source_delivery_id: string;
-  source_recipient: MessageRecipient;
 }
 
 export class MailboxValidationError extends Error {
@@ -79,7 +85,6 @@ export class PersistentMailboxService {
 
   constructor(
     private readonly store: MailboxStateStore,
-    private readonly wakePort: AgentMailboxWakePort,
     options: PersistentMailboxServiceOptions = {},
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
@@ -88,45 +93,116 @@ export class PersistentMailboxService {
   }
 
   async send(input: MailboxSendInput): Promise<MailboxSendResult> {
-    this.validateSend(input);
+    const normalized = normalizeSendInput(input);
+    this.validateSend(normalized);
+    const existing = this.store.findMailboxSendByIdempotencyKey(
+      normalized.task_id,
+      normalized.from_role_id,
+      normalized.idempotency_key,
+    );
+    if (existing) {
+      this.assertIdempotentReplay(existing, normalized);
+      return existing;
+    }
     const createdAt = this.now();
-    const message = this.createMessage(input, createdAt);
-    const deliveries = this.createDeliveries(message.message_id, input, createdAt);
+    const message = this.createMessage(normalized, createdAt);
+    const deliveries = this.createDeliveries(message.message_id, normalized, createdAt);
     this.store.saveMailboxMessage(message, deliveries);
-    return { message, deliveries: await this.wakeDeliveries(message, deliveries) };
+    return { message, deliveries };
   }
 
-  inbox(recipient: MessageRecipient, afterDeliveryId?: string): PersistedMailboxEnvelope[] {
-    validateRecipient(recipient);
-    return this.store.receiveMailboxInbox(recipient, this.now(), afterDeliveryId);
+  inbox(
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
+    afterDeliveryId?: string,
+  ): PersistedMailboxEnvelope[] {
+    requireText(taskId, 'task_id');
+    requireText(workspacePath, 'workspace_path');
+    requireText(recipientRoleId, 'recipient_role_id');
+    return this.store.listMailboxInbox(
+      taskId,
+      workspacePath,
+      recipientRoleId,
+      afterDeliveryId,
+    );
   }
 
-  ack(deliveryId: string, recipient: MessageRecipient): PersistedMailboxDelivery {
+  markInjected(
+    deliveryId: string,
+    recipientRoleId: string,
+    recipientSessionId: string,
+  ): PersistedMailboxDelivery {
+    requireText(recipientRoleId, 'recipient_role_id');
+    requireText(recipientSessionId, 'recipient_session_id');
+    return this.store.markMailboxDeliveryInjected(deliveryId, {
+      recipient_role_id: recipientRoleId,
+      recipient_session_id: recipientSessionId,
+      injected_at: this.now(),
+    });
+  }
+
+  markFailed(
+    deliveryId: string,
+    error: PersistedMailboxError,
+  ): PersistedMailboxDelivery {
+    return this.store.markMailboxDeliveryFailed(deliveryId, {
+      failed_at: this.now(),
+      error,
+    });
+  }
+
+  recordDeliveryAttempt(
+    deliveryId: string,
+    error?: PersistedMailboxError,
+  ): PersistedMailboxDelivery {
+    return this.store.recordMailboxDeliveryAttempt(deliveryId, {
+      attempted_at: this.now(),
+      ...(error ? { error } : {}),
+    });
+  }
+
+  ack(deliveryId: string, recipientRoleId: string): PersistedMailboxDelivery {
     const envelope = this.requireDelivery(deliveryId);
-    this.assertRecipient(envelope.delivery, recipient);
+    this.assertRecipient(envelope.delivery, recipientRoleId);
     if (envelope.delivery.status === 'pending') {
       throw new MailboxDeliveryStateError(deliveryId, envelope.delivery.status);
     }
-    return this.store.acknowledgeMailboxDelivery(deliveryId, recipient, this.now());
+    return this.store.acknowledgeMailboxDelivery(deliveryId, recipientRoleId, this.now());
   }
 
   async reply(input: MailboxReplyInput): Promise<SaveMailboxReplyResult> {
-    this.validateSend(input);
     const source = this.requireDelivery(input.source_delivery_id);
-    this.assertRecipient(source.delivery, input.source_recipient);
+    this.assertRecipient(source.delivery, input.from_role_id);
+    const normalized = normalizeSendInput({
+      ...input,
+      task_id: source.message.task_id,
+      workspace_path: source.message.workspace_path,
+      thread_id: source.message.thread_id,
+      to_role_id: source.message.from_role_id,
+    });
+    this.validateSend(normalized);
+    const existing = this.store.findMailboxSendByIdempotencyKey(
+      source.message.task_id,
+      input.from_role_id,
+      input.idempotency_key,
+    );
+    if (existing) {
+      this.assertIdempotentReplay(existing, normalized);
+      if (existing.message.reply_to_message_id !== source.message.message_id) {
+        throw new MailboxValidationError('idempotency_key belongs to another reply');
+      }
+      return { source_delivery: source.delivery, reply: existing };
+    }
     if (source.delivery.status === 'pending') {
       throw new MailboxDeliveryStateError(input.source_delivery_id, source.delivery.status);
     }
     const createdAt = this.now();
-    const message = this.createMessage(
-      { ...input, thread_id: source.message.thread_id },
-      createdAt,
-      source.message.message_id,
-    );
-    const deliveries = this.createDeliveries(message.message_id, input, createdAt);
+    const message = this.createMessage(normalized, createdAt, source.message.message_id);
+    const deliveries = this.createDeliveries(message.message_id, normalized, createdAt);
     const saved = this.store.saveMailboxReply({
       source_delivery_id: input.source_delivery_id,
-      source_recipient: input.source_recipient,
+      source_recipient_role_id: input.from_role_id,
       message,
       deliveries,
       acknowledged_at: createdAt,
@@ -135,53 +211,83 @@ export class PersistentMailboxService {
       source_delivery: saved.source_delivery,
       reply: {
         message,
-        deliveries: await this.wakeDeliveries(message, deliveries),
+        deliveries,
       },
     };
   }
 
   async replayPendingDeliveries(): Promise<PersistedMailboxEnvelope[]> {
-    const replayable = this.store.listReplayableMailboxDeliveries();
-    const deliveries = await this.wakeEnvelopes(replayable);
-    return replayable.map((envelope, index) => ({
-      message: envelope.message,
-      delivery: deliveries[index] ?? envelope.delivery,
-    }));
+    return this.store.listReplayableMailboxDeliveries();
   }
 
-  private validateSend(input: Omit<MailboxSendInput, 'thread_id'> & { thread_id?: string }): void {
+  getEnvelope(deliveryId: string): PersistedMailboxEnvelope {
+    return this.requireDelivery(deliveryId);
+  }
+
+  findLatestSession(
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
+  ): string | undefined {
+    return this.store.findLatestMailboxSession(taskId, workspacePath, recipientRoleId);
+  }
+
+  findReplyDelivery(
+    sourceDeliveryId: string,
+    recipientRoleId: string,
+  ): PersistedMailboxEnvelope | undefined {
+    const source = this.requireDelivery(sourceDeliveryId);
+    return this.store
+      .listMailboxInbox(
+        source.message.task_id,
+        source.message.workspace_path,
+        recipientRoleId,
+      )
+      .find(
+        (candidate) =>
+          candidate.message.reply_to_message_id === source.message.message_id &&
+          candidate.message.thread_id === source.message.thread_id,
+      );
+  }
+
+  private validateSend(input: Omit<RequiredMailboxSendInput, 'thread_id'> & { thread_id?: string }): void {
     if (input.requires_ack && input.deadline_seconds === undefined) {
       throw new MailboxValidationError('requires_ack messages must set deadline_seconds');
     }
     if (input.deadline_seconds !== undefined && input.deadline_seconds <= 0) {
       throw new MailboxValidationError('deadline_seconds must be positive');
     }
-    if (input.to.length === 0) {
-      throw new MailboxValidationError('messages must have at least one recipient');
-    }
-    const recipients = new Set<string>();
-    for (const recipient of input.to) {
-      validateRecipient(recipient);
-      const key = recipientKey(recipient);
-      if (recipients.has(key)) throw new MailboxValidationError(`Duplicate recipient ${key}`);
-      recipients.add(key);
+    requireText(input.task_id, 'task_id');
+    requireText(input.workspace_path, 'workspace_path');
+    requireText(input.from_role_id, 'from_role_id');
+    requireText(input.to_role_id, 'to_role_id');
+    requireText(input.idempotency_key, 'idempotency_key');
+    if (!input.content.trim()) throw new MailboxValidationError('content is required');
+    if (input.thread_id !== undefined) requireText(input.thread_id, 'thread_id');
+    if (input.from_role_id === input.to_role_id) {
+      throw new MailboxValidationError('Mailbox sender and recipient must be different roles');
     }
   }
 
   private createMessage(
-    input: MailboxSendInput,
+    input: RequiredMailboxSendInput,
     createdAt: string,
     replyToMessageId?: string,
   ): PersistedMailboxMessage {
     return {
       message_id: this.createMessageId(),
+      task_id: input.task_id,
+      workspace_path: input.workspace_path,
       thread_id: input.thread_id,
-      from_agent_id: input.from_agent_id,
+      from_role_id: input.from_role_id,
+      kind: input.kind,
+      content: input.content,
       type: input.type,
       payload: { ...input.payload },
       artifact_refs: [...(input.artifact_refs ?? [])],
       requires_ack: input.requires_ack,
       ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
+      idempotency_key: input.idempotency_key,
       created_at: createdAt,
       schema_version: SCHEMA_VERSION,
     };
@@ -189,67 +295,28 @@ export class PersistentMailboxService {
 
   private createDeliveries(
     messageId: string,
-    input: Pick<MailboxSendInput, 'to' | 'deadline_seconds'>,
+    input: Pick<
+      RequiredMailboxSendInput,
+      'task_id' | 'workspace_path' | 'to_role_id' | 'deadline_seconds'
+    >,
     createdAt: string,
   ): PersistedMailboxDelivery[] {
     const deadlineAt = input.deadline_seconds
       ? new Date(Date.parse(createdAt) + input.deadline_seconds * 1000).toISOString()
       : undefined;
-    return input.to.map((recipient) => ({
+    return [{
       delivery_id: this.createDeliveryId(),
       message_id: messageId,
-      ...(recipient.agent_id ? { recipient_agent_id: recipient.agent_id } : {}),
-      ...(recipient.role_id ? { recipient_role_id: recipient.role_id } : {}),
+      task_id: input.task_id,
+      workspace_path: input.workspace_path,
+      recipient_role_id: input.to_role_id,
       status: 'pending',
       ...(deadlineAt ? { deadline_at: deadlineAt } : {}),
       retry_count: 0,
       created_at: createdAt,
       updated_at: createdAt,
       schema_version: SCHEMA_VERSION,
-    }));
-  }
-
-  private async wakeDeliveries(
-    message: PersistedMailboxMessage,
-    deliveries: PersistedMailboxDelivery[],
-  ): Promise<PersistedMailboxDelivery[]> {
-    return this.wakeEnvelopes(deliveries.map((delivery) => ({ message, delivery })));
-  }
-
-  private async wakeEnvelopes(
-    envelopes: PersistedMailboxEnvelope[],
-  ): Promise<PersistedMailboxDelivery[]> {
-    const results: PersistedMailboxDelivery[] = [];
-    for (const { message, delivery } of envelopes) {
-      let error: PersistedMailboxError | undefined;
-      try {
-        await this.wakePort.wakeAgent({
-          contract_version: 'agent-mailbox-wake.v1',
-          message_id: message.message_id,
-          delivery_id: delivery.delivery_id,
-          thread_id: message.thread_id,
-          ...(delivery.recipient_agent_id
-            ? { recipient_agent_id: delivery.recipient_agent_id }
-            : {}),
-          ...(delivery.recipient_role_id
-            ? { recipient_role_id: delivery.recipient_role_id }
-            : {}),
-          schema_version: SCHEMA_VERSION,
-        });
-      } catch (cause) {
-        error = {
-          code: 'AGENT_WAKE_FAILED',
-          message: cause instanceof Error ? cause.message : String(cause),
-        };
-      }
-      results.push(
-        this.store.recordMailboxWakeAttempt(delivery.delivery_id, {
-          attempted_at: this.now(),
-          ...(error ? { error } : {}),
-        }),
-      );
-    }
-    return results;
+    }];
   }
 
   private requireDelivery(deliveryId: string): PersistedMailboxEnvelope {
@@ -260,27 +327,88 @@ export class PersistentMailboxService {
 
   private assertRecipient(
     delivery: PersistedMailboxDelivery,
-    recipient: MessageRecipient,
+    recipientRoleId: string,
   ): void {
-    validateRecipient(recipient);
-    if (
-      (recipient.agent_id && delivery.recipient_agent_id !== recipient.agent_id) ||
-      (recipient.role_id && delivery.recipient_role_id !== recipient.role_id)
-    ) {
+    if (delivery.recipient_role_id !== recipientRoleId) {
       throw new MailboxRecipientMismatchError(delivery.delivery_id);
+    }
+  }
+
+  private assertIdempotentReplay(
+    existing: MailboxSendPersistenceResult,
+    input: Omit<RequiredMailboxSendInput, 'thread_id'> & { thread_id?: string },
+  ): void {
+    const delivery = existing.deliveries[0];
+    const expectedDeadline = input.deadline_seconds
+      ? new Date(
+          Date.parse(existing.message.created_at) + input.deadline_seconds * 1000,
+        ).toISOString()
+      : undefined;
+    if (
+      existing.message.workspace_path !== input.workspace_path ||
+      (input.thread_id !== undefined && existing.message.thread_id !== input.thread_id) ||
+      existing.message.from_role_id !== input.from_role_id ||
+      existing.message.kind !== input.kind ||
+      existing.message.content !== input.content ||
+      existing.message.type !== input.type ||
+      JSON.stringify(existing.message.payload) !== JSON.stringify(input.payload) ||
+      JSON.stringify(existing.message.artifact_refs) !==
+        JSON.stringify(input.artifact_refs ?? []) ||
+      existing.message.requires_ack !== input.requires_ack ||
+      delivery?.recipient_role_id !== input.to_role_id ||
+      delivery?.deadline_at !== expectedDeadline
+    ) {
+      throw new MailboxValidationError('idempotency_key was reused with different content');
     }
   }
 }
 
-function validateRecipient(recipient: MessageRecipient): void {
-  const count = Number(Boolean(recipient.agent_id)) + Number(Boolean(recipient.role_id));
-  if (count !== 1) {
-    throw new MailboxValidationError(
-      'message recipients must set exactly one of agent_id or role_id',
-    );
-  }
+function requireText(value: string, field: string): void {
+  if (!value.trim()) throw new MailboxValidationError(`${field} is required`);
 }
 
-function recipientKey(recipient: MessageRecipient): string {
-  return recipient.agent_id ? `agent:${recipient.agent_id}` : `role:${recipient.role_id ?? ''}`;
+interface RequiredMailboxSendInput
+  extends Omit<MailboxSendInput, 'kind' | 'content' | 'type' | 'payload' | 'requires_ack'> {
+  kind: MailboxMessageKind;
+  content: string;
+  type: AgentMessageType;
+  payload: Record<string, unknown>;
+  requires_ack: boolean;
+}
+
+/**
+ * Normalize the public Agent contract and the historical Host RPC contract
+ * into one persisted shape. New callers must provide kind/content; old rows
+ * keep their type/payload values for replay and audit compatibility.
+ */
+function normalizeSendInput(input: MailboxSendInput): RequiredMailboxSendInput {
+  const kind = input.kind ?? legacyKind(input.type);
+  const content = input.content ?? legacyContent(input.payload);
+  const type = input.type ?? (kind === 'request' ? 'ask_help' : 'status_update');
+  const payload = input.payload ?? { content };
+  const requires_ack = input.requires_ack ?? kind === 'request';
+  if (!kind) throw new MailboxValidationError('kind is required');
+  if (!content) throw new MailboxValidationError('content is required');
+  return {
+    ...input,
+    kind,
+    content,
+    type,
+    payload,
+    requires_ack,
+  };
+}
+
+function legacyKind(type: AgentMessageType | undefined): MailboxMessageKind | undefined {
+  if (!type) return undefined;
+  return type === 'ask_help' || type === 'review_request' || type === 'proposal' || type === 'decision_request'
+    ? 'request'
+    : 'notice';
+}
+
+function legacyContent(payload: Record<string, unknown> | undefined): string | undefined {
+  if (!payload) return undefined;
+  const candidate = payload.content;
+  if (typeof candidate === 'string' && candidate.trim()) return candidate;
+  return JSON.stringify(payload);
 }

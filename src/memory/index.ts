@@ -79,6 +79,7 @@ export {
 export { LlmExperienceExtractor } from './adapters/llm-experience-extractor';
 export { LlmContextCleaner } from './adapters/context-cleaner';
 export { LlmSkillPromotion } from './adapters/llm-skill-promotion';
+export { LlmPersonaInduction } from './adapters/llm-persona-induction';
 
 // ════════════════════════════════════════════════════════
 //  5. 非 LLM 适配器（降级/测试用）
@@ -87,6 +88,12 @@ export { LlmSkillPromotion } from './adapters/llm-skill-promotion';
 export { NullContextCleaner } from './adapters/null-context-cleaner';
 export { RuleBasedExperienceExtractor } from './adapters/rule-based-experience-extractor';
 export { ruleBasedSkillPromotion } from './services/skill-promotion';
+export { ruleBasedPersonaInduction } from './services/rule-based-persona-induction';
+export {
+  reviewSkill,
+  type ReviewSkillInput,
+  type SkillReviewDecision,
+} from './services/skill-review';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,
@@ -157,6 +164,7 @@ export {
 
 export { ExperienceExtractorProcessor } from './runtime/experience-extractor-processor';
 export { SkillPromotionProcessor } from './runtime/skill-promotion-processor';
+export { PersonaEvolutionProcessor } from './runtime/persona-evolution-processor';
 
 // ════════════════════════════════════════════════════════
 //  13. Tool-calling 运行时（Agent loop 工具调用模式）
@@ -197,6 +205,7 @@ export { buildAgentSystemPrompt } from './prompts/agent-system-prompt';
 export { BatchBufferTriggerPolicy } from './adapters/batch-buffer-trigger-policy';
 export { AlwaysExtractPolicy } from './adapters/always-extract-policy';
 export { DefaultPromotionTriggerPolicy } from './adapters/default-promotion-trigger-policy';
+export { DefaultPersonaTriggerPolicy } from './adapters/default-persona-trigger-policy';
 
 // ════════════════════════════════════════════════════════
 //  18. 竞争派单（Competition Claim）
@@ -233,6 +242,8 @@ export type { SkillMarketPort, SkillMarketSearchResult } from './ports/skill-mar
 export type { AgentContextCleaner, AgentContextCleanInput } from './ports/agent-context-cleaner';
 export type { BufferTriggerPolicy } from './ports/buffer-trigger-policy';
 export type { PromotionTriggerPolicy } from './ports/promotion-trigger-policy';
+export type { PersonaTriggerPolicy } from './ports/persona-trigger-policy';
+export type { PersonaInductionInput } from './services/rule-based-persona-induction';
 export type {
   AgentBoardQuery,
   AgentBoardListItem,

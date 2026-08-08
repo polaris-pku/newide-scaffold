@@ -253,29 +253,31 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     }
   }, 20_000);
 
-  it('replays durable Mailbox deliveries across restarts and supports reply', async () => {
+  it('replays a scoped pending Mailbox delivery across restarts', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-mailbox-rpc-runner-'));
     writeFakeDriver(runnerDir);
     const firstClient = new RpcChildClient(spawnBackend(runnerDir));
     let secondClient: RpcChildClient | undefined;
-    let thirdClient: RpcChildClient | undefined;
 
     try {
       const sent = await firstClient.call<{
         message: { message_id: string; thread_id: string };
         deliveries: Array<{ delivery_id: string; status: string; retry_count: number }>;
       }>('mailbox.send', {
+        task_id: 'task_mailbox_e2e',
+        workspace_path: '/workspace/mailbox-e2e',
         thread_id: 'thread_mailbox_e2e',
-        from_agent_id: 'agent_source',
-        to: [{ role_id: 'role_mailbox_recipient' }],
+        from_role_id: 'role_source',
+        to_role_id: 'role_mailbox_recipient',
         type: 'ask_help',
         payload: { question: 'Review this durable message' },
         requires_ack: true,
         deadline_seconds: 60,
+        idempotency_key: 'rpc_send_1',
       });
       expect(sent.message.thread_id).toBe('thread_mailbox_e2e');
       expect(sent.deliveries).toMatchObject([
-        { status: 'pending', retry_count: 1 },
+        { status: 'pending', retry_count: 0 },
       ]);
       const deliveryId = sent.deliveries[0]?.delivery_id;
       expect(deliveryId).toBeTruthy();
@@ -287,62 +289,17 @@ describe('Task-first JSON-RPC child process acceptance', () => {
           delivery: { delivery_id: string; status: string; retry_count: number };
           message: { message_id: string };
         }>;
-      }>('mailbox.inbox', { role_id: 'role_mailbox_recipient' });
+      }>('mailbox.inbox', {
+        task_id: 'task_mailbox_e2e',
+        workspace_path: '/workspace/mailbox-e2e',
+        role_id: 'role_mailbox_recipient',
+      });
       expect(inbox.deliveries).toMatchObject([
-        { delivery: { delivery_id: deliveryId, status: 'delivered', retry_count: 2 } },
+        { delivery: { delivery_id: deliveryId, status: 'pending', retry_count: 0 } },
       ]);
-
-      await expect(
-        secondClient.call('mailbox.ack', {
-          delivery_id: deliveryId,
-          role_id: 'role_mailbox_recipient',
-        }),
-      ).resolves.toMatchObject({ delivery_id: deliveryId, status: 'acknowledged' });
-
-      const reply = await secondClient.call<{
-        source_delivery: { delivery_id: string; status: string };
-        reply: {
-          message: { message_id: string; reply_to_message_id?: string };
-          deliveries: Array<{ delivery_id: string; status: string; retry_count: number }>;
-        };
-      }>('mailbox.reply', {
-        source_delivery_id: deliveryId,
-        source_recipient: { role_id: 'role_mailbox_recipient' },
-        from_agent_id: 'agent_mailbox_recipient',
-        to: [{ agent_id: 'agent_source' }],
-        type: 'decision_response',
-        payload: { answer: 'Reviewed' },
-        requires_ack: false,
-      });
-      expect(reply.source_delivery).toMatchObject({
-        delivery_id: deliveryId,
-        status: 'acknowledged',
-      });
-      expect(reply.reply).toMatchObject({
-        message: { reply_to_message_id: sent.message.message_id },
-        deliveries: [{ status: 'pending', retry_count: 1 }],
-      });
-      const replyDeliveryId = reply.reply.deliveries[0]?.delivery_id;
-      expect(replyDeliveryId).toBeTruthy();
-
-      await secondClient.close();
-      thirdClient = new RpcChildClient(spawnBackend(runnerDir));
-      const replyInbox = await thirdClient.call<{
-        deliveries: Array<{ delivery: { delivery_id: string; status: string; retry_count: number } }>;
-      }>('mailbox.inbox', { agent_id: 'agent_source' });
-      expect(replyInbox.deliveries).toMatchObject([
-        { delivery: { delivery_id: replyDeliveryId, status: 'delivered', retry_count: 2 } },
-      ]);
-      await expect(
-        thirdClient.call('mailbox.ack', {
-          delivery_id: replyDeliveryId,
-          agent_id: 'agent_source',
-        }),
-      ).resolves.toMatchObject({ delivery_id: replyDeliveryId, status: 'acknowledged' });
     } finally {
       await firstClient.close();
       await secondClient?.close();
-      await thirdClient?.close();
       rmSync(runnerDir, { recursive: true, force: true });
     }
   }, 20_000);

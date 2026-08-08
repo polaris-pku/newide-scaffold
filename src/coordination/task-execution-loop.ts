@@ -62,13 +62,30 @@ export interface SelectAgentStageResult extends StageResult {
   winner_agent_id: string;
 }
 
-export interface ExecuteAgentStageResult extends StageResult {
+interface ExecuteAgentCompletedStageResult extends StageResult {
   changeset_ref: string;
   expected_sha256: string;
   agent_id?: string;
   session_id?: string;
   escalation_request?: CouncilEscalationRequest;
+  mailbox_wait?: undefined;
 }
+
+interface ExecuteAgentWaitingStageResult extends StageResult {
+  changeset_ref?: undefined;
+  expected_sha256?: undefined;
+  agent_id?: string;
+  session_id?: string;
+  escalation_request?: undefined;
+  mailbox_wait: {
+    delivery_ids: string[];
+    waiting_reason: string;
+  };
+}
+
+export type ExecuteAgentStageResult =
+  | ExecuteAgentCompletedStageResult
+  | ExecuteAgentWaitingStageResult;
 
 export interface CouncilStageResult extends StageResult {
   changeset_ref: string;
@@ -213,23 +230,29 @@ export class TaskExecutionLoop {
           const result = await this.executors.execute_agent.execute(
             stageContext(state, cursorInput, controls),
           );
-          assertChangesetResult(result, 'Primary Agent');
+          if (!result.mailbox_wait) assertChangesetResult(result, 'Primary Agent');
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
           const trigger = councilTrigger(state.mode, result.escalation_request);
-          const nextInput: TaskCursorInput = trigger
+          const nextInput: TaskCursorInput = result.mailbox_wait
             ? {
+                cursor: 'mailbox_wait',
+                delivery_ids: [...result.mailbox_wait.delivery_ids],
+                waiting_reason: result.mailbox_wait.waiting_reason,
+              }
+            : trigger
+              ? {
                 cursor: 'council',
                 trigger,
                 primary_evidence_ref: evidence.uri,
                 candidate_manifest_ref: result.changeset_ref,
-              }
-            : {
+                }
+              : {
                 cursor: 'gate',
                 subject_ref: result.changeset_ref,
                 phase: 'post_primary',
                 changeset_ref: result.changeset_ref,
                 expected_sha256: result.expected_sha256,
-              };
+                };
           const committed = this.advanceWithEvidence(
             state,
             cursorInput.cursor,
@@ -240,7 +263,7 @@ export class TaskExecutionLoop {
             {
               ...(result.agent_id ? { owner_agent_id: result.agent_id } : {}),
               ...(result.session_id ? { session_id: result.session_id } : {}),
-              ...(!trigger
+              ...(!result.mailbox_wait && !trigger
                 ? {
                     council_override_input: {
                       cursor: 'council' as const,

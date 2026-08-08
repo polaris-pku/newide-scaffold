@@ -153,10 +153,18 @@ export function createProductionStageExecutors(
       context.signal?.throwIfAborted();
       const executionWorkspace =
         context.mode === 'council'
-          ? path.join(councilRunWorkspaceRoot(dependencies.councilRoot, context.run_id), 'primary')
+          ? path.join(
+              councilRunWorkspaceRoot(
+                dependencies.councilRoot,
+                context.restarted_from_run_id ?? context.run_id,
+              ),
+              'primary',
+            )
           : context.workspace_path;
       if (context.mode === 'council') {
-        await prepareCouncilWorkspace(context.workspace_path, executionWorkspace);
+        if (!context.restarted_from_run_id) {
+          await prepareCouncilWorkspace(context.workspace_path, executionWorkspace);
+        }
       } else {
         await fs.mkdir(executionWorkspace, { recursive: true });
       }
@@ -172,7 +180,7 @@ export function createProductionStageExecutors(
           task_id: context.task_id,
           run_id: context.run_id,
           role_id: context.cursor_input.winner_agent_id,
-          instruction: context.task_request.spec,
+          instruction: agentExecutionInstruction(context),
           workspace_path: executionWorkspace,
           input_artifact_refs: [],
           context_policy: 'production_task_loop',
@@ -181,12 +189,68 @@ export function createProductionStageExecutors(
             ? { memory_ablation: context.memory_ablation }
             : {}),
           ...(context.session_id ? { session_id: context.session_id } : {}),
+          ...(context.cursor_input.mailbox_delivery_id
+            ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
+            : {}),
         },
         {
           ...(context.signal ? { signal: context.signal } : {}),
           ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
         },
       );
+      const mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
+      if (mailboxWait) {
+        await stateStore.update(
+          context.run_id,
+          context.task_id,
+          { primary: { result } },
+          context.restarted_from_run_id,
+        );
+        emit(context, 'memory.context_pack_built', result.context_pack_ref, {
+          agent_id: result.agent_id ?? result.role_id,
+          role_id: result.role_id,
+          context_pack_ref: result.context_pack_ref,
+          memory_buffer_ref: result.memory_buffer_ref,
+          diagnostics: result.diagnostics,
+        });
+        emit(context, 'agent.execution_completed', result.agent_run_id, {
+          agent_id: result.agent_id ?? result.role_id,
+          role_id: result.role_id,
+          status: result.status,
+          ...(result.diagnostics.driver_status === 'not_invoked'
+            ? {}
+            : { session_id: result.session_id }),
+          response: result.response,
+          artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
+          transcript_ref: result.transcript_ref.artifact_id,
+          context_pack_ref: result.context_pack_ref,
+          memory_buffer_ref: result.memory_buffer_ref,
+          driver_run_result_id: result.driver_run_result_id,
+          diagnostics: result.diagnostics,
+        });
+        return {
+          agent_id: result.agent_id ?? result.role_id,
+          ...(result.diagnostics.driver_status === 'not_invoked'
+            ? {}
+            : { session_id: result.session_id }),
+          mailbox_wait: mailboxWait,
+          evidence: {
+            status: result.status,
+            agent_id: result.agent_id ?? result.role_id,
+            role_id: result.role_id,
+            ...(result.diagnostics.driver_status === 'not_invoked'
+              ? {}
+              : { session_id: result.session_id }),
+            context_pack_ref: result.context_pack_ref,
+            memory_buffer_ref: result.memory_buffer_ref,
+            mailbox_wait: mailboxWait,
+          },
+          artifact_refs: [
+            result.transcript_ref.artifact_id,
+            ...result.artifact_refs.map((artifact) => artifact.artifact_id),
+          ],
+        };
+      }
       if (result.status !== 'completed') {
         if (context.mode !== 'council') {
           throw new Error(`Primary Agent ended with status ${result.status}`);
@@ -354,9 +418,13 @@ export function createProductionStageExecutors(
         created_at: nowTimestamp(),
         schema_version: SCHEMA_VERSION,
       };
+      const strategyName = (
+        dependencies.councilProvider as CouncilProvider & { strategyName?: string }
+      ).strategyName;
       emit(context, 'council.started', context.run_id, {
         trigger: context.cursor_input.trigger,
         candidate_artifact_refs: evidencePack.artifact_refs,
+        ...(strategyName ? { strategy: strategyName } : {}),
       });
       const selector = new ArtifactSelector({
         mode: 'council',
@@ -424,6 +492,8 @@ export function createProductionStageExecutors(
         synthesis: councilRunResult.synthesis,
         output: councilRunResult.output,
         result: councilRunResult.result,
+        outcome: councilRunResult.outcome,
+        ...(strategyName ? { strategy: strategyName } : {}),
       });
       emit(context, 'artifact.selected', selection.manifest_ref, {
         mode: 'council',
@@ -437,6 +507,8 @@ export function createProductionStageExecutors(
           decision: councilRunResult.decision,
           participants: councilRunResult.participants,
           selected_artifact_refs: councilRunResult.selected_artifact_refs,
+          outcome: councilRunResult.outcome,
+          ...(strategyName ? { strategy: strategyName } : {}),
           changeset_ref: selection.manifest_ref,
           expected_sha256: selection.expected_sha256,
         },
@@ -660,6 +732,41 @@ export function createProductionStageExecutors(
     council,
     gate,
     deliver,
+  };
+}
+
+function agentExecutionInstruction(
+  context: TaskStageExecutionContext<'execute_agent'>,
+): string {
+  const deliveryId = context.cursor_input.mailbox_delivery_id;
+  if (!deliveryId) return context.task_request.spec;
+  return [
+    `Continue the original Task after receiving Mailbox delivery ${deliveryId}.`,
+    'This delivery is the reply to a request already sent by this Agent. Process the inbound reply first through invoke_driver.',
+    'Do not send another Mailbox request for the same task. After processing the reply, continue and complete the original Task.',
+    `Original Task: ${context.task_request.spec}`,
+  ].join('\n');
+}
+
+function mailboxWaitFromResult(
+  result: AgentExecutionResult,
+): { delivery_ids: string[]; waiting_reason: string } | undefined {
+  const outcomes = result.diagnostics.mailbox_outcomes;
+  if (!Array.isArray(outcomes)) return undefined;
+  const waiting = outcomes.find(
+    (outcome) =>
+      outcome !== null &&
+      typeof outcome === 'object' &&
+      Reflect.get(outcome, 'kind') === 'request' &&
+      Reflect.get(outcome, 'wait_for_reply') === true &&
+      typeof Reflect.get(outcome, 'delivery_id') === 'string',
+  );
+  if (!waiting) return undefined;
+  const deliveryId = String(Reflect.get(waiting, 'delivery_id'));
+  const recipient = String(Reflect.get(waiting, 'to_role_id') ?? 'recipient');
+  return {
+    delivery_ids: [deliveryId],
+    waiting_reason: `Waiting for Mailbox reply from ${recipient}`,
   };
 }
 

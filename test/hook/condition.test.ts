@@ -20,7 +20,7 @@ function makeEngine(ifExpression: string) {
       gates: {
         'allow-gate': {
           type: 'command',
-          run: 'node -e "process.exit(0)"',
+          command: 'node -e "process.exit(0)"',
           retry_threshold: 1,
         },
       },
@@ -131,6 +131,13 @@ describe('in operator', () => {
       payload: { risk_level: 'low' },
     });
     expect(matched).toBe(false);
+  });
+
+  it('in operator works with arrays stored in payload', async () => {
+    const matched = await evaluateCondition("'high' in payload.levels", {
+      payload: { levels: ['low', 'medium', 'high'] },
+    });
+    expect(matched).toBe(true);
   });
 });
 
@@ -397,7 +404,7 @@ describe('exists operator', () => {
         gates: {
           'allow-gate': {
             type: 'command',
-            run: 'node -e "process.exit(0)"',
+            command: 'node -e "process.exit(0)"',
             retry_threshold: 1,
           },
         },
@@ -516,7 +523,7 @@ describe('edge cases', () => {
         gates: {
           'allow-gate': {
             type: 'command',
-            run: 'node -e "process.exit(0)"',
+            command: 'node -e "process.exit(0)"',
             retry_threshold: 1,
           },
         },
@@ -552,7 +559,7 @@ describe('edge cases', () => {
         gates: {
           'allow-gate': {
             type: 'command',
-            run: 'node -e "process.exit(0)"',
+            command: 'node -e "process.exit(0)"',
             retry_threshold: 1,
           },
         },
@@ -576,6 +583,14 @@ describe('edge cases', () => {
     );
     // Expect false — value contains special chars that don't match glob *.ts
     expect(matched).toBe(false);
+  });
+
+  it('does not reject dangerous-looking string literals in patterns', async () => {
+    const matched = await evaluateCondition(
+      "payload.file_path matches '.constructor'",
+      { payload: { file_path: '.constructor' } },
+    );
+    expect(matched).toBe(true);
   });
 
   it('regex with literal dot in pattern matches literally', async () => {

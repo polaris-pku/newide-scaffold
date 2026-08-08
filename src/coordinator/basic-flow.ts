@@ -172,7 +172,7 @@ export async function runBasicFlow(options?: BasicFlowOptions): Promise<BasicFlo
       gates: {
         'allow-gate': {
           type: 'command',
-          run: 'node -e "process.exit(0)"',
+          command: 'node -e "process.exit(0)"',
           retry_threshold: 1,
         },
       },

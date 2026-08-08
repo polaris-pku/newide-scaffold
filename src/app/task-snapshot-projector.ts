@@ -100,6 +100,7 @@ function projectCouncil(
     ...(council?.decision_id ? { decision_id: council.decision_id } : {}),
     ...(isCouncilVerdict(council?.verdict) ? { verdict: council.verdict } : {}),
     ...(parsedResult.success ? { result: parsedResult.data } : {}),
+    ...(council?.outcome ? { outcome: { ...council.outcome } } : {}),
   };
 }
 

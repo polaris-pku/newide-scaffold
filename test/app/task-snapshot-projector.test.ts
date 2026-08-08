@@ -59,6 +59,16 @@ describe('projectTaskSnapshot', () => {
       verification_refs: ['verification_1'],
       decision_record_ref: 'decision_1',
     };
+    const outcome = {
+      status: 'needs_human' as const,
+      participant_role_ids: ['role_a', 'role_b'],
+      selected_artifact_refs: ['artifact_final'],
+      decision_summary: 'Selected the best available candidate.',
+      quality: 'best_effort' as const,
+      unresolved_issues: ['optional benchmark was unavailable'],
+      warnings: ['review coverage was incomplete'],
+      audit_refs: ['decision_1'],
+    };
     const terminal = runSnapshot({
       market: {
         winner_agent_id: 'agent_winner',
@@ -78,6 +88,7 @@ describe('projectTaskSnapshot', () => {
         blocked_by: [],
         can_create_merge_authorization: false,
         result,
+        outcome,
       },
       artifacts: [{ artifact_id: 'artifact_final' }],
       final_output: {
@@ -118,6 +129,7 @@ describe('projectTaskSnapshot', () => {
       decision_id: 'decision_1',
       verdict: 'select',
       result,
+      outcome,
     });
     expect(snapshot.warnings).toEqual(result.warnings);
     expect(snapshot.final_output).toEqual({

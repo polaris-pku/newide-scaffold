@@ -46,6 +46,8 @@ export interface AgentMemoryScope {
 
   saveExperience(experience: ExperienceRecord): Promise<void>;
   saveSkill(skill: SkillRecord): Promise<void>;
+  /** 覆盖写入当前 Persona 快照（如 Persona 演化后 version+1） */
+  savePersona(persona: PersonaDef): Promise<void>;
   updateSkill(skill: SkillRecord): Promise<void>;
   updateExperience(experience: ExperienceRecord): Promise<void>;
 }

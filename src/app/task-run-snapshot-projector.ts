@@ -5,7 +5,11 @@ import type {
   PersistedTaskAggregate,
   TaskResumeCursor,
 } from '../persistence';
-import { runSnapshotSchema, type RunSnapshot } from '../protocol/run-snapshot';
+import {
+  councilOutcomeEvidenceSchema,
+  runSnapshotSchema,
+  type RunSnapshot,
+} from '../protocol/run-snapshot';
 import { projectRunEventSource } from '../protocol/run-event';
 import type { RunOutcome } from '../coordinator/run-outcome';
 import { buildRunOutputPaths } from '../coordinator/run-result';
@@ -256,6 +260,7 @@ function councilProjection(
 ): NonNullable<RunSnapshot['council']> {
   const payload = event?.payload ?? {};
   const output = asRecord(payload.output);
+  const outcome = councilOutcomeEvidenceSchema.safeParse(payload.outcome);
   return {
     enabled: true,
     status,
@@ -274,6 +279,7 @@ function councilProjection(
     ...(asRecord(payload.synthesis) ? { synthesis: asRecord(payload.synthesis) } : {}),
     ...(output ? { output } : {}),
     ...(asRecord(payload.result) ? { result: asRecord(payload.result) } : {}),
+    ...(outcome.success ? { outcome: outcome.data } : {}),
   };
 }
 

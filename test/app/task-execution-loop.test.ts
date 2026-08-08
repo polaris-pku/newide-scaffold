@@ -57,6 +57,25 @@ describe('TaskExecutionLoop', () => {
     expect(fixture.memoryAblations).toEqual(['B0', 'B0', 'B0', 'B0']);
   });
 
+  it('stops at mailbox_wait without inventing a changeset', async () => {
+    const fixture = createFixture({ mailboxWait: true });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const waiting = await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(fixture.calls).toEqual(['select_agent', 'execute_agent']);
+    expect(waiting).toMatchObject({
+      task: { status: 'running', owner_agent_id: 'agent_a' },
+    });
+    expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state).toMatchObject({
+      resume_cursor: 'mailbox_wait',
+      cursor_input: {
+        cursor: 'mailbox_wait',
+        delivery_ids: ['delivery_review'],
+      },
+    });
+  });
+
   it('refuses a legacy cursor projection that has no matching typed input', async () => {
     const fixture = createFixture();
     begin(fixture.processor, selectInput, 'single_agent');
@@ -306,6 +325,7 @@ describe('TaskExecutionLoop', () => {
 });
 
 interface FixtureOptions {
+  mailboxWait?: boolean;
   requestCouncil?: boolean;
   failAt?: TaskCursorInput['cursor'];
   evidenceFailureAt?: TaskCursorInput['cursor'];
@@ -367,16 +387,34 @@ function createFixture(options: FixtureOptions = {}): {
       }),
     },
     execute_agent: {
-      execute: execute('execute_agent', {
-        changeset_ref: 'artifact_primary_changeset',
-        expected_sha256: 'd'.repeat(64),
-        agent_id: 'agent_a',
-        session_id: 'session_primary',
-        evidence: { response: 'implementation complete' },
-        ...(options.requestCouncil
-          ? { escalation_request: { type: 'request_council' as const, reason: 'review needed' } }
-          : {}),
-      }),
+      execute: execute(
+        'execute_agent',
+        options.mailboxWait
+          ? {
+              agent_id: 'agent_a',
+              session_id: 'session_primary',
+              mailbox_wait: {
+                delivery_ids: ['delivery_review'],
+                waiting_reason: 'Waiting for reviewer',
+              },
+              evidence: { status: 'waiting' },
+            }
+          : {
+              changeset_ref: 'artifact_primary_changeset',
+              expected_sha256: 'd'.repeat(64),
+              agent_id: 'agent_a',
+              session_id: 'session_primary',
+              evidence: { response: 'implementation complete' },
+              ...(options.requestCouncil
+                ? {
+                    escalation_request: {
+                      type: 'request_council' as const,
+                      reason: 'review needed',
+                    },
+                  }
+                : {}),
+            },
+      ),
     },
     council: {
       execute: execute('council', {

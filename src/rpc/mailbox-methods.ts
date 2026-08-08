@@ -1,6 +1,6 @@
 /** mailbox.* JSON-RPC 方法适配器。 */
 import { z } from 'zod';
-import type { AgentMessageType, MessageRecipient } from '../core';
+import type { AgentMessageType } from '../core';
 import {
   MailboxDeliveryNotFoundError,
   MailboxDeliveryStateError,
@@ -24,23 +24,17 @@ export interface MailboxMethodsService {
     deliveries: PersistedMailboxDelivery[];
   }>;
   listMailboxInbox(
-    recipient: MessageRecipient,
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
     afterDeliveryId?: string,
   ): Promise<PersistedMailboxEnvelope[]>;
   acknowledgeMailboxDelivery(
     deliveryId: string,
-    recipient: MessageRecipient,
+    recipientRoleId: string,
   ): Promise<PersistedMailboxDelivery>;
   replyMailboxMessage(input: MailboxReplyInput): Promise<SaveMailboxReplyResult>;
 }
-
-const recipientSchema = z
-  .object({
-    agent_id: z.string().trim().min(1).optional(),
-    role_id: z.string().trim().min(1).optional(),
-  })
-  .strict()
-  .refine((value) => (value.agent_id !== undefined) !== (value.role_id !== undefined));
 
 const messageTypeSchema = z.enum([
   'ask_help',
@@ -58,46 +52,46 @@ const messageTypeSchema = z.enum([
 
 const sendParamsSchema = z
   .object({
+    task_id: z.string().trim().min(1),
+    workspace_path: z.string().trim().min(1),
     thread_id: z.string().trim().min(1),
-    from_agent_id: z.string().trim().min(1),
-    to: z.array(recipientSchema).min(1),
+    from_role_id: z.string().trim().min(1),
+    to_role_id: z.string().trim().min(1),
     type: messageTypeSchema,
     payload: z.record(z.string(), z.unknown()),
     artifact_refs: z.array(z.string().trim().min(1)).optional(),
     requires_ack: z.boolean(),
     deadline_seconds: z.number().int().positive().optional(),
+    idempotency_key: z.string().trim().min(1),
   })
   .strict();
 
 const inboxParamsSchema = z
   .object({
-    agent_id: z.string().trim().min(1).optional(),
-    role_id: z.string().trim().min(1).optional(),
+    task_id: z.string().trim().min(1),
+    workspace_path: z.string().trim().min(1),
+    role_id: z.string().trim().min(1),
     after_delivery_id: z.string().trim().min(1).optional(),
   })
-  .strict()
-  .refine((value) => (value.agent_id !== undefined) !== (value.role_id !== undefined));
+  .strict();
 
 const ackParamsSchema = z
   .object({
     delivery_id: z.string().trim().min(1),
-    agent_id: z.string().trim().min(1).optional(),
-    role_id: z.string().trim().min(1).optional(),
+    role_id: z.string().trim().min(1),
   })
-  .strict()
-  .refine((value) => (value.agent_id !== undefined) !== (value.role_id !== undefined));
+  .strict();
 
 const replyParamsSchema = z
   .object({
     source_delivery_id: z.string().trim().min(1),
-    source_recipient: recipientSchema,
-    from_agent_id: z.string().trim().min(1),
-    to: z.array(recipientSchema).min(1),
+    from_role_id: z.string().trim().min(1),
     type: messageTypeSchema,
     payload: z.record(z.string(), z.unknown()),
     artifact_refs: z.array(z.string().trim().min(1)).optional(),
     requires_ack: z.boolean(),
     deadline_seconds: z.number().int().positive().optional(),
+    idempotency_key: z.string().trim().min(1),
   })
   .strict();
 
@@ -115,14 +109,19 @@ export class MailboxRpcMethods {
       const parsed = parseParams(inboxParamsSchema, params);
       return this.callWithMailboxError(() =>
         this.service
-          .listMailboxInbox(toRecipient(parsed), parsed.after_delivery_id)
+          .listMailboxInbox(
+            parsed.task_id,
+            parsed.workspace_path,
+            parsed.role_id,
+            parsed.after_delivery_id,
+          )
           .then((deliveries) => ({ deliveries })),
       );
     });
     dispatcher.register('mailbox.ack', (params) => {
       const parsed = parseParams(ackParamsSchema, params);
       return this.callWithMailboxError(() =>
-        this.service.acknowledgeMailboxDelivery(parsed.delivery_id, toRecipient(parsed)),
+        this.service.acknowledgeMailboxDelivery(parsed.delivery_id, parsed.role_id),
       );
     });
     dispatcher.register('mailbox.reply', (params) => {
@@ -130,16 +129,15 @@ export class MailboxRpcMethods {
       return this.callWithMailboxError(() =>
         this.service.replyMailboxMessage({
           source_delivery_id: parsed.source_delivery_id,
-          source_recipient: toRecipient(parsed.source_recipient),
-          from_agent_id: parsed.from_agent_id,
-          to: parsed.to.map((recipient) => toRecipient(recipient)),
+          from_role_id: parsed.from_role_id,
           type: parsed.type as AgentMessageType,
           payload: { ...parsed.payload },
           ...(parsed.artifact_refs ? { artifact_refs: [...parsed.artifact_refs] } : {}),
           requires_ack: parsed.requires_ack,
           ...(parsed.deadline_seconds !== undefined
             ? { deadline_seconds: parsed.deadline_seconds }
-            : {}),
+              : {}),
+          idempotency_key: parsed.idempotency_key,
         }),
       );
     });
@@ -186,23 +184,20 @@ function parseParams<T>(schema: z.ZodType<T>, params: unknown): T {
   return parsed.data;
 }
 
-type RawRecipient = { agent_id?: string | undefined; role_id?: string | undefined };
-
-function toRecipient(input: RawRecipient): MessageRecipient {
-  return input.agent_id ? { agent_id: input.agent_id } : { role_id: input.role_id as string };
-}
-
 function toSendInput(input: z.infer<typeof sendParamsSchema>): MailboxSendInput {
   return {
+    task_id: input.task_id,
+    workspace_path: input.workspace_path,
     thread_id: input.thread_id,
-    from_agent_id: input.from_agent_id,
-    to: input.to.map((recipient) => toRecipient(recipient)),
+    from_role_id: input.from_role_id,
+    to_role_id: input.to_role_id,
     type: input.type as AgentMessageType,
     payload: { ...input.payload },
     ...(input.artifact_refs ? { artifact_refs: [...input.artifact_refs] } : {}),
     requires_ack: input.requires_ack,
     ...(input.deadline_seconds !== undefined
       ? { deadline_seconds: input.deadline_seconds }
-      : {}),
+        : {}),
+    idempotency_key: input.idempotency_key,
   };
 }

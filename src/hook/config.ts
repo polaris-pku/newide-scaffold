@@ -1,4 +1,4 @@
-import { type GateDecision, type SubGateRef } from '../gate';
+import { type GateDecision, type SubGateRef, type GateOutputConfig } from '../gate';
 import type { HookPoint } from './constants';
 
 // ──────────────────────────────────────────────
@@ -23,18 +23,18 @@ export interface HookSettings {
 export interface GateConfig {
   /** Gate runner type */
   type: 'command' | 'prompt' | 'composite' | 'http';
-  /** Command string (command type), prompt text (prompt type), or URL (http type) */
-  run?: string;
-  /** Model identifier for prompt-type gates */
+  /** Shell command (type: command) */
+  command?: string;
+  /** Prompt text (type: prompt) */
+  prompt?: string;
+  /** Model identifier (type: prompt) */
   model?: string;
-  /** Sub-gate references for composite-type gates */
+  /** HTTP URL (type: http) */
+  http?: string;
+  /** Sub-gate references (type: composite) */
   gates?: SubGateRef[];
-  /** Output format configuration */
-  output?: {
-    format?: string;
-  };
-  /** Severity-to-decision mapping */
-  severity_map?: Record<string, GateDecision>;
+  /** Output format parsing and decision-mapping configuration */
+  output?: GateOutputConfig;
   /** Gate timeout override in seconds */
   timeout?: number;
   /** Maximum retry attempts (default 3) */

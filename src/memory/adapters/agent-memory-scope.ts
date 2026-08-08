@@ -95,6 +95,10 @@ class ScopedAgentMemory implements AgentMemoryScope {
     return this.repository.saveSkill(this.role_id, skill);
   }
 
+  savePersona(persona: PersonaDef): Promise<void> {
+    return this.repository.savePersona(this.role_id, persona);
+  }
+
   updateSkill(skill: SkillRecord): Promise<void> {
     return this.repository.updateSkill(this.role_id, skill);
   }
