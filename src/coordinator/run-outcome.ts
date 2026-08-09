@@ -1,4 +1,5 @@
 export type RunOutcomeStatus =
+  | 'completed'
   | 'verified'
   | 'best_effort'
   | 'failed'
@@ -24,5 +25,5 @@ export interface RunOutcome {
 }
 
 export function isCompletedRunOutcome(status: RunOutcomeStatus): boolean {
-  return status === 'verified' || status === 'best_effort';
+  return status === 'completed' || status === 'verified' || status === 'best_effort';
 }

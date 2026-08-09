@@ -54,6 +54,9 @@ describe('Council strategy boundary', () => {
     expect(output.outcome?.unresolved_issues).toContain(
       'proposal proposal_b lacks a review by another role_id',
     );
+    expect(output.outcome?.unresolved_issues).not.toContain(
+      'lead role_a is also a proposer; independent lead evidence is required',
+    );
   });
 
   it('rejects an unknown strategy instead of silently falling back', () => {

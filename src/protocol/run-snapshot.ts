@@ -6,7 +6,7 @@ const recordSchema = z.record(z.string(), z.unknown());
 const taskStatusSchema = z.enum(TASK_STATUSES);
 const runOutcomeSchema = z
   .object({
-    status: z.enum(['verified', 'best_effort', 'failed', 'blocked', 'cancelled']),
+    status: z.enum(['completed', 'verified', 'best_effort', 'failed', 'blocked', 'cancelled']),
     reason: z.string().min(1),
     criteria: z.array(
       z
