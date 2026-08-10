@@ -6,6 +6,20 @@ import path from 'node:path';
 /** Namespace for snapshot refs that keep safepoint commits reachable across `git gc`. */
 const SNAPSHOT_REF_PREFIX = 'refs/newide/safepoints';
 
+/**
+ * Runtime/coordination files that must never enter a workspace snapshot.
+ * Capturing them makes resume try to overwrite live SQLite handles and fails on Windows.
+ */
+const SNAPSHOT_EXCLUDE_GLOBS = [
+  '*.sqlite',
+  '*.sqlite-shm',
+  '*.sqlite-wal',
+  '*.sqlite-journal',
+  '*.db',
+  '*.db-shm',
+  '*.db-wal',
+] as const;
+
 export interface FileAnchor {
   base_commit: string;
   /** Commit object holding the captured worktree content. Absent when not capturable. */
@@ -147,10 +161,15 @@ export function restoreFileAnchor(
   const indexDir = mkdtempSync(path.join(os.tmpdir(), 'newide-anchor-restore-'));
   const indexFile = path.join(indexDir, 'index');
   try {
-    const snapshotFiles = listTreeFiles(worktree, verification.snapshot_commit);
-    const beforeFiles = new Set(listWorktreeFiles(worktree));
+    const snapshotFiles = listTreeFiles(worktree, verification.snapshot_commit).filter(
+      (file) => !isRuntimeDatabasePath(file),
+    );
+    const beforeFiles = new Set(
+      listWorktreeFiles(worktree).filter((file) => !isRuntimeDatabasePath(file)),
+    );
 
     git(worktree, ['read-tree', verification.snapshot_commit], indexFile);
+    excludeRuntimeDatabaseFiles(worktree, indexFile);
     git(worktree, ['checkout-index', '-a', '-f'], indexFile);
 
     const extraFiles = [...beforeFiles].filter((file) => !snapshotFiles.includes(file)).sort();
@@ -212,6 +231,8 @@ function captureSnapshotCommit(
   try {
     git(worktree, ['read-tree', baseCommit], indexFile);
     git(worktree, ['add', '-A'], indexFile);
+    // Drop live coordination DBs / lockfiles so restore never fights an open SQLite handle.
+    excludeRuntimeDatabaseFiles(worktree, indexFile);
     const tree = git(worktree, ['write-tree'], indexFile);
     const commit = git(worktree, [
       'commit-tree',
@@ -239,6 +260,29 @@ function captureSnapshotCommit(
   } finally {
     rmSync(indexDir, { recursive: true, force: true });
   }
+}
+
+function excludeRuntimeDatabaseFiles(worktree: string, indexFile: string): void {
+  for (const pattern of SNAPSHOT_EXCLUDE_GLOBS) {
+    try {
+      git(worktree, ['rm', '-r', '--cached', '-f', '--ignore-unmatch', '--', pattern], indexFile);
+    } catch {
+      // pattern may match nothing
+    }
+  }
+}
+
+function isRuntimeDatabasePath(filePath: string): boolean {
+  const base = path.basename(filePath).toLowerCase();
+  return (
+    base.endsWith('.sqlite') ||
+    base.endsWith('.sqlite-shm') ||
+    base.endsWith('.sqlite-wal') ||
+    base.endsWith('.sqlite-journal') ||
+    base.endsWith('.db') ||
+    base.endsWith('.db-shm') ||
+    base.endsWith('.db-wal')
+  );
 }
 
 function readModifiedFiles(worktree: string): string[] {
@@ -282,11 +326,20 @@ function unavailableAnchor(worktreePath: string, reason: string): FileAnchor {
 }
 
 function git(cwd: string, args: string[], indexFile?: string): string {
+  // Force LF and no autocrlf so snapshot bytes match what the agent wrote, even on Windows.
   return execFileSync('git', args, {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 15_000,
-    ...(indexFile ? { env: { ...process.env, GIT_INDEX_FILE: indexFile } } : {}),
+    env: {
+      ...process.env,
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.autocrlf',
+      GIT_CONFIG_VALUE_0: 'false',
+      GIT_CONFIG_KEY_1: 'core.eol',
+      GIT_CONFIG_VALUE_1: 'lf',
+      ...(indexFile ? { GIT_INDEX_FILE: indexFile } : {}),
+    },
   }).trim();
 }

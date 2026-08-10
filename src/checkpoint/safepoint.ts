@@ -70,8 +70,9 @@ export function buildSafepointCheckpoint(
         snapshot_commit: inheritedSnapshot.snapshot_commit,
         worktree_path: inheritedSnapshot.worktree_path,
         branch: inheritedSnapshot.branch,
-        modified_files: inheritedSnapshot.modified_files,
-        recoverable: true,
+        modified_files: [...inheritedSnapshot.modified_files],
+        // Inherit only when a snapshot commit exists; metadata-only anchors stay unrecoverable.
+        recoverable: Boolean(inheritedSnapshot.snapshot_commit),
       }
     : captureFileAnchor(aggregate.task.workspace_path, { label: checkpointId });
   const agentId =
