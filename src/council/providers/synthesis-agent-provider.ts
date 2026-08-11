@@ -285,6 +285,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           council_seat: participant.seat,
           council_seat_index: participant.seat_index,
           instruction: requireDriverDelegation(instruction),
+          driver_instruction: instruction,
           workspace_path: workspacePath,
           input_artifact_refs: inputArtifactRefs,
           context_policy: `council_${participant.seat}`,

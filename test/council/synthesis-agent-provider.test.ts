@@ -69,6 +69,9 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(requests).toHaveLength(4);
     expect(requests[0]?.instruction).toContain('council-plan.md');
     expect(requests[0]?.instruction).toContain('Do not modify product files');
+    expect(requests[0]?.instruction).toContain('call the invoke_driver tool');
+    expect(requests[0]?.driver_instruction).toContain('council-plan.md');
+    expect(requests[0]?.driver_instruction).not.toContain('invoke_driver');
     expect(requests[2]?.instruction).toContain('Review the staged Council Plan inputs');
     expect(requests[3]?.instruction).toContain('final-plan.md');
     expect(requests[3]?.instruction).toContain('Do not implement');

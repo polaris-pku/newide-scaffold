@@ -657,6 +657,28 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
   });
 
+  it('keeps Host-only delegation guidance out of the Driver task instruction', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const { facade } = createFacade(
+      driver,
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+    );
+
+    await facade.runAgent({
+      ...request('task_clean_driver_instruction', 'proposer_a'),
+      instruction:
+        'Draft the Council proposal.\n\nCouncil execution requirement: call the invoke_driver tool.',
+      driver_instruction: 'Draft the Council proposal.',
+    });
+
+    const prompt = parseDriverContext(driver.prompts[0]!.prompt) as {
+      task_instruction: string;
+    };
+    expect(prompt.task_instruction).toBe('Draft the Council proposal.');
+    expect(driver.prompts[0]!.prompt).not.toContain('Council execution requirement');
+  });
+
   it.each([
     ['failed', 'failed'],
     ['cancelled', 'cancelled'],
