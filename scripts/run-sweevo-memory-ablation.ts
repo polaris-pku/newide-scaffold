@@ -152,7 +152,7 @@ const driverRunnerRaw =
   process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
 const driverEnvFileRaw = process.env.ACP_DRIVER_ENV_FILE ?? fileEnv.ACP_DRIVER_ENV_FILE;
 const sweEvoRootRaw = process.env.NEWIDE_SWE_EVO_ROOT ?? fileEnv.NEWIDE_SWE_EVO_ROOT;
-const baseEnv = {
+const baseEnv: NodeJS.ProcessEnv = {
   ...process.env,
   ...fileEnv,
   ACP_DRIVER_RUNNER_DIR: path.resolve(
@@ -186,6 +186,38 @@ if (unlimitedRunTimeout) {
 // SWE-EVO paper alignment: deny WebFetch/WebSearch and network Bash at ACP permission gate.
 // Override with NEWIDE_SWE_EVO_BLOCK_INTERNET=0 only for debugging.
 baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET ??= '1';
+// Anti-hacking: jail the agent process to the current workspace only (bubblewrap).
+// Override with NEWIDE_EVAL_FS_JAIL=0 only for debugging.
+baseEnv.NEWIDE_EVAL_FS_JAIL ??= '1';
+// Translate benchmark policy into ACP's generic process-sandbox contract.
+baseEnv.ACP_DENY_NETWORK_TOOLS ??= baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET;
+baseEnv.ACP_DENY_PATH_SUBSTRINGS_JSON ??= JSON.stringify([
+  'eval-mirrors',
+  '/eval/data',
+  'test_patch',
+  'patch_without_test',
+  'site-packages',
+  'dist-packages',
+  'miniconda',
+  'anaconda',
+]);
+baseEnv.ACP_PROCESS_SANDBOX ??= baseEnv.NEWIDE_EVAL_FS_JAIL;
+baseEnv.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES ??= '1';
+baseEnv.ACP_PROCESS_SANDBOX_RO_PATHS_JSON ??= JSON.stringify([
+  '.claude/settings.json',
+  '.git/config',
+]);
+if (baseEnv.NEWIDE_EVAL_FS_JAIL_BWRAP) {
+  baseEnv.ACP_PROCESS_SANDBOX_BWRAP ??= baseEnv.NEWIDE_EVAL_FS_JAIL_BWRAP;
+}
+if (baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE) {
+  baseEnv.ACP_PROCESS_SANDBOX_NPM_CACHE ??= baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE;
+}
+if (baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS) {
+  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON ??= JSON.stringify(
+    baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS.split(path.delimiter).filter(Boolean),
+  );
+}
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
@@ -196,6 +228,7 @@ log(
 );
 log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
 log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
+log(`NEWIDE_EVAL_FS_JAIL: ${baseEnv.NEWIDE_EVAL_FS_JAIL}`);
 const permissionBuildPath = path.join(
   String(baseEnv.ACP_DRIVER_RUNNER_DIR),
   'dist',
@@ -205,7 +238,7 @@ const permissionBuildPath = path.join(
 );
 const permissionBuildSupportsOfflineBlock =
   existsSync(permissionBuildPath) &&
-  readFileSync(permissionBuildPath, 'utf-8').includes('NEWIDE_SWE_EVO_BLOCK_INTERNET');
+  readFileSync(permissionBuildPath, 'utf-8').includes('ACP_DENY_NETWORK_TOOLS');
 if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !permissionBuildSupportsOfflineBlock) {
   throw new Error(
     [
@@ -215,12 +248,43 @@ if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !permissionBuildSupportsOff
     ].join(' '),
   );
 }
+const jailBuildPath = path.join(
+  String(baseEnv.ACP_DRIVER_RUNNER_DIR),
+  'dist',
+  'src',
+  'security',
+  'eval-fs-jail.js',
+);
+if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
+  if (!existsSync(jailBuildPath)) {
+    throw new Error(
+      [
+        'Eval FS jail requested (NEWIDE_EVAL_FS_JAIL=1) but the ACP driver build is missing',
+        `${jailBuildPath}.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_EVAL_FS_JAIL=0 (debug only).',
+      ].join(' '),
+    );
+  }
+  const bwrapPath = baseEnv.ACP_PROCESS_SANDBOX_BWRAP?.trim() || '/usr/bin/bwrap';
+  if (!existsSync(bwrapPath)) {
+    throw new Error(
+      [
+        'Eval FS jail requested (NEWIDE_EVAL_FS_JAIL=1) but bubblewrap was not found',
+        `at ${bwrapPath}.`,
+        'Install bubblewrap or set NEWIDE_EVAL_FS_JAIL_BWRAP to the bwrap binary.',
+      ].join(' '),
+    );
+  }
+  log(`eval FS jail bwrap: ${bwrapPath}`);
+}
 const armReports: Array<{
   ablation: MemoryAblation;
   state_root: string;
   database_schema: string;
+  total_count: number;
   scored_count: number;
   resolved_count: number;
+  intent_to_treat_resolved_rate: number;
   applied_count: number;
   p2p_regression_count: number;
   instances: InstanceRow[];
@@ -277,8 +341,11 @@ for (const ablation of ablations) {
     ablation,
     state_root: isolation.state_root,
     database_schema: isolation.database_schema,
+    total_count: rows.length,
     scored_count: rows.filter((row) => row.harness_scored === true).length,
     resolved_count: rows.filter((row) => row.resolved === true).length,
+    intent_to_treat_resolved_rate:
+      rows.length > 0 ? rows.filter((row) => row.resolved === true).length / rows.length : 0,
     applied_count: rows.filter((row) => row.applied === true).length,
     p2p_regression_count: rows.filter((row) => row.p2p_regression === true).length,
     instances: rows,
@@ -350,6 +417,10 @@ async function runOneInstance(input: {
     repo: instance.repo,
     base_commit: instance.base_commit,
     status: 'failed',
+    harness_scored: false,
+    resolved: false,
+    applied: false,
+    p2p_regression: false,
   };
 
   let prepared:
@@ -518,6 +589,8 @@ function buildPrompt(instance: SweEvoInstance): string {
     'You are fixing a real GitHub issue in an already-checked-out repository worktree.',
     'Edit files directly in the workspace. Do not only describe a plan.',
     'Produce a minimal correct patch that addresses the problem statement.',
+    'Do not add, edit, delete, rename, or generate tests or test-runner configuration.',
+    'Changes to tests, conftest.py, pytest/tox/nox/Jest/Vitest configuration are rejected.',
     '',
     'Offline evaluation constraints (SWE-EVO paper alignment):',
     '- You have NO internet access. Do not use WebFetch, WebSearch, or any browser tool.',

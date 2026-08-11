@@ -15,6 +15,11 @@ import {
 } from '../../eval/sweevo-harness-adapter';
 import type { SweEvoInstance } from '../../eval/types';
 import { parsePredictionMode } from '../../eval/validation';
+import {
+  assertSafeCandidatePatch,
+  extractPatchPaths,
+  isProtectedEvalPath,
+} from '../../eval/patch-policy';
 
 const SAMPLE_INSTANCE: SweEvoInstance = {
   repo: 'demo/repo',
@@ -73,6 +78,9 @@ describe('F eval utilities', () => {
     expect(command.args).toContain(toWslPath(workDir));
     expect(command.args).toContain('python3');
     expect(command.args).toContain(
+      toWslPath(join(process.env.NEWIDE_SCAFFOLD_ROOT ?? process.cwd(), 'eval', 'harness', 'secure-sweevo-evaluate.py')),
+    );
+    expect(command.args).toContain(
       toWslPath(join(sweEvoRoot, 'SWE-bench', 'evaluate_instance.py')),
     );
     expect(command.args).toContain(toWslPath(trajectoryDir));
@@ -80,14 +88,17 @@ describe('F eval utilities', () => {
 
   it('honors NEWIDE_SWE_EVO_PYTHON as a direct interpreter path', () => {
     process.env.NEWIDE_SWE_EVO_PYTHON = 'C:\\Python310\\python.exe';
+    const sweEvoRoot = process.platform === 'win32' ? 'D:\\SWE-EVO' : '/tmp/SWE-EVO';
     const command = buildSweEvoHarnessCommand({
-      sweEvoRoot: process.platform === 'win32' ? 'D:\\SWE-EVO' : '/tmp/SWE-EVO',
+      sweEvoRoot,
       workDir: process.platform === 'win32' ? 'D:\\work' : '/tmp/work',
       trajectoryDir: process.platform === 'win32' ? 'D:\\traj' : '/tmp/traj',
       maxWorkers: 4,
     });
     expect(command.command).toBe('C:\\Python310\\python.exe');
-    expect(command.args[0]).toContain('evaluate_instance.py');
+    expect(command.args[0]).toContain('secure-sweevo-evaluate.py');
+    expect(command.args).toContain('--official-script');
+    expect(command.args).toContain(join(sweEvoRoot, 'SWE-bench', 'evaluate_instance.py'));
   });
 
   it('loads dataset jsonl and builds oracle SWE-bench predictions', async () => {
@@ -132,6 +143,24 @@ describe('F eval utilities', () => {
 
   it('rejects invalid prediction modes', () => {
     expect(() => parsePredictionMode('glod')).toThrow(/Invalid --mode/);
+  });
+
+  it('rejects candidate patches that modify tests or test-runner configuration', () => {
+    const testPatch = [
+      'diff --git a/tests/test_demo.py b/tests/test_demo.py',
+      '--- a/tests/test_demo.py',
+      '+++ b/tests/test_demo.py',
+      '@@ -1 +1 @@',
+      '-assert broken',
+      '+assert True',
+      '',
+    ].join('\n');
+    expect(extractPatchPaths(testPatch)).toContain('tests/test_demo.py');
+    expect(() => assertSafeCandidatePatch(testPatch)).toThrow(/protected tests/i);
+    expect(isProtectedEvalPath('src/demo.py')).toBe(false);
+    expect(isProtectedEvalPath('pyproject.toml')).toBe(true);
+    expect(isProtectedEvalPath('conftest.py')).toBe(true);
+    expect(isProtectedEvalPath('vitest.config.ts')).toBe(true);
   });
 
   it('detects p2p regression from harness report', () => {

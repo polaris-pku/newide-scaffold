@@ -1,10 +1,17 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { loadManifest, resolveDatasetJsonl, resolveRunDir, resolveSweEvoRoot } from './paths';
+import {
+  getScaffoldRoot,
+  loadManifest,
+  resolveDatasetJsonl,
+  resolveRunDir,
+  resolveSweEvoRoot,
+} from './paths';
 import { getInstanceOrThrow, indexDatasetById, loadDataset } from './load-dataset';
 import { writeJson } from './run-summary';
 import type { SweBenchHarnessReport, SweBenchPrediction, SweEvoInstance } from './types';
+import { assertSafeCandidatePatch } from './patch-policy';
 
 export interface SweEvoHarnessAdapterOptions {
   predictionsPath: string;
@@ -101,7 +108,13 @@ export function buildSweEvoHarnessCommand(input: {
   maxWorkers: number;
 }): SweEvoHarnessAdapterResult['command'] {
   const python = resolveSweEvoPython();
-  const scriptPath = join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py');
+  const officialScriptPath = join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py');
+  const wrapperPath = join(
+    getScaffoldRoot(),
+    'eval',
+    'harness',
+    'secure-sweevo-evaluate.py',
+  );
   const viaWsl = python.toLowerCase() === 'wsl';
   const trajectoriesPath = viaWsl
     ? toWslPath(input.trajectoryDir)
@@ -126,7 +139,9 @@ export function buildSweEvoHarnessCommand(input: {
         toWslPath(input.workDir),
         '--',
         resolveSweEvoWslPython(input.sweEvoRoot),
-        toWslPath(scriptPath),
+        toWslPath(wrapperPath),
+        '--official-script',
+        toWslPath(officialScriptPath),
         ...scriptArgs,
       ],
     };
@@ -135,7 +150,7 @@ export function buildSweEvoHarnessCommand(input: {
   return {
     cwd: input.workDir,
     command: python,
-    args: [scriptPath, ...scriptArgs],
+    args: [wrapperPath, '--official-script', officialScriptPath, ...scriptArgs],
   };
 }
 
@@ -216,6 +231,9 @@ export async function runSweEvoHarnessAdapter(
   options: SweEvoHarnessAdapterOptions,
 ): Promise<SweEvoHarnessAdapterResult> {
   const predictions = readPredictionsJsonl(options.predictionsPath);
+  for (const prediction of predictions) {
+    assertSafeCandidatePatch(prediction.model_patch);
+  }
   const runDir = resolveRunDir(options.runId, options.outRoot);
   const trajectoryDir = join(runDir, 'sweevo-openhands');
   const trajectoryPath = join(trajectoryDir, 'output.jsonl');

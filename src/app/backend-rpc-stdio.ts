@@ -134,9 +134,36 @@ export async function createProductionBackendService(
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
-        // SWE-EVO offline eval: forward so ACP PermissionHandler can deny network tools.
-        ...(env.NEWIDE_SWE_EVO_BLOCK_INTERNET !== undefined
-          ? { NEWIDE_SWE_EVO_BLOCK_INTERNET: env.NEWIDE_SWE_EVO_BLOCK_INTERNET }
+        // NewIDE owns benchmark policy; ACP receives only generic enforcement settings.
+        ...(env.ACP_DENY_NETWORK_TOOLS !== undefined
+          ? { ACP_DENY_NETWORK_TOOLS: env.ACP_DENY_NETWORK_TOOLS }
+          : {}),
+        ...(env.ACP_DENY_PATH_SUBSTRINGS_JSON !== undefined
+          ? { ACP_DENY_PATH_SUBSTRINGS_JSON: env.ACP_DENY_PATH_SUBSTRINGS_JSON }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX !== undefined
+          ? { ACP_PROCESS_SANDBOX: env.ACP_PROCESS_SANDBOX }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_BWRAP !== undefined
+          ? { ACP_PROCESS_SANDBOX_BWRAP: env.ACP_PROCESS_SANDBOX_BWRAP }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_NPM_CACHE !== undefined
+          ? { ACP_PROCESS_SANDBOX_NPM_CACHE: env.ACP_PROCESS_SANDBOX_NPM_CACHE }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON !== undefined
+          ? {
+              ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON:
+                env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
+            }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON !== undefined
+          ? { ACP_PROCESS_SANDBOX_RO_PATHS_JSON: env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES !== undefined
+          ? {
+              ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES:
+                env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES,
+            }
           : {}),
       },
       unsetEnv: [

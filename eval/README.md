@@ -220,7 +220,19 @@ pnpm eval:sweevo-ablation -- --subset v0-smoke --run-harness
 pnpm eval:sweevo-ablation -- --subset v0-repo-full --ablations "B0,B1,B2" --run-harness
 ```
 
-方向一批跑默认开启 `NEWIDE_SWE_EVO_BLOCK_INTERNET=1`（对齐 SWE-EVO 论文：生成阶段禁止外网检索）。实现为 ACP 权限门拒绝 `WebFetch`/`WebSearch`/出网 Bash，并在 ephemeral worktree 写入 `.claude/settings.json` deny 列表。工作区是只含 `base_commit` 的单提交浅克隆，不共享 mirror 的 tags、refs 或对象库，并在启动 Agent 前删除 remote，避免通过目标 release tag 提取 gold delta。数据集 `PRs[].patch_without_test` **不会**注入 prompt（避免泄漏金标 patch）。注意：PowerShell 下逗号参数需加引号 `"B0,B1,B2"`。
+方向一批跑默认开启 `NEWIDE_SWE_EVO_BLOCK_INTERNET=1`（对齐 SWE-EVO 论文：生成阶段禁止外网检索）。NewIDE 将该 benchmark 策略翻译成 ACP 通用的 `ACP_DENY_NETWORK_TOOLS` / `ACP_DENY_PATH_SUBSTRINGS_JSON`，由 ACP 权限门执行，并在 ephemeral worktree 写入 `.claude/settings.json` deny 列表。工作区是只含 `base_commit` 的单提交浅克隆，不共享 mirror 的 tags、refs 或对象库，并在启动 Agent 前删除 remote，避免通过目标 release tag 提取 gold delta。数据集 `PRs[].patch_without_test` **不会**注入 prompt（避免泄漏金标 patch）。另默认开启 `NEWIDE_EVAL_FS_JAIL=1`，并翻译为 ACP 通用 process sandbox 配置：用 bubblewrap 把 agent 进程限制在当前 workspace，宿主机 sibling worktree / `eval-mirrors` / gold jsonl / site-packages 均不可见（需安装 `bubblewrap`；调试可设 `NEWIDE_EVAL_FS_JAIL=0`）。SWE-EVO 具体路径与只读文件列表只存在于 NewIDE，ACP 不包含 benchmark 语义。注意：PowerShell 下逗号参数需加引号 `"B0,B1,B2"`。
+
+提交边界还会拒绝任何测试或测试运行器配置改动，包括 `tests/`、`test/`、
+`test_*.py`、`*_test.py`、`conftest.py`、pytest/tox/nox/Jest/Vitest 配置。
+该检查同时覆盖 worktree diff、`--patch-file` 和 harness adapter 入口；命中时整条
+candidate 作为失败处理，不会静默剥离测试 hunk。主结果必须使用
+`intent_to_treat_resolved_rate`，分母为该臂计划运行的全部实例；未产出 patch、
+被安全策略拒绝、超时或缺失 harness report 的实例都按未解决计。
+
+官方 `../SWE-EVO` 工作树保持不变。Harness adapter 先调用 NewIDE 自有的
+`eval/harness/secure-sweevo-evaluate.py`：它临时从 evaluator 副本中分离隐藏
+`test_patch`，补齐缺失提交，恢复基线测试并注入隐藏测试，然后通过官方
+`swebench` 包和 Docker 镜像评分；退出时恢复临时 trajectory 和 instance 文件。
 
 ### 离线 PR/Issue context（论文默认设定）
 
