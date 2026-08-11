@@ -7,10 +7,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../../core';
-import {
-  isMaterializableFileArtifact,
-  readArtifactBytes,
-} from '../../coordinator/artifact-content';
+import { isMaterializableFileArtifact } from '../../coordinator/artifact-content';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../../protocol/agent-execution';
 import type { CouncilParticipantResolver } from '../council-participant-resolver';
 import type {
@@ -18,6 +15,7 @@ import type {
   CouncilSeat,
 } from '../council-participant';
 import type {
+  CouncilArtifactMode,
   CouncilDecision,
   CouncilExecutionOptions,
   CouncilLifecycleEvent,
@@ -29,7 +27,8 @@ import type {
   Proposal,
   Review,
 } from '../contract';
-import { prepareCouncilWorkspace } from '../council-workspace';
+import { prepareCouncilWorkspace, stageCouncilArtifacts } from '../council-workspace';
+import { assertCouncilPlanArtifacts } from '../plan-artifact';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -112,7 +111,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         input,
         executionRunId,
         participant,
-        `Produce proposal ${label} for: ${input.question}. Work only in this isolated role workspace and implement a concrete candidate solution.`,
+        buildProposalInstruction(input.question, label, options?.artifact_mode),
         input.evidence_pack?.artifact_refs ?? [],
         'proposal',
         workspace,
@@ -133,12 +132,12 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     ];
     const reviewerWorkspace = participantWorkspace(councilDir, reviewerParticipant);
     await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
-    await stageArtifacts(reviewerWorkspace, candidateArtifacts);
+    await stageCouncilArtifacts(reviewerWorkspace, candidateArtifacts);
     const reviewer = await this.tryRunRole(
       input,
       executionRunId,
       reviewerParticipant,
-      buildReviewerInstruction(input.question, proposals),
+      buildReviewerInstruction(input.question, proposals, options?.artifact_mode),
       proposals.flatMap((proposal) => proposal.artifact_refs),
       'review',
       reviewerWorkspace,
@@ -166,7 +165,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
 
     const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
     await prepareCouncilWorkspace(input.workspace_path, synthesizerWorkspace);
-    await stageArtifacts(synthesizerWorkspace, candidateArtifacts);
+    await stageCouncilArtifacts(synthesizerWorkspace, candidateArtifacts);
     await fs.mkdir(synthesizerWorkspace, { recursive: true });
     await fs.writeFile(
       path.join(synthesizerWorkspace, 'reviews.json'),
@@ -180,7 +179,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         input,
         executionRunId,
         synthesizerParticipant,
-        buildSynthesisInstruction(input.question, round),
+        buildSynthesisInstruction(input.question, round, options?.artifact_mode),
         proposals.flatMap((proposal) => proposal.artifact_refs),
         'synthesis',
         synthesizerWorkspace,
@@ -323,6 +322,24 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       );
       await emitFailureLifecycle(options, failure);
       throw failure;
+    }
+    if (options?.artifact_mode === 'plan') {
+      try {
+        assertCouncilPlanArtifacts(result.artifact_refs, phase, {
+          required: phase !== 'review',
+        });
+      } catch (error) {
+        const failure = new CouncilRoleExecutionError(
+          phase,
+          participant,
+          'failed',
+          result.agent_run_id,
+          result.driver_run_result_id,
+          errorDetails(error),
+        );
+        await emitFailureLifecycle(options, failure);
+        throw failure;
+      }
     }
     return result;
   }
@@ -641,10 +658,18 @@ interface ParsedReview {
 }
 
 function parseReviewPayload(response: string | undefined): ParsedReview[] | undefined {
-  const source = (response ?? '')
-    .trim()
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/, '');
+  const raw = (response ?? '').trim();
+  const fenced = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(
+    (match) => match[1]?.trim() ?? '',
+  );
+  for (const source of [raw, ...fenced].filter(Boolean)) {
+    const parsed = parseReviewCandidate(source);
+    if (parsed) return parsed;
+  }
+  return undefined;
+}
+
+function parseReviewCandidate(source: string): ParsedReview[] | undefined {
   try {
     const value = JSON.parse(source) as { reviews?: unknown };
     if (!Array.isArray(value.reviews)) return undefined;
@@ -681,7 +706,36 @@ function parseReviewPayload(response: string | undefined): ParsedReview[] | unde
   }
 }
 
-function buildReviewerInstruction(question: string, proposals: readonly Proposal[]): string {
+function buildProposalInstruction(
+  question: string,
+  label: string,
+  artifactMode: CouncilArtifactMode | undefined,
+): string {
+  if (artifactMode !== 'plan') {
+    return `Produce proposal ${label} for: ${question}. Work only in this isolated role workspace and implement a concrete candidate solution.`;
+  }
+  return [
+    `Produce independent implementation Plan ${label} for: ${question}.`,
+    'Use your role Persona, Skills, and Memory to reason about the best approach.',
+    'Do not modify product files or implement the solution.',
+    'Write the complete Plan to council-plan.md, including affected files, ordered steps, risks, and verification.',
+  ].join(' ');
+}
+
+function buildReviewerInstruction(
+  question: string,
+  proposals: readonly Proposal[],
+  artifactMode: CouncilArtifactMode | undefined,
+): string {
+  if (artifactMode === 'plan') {
+    return [
+      `Review the staged Council Plan inputs for: ${question}.`,
+      `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
+      'Compare scope, implementation feasibility, unnecessary changes, risks, and verification coverage.',
+      'Do not modify product files.',
+      'Return JSON only: {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}.',
+    ].join(' ');
+  }
   return [
     `Review the isolated proposal inputs for: ${question}.`,
     `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
@@ -690,23 +744,24 @@ function buildReviewerInstruction(question: string, proposals: readonly Proposal
   ].join(' ');
 }
 
-function buildSynthesisInstruction(question: string, round: number): string {
+function buildSynthesisInstruction(
+  question: string,
+  round: number,
+  artifactMode: CouncilArtifactMode | undefined,
+): string {
+  if (artifactMode === 'plan') {
+    return [
+      `Synthesis round ${String(round)} for: ${question}.`,
+      'Read the staged Council Plans and reviews.json in this isolated workspace.',
+      'Resolve material review concerns and write one executable final Plan to final-plan.md.',
+      'Do not implement the Plan or modify product files.',
+      'The final Plan must identify affected files, ordered steps, risks, and verification.',
+    ].join(' ');
+  }
   return [
     `Synthesis round ${String(round)} for: ${question}.`,
     'Read the staged proposal inputs and reviews.json in this isolated workspace.',
     'Implement the concrete final candidate changes in the repository workspace.',
     'Do not merely describe a decision; at least one materializable file change is required.',
   ].join(' ');
-}
-
-async function stageArtifacts(workspace: string, artifacts: readonly ArtifactRef[]): Promise<void> {
-  await fs.mkdir(workspace, { recursive: true });
-  for (const artifact of artifacts) {
-    if (!isMaterializableFileArtifact(artifact)) continue;
-    const targetPath = artifact.content?.target_path;
-    if (!targetPath) continue;
-    const target = path.join(workspace, 'inputs', artifact.artifact_id, targetPath);
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, await readArtifactBytes(artifact));
-  }
 }

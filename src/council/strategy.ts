@@ -7,7 +7,7 @@ import type {
   CouncilRunResult,
 } from './contract';
 
-export type CouncilStrategyName = 'classic' | 'adaptive_lead';
+export type CouncilStrategyName = 'classic' | 'adaptive_lead' | 'plan_first';
 
 export interface CouncilStrategy {
   readonly name: CouncilStrategyName;
@@ -62,6 +62,23 @@ export class AdaptiveLeadCouncilStrategy implements CouncilStrategy {
   }
 }
 
+export class PlanFirstCouncilStrategy implements CouncilStrategy {
+  readonly name = 'plan_first' as const;
+
+  constructor(private readonly provider: CouncilProvider) {}
+
+  async runCouncilRound(
+    input: CouncilRoundInput,
+    options?: CouncilExecutionOptions,
+  ): Promise<CouncilRunResult> {
+    const result = await this.provider.runCouncilRound(input, {
+      ...options,
+      artifact_mode: 'plan',
+    });
+    return withOutcome(result, buildOutcome(result));
+  }
+}
+
 export class StrategicCouncilProvider implements CouncilProvider {
   constructor(private readonly strategy: CouncilStrategy) {}
 
@@ -84,15 +101,23 @@ export function createCouncilStrategyProvider(
   const strategy =
     strategyName === 'classic'
       ? new ClassicCouncilStrategy(provider)
-      : new AdaptiveLeadCouncilStrategy(provider);
+      : strategyName === 'adaptive_lead'
+        ? new AdaptiveLeadCouncilStrategy(provider)
+        : new PlanFirstCouncilStrategy(provider);
   return new StrategicCouncilProvider(strategy);
 }
 
 export function readCouncilStrategy(value = process.env.NEWIDE_COUNCIL_STRATEGY): CouncilStrategyName {
   const normalized = value?.trim() || 'classic';
-  if (normalized === 'classic' || normalized === 'adaptive_lead') return normalized;
+  if (
+    normalized === 'classic' ||
+    normalized === 'adaptive_lead' ||
+    normalized === 'plan_first'
+  ) {
+    return normalized;
+  }
   throw new Error(
-    `Unsupported NEWIDE_COUNCIL_STRATEGY: ${normalized}. Expected classic or adaptive_lead.`,
+    `Unsupported NEWIDE_COUNCIL_STRATEGY: ${normalized}. Expected classic, adaptive_lead, or plan_first.`,
   );
 }
 

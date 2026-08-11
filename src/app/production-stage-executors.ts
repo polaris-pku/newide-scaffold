@@ -16,12 +16,24 @@ import {
   evaluateCompletionCriteria,
   type CompletionCriteriaEvaluation,
 } from '../coordinator/completion-criteria-evaluator';
-import { readArtifactContentBytes, sha256 } from '../coordinator/artifact-content';
+import {
+  isMaterializableFileArtifact,
+  readArtifactBytes,
+  readArtifactContentBytes,
+  sha256,
+} from '../coordinator/artifact-content';
 import type { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
 import { AutonomousCouncilHandler } from '../coordinator/handlers/autonomous-council-handler';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
-import type { CouncilProvider, CouncilRunResult, EvidencePack } from '../council';
-import { prepareCouncilWorkspace } from '../council/council-workspace';
+import {
+  assertCouncilPlanArtifacts,
+  isCouncilPlanArtifact,
+  reconcileCouncilOutcome,
+  type CouncilProvider,
+  type CouncilRunResult,
+  type EvidencePack,
+} from '../council';
+import { prepareCouncilWorkspace, stageCouncilArtifacts } from '../council/council-workspace';
 import type { GateResult } from '../gate';
 import type { TaskResumeCursor } from '../persistence';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../protocol/agent-execution';
@@ -148,6 +160,8 @@ export function createProductionStageExecutors(
   const executeAgent: ExecuteAgentStageExecutor = {
     async execute(context) {
       context.signal?.throwIfAborted();
+      const strategyName = councilStrategyName(dependencies.councilProvider);
+      const planFirst = context.mode === 'council' && strategyName === 'plan_first';
       const executionWorkspace =
         context.mode === 'council'
           ? path.join(
@@ -172,10 +186,10 @@ export function createProductionStageExecutors(
           task_id: context.task_id,
           run_id: context.run_id,
           role_id: context.cursor_input.winner_agent_id,
-          instruction: agentExecutionInstruction(context),
+          instruction: agentExecutionInstruction(context, planFirst),
           workspace_path: executionWorkspace,
           input_artifact_refs: [],
-          context_policy: 'production_task_loop',
+          context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
           schema_version: SCHEMA_VERSION,
           ...(context.session_id ? { session_id: context.session_id } : {}),
           ...(context.cursor_input.mailbox_delivery_id
@@ -300,6 +314,9 @@ export function createProductionStageExecutors(
           ],
         };
       }
+      if (planFirst) {
+        assertCouncilPlanArtifacts(result.artifact_refs, 'primary proposal');
+      }
       const selection = await selectionState({
         context,
         mode: 'single_agent',
@@ -423,18 +440,39 @@ export function createProductionStageExecutors(
       if (selected.selected_artifacts.length === 0) {
         throw new Error('Council produced no selected artifact');
       }
-      const councilRunResult = selected.council_run_result;
+      let councilRunResult = selected.council_run_result;
       if (!councilRunResult) throw new Error('Council stage returned no CouncilRunResult');
+      let selectedArtifacts = selected.selected_artifacts;
+      let producerAgentId =
+        councilRunResult.participants?.find((participant) => participant.seat === 'synthesizer')
+          ?.agent_id ??
+        primary.agent_id ??
+        primary.role_id;
+      let response = councilRunResult.decision.reason || primary.response;
+      if (strategyName === 'plan_first') {
+        const finalPlans = assertCouncilPlanArtifacts(selectedArtifacts, 'final synthesis');
+        const implementation = await executeFinalCouncilPlan({
+          context,
+          primary,
+          finalPlans,
+          dependencies,
+        });
+        selectedArtifacts = implementation.artifact_refs;
+        producerAgentId = primary.agent_id ?? primary.role_id;
+        response = implementation.result.response;
+        councilRunResult = await attachPlanExecution(
+          councilRunResult,
+          finalPlans,
+          implementation.result,
+          implementation.artifact_refs,
+        );
+      }
       const selection = await selectionState({
         context,
         mode: 'council',
-        artifacts: selected.selected_artifacts,
-        producerAgentId:
-          councilRunResult.participants?.find((participant) => participant.seat === 'synthesizer')
-            ?.agent_id ??
-          primary.agent_id ??
-          primary.role_id,
-        response: councilRunResult.decision.reason || primary.response,
+        artifacts: selectedArtifacts,
+        producerAgentId,
+        response,
         sessionId: primary.session_id,
         driverId: String(primary.diagnostics.driver_id ?? primary.role_id),
         runsRoot: dependencies.runsRoot,
@@ -462,11 +500,12 @@ export function createProductionStageExecutors(
         output: councilRunResult.output,
         result: councilRunResult.result,
         outcome: councilRunResult.outcome,
+        plan_execution: councilRunResult.plan_execution,
         ...(strategyName ? { strategy: strategyName } : {}),
       });
       emit(context, 'artifact.selected', selection.manifest_ref, {
         mode: 'council',
-        selected_artifact_refs: selected.selected_artifacts.map((artifact) => artifact.artifact_id),
+        selected_artifact_refs: selectedArtifacts.map((artifact) => artifact.artifact_id),
       });
       return {
         changeset_ref: selection.manifest_ref,
@@ -481,7 +520,7 @@ export function createProductionStageExecutors(
           changeset_ref: selection.manifest_ref,
           expected_sha256: selection.expected_sha256,
         },
-        artifact_refs: selected.selected_artifacts.map((artifact) => artifact.artifact_id),
+        artifact_refs: selectedArtifacts.map((artifact) => artifact.artifact_id),
       };
     },
   };
@@ -701,10 +740,152 @@ export function createProductionStageExecutors(
   };
 }
 
+function councilStrategyName(provider: CouncilProvider): string | undefined {
+  return (provider as CouncilProvider & { strategyName?: string }).strategyName;
+}
+
+async function executeFinalCouncilPlan(input: {
+  context: TaskStageExecutionContext<'council'>;
+  primary: AgentExecutionResult;
+  finalPlans: ArtifactRef[];
+  dependencies: ProductionStageExecutorDependencies;
+}): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[] }> {
+  const workspace = path.join(
+    input.dependencies.councilRoot,
+    input.context.restarted_from_run_id ?? input.context.run_id,
+    'primary',
+  );
+  await stageCouncilArtifacts(workspace, input.finalPlans);
+  emit(input.context, 'agent.execution_requested', input.context.run_id, {
+    phase: 'council_plan_execution',
+    role_id: input.primary.role_id,
+    session_id: input.primary.session_id,
+    workspace_path: workspace,
+    final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
+  });
+  const result = await input.dependencies.agentExecutionFacade.runAgent(
+    {
+      task_id: input.context.task_id,
+      run_id: input.context.run_id,
+      role_id: input.primary.role_id,
+      instruction: [
+        'Implement the approved final Council Plan staged under inputs/.',
+        'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
+        'Do not stop after rewriting or summarizing the Plan; produce the concrete implementation artifacts.',
+        `Original Task: ${input.context.task_request.spec}`,
+      ].join('\n'),
+      workspace_path: workspace,
+      session_id: input.primary.session_id,
+      input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
+      context_policy: 'council_plan_execution',
+      schema_version: SCHEMA_VERSION,
+    },
+    {
+      ...(input.context.signal ? { signal: input.context.signal } : {}),
+      ...(input.context.on_driver_event
+        ? { onDriverEvent: input.context.on_driver_event }
+        : {}),
+    },
+  );
+  if (result.status !== 'completed') {
+    throw new Error(`Primary Agent Plan execution ended with status ${result.status}`);
+  }
+  const implementationArtifacts = result.artifact_refs.filter(
+    (artifact) => isMaterializableFileArtifact(artifact) && !isCouncilPlanArtifact(artifact),
+  );
+  if (implementationArtifacts.length === 0) {
+    throw new Error('Primary Agent completed the final Council Plan without implementation artifacts');
+  }
+  emit(input.context, 'agent.execution_completed', result.agent_run_id, {
+    phase: 'council_plan_execution',
+    agent_id: result.agent_id ?? result.role_id,
+    role_id: result.role_id,
+    status: result.status,
+    session_id: result.session_id,
+    response: result.response,
+    artifact_refs: implementationArtifacts.map((artifact) => artifact.artifact_id),
+    transcript_ref: result.transcript_ref.artifact_id,
+    context_pack_ref: result.context_pack_ref,
+    memory_buffer_ref: result.memory_buffer_ref,
+    driver_run_result_id: result.driver_run_result_id,
+    diagnostics: result.diagnostics,
+  });
+  return { result, artifact_refs: implementationArtifacts };
+}
+
+async function attachPlanExecution(
+  councilRunResult: CouncilRunResult,
+  finalPlans: ArtifactRef[],
+  result: AgentExecutionResult,
+  implementationArtifacts: ArtifactRef[],
+): Promise<CouncilRunResult> {
+  const firstArtifact = implementationArtifacts[0]!;
+  const councilResult = councilRunResult.result;
+  if (!councilResult) throw new Error('Plan-first Council stage returned no CouncilResult');
+  const updatedResult = {
+    ...councilResult,
+    final_artifact_ref: firstArtifact.artifact_id,
+    final_artifact_sha256: sha256(await readArtifactBytes(firstArtifact)),
+    verification_refs: uniqueStrings([
+      ...councilResult.verification_refs,
+      ...finalPlans.map((artifact) => artifact.artifact_id),
+      result.agent_run_id,
+      result.driver_run_result_id,
+    ]),
+  };
+  const implementationRefs = implementationArtifacts.map((artifact) => artifact.artifact_id);
+  const reconciled = reconcileCouncilOutcome(
+    {
+      ...councilRunResult,
+      generated_artifact_refs: [
+        ...councilRunResult.generated_artifact_refs,
+        ...implementationArtifacts,
+      ],
+      selected_artifact_refs: implementationRefs,
+      result: updatedResult,
+      plan_execution: {
+        executor_role_id: result.role_id,
+        session_id: result.session_id,
+        agent_run_id: result.agent_run_id,
+        driver_run_result_id: result.driver_run_result_id,
+        final_plan_artifact_refs: finalPlans.map((artifact) => artifact.artifact_id),
+        implementation_artifact_refs: implementationRefs,
+      },
+    },
+    updatedResult,
+  );
+  return {
+    ...reconciled,
+    ...(reconciled.outcome
+      ? {
+          outcome: { ...reconciled.outcome, selected_artifact_refs: implementationRefs },
+        }
+      : {}),
+    ...(reconciled.output
+      ? {
+          output: { ...reconciled.output, selected_artifact_refs: implementationRefs },
+        }
+      : {}),
+  };
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)];
+}
+
 function agentExecutionInstruction(
   context: TaskStageExecutionContext<'execute_agent'>,
+  planFirst = false,
 ): string {
   const deliveryId = context.cursor_input.mailbox_delivery_id;
+  if (planFirst) {
+    return [
+      'Produce an independent implementation Plan for the original Task.',
+      'Use your Persona, Skills, and Memory, but do not modify product files or implement the solution yet.',
+      'Write the complete Plan to council-plan.md, including affected files, ordered steps, risks, and verification.',
+      `Original Task: ${context.task_request.spec}`,
+    ].join('\n');
+  }
   if (!deliveryId) return context.task_request.spec;
   return [
     `Continue the original Task after receiving Mailbox delivery ${deliveryId}.`,

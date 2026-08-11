@@ -27,6 +27,7 @@ DEEPSEEK_API_KEY=replace-with-your-key
 ACP_AGENT_ID=claude
 NEWIDE_B_EMBEDDING_PROVIDER=hash
 NEWIDE_B_EMBEDDING_DIMENSIONS=32
+# NEWIDE_COUNCIL_STRATEGY=plan_first
 ```
 
 在 ACP Client 仓库的 `.env` 中配置对应 agent 的凭据。例如 `ACP_AGENT_ID=claude` 时：
@@ -54,6 +55,11 @@ pnpm task:run -- \
 ```bash
 pnpm task:run -- --help
 ```
+
+Council 默认使用 `classic`，各角色直接产生候选实现。设置
+`NEWIDE_COUNCIL_STRATEGY=plan_first` 后，Primary 与 Council 角色只生成和审阅 Plan，
+Synthesizer 选出 `final-plan.md`，再由原 Primary Agent 在同一 Session 和隔离 workspace
+中实施；Task/Run RPC、Gate 和交付入口不变。
 
 `.env.local`、ACP Client 的 `.env` 和 API key 均不得提交到 Git。
 

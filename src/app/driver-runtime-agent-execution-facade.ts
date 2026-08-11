@@ -188,6 +188,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         'NewIDE session initialization only.',
         `Register this ACP session for collaboration role ${input.role_id}.`,
         'Do not modify files, call tools, or solve the task. Reply with SESSION_READY and stop.',
+        'This instruction applies only to this initialization turn; every later turn must follow its newest task instruction instead.',
       ].join('\n'),
       workspace_path: input.workspace_path,
       created_at: nowTimestamp(),
