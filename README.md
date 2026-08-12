@@ -25,8 +25,15 @@ agent：
 LLM_PROVIDER=deepseek
 DEEPSEEK_API_KEY=replace-with-your-key
 ACP_AGENT_ID=claude
-NEWIDE_B_EMBEDDING_PROVIDER=hash
-NEWIDE_B_EMBEDDING_DIMENSIONS=32
+NEWIDE_B_POSTGRES_CONTAINER=newide-b-memory-semantic
+NEWIDE_B_POSTGRES_VOLUME=newide_b_memory_semantic_pgdata
+NEWIDE_B_POSTGRES_PORT=55433
+NEWIDE_B_POSTGRES_DATABASE=newide_b_semantic
+NEWIDE_B_DATABASE_URL=postgresql://newide:newide_local@127.0.0.1:55433/newide_b_semantic
+NEWIDE_B_EMBEDDING_PROVIDER=openai
+NEWIDE_B_EMBEDDING_DIMENSIONS=1536
+EMBEDDING_API_KEY=replace-with-your-openai-key
+EMBEDDING_BASE_URL=https://api.openai.com/v1
 # NEWIDE_COUNCIL_STRATEGY=plan_first
 ```
 
@@ -45,9 +52,10 @@ pnpm task:run -- \
   --local-postgres
 ```
 
-脚本会构建 ACP Client 和后端 CLI，并启动或复用本地 PostgreSQL。已有数据库时，在
-`.env.local` 设置 `NEWIDE_B_DATABASE_URL` 并省略 `--local-postgres`。ACP Client 不在
-默认相邻目录时传 `--driver-runner /path/to/acp-client`。
+脚本会读取 `.env.local`，构建 ACP Client 和后端 CLI，并启动或复用本地 PostgreSQL。
+`text-embedding-3-small` 使用 1536 维向量；不要复用已有的 32 维 hash 数据库。已有
+1536 维数据库时，设置 `NEWIDE_B_DATABASE_URL` 并省略 `--local-postgres`。ACP Client
+不在默认相邻目录时传 `--driver-runner /path/to/acp-client`。
 
 过程日志写到 stderr，终态 JSON 写到 stdout；运行证据默认位于
 `.newide/task-runs/<timestamp>/`，生成文件位于 `--workspace`。完整参数见：

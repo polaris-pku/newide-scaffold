@@ -2,7 +2,7 @@ tasks:
   embed:
     models:
       - provider: openai
-        model: text-embedding-v3
+        model: text-embedding-3-small
         order: 1
     strategy: order
     timeoutMs: 30000

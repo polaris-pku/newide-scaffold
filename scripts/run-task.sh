@@ -51,6 +51,21 @@ fail() {
   exit 2
 }
 
+load_env_defaults() {
+  local file_path="$1"
+  [[ -f "$file_path" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#${line%%[![:space:]]*}}"
+    [[ -n "$line" && "$line" != \#* && "$line" == *=* ]] || continue
+    local key="${line%%=*}"
+    local value="${line#*=}"
+    key="${key%${key##*[![:space:]]}}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ -z "${!key+x}" ]] || continue
+    export "$key=$value"
+  done < "$file_path"
+}
+
 require_value() {
   local option="$1"
   local value="${2:-}"
@@ -139,6 +154,10 @@ fi
 command -v node >/dev/null 2>&1 || fail 'Node.js was not found (version >=22.22.1 is required)'
 command -v pnpm >/dev/null 2>&1 || fail 'pnpm was not found (enable Corepack or install pnpm)'
 
+# Make the documented backend .env.local authoritative for this launcher too.
+# Existing shell variables still take precedence.
+load_env_defaults "$REPO_ROOT/.env.local"
+
 WORKSPACE="$(absolute_path "$WORKSPACE_INPUT")"
 mkdir -p "$WORKSPACE"
 WORKSPACE="$(cd "$WORKSPACE" && pwd -P)"
@@ -174,10 +193,6 @@ fi
 
 export ACP_DRIVER_RUNNER_DIR="$DRIVER_RUNNER"
 export ACP_DRIVER_TIMEOUT_MS="$DRIVER_TIMEOUT_MS"
-export NEWIDE_B_EMBEDDING_PROVIDER="${NEWIDE_B_EMBEDDING_PROVIDER:-hash}"
-if [[ "$NEWIDE_B_EMBEDDING_PROVIDER" == 'hash' ]]; then
-  export NEWIDE_B_EMBEDDING_DIMENSIONS="${NEWIDE_B_EMBEDDING_DIMENSIONS:-32}"
-fi
 
 if [[ "$USE_LOCAL_POSTGRES" -eq 1 ]]; then
   NEWIDE_B_DATABASE_URL="$("$REPO_ROOT/scripts/ensure-b-memory-postgres.sh")"
