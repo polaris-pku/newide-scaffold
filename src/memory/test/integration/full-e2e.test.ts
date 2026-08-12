@@ -166,13 +166,14 @@ suitePg('E2E: FileBuffer → 提取 → PG 入库 → BoardQuery', () => {
     // 3. 创建 FileBufferRepository
     bufferRepo = new FileBufferRepository({ agentStateRoot: tempDir });
 
-    // 4. 初始化 Agent
+    // 4. 初始化 Agent + buffer 目录（与生产 agent-manager 一致）
     await repository.initializeAgent({
       role_id: ROLE_ID,
       name: 'E2E 测试 Agent',
       tags: ['e2e', 'test', 'file-upload'],
       persona_seed: '一个专注于文件处理的开发 Agent',
     });
+    await bufferRepo.ensureAgent(ROLE_ID);
 
     // 5. 创建 BoardQuery facade
     boardQuery = new RepositoryAgentBoardQuery(repository);
@@ -434,6 +435,7 @@ suiteFull('E2E: 向量检索验证 (PG + Embedding)', () => {
       name: 'E2E 向量检索 Agent',
       tags: ['e2e', 'vector-search'],
     });
+    await bufferRepo.ensureAgent(ROLE_ID);
 
     // 预置几条带真实 embedding 的经验
     const sampleData = [
@@ -522,9 +524,11 @@ suiteFull('E2E: 向量检索验证 (PG + Embedding)', () => {
     expect(results[0]!.description).toContain('multer');
   });
 
-  it('searchExperiences 区分正负经验', async () => {
+  it('searchExperiences 区分正负经验（检索契约只返回正经验）', async () => {
     const memory = createAgentMemoryScope(repository, bufferRepo, ROLE_ID);
 
+    // 检索契约（pg-memory-repository / memory-retrieval 一致）：只召回 positive 经验。
+    // "nginx 配置问题" 语义上命中 multer/nginx 相关正经验，但绝不返回 negative 类型。
     const queryVec = await embedding.embed('nginx 配置问题');
     const results = await memory.searchExperiences({
       query_embedding: queryVec,
@@ -539,10 +543,13 @@ suiteFull('E2E: 向量检索验证 (PG + Embedding)', () => {
       console.log(`   - [${exp.type}] ${exp.description} (confidence: ${exp.confidence})`);
     }
 
-    // 应该包含 nginx 相关的负经验
-    const nginxExp = results.find((e) => e.description.includes('nginx'));
-    expect(nginxExp).toBeDefined();
-    expect(nginxExp!.type).toBe('negative');
+    // 只返回正经验：negative 预置经验（nginx 排查）绝不会进入检索结果
+    for (const exp of results) {
+      expect(exp.type).toBe('positive');
+    }
+    // 语义上应命中 nginx/文件上传相关经验
+    expect(results.some((e) => e.description.includes('nginx'))).toBe(false);
+    expect(results.some((e) => e.description.includes('multer'))).toBe(true);
   });
 
   it('listExperiences 返回全部经验', async () => {

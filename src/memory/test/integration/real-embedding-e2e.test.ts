@@ -39,6 +39,7 @@ import { AgentManager } from '../../runtime/agent-manager';
 import { InvokeDriverTool } from '../../runtime/tools/invoke-driver-tool';
 import { LiteLLMToolCallingClient } from '../../adapters/litellm-tool-calling-client';
 import { LiteLLMClientAdapter } from '../../adapters/litellm-client-adapter';
+import { LlmExperienceExtractor } from '../../adapters/llm-experience-extractor';
 import { extractBuffer } from '../../services/memory-cycle';
 import { createAgentMemoryScope } from '../../adapters/agent-memory-scope';
 import type { DriverReturn } from '../../schemas';
@@ -286,7 +287,7 @@ describeE2E('Real Embedding Provider E2E (PG + LiteLLM)', () => {
     const llmClient = new LiteLLMClientAdapter('extract-driver-return');
     const memory = createAgentMemoryScope(pgRepo, fileRepo, roleId);
 
-    const extraction = await extractBuffer(memory, seq, llmClient);
+    const extraction = await extractBuffer(memory, seq, new LlmExperienceExtractor(llmClient));
 
     expect(extraction.experiences.length).toBeGreaterThan(0);
     expect(extraction.result.experiences_created).toBeGreaterThan(0);

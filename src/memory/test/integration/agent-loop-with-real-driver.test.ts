@@ -11,6 +11,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execSync } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { AgentManager } from '../../runtime/agent-manager';
@@ -18,7 +21,8 @@ import { InMemoryRepository } from '../../adapters/in-memory-repository';
 import { InMemoryBufferRepository } from '../../adapters/in-memory-buffer-repository';
 import { LiteLLMToolCallingClient } from '../../adapters/litellm-tool-calling-client';
 import { InvokeDriverTool } from '../../runtime/tools/invoke-driver-tool';
-import { createLlmDriver } from '../drivers/llm-driver';
+import { DriverBridge } from '../../../driver/driver-bridge';
+import { CliDriverRuntime } from '../drivers/cli-driver-runtime';
 import type { AgentTaskRequest } from '../../agent-types';
 
 // ──────────────────────────────────────────────
@@ -50,9 +54,9 @@ function loadEnv(): void {
 loadEnv();
 
 /** 检查 claude 命令行工具是否可用 */
-function hasClaudeCli(): boolean {
+function hasCli(cmd: string): boolean {
   try {
-    execSync(process.platform === 'win32' ? 'where claude' : 'command -v claude', {
+    execSync(process.platform === 'win32' ? `where ${cmd}` : `command -v ${cmd}`, {
       encoding: 'utf-8',
       timeout: 5000,
     });
@@ -62,8 +66,11 @@ function hasClaudeCli(): boolean {
   }
 }
 
+const KIMI_PATH = 'C:\\Users\\13008\\.kimi-code\\bin\\kimi.exe';
+
 const deps = {
-  claudeCli: hasClaudeCli(),
+  kimiCli: existsSync(KIMI_PATH),
+  claudeCli: hasCli('claude'),
   deepseekKey: !!(process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY),
 };
 
@@ -71,9 +78,9 @@ const deps = {
 // 测试
 // ──────────────────────────────────────────────
 
-describe('Agent loop with real LLM Driver (Claude CLI)', () => {
+describe('Agent loop with real LLM Driver (CLI)', () => {
   const missing: string[] = [];
-  if (!deps.claudeCli) missing.push('claude CLI');
+  if (!deps.kimiCli && !deps.claudeCli) missing.push('kimi / claude CLI');
   if (!deps.deepseekKey) missing.push('DEEPSEEK_API_KEY / OPENAI_API_KEY');
 
   if (missing.length > 0) {
@@ -84,29 +91,42 @@ describe('Agent loop with real LLM Driver (Claude CLI)', () => {
    * 端到端集成测试：
    *
    * 1. 顶层 Agent 使用 LiteLLMToolCallingClient（真实 LLM）
-   * 2. Driver 使用 createLlmDriver({ mode: 'cli' }) 调用本地 claude
+   * 2. Driver 使用 CliDriverRuntime + DriverBridge 调用本地 CLI（优先 kimi）
    * 3. Agent 收到任务后通过 tool-calling 循环自主决策
    * 4. LLM 应自然调用 invoke_driver 工具
-   * 5. Claude Driver 收到子任务，返回结构化 DriverReturn
+   * 5. CLI Driver 收到子任务，返回结构化 DriverReturn
    * 6. Agent 看到 driver 返回 → 报告完成 → writeToBuffer
    */
-  it.runIf(deps.claudeCli && deps.deepseekKey)(
-    '应完成完整的 agent loop 周期：Agent LLM → invoke_driver → Claude CLI Driver → writeToBuffer',
+  it.runIf((deps.kimiCli || deps.claudeCli) && deps.deepseekKey)(
+    '应完成完整的 agent loop 周期：Agent LLM → invoke_driver → CLI Driver → writeToBuffer',
     async () => {
       // ── 1. 存储层 ──
       const repository = new InMemoryRepository();
       const bufferRepository = new InMemoryBufferRepository();
+
+      // 临时工作目录，避免 CLI driver 生成的文件污染项目根
+      const workspace = await mkdtemp(join(tmpdir(), 'agent-loop-driver-'));
+      try {
 
       // ── 2. 顶层 Agent 的 LLM ──
       const llm = new LiteLLMToolCallingClient({
         taskName: 'memory-query',
       });
 
-      // ── 3. 真实 LLM Driver（CLI 模式） ──
+      // ── 3. 真实 CLI Driver（优先 kimi，回退 claude） ──
       let driverCallCount = 0;
       let lastDriverInstruction = '';
 
-      const driverHandler = createLlmDriver({ mode: 'cli' });
+      const useKimi = deps.kimiCli;
+      const cliDriver = new CliDriverRuntime({
+        cliCommand: useKimi ? KIMI_PATH : 'claude',
+        args: useKimi ? [] : ['--dangerously-skip-permissions'],
+        promptArgs: useKimi ? ['-p'] : [],
+        driverId: useKimi ? 'kimi-driver' : 'claude-driver',
+        cwd: workspace,
+      });
+      const bridge = new DriverBridge({ driver: cliDriver });
+      const driverHandler = bridge.createHandler();
 
       const driverTool = new InvokeDriverTool(async (task) => {
         driverCallCount++;
@@ -153,13 +173,8 @@ describe('Agent loop with real LLM Driver (Claude CLI)', () => {
       //     需要 Driver 分析代码并给出改进建议
       const task: AgentTaskRequest = {
         spec:
-          'Analyze the following code snippet and suggest improvements. ' +
-          'Use invoke_driver to perform the analysis.\n\n' +
-          '```\n' +
-          'function greet(name) {\n' +
-          '  return "Hello, " + name;\n' +
-          '}\n' +
-          '```',
+          'Write "Hello" to a file named hello.txt. ' +
+          'Use invoke_driver to perform the work.',
         task_id: 'task_driver_cli_001',
         call_id: 'call_driver_cli_001',
         source_driver: 'test-driver',
@@ -175,7 +190,7 @@ describe('Agent loop with real LLM Driver (Claude CLI)', () => {
 
       // 7b. LLM 实际调用了 invoke_driver
       expect(driverCallCount).toBeGreaterThanOrEqual(1);
-      expect(lastDriverInstruction).toContain('greet');
+      expect(lastDriverInstruction).toContain('hello');
 
       // 7c. MemoryCycleResult 的 agent_id 正确
       expect(result.cycle.agent_id).toBe('role_driver_cli_test');
@@ -201,7 +216,10 @@ describe('Agent loop with real LLM Driver (Claude CLI)', () => {
       const agent = manager.getAgent('role_driver_cli_test')!;
       expect(agent.getState()).toBe('sleeping');
       expect(agent.hasPendingTask()).toBe(false);
+      } finally {
+        await rm(workspace, { recursive: true, force: true });
+      }
     },
-    180_000, // 超时：Agent LLM + Claude CLI 两次调用，设 3 分钟
+    180_000, // 超时：Agent LLM + CLI driver 两次调用，设 3 分钟
   );
 });
