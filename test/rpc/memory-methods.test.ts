@@ -10,7 +10,17 @@ describe('MemoryRpcMethods', () => {
       role_id: roleId,
       requested_by: requestedBy,
     }));
-    const service = fakeService({ promoteMemorySkills });
+    const approveMemorySkill = vi.fn(async () => ({
+      id: 'skill_1',
+      review_status: 'approved',
+      reviewed_by: 'reviewer',
+    }) as never);
+    const rejectMemorySkill = vi.fn(async () => ({
+      id: 'skill_2',
+      review_status: 'rejected',
+      reviewed_by: 'reviewer',
+    }) as never);
+    const service = fakeService({ promoteMemorySkills, approveMemorySkill, rejectMemorySkill });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
     const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
@@ -35,7 +45,13 @@ describe('MemoryRpcMethods', () => {
       '{"jsonrpc":"2.0","id":6,"method":"memory.promoteSkills","params":{"role_id":"role_ts_engineer","requested_by":"user"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":7,"method":"memory.listSkills","params":{"role_id":"role_ts_engineer","extra":true}}',
+      '{"jsonrpc":"2.0","id":7,"method":"memory.approveSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1","reviewed_by":"reviewer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":8,"method":"memory.rejectSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_2","reviewed_by":"reviewer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":9,"method":"memory.listSkills","params":{"role_id":"role_ts_engineer","extra":true}}',
     );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
@@ -47,8 +63,7 @@ describe('MemoryRpcMethods', () => {
             operations: {
               list_experiences: { status: 'available' },
               approve_skill: {
-                status: 'unavailable',
-                reason: expect.any(String),
+                status: 'available',
               },
               update_persona: {
                 status: 'unavailable',
@@ -64,9 +79,21 @@ describe('MemoryRpcMethods', () => {
       { id: 4, result: { skills: [{ id: 'skill_1' }] } },
       { id: 5, result: { maintenance: [{ maintenance_ref: 'b_maintenance_1' }] } },
       { id: 6, result: { maintenance: { requested_by: 'user' } } },
-      { id: 7, error: { code: -32602, message: 'Invalid params' } },
+      { id: 7, result: { skill: { id: 'skill_1', review_status: 'approved' } } },
+      { id: 8, result: { skill: { id: 'skill_2', review_status: 'rejected' } } },
+      { id: 9, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
+    expect(approveMemorySkill).toHaveBeenCalledWith(
+      'role_ts_engineer',
+      'skill_1',
+      'reviewer',
+    );
+    expect(rejectMemorySkill).toHaveBeenCalledWith(
+      'role_ts_engineer',
+      'skill_2',
+      'reviewer',
+    );
   });
 });
 
@@ -87,8 +114,8 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         list_skills: { status: 'available' },
         list_maintenance: { status: 'available' },
         promote_skills: { status: 'available' },
-        approve_skill: { status: 'unavailable', reason: 'not exposed' },
-        reject_skill: { status: 'unavailable', reason: 'not exposed' },
+        approve_skill: { status: 'available' },
+        reject_skill: { status: 'available' },
         update_persona: { status: 'unavailable', reason: 'not exposed' },
       },
     }),
@@ -118,6 +145,8 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     listMemoryExperiences: async () => [{ id: 'experience_1' } as never],
     listMemoryMaintenance: async () => [maintenance()],
     promoteMemorySkills: async () => maintenance(),
+    approveMemorySkill: async () => ({ id: 'skill_1' } as never),
+    rejectMemorySkill: async () => ({ id: 'skill_1' } as never),
     ...overrides,
   };
 }

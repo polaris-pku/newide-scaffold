@@ -37,7 +37,8 @@ describe('B memory evolution end to end', () => {
   it('feeds an automatically persisted Experience into the next A DriverContext', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-evolution-'));
     roots.push(root);
-    const repository = new InMemoryRepository(alwaysRelevantEmbedding());
+    const embedding = alwaysRelevantEmbedding();
+    const repository = new InMemoryRepository(embedding);
     const bufferRepository = new InMemoryBufferRepository();
     const driver = new CapturingDriver();
     const maintenance = new BMemoryMaintenanceRunner({
@@ -51,6 +52,7 @@ describe('B memory evolution end to end', () => {
       repository,
       bufferRepository,
       llm: invokeDriverLlm(),
+      embedding,
       memoryMaintenance: maintenance,
     });
 
@@ -87,10 +89,11 @@ describe('B memory evolution end to end', () => {
     );
   });
 
-  it('persists an explicitly promoted pending Skill and exposes it through memory RPC', async () => {
+  it('promotes, approves, and retrieves a Skill through memory RPC', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-pending-skill-'));
     roots.push(root);
-    const repository = new InMemoryRepository(alwaysRelevantEmbedding());
+    const embedding = alwaysRelevantEmbedding();
+    const repository = new InMemoryRepository(embedding);
     const bufferRepository = new InMemoryBufferRepository();
     const driver = new CapturingDriver();
     const maintenance = new BMemoryMaintenanceRunner({
@@ -104,6 +107,7 @@ describe('B memory evolution end to end', () => {
       repository,
       bufferRepository,
       llm: invokeDriverLlm(),
+      embedding,
       memoryMaintenance: maintenance,
     });
 
@@ -177,7 +181,8 @@ describe('B memory evolution end to end', () => {
           },
           operations: {
             promote_skills: { status: 'available' },
-            approve_skill: { status: 'unavailable', reason: expect.any(String) },
+            approve_skill: { status: 'available' },
+            reject_skill: { status: 'available' },
             update_persona: { status: 'unavailable', reason: expect.any(String) },
           },
         },
@@ -207,6 +212,36 @@ describe('B memory evolution end to end', () => {
         skills: [{ id: storedSkill!.id, review_status: 'pending' }],
       },
     });
+    await expect(
+      dispatcher.dispatch({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'memory.approveSkill',
+        params: {
+          role_id: 'role_ts_engineer',
+          skill_id: storedSkill!.id,
+          reviewed_by: 'acceptance',
+        },
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        skill: {
+          id: storedSkill!.id,
+          review_status: 'approved',
+          reviewed_by: 'acceptance',
+          reviewed_at: expect.any(String),
+        },
+      },
+    });
+
+    await facade.runAgent(request('task_reuse_approved_skill', 'Reuse the approved Skill.'));
+    await maintenance.waitForIdle();
+    const nextDriverContext = parseDriverContext(driver.prompts[1]!.prompt) as {
+      skills: Array<{ id: string }>;
+    };
+    expect(nextDriverContext.skills).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: storedSkill!.id })]),
+    );
   });
 });
 
@@ -220,6 +255,10 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
     listMemoryExperiences: (roleId) => service.listExperiences(roleId),
     listMemoryMaintenance: (roleId) => service.listMaintenance(roleId),
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
+    approveMemorySkill: (roleId, skillId, reviewedBy) =>
+      service.approveSkill(roleId, skillId, reviewedBy),
+    rejectMemorySkill: (roleId, skillId, reviewedBy) =>
+      service.rejectSkill(roleId, skillId, reviewedBy),
   }).register(dispatcher);
   return dispatcher;
 }

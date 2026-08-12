@@ -5,7 +5,7 @@ import {
   type SkillView,
 } from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
-import type { BPublicCapabilities } from './b-public-capabilities';
+import type { BPublicCapabilities, ReviewedSkill } from './b-public-capabilities';
 import { filterLegacyCouncilPseudoAgents } from './council-legacy-agent-filter';
 import type { BEmbeddingRuntimeInfo } from './production-b-runtime';
 
@@ -32,7 +32,10 @@ export interface BMemoryCapabilities {
 
 export class BMemoryBackendService {
   constructor(
-    private readonly capabilities: Pick<BPublicCapabilities, 'boardQuery' | 'maintenance'>,
+    private readonly capabilities: Pick<
+      BPublicCapabilities,
+      'boardQuery' | 'maintenance' | 'reviewSkill'
+    >,
     private readonly embeddingInfo: BEmbeddingRuntimeInfo,
   ) {}
 
@@ -48,16 +51,10 @@ export class BMemoryBackendService {
         list_maintenance: { status: 'available' },
         promote_skills: {
           status: 'available',
-          reason: 'Promotion creates pending Skills; it does not approve them.',
+          reason: 'Promotion creates pending Skills for explicit review.',
         },
-        approve_skill: {
-          status: 'unavailable',
-          reason: 'B does not expose a public Skill approval transition.',
-        },
-        reject_skill: {
-          status: 'unavailable',
-          reason: 'B does not expose a public Skill rejection transition.',
-        },
+        approve_skill: { status: 'available' },
+        reject_skill: { status: 'available' },
         update_persona: {
           status: 'unavailable',
           reason: 'B does not expose a public Persona update transition.',
@@ -92,6 +89,24 @@ export class BMemoryBackendService {
     return this.capabilities.maintenance.promoteSkills({
       role_id: roleId,
       requested_by: requestedBy,
+    });
+  }
+
+  approveSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.capabilities.reviewSkill({
+      role_id: roleId,
+      skill_id: skillId,
+      decision: 'approved',
+      reviewer: reviewedBy,
+    });
+  }
+
+  rejectSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.capabilities.reviewSkill({
+      role_id: roleId,
+      skill_id: skillId,
+      decision: 'rejected',
+      reviewer: reviewedBy,
     });
   }
 }

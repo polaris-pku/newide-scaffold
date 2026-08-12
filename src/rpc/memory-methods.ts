@@ -2,6 +2,7 @@
 import { z } from 'zod';
 import type { BMemoryMaintenanceEvidence } from '../app/b-memory-maintenance-runner';
 import type { BMemoryCapabilities } from '../app/b-memory-backend-service';
+import type { ReviewedSkill } from '../app/b-public-capabilities';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
@@ -19,6 +20,8 @@ export interface MemoryMethodsService {
   listMemoryExperiences(roleId: string): Promise<ExperienceView[]>;
   listMemoryMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]>;
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence>;
+  approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill>;
+  rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -30,6 +33,13 @@ const promoteParamsSchema = z
   .object({
     role_id: z.string().trim().min(1),
     requested_by: z.string().trim().min(1).default('user'),
+  })
+  .strict();
+const reviewParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    skill_id: z.string().trim().min(1),
+    reviewed_by: z.string().trim().min(1).default('user'),
   })
   .strict();
 
@@ -70,6 +80,18 @@ export class MemoryRpcMethods {
       return this.service
         .promoteMemorySkills(parsed.role_id, parsed.requested_by)
         .then((maintenance) => ({ maintenance }));
+    });
+    dispatcher.register('memory.approveSkill', (params) => {
+      const parsed = parseParams(reviewParamsSchema, params);
+      return this.service
+        .approveMemorySkill(parsed.role_id, parsed.skill_id, parsed.reviewed_by)
+        .then((skill) => ({ skill }));
+    });
+    dispatcher.register('memory.rejectSkill', (params) => {
+      const parsed = parseParams(reviewParamsSchema, params);
+      return this.service
+        .rejectMemorySkill(parsed.role_id, parsed.skill_id, parsed.reviewed_by)
+        .then((skill) => ({ skill }));
     });
   }
 }

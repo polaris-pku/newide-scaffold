@@ -201,6 +201,17 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
       const id = typeof skill.id === 'string' ? skill.id : undefined;
       return id && !beforeSkillIds[firstAgentId]?.includes(id);
     });
+    const reviewedSkills = await Promise.all(
+      promotedSkills.map(async (skill) => {
+        if (typeof skill.id !== 'string' || skill.review_status !== 'pending') return skill;
+        const reviewed = await backend.request<{ skill?: unknown }>('memory.approveSkill', {
+          role_id: firstAgentId,
+          skill_id: skill.id,
+          reviewed_by: 'real-acceptance',
+        });
+        return asRecord(reviewed.skill) ?? skill;
+      }),
+    );
 
     const second = await runMemoryTask(
       backend,
@@ -233,7 +244,7 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
     const reusedExperienceIds = firstExperienceIds.filter((id) =>
       retrievedExperienceIds.includes(id),
     );
-    const promotedSkillStates = promotedSkills.map((skill) => ({
+    const promotedSkillStates = reviewedSkills.map((skill) => ({
       id: skill.id,
       review_status: skill.review_status,
       market_status: skill.market_status,
@@ -306,6 +317,12 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
     }
     if (promotedSkills.length === 0) {
       errors.push('Skill promotion produced no persisted Skill');
+    }
+    if (!promotedSkillStates.some((skill) => skill.reusable)) {
+      errors.push('Skill approval produced no reusable approved Skill');
+    }
+    if (!promotedSkillStates.some((skill) => skill.retrieved_by_second_task)) {
+      errors.push('second task did not retrieve an approved promoted Skill');
     }
 
     log(`memory first run: ${first.created.run_id} agent=${firstAgentId}`);
@@ -1080,7 +1097,12 @@ function validateMemoryCapabilities(
       errors.push(`memory capability ${operation} is not available`);
     }
   }
-  for (const operation of ['approve_skill', 'reject_skill', 'update_persona']) {
+  for (const operation of ['approve_skill', 'reject_skill']) {
+    if (asRecord(operations[operation])?.status !== 'available') {
+      errors.push(`memory capability ${operation} is not available`);
+    }
+  }
+  for (const operation of ['update_persona']) {
     const capability = asRecord(operations[operation]);
     if (
       capability?.status !== 'unavailable' ||
