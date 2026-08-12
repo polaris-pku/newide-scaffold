@@ -2,7 +2,7 @@
  * RuleBasedExperienceExtractor — ExperienceExtractor 的规则版实现
  *
  * 从 BufferSnapshot.driver_return 的 decisions、assumptions、blockers 等字段
- * 按规则提取真实经验，替代 MockExperienceExtractor 的固定输出。
+ * 按规则提取真实经验。
  *
  * 提取规则：
  *   1. 正经验（positive）：从 decisions + assumptions 拼装 content

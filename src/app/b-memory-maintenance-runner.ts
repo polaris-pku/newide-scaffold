@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { SCHEMA_VERSION, nowTimestamp } from '../core';
 import {
   LlmExperienceExtractor,
+  LlmSkillPromotion,
   createAgentMemoryScope,
   processPendingBuffer,
   promoteExperiencesForAgent,
@@ -75,12 +76,14 @@ export interface BMemoryMaintenanceRunnerOptions {
 
 export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
   private readonly extractor: LlmExperienceExtractor;
+  private readonly promoter: LlmSkillPromotion;
   private readonly roleQueues = new Map<string, Promise<void>>();
   private readonly scheduleFlights = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
   private readonly jobs = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
 
   constructor(private readonly options: BMemoryMaintenanceRunnerOptions) {
     this.extractor = new LlmExperienceExtractor(options.llm);
+    this.promoter = new LlmSkillPromotion(options.llm);
   }
 
   scheduleBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence> {
@@ -198,9 +201,13 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
       if (ablationPolicy.promote_skills) {
         const outcomes = await promoteExperiencesForAgent(
           input.role_id,
-          this.options.repository,
-          this.options.bufferRepository,
-          this.options.llm,
+          (role_id) =>
+            createAgentMemoryScope(
+              this.options.repository,
+              this.options.bufferRepository,
+              role_id,
+            ),
+          this.promoter,
         );
         skills = [];
         for (const outcome of outcomes) {
@@ -268,9 +275,13 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     try {
       const outcomes = await promoteExperiencesForAgent(
         input.role_id,
-        this.options.repository,
-        this.options.bufferRepository,
-        this.options.llm,
+        (role_id) =>
+          createAgentMemoryScope(
+            this.options.repository,
+            this.options.bufferRepository,
+            role_id,
+          ),
+        this.promoter,
       );
       const skills = outcomes.flatMap((outcome) => (outcome.skill ? [outcome.skill] : []));
       return this.persist({
