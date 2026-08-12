@@ -166,6 +166,7 @@ export interface FrontendRunSnapshot {
     output?: CouncilRunResult['output'];
     result?: CouncilResult;
     outcome?: CouncilRunResult['outcome'];
+    plan_execution?: CouncilRunResult['plan_execution'];
   };
   links: Omit<IntegrationRunOutputPaths, 'run_dir'>;
 }
@@ -293,6 +294,9 @@ export function buildFrontendRunSnapshot(
             ...(input.summary.council_result ? { result: input.summary.council_result } : {}),
             ...(input.council_run_result?.outcome
               ? { outcome: input.council_run_result.outcome }
+              : {}),
+            ...(input.council_run_result?.plan_execution
+              ? { plan_execution: input.council_run_result.plan_execution }
               : {}),
           },
         }
