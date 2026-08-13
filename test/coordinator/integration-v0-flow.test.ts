@@ -99,7 +99,7 @@ describe('runIntegrationV0Flow', () => {
     expect(result.task_id).toBeDefined();
     expect(result.summary.mode).toBe('single_agent');
     expect(result.summary.status).toBe('completed');
-    expect(result.summary.run_outcome.status).toBe('best_effort');
+    expect(result.summary.run_outcome.status).toBe('completed');
 
     // Verify mailbox events in timeline
     const timelineNames = result.timeline.map((t) => t.name);
@@ -237,7 +237,7 @@ describe('runIntegrationV0Flow', () => {
     expect(result.summary.status).toBe('failed');
   });
 
-  it('reports a gate that was not evaluated as GATE_BLOCKED', async () => {
+  it('completes when no Gate hook matches', async () => {
     const result = await runFlow({
       hookEngine: {
         handleEvent: async () => ({
@@ -252,14 +252,12 @@ describe('runIntegrationV0Flow', () => {
       },
     });
 
-    expect(result.summary.failure).toEqual({
-      code: 'GATE_BLOCKED',
-      message: 'Required gates were not evaluated',
-      details: { phase: 'gate', gate_phase: 'pre_selection', gate_results: [] },
-    });
+    expect(result.summary.status).toBe('completed');
+    expect(result.summary.run_outcome.status).toBe('completed');
+    expect(result.summary.failure).toBeUndefined();
   });
 
-  it('labels a missing pre-council gate with the council phase', async () => {
+  it('completes Council delivery when no Gate hook matches', async () => {
     const result = await runFlow({
       enableCouncil: true,
       hookEngine: {
@@ -275,10 +273,9 @@ describe('runIntegrationV0Flow', () => {
       },
     });
 
-    expect(result.summary.failure).toMatchObject({
-      code: 'GATE_BLOCKED',
-      details: { gate_phase: 'pre_council' },
-    });
+    expect(result.summary.status).toBe('completed');
+    expect(result.summary.run_outcome.status).toBe('completed');
+    expect(result.summary.failure).toBeUndefined();
   });
 
   it.each([

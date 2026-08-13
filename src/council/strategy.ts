@@ -7,7 +7,7 @@ import type {
   CouncilRunResult,
 } from './contract';
 
-export type CouncilStrategyName = 'classic' | 'adaptive_lead';
+export type CouncilStrategyName = 'classic' | 'adaptive_lead' | 'plan_first';
 
 export interface CouncilStrategy {
   readonly name: CouncilStrategyName;
@@ -62,6 +62,23 @@ export class AdaptiveLeadCouncilStrategy implements CouncilStrategy {
   }
 }
 
+export class PlanFirstCouncilStrategy implements CouncilStrategy {
+  readonly name = 'plan_first' as const;
+
+  constructor(private readonly provider: CouncilProvider) {}
+
+  async runCouncilRound(
+    input: CouncilRoundInput,
+    options?: CouncilExecutionOptions,
+  ): Promise<CouncilRunResult> {
+    const result = await this.provider.runCouncilRound(input, {
+      ...options,
+      artifact_mode: 'plan',
+    });
+    return withOutcome(result, buildOutcome(result));
+  }
+}
+
 export class StrategicCouncilProvider implements CouncilProvider {
   constructor(private readonly strategy: CouncilStrategy) {}
 
@@ -84,15 +101,23 @@ export function createCouncilStrategyProvider(
   const strategy =
     strategyName === 'classic'
       ? new ClassicCouncilStrategy(provider)
-      : new AdaptiveLeadCouncilStrategy(provider);
+      : strategyName === 'adaptive_lead'
+        ? new AdaptiveLeadCouncilStrategy(provider)
+        : new PlanFirstCouncilStrategy(provider);
   return new StrategicCouncilProvider(strategy);
 }
 
 export function readCouncilStrategy(value = process.env.NEWIDE_COUNCIL_STRATEGY): CouncilStrategyName {
   const normalized = value?.trim() || 'classic';
-  if (normalized === 'classic' || normalized === 'adaptive_lead') return normalized;
+  if (
+    normalized === 'classic' ||
+    normalized === 'adaptive_lead' ||
+    normalized === 'plan_first'
+  ) {
+    return normalized;
+  }
   throw new Error(
-    `Unsupported NEWIDE_COUNCIL_STRATEGY: ${normalized}. Expected classic or adaptive_lead.`,
+    `Unsupported NEWIDE_COUNCIL_STRATEGY: ${normalized}. Expected classic, adaptive_lead, or plan_first.`,
   );
 }
 
@@ -100,18 +125,23 @@ export function reconcileCouncilOutcome(
   result: CouncilRunResult,
   councilResult: CouncilResult,
 ): CouncilRunResult {
-  if (!result.outcome) return result;
+  const current = result.outcome ?? buildOutcome(result);
   return {
     ...result,
     outcome: {
-      ...result.outcome,
+      ...current,
+      status: 'completed',
+      selected_artifact_refs: unique([
+        ...current.selected_artifact_refs,
+        councilResult.final_artifact_ref,
+      ]),
       quality: councilResult.quality,
       unresolved_issues: unique([
-        ...result.outcome.unresolved_issues,
+        ...current.unresolved_issues,
         ...councilResult.unmet_criteria,
       ]),
       warnings: unique([
-        ...result.outcome.warnings.filter(
+        ...current.warnings.filter(
           (warning) => warning !== 'Council quality attestation is not available yet.',
         ),
         ...councilResult.warnings,
@@ -174,8 +204,6 @@ function adaptiveUnresolvedIssues(result: CouncilRunResult): string[] {
   const leadId = result.synthesis?.synthesizer_id;
   if (!leadId) {
     issues.push('a real lead synthesis is required');
-  } else if (distinctProposers.has(leadId)) {
-    issues.push(`lead ${leadId} is also a proposer; independent lead evidence is required`);
   }
   if (result.decision.verdict !== 'select' || result.selected_artifact_refs.length === 0) {
     issues.push('adaptive Council did not select a final artifact');

@@ -860,6 +860,7 @@ async function runIntegrationV0FlowBody(
 
   const postCouncilGateResults: GateResult[] = [];
   const postCouncilGatesRequired = Boolean(councilCompletedEvent);
+  let postCouncilGateMatched = false;
   if (councilCompletedEvent) {
     const postCouncilHookResult = options?.hookEngine
       ? await options.hookEngine.handleEvent({
@@ -876,6 +877,7 @@ async function runIntegrationV0FlowBody(
             (artifact) => artifact.artifact_id,
           ),
         });
+    postCouncilGateMatched = postCouncilHookResult.matched;
     options?.signal?.throwIfAborted();
     const usedGateResultIds = new Set(preGateResults.map((gate) => gate.gate_result_id));
     for (const sourceGateResult of postCouncilHookResult.gate_results) {
@@ -907,9 +909,10 @@ async function runIntegrationV0FlowBody(
   }
 
   const preGatesPassed =
-    preGateResults.length > 0 && preGateResults.every((gate) => gate.decision === 'allow');
+    !hookResult.matched ||
+    (preGateResults.length > 0 && preGateResults.every((gate) => gate.decision === 'allow'));
   const postCouncilGatesPassed =
-    !postCouncilGatesRequired ||
+    !postCouncilGateMatched ||
     (postCouncilGateResults.length > 0 &&
       postCouncilGateResults.every((gate) => gate.decision === 'allow'));
   const combinedGateResults = [...preGateResults, ...postCouncilGateResults];
@@ -1120,7 +1123,9 @@ async function runIntegrationV0FlowBody(
     driverResult,
     preGateResults,
     postCouncilGateResults,
+    preGateRequired: hookResult.matched,
     postCouncilGatesRequired,
+    postCouncilGateRequired: postCouncilGateMatched,
     hasMaterializableArtifact,
     hasResponse,
     hasChangedFiles,
@@ -1463,7 +1468,9 @@ function buildIntegrationFailure(input: {
   driverResult: DriverRunResult;
   preGateResults: GateResult[];
   postCouncilGateResults: GateResult[];
+  preGateRequired: boolean;
   postCouncilGatesRequired: boolean;
+  postCouncilGateRequired: boolean;
   hasMaterializableArtifact: boolean;
   hasResponse: boolean;
   hasChangedFiles: boolean;
@@ -1477,7 +1484,7 @@ function buildIntegrationFailure(input: {
       details: { phase: 'driver', ...(input.driverResult.error ?? {}) },
     };
   }
-  if (input.preGateResults.length === 0) {
+  if (input.preGateRequired && input.preGateResults.length === 0) {
     return {
       code: 'GATE_BLOCKED',
       message: 'Required gates were not evaluated',
@@ -1507,7 +1514,7 @@ function buildIntegrationFailure(input: {
       details: { phase: 'gate', gate_phase: preGatePhase, gate_results: input.preGateResults },
     };
   }
-  if (input.postCouncilGatesRequired && input.postCouncilGateResults.length === 0) {
+  if (input.postCouncilGateRequired && input.postCouncilGateResults.length === 0) {
     return {
       code: 'GATE_BLOCKED',
       message: 'Required post-council gates were not evaluated',

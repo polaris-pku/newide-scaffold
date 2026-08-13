@@ -2,7 +2,7 @@
  * LiteLLMClientAdapter — 将 LiteLLMClient 适配为 LlmClient 接口
  *
  * 实现 LlmClient（complete）：用于上下文清理、经验提取、技能晋升。
- * Tool-calling（Agent dispatch）请使用 DeepSeekToolCallingClient。
+ * Tool-calling（Agent dispatch）请使用 LiteLLMToolCallingClient。
  *
  * 自动加载项目根目录的 .env.local（已 gitignore），将其中定义的
  * 环境变量注入 process.env，供 AI SDK provider（如 @ai-sdk/openai）使用。

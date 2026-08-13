@@ -55,6 +55,7 @@ export interface Review {
 }
 
 export interface CouncilResult {
+  /** @deprecated Audit metadata only; Task completion is based on final artifact convergence. */
   quality: 'verified' | 'best_effort';
   final_artifact_ref: ArtifactId;
   final_artifact_sha256: string;
@@ -75,6 +76,7 @@ export interface CouncilOutcome {
   participant_role_ids: string[];
   selected_artifact_refs: ArtifactId[];
   decision_summary: string;
+  /** @deprecated Audit metadata only; it never controls Council or Task status. */
   quality: 'verified' | 'best_effort';
   unresolved_issues: string[];
   warnings: string[];
@@ -164,10 +166,20 @@ export interface CouncilRunResult {
   selected_artifact_refs: ArtifactId[];
   result?: CouncilResult;
   outcome?: CouncilOutcome;
+  plan_execution?: CouncilPlanExecution;
   diagnostic_refs?: string[];
   comparison_refs?: string[];
   created_at: Timestamp;
   schema_version: SchemaVersion;
+}
+
+export interface CouncilPlanExecution {
+  executor_role_id: string;
+  session_id: string;
+  agent_run_id: string;
+  driver_run_result_id: string;
+  final_plan_artifact_refs: ArtifactId[];
+  implementation_artifact_refs: ArtifactId[];
 }
 
 export interface CouncilRunRequest {
@@ -213,7 +225,11 @@ export interface CouncilExecutionOptions {
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
   onLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
+  /** Internal strategy hint; it is not part of the public Task/Run RPC. */
+  artifact_mode?: CouncilArtifactMode;
 }
+
+export type CouncilArtifactMode = 'implementation' | 'plan';
 
 export interface CouncilProvider {
   runCouncilRound(

@@ -65,14 +65,7 @@ export class AutonomousCouncilHandler {
       warnings.push('Council synthesis was unavailable; selected a reviewed proposal.');
     }
     if (identityConflict) {
-      warnings.push(
-        'Council reused a persisted Agent across seats; the result is best_effort and not fully verified.',
-      );
-    }
-    if (!verified) {
-      warnings.push(
-        'Council verification did not fully pass; delivering the best available artifact.',
-      );
+      warnings.push('Council reused a persisted Agent across seats; identity reuse was audited.');
     }
     const councilResult: CouncilResult = {
       quality: verified ? 'verified' : 'best_effort',

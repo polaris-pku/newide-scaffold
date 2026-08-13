@@ -27,6 +27,19 @@ const MARKET_AGENT_CATALOG = [
     tags: ['market_eligible', 'typescript'],
     persona_seed: 'Build reliable TypeScript services with explicit contracts and tests.',
   },
+  {
+    role_id: 'role_code_reviewer',
+    name: 'Code Reviewer',
+    tags: ['market_eligible', 'reviewer'],
+    persona_seed:
+      'Critically review proposed solutions for correctness, edge cases, and test coverage.',
+  },
+  {
+    role_id: 'role_synthesis_engineer',
+    name: 'Synthesis Engineer',
+    tags: ['market_eligible', 'synthesis'],
+    persona_seed: 'Synthesize the strongest final answer from proposals and reviews.',
+  },
 ] as const;
 
 export interface BMemoryStorage {

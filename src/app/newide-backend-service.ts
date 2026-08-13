@@ -67,9 +67,15 @@ import type {
   SaveMailboxReplyResult,
 } from '../mailbox';
 import type { DriverStreamEvent } from '../driver/contract';
-import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
+import type {
+  AgentBoardAgentView,
+  AgentBoardListItem,
+  ExperienceView,
+  SkillView,
+} from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
+import type { ReviewedSkill } from './b-public-capabilities';
 import {
   NoopDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
@@ -324,6 +330,14 @@ export class NewideBackendService {
 
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
+  }
+
+  approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().approveSkill(roleId, skillId, reviewedBy);
+  }
+
+  rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().rejectSkill(roleId, skillId, reviewedBy);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {
@@ -591,7 +605,7 @@ export class NewideBackendService {
     if (this.closing) throw new Error('Backend service is closing');
     const processor = this.taskProcessor!;
     const loop = this.taskExecutionLoop!;
-    const mode = params.mode ?? 'single_agent';
+    const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
     const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
     const identity = {
@@ -910,7 +924,7 @@ export class NewideBackendService {
     if (this.closing) {
       return Promise.reject(new Error('Backend service is closing'));
     }
-    const mode = params.mode ?? 'single_agent';
+    const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
     const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
     const controller = new AbortController();
@@ -1644,4 +1658,15 @@ function normalizeWorkspacePath(input: string): string {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * NEWIDE_DEFAULT_RUN_MODE 解析：run.create 未显式传 mode 时用该值决定
+ * single_agent / council。默认 single_agent。
+ */
+export function readDefaultRunMode(env: NodeJS.ProcessEnv): AppRunMode {
+  const raw = env.NEWIDE_DEFAULT_RUN_MODE?.trim();
+  if (!raw) return 'single_agent';
+  if (raw === 'council' || raw === 'single_agent') return raw;
+  throw new Error(`Invalid NEWIDE_DEFAULT_RUN_MODE: ${raw}. Expected council or single_agent.`);
 }

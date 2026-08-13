@@ -54,6 +54,30 @@ describe('Council strategy boundary', () => {
     expect(output.outcome?.unresolved_issues).toContain(
       'proposal proposal_b lacks a review by another role_id',
     );
+    expect(output.outcome?.unresolved_issues).not.toContain(
+      'lead role_a is also a proposer; independent lead evidence is required',
+    );
+  });
+
+  it('injects plan artifact mode without changing the Council request contract', async () => {
+    const result = councilResult({ adaptive: true });
+    let artifactMode: string | undefined;
+    const provider = createCouncilStrategyProvider(
+      {
+        async runCouncilRound(_input, options) {
+          artifactMode = options?.artifact_mode;
+          return result;
+        },
+      },
+      'plan_first',
+    );
+
+    const output = await provider.runCouncilRound(baseInput());
+
+    expect(readCouncilStrategy('plan_first')).toBe('plan_first');
+    expect(provider.strategyName).toBe('plan_first');
+    expect(artifactMode).toBe('plan');
+    expect(output.outcome?.status).toBe('completed');
   });
 
   it('rejects an unknown strategy instead of silently falling back', () => {

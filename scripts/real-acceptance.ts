@@ -127,9 +127,10 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
     );
     const capabilities = asRecord(capabilityResponse.capabilities) ?? {};
     const embedding = asRecord(capabilities.embedding) ?? {};
+    const skillReview = asRecord(capabilities.skill_review) ?? {};
     const operations = asRecord(capabilities.operations) ?? {};
     details.capabilities = capabilities;
-    validateMemoryCapabilities(operations, embedding, errors);
+    validateMemoryCapabilities(operations, embedding, skillReview, errors);
 
     const listed = await backend.request<{ agents?: Array<{ role_id?: string }> }>(
       'memory.listAgents',
@@ -202,7 +203,6 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
       const id = typeof skill.id === 'string' ? skill.id : undefined;
       return id && !beforeSkillIds[firstAgentId]?.includes(id);
     });
-
     const second = await runMemoryTask(
       backend,
       [
@@ -307,6 +307,12 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
     }
     if (promotedSkills.length === 0) {
       errors.push('Skill promotion produced no persisted Skill');
+    }
+    if (!promotedSkillStates.some((skill) => skill.reusable)) {
+      errors.push('Skill approval produced no reusable approved Skill');
+    }
+    if (!promotedSkillStates.some((skill) => skill.retrieved_by_second_task)) {
+      errors.push('second task did not retrieve an approved promoted Skill');
     }
 
     log(`memory first run: ${first.created.run_id} agent=${firstAgentId}`);
@@ -1070,6 +1076,7 @@ async function runMemoryTask(
 function validateMemoryCapabilities(
   operations: Record<string, unknown>,
   embedding: Record<string, unknown>,
+  skillReview: Record<string, unknown>,
   errors: string[],
 ): void {
   for (const operation of [
@@ -1084,7 +1091,12 @@ function validateMemoryCapabilities(
       errors.push(`memory capability ${operation} is not available`);
     }
   }
-  for (const operation of ['approve_skill', 'reject_skill', 'update_persona']) {
+  for (const operation of ['approve_skill', 'reject_skill']) {
+    if (asRecord(operations[operation])?.status !== 'available') {
+      errors.push(`memory capability ${operation} is not available`);
+    }
+  }
+  for (const operation of ['update_persona']) {
     const capability = asRecord(operations[operation]);
     if (
       capability?.status !== 'unavailable' ||
@@ -1106,6 +1118,9 @@ function validateMemoryCapabilities(
     embedding.dimensions <= 0
   ) {
     errors.push('embedding dimensions are missing or invalid');
+  }
+  if (skillReview.mode !== 'auto_approve') {
+    errors.push('memory acceptance requires skill_review.mode=auto_approve');
   }
 }
 
@@ -1272,6 +1287,7 @@ async function startBackend(label: string): Promise<BackendClient> {
     env: {
       ...process.env,
       ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '300000',
+      NEWIDE_B_SKILL_AUTO_APPROVE: process.env.NEWIDE_B_SKILL_AUTO_APPROVE ?? '1',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     },

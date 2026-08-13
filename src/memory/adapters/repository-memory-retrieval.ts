@@ -12,7 +12,7 @@
  *
  * ## 注入点
  *
- * mvp/default-agent-run-deps.ts → defaultMvpAgentRunDeps.queryMemory
+ * default-agent-run-deps.ts → defaultMvpAgentRunDeps.queryMemory
  */
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { AgentTaskRequest } from '../agent-types';

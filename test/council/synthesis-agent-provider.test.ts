@@ -12,6 +12,120 @@ import { councilRunDirName } from '../../src/council/council-workspace';
 import { SynthesisAgentCouncilProvider } from '../../src/council/providers/synthesis-agent-provider';
 
 describe('SynthesisAgentCouncilProvider', () => {
+  it('runs plan-first roles without allowing product-file changes', async () => {
+    const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-plan-'));
+    const requests: AgentExecutionRequest[] = [];
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        requests.push(input);
+        const targetPath =
+          input.council_seat === 'synthesizer' ? 'final-plan.md' : 'council-plan.md';
+        const proposalIds = input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [];
+        return {
+          agent_run_id: `agent_run_${input.role_id}`,
+          agent_id: input.role_id,
+          role_id: input.role_id,
+          context_pack_ref: `context_${input.role_id}`,
+          driver_run_result_id: `driver_result_${input.role_id}`,
+          artifact_refs:
+            input.council_seat === 'reviewer'
+              ? []
+              : [createArtifact(`artifact_${input.role_id}`, input.role_id, 'file', targetPath)],
+          transcript_ref: createArtifact(
+            `transcript_${input.role_id}`,
+            input.role_id,
+            'transcript',
+          ),
+          session_id: `session_${input.role_id}`,
+          response:
+            input.council_seat === 'reviewer'
+              ? [
+                  'Review completed.',
+                  '```json',
+                  JSON.stringify({
+                    reviews: proposalIds.map((proposalId) => ({
+                      proposal_id: proposalId,
+                      verdict: 'approve',
+                      reason: 'Plan is actionable.',
+                      unmet_criteria: [],
+                      evidence_refs: [],
+                    })),
+                  }),
+                  '```',
+                  '<<<DRIVER_RETURN>>>',
+                ].join('\n')
+              : `${input.role_id} completed`,
+          tool_events: [],
+          diagnostics: { driver_id: `driver_${input.role_id}` },
+          status: 'completed',
+          created_at: '2026-07-07T00:00:00.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade, councilRoot });
+
+    const result = await provider.runCouncilRound(baseInput(), { artifact_mode: 'plan' });
+
+    expect(requests).toHaveLength(4);
+    expect(requests[0]?.instruction).toContain('council-plan.md');
+    expect(requests[0]?.instruction).toContain('Do not modify product files');
+    expect(requests[0]?.instruction).toContain('call the invoke_driver tool');
+    expect(requests[0]?.driver_instruction).toContain('council-plan.md');
+    expect(requests[0]?.driver_instruction).not.toContain('invoke_driver');
+    expect(requests[2]?.instruction).toContain('Review the staged Council Plan inputs');
+    expect(requests[3]?.instruction).toContain('final-plan.md');
+    expect(requests[3]?.instruction).toContain('Do not implement');
+    expect(result.reviews).toHaveLength(2);
+    expect(result.reviews.every((review) => review.verdict === 'approve')).toBe(true);
+    expect(result.selected_artifact_refs).toEqual([
+      `artifact_${COUNCIL_AGENTS.synthesizer}`,
+    ]);
+  });
+
+  it('rejects product files emitted by a plan-first Council role', async () => {
+    const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-plan-invalid-'));
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        return {
+          agent_run_id: `agent_run_${input.role_id}`,
+          agent_id: input.role_id,
+          role_id: input.role_id,
+          context_pack_ref: `context_${input.role_id}`,
+          driver_run_result_id: `driver_result_${input.role_id}`,
+          artifact_refs: [
+            createArtifact(`artifact_${input.role_id}`, input.role_id, 'file', 'src/change.ts'),
+          ],
+          transcript_ref: createArtifact(
+            `transcript_${input.role_id}`,
+            input.role_id,
+            'transcript',
+          ),
+          session_id: `session_${input.role_id}`,
+          response: 'completed',
+          tool_events: [],
+          diagnostics: { driver_id: `driver_${input.role_id}` },
+          status: 'completed',
+          created_at: '2026-07-07T00:00:00.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade, councilRoot });
+
+    const result = await provider.runCouncilRound(baseInput(), { artifact_mode: 'plan' });
+
+    expect(result.selected_artifact_refs).toEqual([]);
+    expect(result.decision.verdict).toBe('request_revision');
+    expect(result.diagnostic_refs).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/^COUNCIL_PROPOSAL_FAILED:/),
+        expect.stringMatching(/^COUNCIL_REVIEW_FAILED:/),
+        expect.stringMatching(/^COUNCIL_SYNTHESIS_FAILED:/),
+      ]),
+    );
+  });
+
   it('runs proposer, reviewer, and synthesizer roles through AgentExecutionFacade', async () => {
     const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-provider-'));
     const requests: AgentExecutionRequest[] = [];
@@ -362,6 +476,7 @@ function createArtifact(
   artifactId: string,
   roleId: string,
   type: ArtifactRef['type'] = 'patch',
+  targetPath = `${roleId}.txt`,
 ): ArtifactRef {
   return {
     artifact_id: artifactId,
@@ -375,7 +490,7 @@ function createArtifact(
           content: {
             kind: 'text' as const,
             content_ref: `data:text/plain,${encodeURIComponent(`output from ${roleId}\n`)}`,
-            target_path: `${roleId}.txt`,
+            target_path: targetPath,
           },
         }),
     created_at: '2026-07-07T00:00:00.000Z',

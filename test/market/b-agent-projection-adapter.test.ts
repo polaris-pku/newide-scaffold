@@ -6,7 +6,7 @@ import type {
   ExperienceView,
   SkillView,
 } from '../../src/memory/ports/agent-board-query';
-import type { AgentCompetitionQuery } from '../../src/memory/ports/agent-competition-query';
+import type { AgentCompetitionClaimQuery } from '../../src/market/b-agent-projection-adapter';
 import { BAgentProjectionAdapter } from '../../src/market';
 
 const NOW = Date.parse('2026-07-18T00:00:00.000Z');
@@ -171,7 +171,7 @@ describe('BAgentProjectionAdapter', () => {
 
 function competition(
   claims: Array<ReturnType<typeof claim>>,
-): AgentCompetitionQuery {
+): AgentCompetitionClaimQuery {
   return {
     async collectCompetitionClaims(task) {
       return {

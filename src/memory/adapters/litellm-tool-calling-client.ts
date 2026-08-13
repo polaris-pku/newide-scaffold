@@ -174,7 +174,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     this.taskName = options.taskName ?? 'memory-query';
     this.modelOverride = options.model;
 
-    // 构造参数覆盖环境变量（按老版 DeepSeekToolCallingClient 的语义）
+    // 构造参数覆盖环境变量
     if (options.apiKey) {
       process.env.OPENAI_API_KEY = options.apiKey;
     }

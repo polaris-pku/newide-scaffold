@@ -336,13 +336,12 @@ suite('E2E 真实 Agent 循环 (Agent → Driver → Buffer → Extract → PG �
       `📐 Embedding 维度: ${embedding.dimensions} (${hasEmbeddingKey ? 'LiteLLM' : 'Hash fallback'})`,
     );
 
-    // 先清理上次残留数据
+    // 先建 schema，再清理上次残留数据（清理依赖表已存在）
+    await ensurePgMemorySchema(pool, embedding.dimensions);
+    console.log(`✅ PG schema 已就绪`);
     await pool.query('DELETE FROM memory_experiences WHERE role_id = $1', [ROLE_ID]);
     await pool.query('DELETE FROM memory_skills WHERE role_id = $1', [ROLE_ID]);
     await pool.query('DELETE FROM memory_agents WHERE role_id = $1', [ROLE_ID]);
-
-    await ensurePgMemorySchema(pool, embedding.dimensions);
-    console.log(`✅ PG schema 已就绪`);
 
     repository = new PgMemoryRepository({ pool, embedding });
     bufferRepo = new FileBufferRepository({ agentStateRoot: tempDir });
@@ -407,7 +406,7 @@ suite('E2E 真实 Agent 循环 (Agent → Driver → Buffer → Extract → PG �
 
   it('Cycle 1: Agent 通过真实 LLM tool-calling 执行任务', async () => {
     const task: AgentTaskRequest = {
-      spec: '实现一个 JWT 认证中间件，支持 token 刷新和黑名单机制。请先查询记忆中是否有相关经验，然后调用 Driver 完成实现。',
+      spec: '写一个 hello_world.txt 文件，内容为 hello。调用 Driver 完成。',
       task_id: 'task-real-001',
       source_driver: 'code-driver',
     };
@@ -685,7 +684,7 @@ suite('E2E 真实 Agent 循环 (Agent → Driver → Buffer → Extract → PG �
     console.log(`  Agent loaded: ${!!agent}, state: ${agent?.getState()}`);
 
     const task: AgentTaskRequest = {
-      spec: '实现一个基于 JWT 的 API 权限控制系统，需要支持角色级别的访问控制。请先查询记忆中关于 JWT 认证的经验，参考已有经验来优化实现方案。',
+      spec: '再写一个 goodbye.txt 文件，内容为 goodbye。调用 Driver 完成。',
       task_id: 'task-real-002',
       source_driver: 'code-driver',
     };

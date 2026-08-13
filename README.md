@@ -4,6 +4,84 @@
 production path now includes a real external Driver, persistent B role/persona/memory,
 durable Task/Run state, and Council proposal/review/synthesis/delivery.
 
+## Quick Start
+
+只保留两个正式入口：后端 CLI 和 Polaris Electron。需要 Node.js `>=22.22.1`、
+pnpm `>=11.8.0`；使用本地 B PostgreSQL 时还需要 Docker。
+
+### Backend CLI
+
+B/C/D 后端和 ACP Client 可以位于任意目录。先安装两个仓库的依赖：
+
+```bash
+pnpm --dir /path/to/acp-client install
+pnpm install
+```
+
+复制本仓库的 `.env.example` 为 `.env.local`，至少配置 B/Council 模型和实际 coding
+agent：
+
+```dotenv
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=replace-with-your-key
+ACP_AGENT_ID=claude
+NEWIDE_B_EMBEDDING_PROVIDER=hash
+NEWIDE_B_EMBEDDING_DIMENSIONS=32
+# NEWIDE_COUNCIL_STRATEGY=plan_first
+```
+
+固定 Council 工作流（主/副出方案 + 评审 + 合成，主最后实现计划）：设
+`NEWIDE_COUNCIL_STRATEGY=plan_first`、`NEWIDE_DEFAULT_RUN_MODE=council`，
+并用 `NEWIDE_COUNCIL_SEATS` 固定 4 个席位；关闭竞标用
+`NEWIDE_AUCTION_ENABLED=0` + `NEWIDE_PRIMARY_AGENT_ID`。详见 `.env.example`。
+
+在 ACP Client 仓库的 `.env` 中配置对应 agent 的凭据。例如 `ACP_AGENT_ID=claude` 时：
+
+```dotenv
+ANTHROPIC_API_KEY=replace-with-your-key
+```
+
+运行一次真实 Council 任务：
+
+```bash
+pnpm task:run -- \
+  --workspace ./task-workspace \
+  --prompt "实现需求并把最终文件写入 workspace" \
+  --local-postgres
+```
+
+脚本会构建 ACP Client 和后端 CLI，并启动或复用本地 PostgreSQL。已有数据库时，在
+`.env.local` 设置 `NEWIDE_B_DATABASE_URL` 并省略 `--local-postgres`。ACP Client 不在
+默认相邻目录时传 `--driver-runner /path/to/acp-client`。
+
+过程日志写到 stderr，终态 JSON 写到 stdout；运行证据默认位于
+`.newide/task-runs/<timestamp>/`，生成文件位于 `--workspace`。完整参数见：
+
+```bash
+pnpm task:run -- --help
+```
+
+Council 默认使用 `classic`，各角色直接产生候选实现。设置
+`NEWIDE_COUNCIL_STRATEGY=plan_first` 后，Primary 与 Council 角色只生成和审阅 Plan，
+Synthesizer 选出 `final-plan.md`，再由原 Primary Agent 在同一 Session 和隔离 workspace
+中实施；Task/Run RPC、Gate 和交付入口不变。
+
+`.env.local`、ACP Client 的 `.env` 和 API key 均不得提交到 Git。
+
+### Polaris Electron
+
+Electron 使用 Polaris 仓库内打包的 A/B/C/D 后端：
+
+```bash
+cd /path/to/polaris
+pnpm install
+pnpm build:backend
+pnpm electron:dev
+```
+
+在应用设置中配置 provider、model、API key 和 B 数据库连接。后端包变化后重新执行
+`pnpm build:backend`；日常前端联调直接运行 `pnpm electron:dev`。
+
 ```text
 TaskCreateRequest
 -> RunCreated
@@ -21,9 +99,7 @@ TaskCreateRequest
 -> RunCompleted
 ```
 
-Legacy mock/demo implementations still exist for deterministic development tests; they are not
-the production CLI composition. Query `system.readiness` and `system.capabilities` instead of
-inferring production support from source files.
+Query `system.readiness` and `system.capabilities` to inspect production support.
 
 ## Repository Shape
 
@@ -35,51 +111,13 @@ The RFC files live beside this repository in `../RFC`. They are design inputs an
 src/
   core/         shared contracts only
   coordinator/  Direction C coordination layer (task state, checkpoint, stores)
-  council/      Direction C council contracts plus MockCouncil
-  driver/       Direction A driver contract plus MockDriver
-  memory/       Direction B context pack contract plus MockMemoryProvider
+  council/      Direction C council contracts and implementations
+  driver/       Direction A driver contracts and adapters
+  memory/       Direction B context pack contracts and providers
   hook/         Direction D.1 hook system
   gate/         Direction D.2 gate evaluation system
   examples/     runnable demos
 ```
-
-## Install And Run
-
-```bash
-pnpm install
-pnpm build
-pnpm pack --pack-destination .newide/packages
-```
-
-The tarball exposes a `newide` binary. It can run the JSON-RPC service or a one-shot Council
-evaluation:
-
-```bash
-newide serve --stdio --state-root /absolute/state/root
-
-newide council run \
-  --workspace /absolute/task/workspace \
-  --state-root /absolute/state/root \
-  --prompt "Implement the requested change" \
-  --allow-degraded
-```
-
-`council.execute` is currently reported as `degraded`, so the one-shot command requires explicit
-`--allow-degraded`. It still executes real model calls and writes real artifacts; the terminal JSON
-preserves the capability status and result quality. stdout contains one
-`newide.eval.council.v1` terminal JSON object with `run_id`, `task_id`, `status`, `quality`,
-`council_capability`, `result_path`, `summary_path`, `frontend_snapshot_path`, `audit_path`, decision
-summary, and errors. Progress and lifecycle diagnostics use stderr. A terminal production run also
-publishes `summary.json` under its run directory; Eval consumes its top-level `worktree_path`.
-
-Runtime configuration is loaded from the caller's `.env.local` plus process environment. Required
-external dependencies are explicit:
-
-- `NEWIDE_B_DATABASE_URL` for the B PostgreSQL repository;
-- a real model provider/API key;
-- `ACP_DRIVER_RUNNER_DIR` when the A runner is not in the default sibling checkout;
-- a real semantic embedding provider for non-degraded memory evaluation. Setting
-  `NEWIDE_B_EMBEDDING_PROVIDER=hash` is an explicit local/degraded mode.
 
 ## F Eval Real Harness Setup
 
@@ -169,7 +207,9 @@ Notes:
 
 `src/core` owns shared contracts: IDs, timestamps, task/run state, events, artifacts, checkpoints, decisions, merge authorization, messages, role and memory refs, context pack refs, and file leases. It must not import `coordinator`, `driver`, `memory`, `hook`, `gate`, or `council`.
 
-`src/driver` owns Direction A's runtime boundary. v0 defines `DriverRuntimeHandle`, `DriverCapabilities`, `DriverPrompt`, `DriverRunResult`, `DriverError`, and `MockDriver`. Real ACP, adapter, and PTY integrations should be added behind these contracts later.
+`src/driver` owns Direction A's runtime boundary. v0 defines `DriverRuntimeHandle`,
+`DriverCapabilities`, `DriverPrompt`, `DriverRunResult`, and `DriverError`. ACP, adapter, and PTY
+integrations live behind these contracts.
 
 `src/memory` owns Direction B's role/persona/memory implementation and public ports. The
 application composition consumes those ports and must not replace them with app-owned memory
@@ -188,17 +228,8 @@ coordination store; in-memory stores remain test/demo implementations.
 
 ## Development Boundaries
 
-Cross-module imports should go through module entrypoints:
-
-```ts
-import { Task, Event } from '../core';
-import { MockDriver } from '../driver';
-import { MockMemoryProvider } from '../memory';
-import { HookEngine } from '../hook';
-import { MockAllowGate } from '../gate';
-```
-
-Avoid importing another module's internal files directly. For example, prefer `../memory/mvp` for MVP code over deep paths like `../memory/mvp/mock-memory-provider`.
+Cross-module imports should go through module entrypoints. Avoid importing another module's
+internal files directly.
 
 `src/core` is the shared protocol layer. It must not import from other modules.
 

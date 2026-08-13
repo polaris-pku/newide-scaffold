@@ -12,6 +12,7 @@ import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler
 import {
   AgentBoardCouncilParticipantResolver,
   createCouncilStrategyProvider,
+  readCouncilSeatAssignments,
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
@@ -255,6 +256,7 @@ export async function createProductionBackendService(
         root: path.join(stateRoot, 'market'),
       }),
     });
+    const councilSeatAssignments = readCouncilSeatAssignments(env.NEWIDE_COUNCIL_SEATS);
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
@@ -262,6 +264,7 @@ export async function createProductionBackendService(
         boardQuery: bCapabilities.boardQuery,
         allowedAgentIds: bRuntime.market_agent_ids,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
+        ...(councilSeatAssignments ? { seatAssignments: councilSeatAssignments } : {}),
       }),
     });
     const councilProvider = createCouncilStrategyProvider(
@@ -284,6 +287,7 @@ export async function createProductionBackendService(
     const bMemoryService = new BMemoryBackendService(
       bCapabilities,
       bRuntime.embedding_info,
+      { autoApprovePromotedSkills: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1' },
     );
 
     try {
@@ -307,6 +311,10 @@ export async function createProductionBackendService(
         councilProvider,
         gateExecutor,
         bootstrapAgentIds: bRuntime.market_agent_ids,
+        auctionEnabled: readAuctionEnabled(env.NEWIDE_AUCTION_ENABLED),
+        ...(env.NEWIDE_PRIMARY_AGENT_ID?.trim()
+          ? { primaryAgentId: env.NEWIDE_PRIMARY_AGENT_ID.trim() }
+          : {}),
         runsRoot,
         councilRoot: path.join(stateRoot, 'council'),
         worktreesRoot: path.join(stateRoot, 'worktrees'),
@@ -565,4 +573,15 @@ function assertValidMarketAgentIds(value: unknown): asserts value is readonly st
   if (!valid) {
     throw new Error('Production B runtime must provide non-empty, unique market_agent_ids');
   }
+}
+
+/**
+ * NEWIDE_AUCTION_ENABLED 解析：默认 true；"0"/"false" 关闭竞标。
+ */
+export function readAuctionEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
 }

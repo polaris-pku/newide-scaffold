@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createProductionBackendService,
   parseDriverEnv,
+  readAuctionEnabled,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
 import type { NewideBackendService } from '../../src/app/newide-backend-service';
@@ -29,6 +30,26 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
 } from '../../src/app/b-memory-maintenance-runner';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
+
+describe('readAuctionEnabled', () => {
+  it('defaults to true when unset', () => {
+    expect(readAuctionEnabled(undefined)).toBe(true);
+    expect(readAuctionEnabled('')).toBe(true);
+    expect(readAuctionEnabled('  ')).toBe(true);
+  });
+
+  it('parses disable and enable values', () => {
+    expect(readAuctionEnabled('0')).toBe(false);
+    expect(readAuctionEnabled('false')).toBe(false);
+    expect(readAuctionEnabled('FALSE')).toBe(false);
+    expect(readAuctionEnabled('1')).toBe(true);
+    expect(readAuctionEnabled('true')).toBe(true);
+  });
+
+  it('rejects invalid values', () => {
+    expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
 
 describe('backend RPC stdio entrypoint', () => {
   it('fails fast when the configured ACP runner directory does not exist', async () => {
@@ -487,14 +508,11 @@ describe('backend RPC stdio entrypoint', () => {
       expect(
         councilEventTypes.filter((type) => type === 'council.synthesis.completed'),
       ).toHaveLength(1);
-      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(1);
+      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(0);
       expect(councilEventTypes.indexOf('council.completed')).toBeLessThan(
         councilEventTypes.indexOf('artifact.selected'),
       );
       expect(councilEventTypes.indexOf('artifact.selected')).toBeLessThan(
-        councilEventTypes.lastIndexOf('gate.result'),
-      );
-      expect(councilEventTypes.lastIndexOf('gate.result')).toBeLessThan(
         councilEventTypes.indexOf('worktree.materialized'),
       );
       expect(externalCouncilSnapshot.delivery_report?.files_written.length).toBeGreaterThan(0);
@@ -516,13 +534,11 @@ describe('backend RPC stdio entrypoint', () => {
       const keyTypes = [
         'council.completed',
         'artifact.selected',
-        'gate.result',
         'worktree.materialized',
       ];
       const expectedOrder = [
         'council.completed',
         'artifact.selected',
-        'gate.result',
         'worktree.materialized',
       ];
       const postCouncilSequence = (types: string[]) =>
@@ -559,10 +575,8 @@ describe('backend RPC stdio entrypoint', () => {
         council: {
           result: {
             quality: 'best_effort',
-            warnings: expect.arrayContaining([
-              'Council verification did not fully pass; delivering the best available artifact.',
-            ]),
           },
+          outcome: { status: 'completed' },
         },
         errors: [],
       });

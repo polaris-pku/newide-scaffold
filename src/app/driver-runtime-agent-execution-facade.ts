@@ -93,6 +93,8 @@ interface InvocationContext {
   run_id: string;
   role_id: string;
   instruction: string;
+  driver_instruction: string;
+  driver_instruction_locked: boolean;
   workspace_path?: string;
   session_id?: string;
   signal?: AbortSignal;
@@ -188,6 +190,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         'NewIDE session initialization only.',
         `Register this ACP session for collaboration role ${input.role_id}.`,
         'Do not modify files, call tools, or solve the task. Reply with SESSION_READY and stop.',
+        'This instruction applies only to this initialization turn; every later turn must follow its newest task instruction instead.',
       ].join('\n'),
       workspace_path: input.workspace_path,
       created_at: nowTimestamp(),
@@ -340,6 +343,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         run_id: input.run_id,
         role_id: runtimeRoleId,
         instruction: input.instruction,
+        driver_instruction: input.driver_instruction ?? input.instruction,
+        driver_instruction_locked: input.driver_instruction !== undefined,
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
@@ -736,7 +741,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     throwIfAborted(invocation.signal);
     try {
       const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
-        task_instruction: invocation.instruction,
+        task_instruction: invocation.driver_instruction,
         skills: deduplicateMemoryItems([
           ...toDriverMemoryItems(invocation.retrieval.skills),
           ...toMemoryItems('skill', task.context?.skills),
@@ -744,7 +749,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         experiences: deduplicateMemoryItems([
           ...toDriverMemoryItems(invocation.retrieval.experiences),
           ...toMemoryItems('experience', task.context?.experiences),
-          ...delegationContext(invocation.instruction, task.instruction),
+          ...(invocation.driver_instruction_locked
+            ? []
+            : delegationContext(invocation.driver_instruction, task.instruction)),
         ]),
       };
       invocation.driver_invocation_context = driverInvocationContext;
