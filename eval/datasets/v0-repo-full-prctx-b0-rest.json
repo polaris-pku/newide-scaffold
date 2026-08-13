@@ -1,0 +1,27 @@
+{
+  "subset_id": "v0-repo-full-prctx-b0-rest",
+  "description": "Remaining v0-repo-full-prctx instances after interrupted hardened council B0 run 2026-08-11T07-34-01-776Z (skip 1 completed conan 2.0.14→2.0.15).",
+  "source_dataset_version": "hf_out-v1-prctx",
+  "source_jsonl": "eval/data/sweevo-v0-repo-full-prctx.jsonl",
+  "selection_rule": "v0-repo-full-prctx minus conan-io__conan_2.0.14_2.0.15.",
+  "environment_notes": [
+    "Resume arm B0 only against existing experiment-dir with NEWIDE_ABLATION_ALLOW_EXISTING_SCHEMA=1.",
+    "Keep the completed B0/conan-io__conan_2.0.14_2.0.15.json; merge into arm-summary after rest finishes.",
+    "Run full v0-repo-full-prctx with --ablations B1 and B2 in parallel."
+  ],
+  "instance_ids": [
+    "conan-io__conan_2.0.2_2.0.3",
+    "dask__dask_2022.9.2_2022.10.0",
+    "dask__dask_2023.3.2_2023.4.0",
+    "dask__dask_2023.6.0_2023.6.1",
+    "dask__dask_2023.6.1_2023.7.0",
+    "dask__dask_2023.8.0_2023.8.1",
+    "dask__dask_2023.9.2_2023.9.3",
+    "dask__dask_2024.1.0_2024.1.1",
+    "dask__dask_2024.3.1_2024.4.0",
+    "psf__requests_v2.12.2_v2.12.3",
+    "psf__requests_v2.27.0_v2.27.1",
+    "psf__requests_v2.4.0_v2.4.1",
+    "psf__requests_v2.9.0_v2.9.1"
+  ]
+}
