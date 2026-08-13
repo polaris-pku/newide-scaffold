@@ -249,6 +249,7 @@ export async function createProductionBackendService(
     const bMemoryService = new BMemoryBackendService(
       bCapabilities,
       bRuntime.embedding_info,
+      { autoApprovePromotedSkills: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1' },
     );
 
     try {

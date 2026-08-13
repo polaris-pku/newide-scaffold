@@ -1,8 +1,10 @@
 import {
   RepositoryAgentBoardQuery,
+  reviewSkill,
   type AgentBoardQuery,
   type BufferRepository,
   type MemoryRepository,
+  type ReviewSkillInput,
 } from '../memory';
 import type {
   BMemoryMaintenanceEvidence,
@@ -10,6 +12,8 @@ import type {
   BSkillPromotionRequest,
 } from './b-memory-maintenance-runner';
 import type { BackendBRuntime } from './production-b-runtime';
+
+export type ReviewedSkill = Awaited<ReturnType<typeof reviewSkill>>;
 
 export interface BMemoryMaintenanceCapabilities extends BMemoryMaintenancePort {
   listEvidence(roleId?: string): Promise<BMemoryMaintenanceEvidence[]>;
@@ -27,6 +31,7 @@ export interface BPublicCapabilities {
   readonly bufferRepository: BufferRepository;
   readonly boardQuery: AgentBoardQuery;
   readonly maintenance: BMemoryMaintenanceCapabilities;
+  reviewSkill(input: ReviewSkillInput): Promise<ReviewedSkill>;
 }
 
 export function createBPublicCapabilities(
@@ -38,5 +43,6 @@ export function createBPublicCapabilities(
     bufferRepository: runtime.bufferRepository,
     boardQuery: new RepositoryAgentBoardQuery(runtime.repository),
     maintenance,
+    reviewSkill: (input) => reviewSkill(runtime.repository, input),
   };
 }
