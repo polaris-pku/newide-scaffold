@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   AgentBoardCouncilParticipantResolver,
+  readCouncilSeatAssignments,
 } from '../../src/council';
 import type { AgentBoardListItem, AgentBoardQuery } from '../../src/memory';
 
@@ -62,6 +63,98 @@ describe('AgentBoardCouncilParticipantResolver', () => {
         question: 'No eligible agent.',
       }),
     ).rejects.toThrow('No eligible persisted Agent');
+  });
+
+  it('binds Council seats to fixed role_ids when seatAssignments is configured', async () => {
+    const resolver = new AgentBoardCouncilParticipantResolver({
+      boardQuery: boardQuery([
+        agent('role_primary', ['market_eligible']),
+        agent('role_deputy', ['market_eligible']),
+        agent('role_reviewer', ['market_eligible']),
+        agent('role_synthesizer', ['market_eligible']),
+      ]),
+      allowedAgentIds: [
+        'role_primary',
+        'role_deputy',
+        'role_reviewer',
+        'role_synthesizer',
+      ],
+      seatAssignments: {
+        proposer0: 'role_primary',
+        proposer1: 'role_deputy',
+        reviewer: 'role_reviewer',
+        synthesizer: 'role_synthesizer',
+      },
+    });
+
+    const participants = await resolver.resolve({
+      run_id: 'run_fixed_seats',
+      task_id: 'task_fixed_seats',
+      question: 'Implement a feature.',
+    });
+
+    expect(participants.map(({ seat, seat_index, agent_id }) => ({
+      seat,
+      seat_index,
+      agent_id,
+    }))).toEqual([
+      { seat: 'proposer', seat_index: 0, agent_id: 'role_primary' },
+      { seat: 'proposer', seat_index: 1, agent_id: 'role_deputy' },
+      { seat: 'reviewer', seat_index: 0, agent_id: 'role_reviewer' },
+      { seat: 'synthesizer', seat_index: 0, agent_id: 'role_synthesizer' },
+    ]);
+    expect(participants.some((participant) => participant.conflict_flags?.length)).toBe(false);
+  });
+
+  it('rejects fixed seatAssignments when a mapped Agent is missing or not eligible', async () => {
+    const resolver = new AgentBoardCouncilParticipantResolver({
+      boardQuery: boardQuery([
+        agent('role_primary', ['market_eligible']),
+        agent('role_deputy', ['market_eligible']),
+        agent('role_reviewer', ['market_eligible'], 'retired'),
+      ]),
+      allowedAgentIds: [
+        'role_primary',
+        'role_deputy',
+        'role_reviewer',
+        'role_synthesizer',
+      ],
+      seatAssignments: {
+        proposer0: 'role_primary',
+        proposer1: 'role_deputy',
+        reviewer: 'role_reviewer',
+        synthesizer: 'role_synthesizer',
+      },
+    });
+
+    await expect(
+      resolver.resolve({
+        run_id: 'run_missing_seat',
+        task_id: 'task_missing_seat',
+        question: 'Missing synthesizer.',
+      }),
+    ).rejects.toThrow('role_reviewer has no eligible persisted Agent');
+  });
+
+  it('parses NEWIDE_COUNCIL_SEATS into a fixed seat mapping', () => {
+    expect(
+      readCouncilSeatAssignments(
+        'role_primary,role_deputy,role_reviewer,role_synthesizer',
+      ),
+    ).toEqual({
+      proposer0: 'role_primary',
+      proposer1: 'role_deputy',
+      reviewer: 'role_reviewer',
+      synthesizer: 'role_synthesizer',
+    });
+    expect(readCouncilSeatAssignments(undefined)).toBeUndefined();
+    expect(readCouncilSeatAssignments('  ')).toBeUndefined();
+    expect(() =>
+      readCouncilSeatAssignments('role_a,role_b,role_c'),
+    ).toThrow('NEWIDE_COUNCIL_SEATS');
+    expect(() =>
+      readCouncilSeatAssignments('role a,role_b,role_c,role_d'),
+    ).toThrow('NEWIDE_COUNCIL_SEATS');
   });
 });
 

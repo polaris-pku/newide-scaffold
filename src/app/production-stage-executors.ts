@@ -57,6 +57,10 @@ export interface ProductionStageExecutorDependencies {
   councilRoot: string;
   worktreesRoot: string;
   deliverArtifactHandler?: DeliverArtifactHandler;
+  /** false 时关闭竞标：select_agent 直接选 primaryAgentId（单候选短路）。默认 true。 */
+  auctionEnabled?: boolean;
+  /** 关闭竞标时指定的 primary role_id。 */
+  primaryAgentId?: string;
 }
 
 interface ProductionSelectionState {
@@ -122,8 +126,16 @@ export function createProductionStageExecutors(
   const selectAgent: SelectAgentStageExecutor = {
     async execute(context) {
       context.signal?.throwIfAborted();
-      const candidateIds =
-        context.cursor_input.candidate_ids.length > 0
+      const auctionDisabled = dependencies.auctionEnabled === false;
+      if (auctionDisabled && !dependencies.primaryAgentId?.trim()) {
+        throw new Error(
+          'Auction is disabled but no primaryAgentId is configured; set NEWIDE_PRIMARY_AGENT_ID.',
+        );
+      }
+      // 关闭竞标时把候选固定为 primary（单候选短路，MarketAuctionEngine 直接返回它）。
+      const candidateIds = auctionDisabled
+        ? [dependencies.primaryAgentId!]
+        : context.cursor_input.candidate_ids.length > 0
           ? context.cursor_input.candidate_ids
           : context.task_request.role_id
             ? [context.task_request.role_id]

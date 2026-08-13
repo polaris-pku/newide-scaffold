@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createProductionBackendService,
   parseDriverEnv,
+  readAuctionEnabled,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
 import type { NewideBackendService } from '../../src/app/newide-backend-service';
@@ -29,6 +30,26 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
 } from '../../src/app/b-memory-maintenance-runner';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
+
+describe('readAuctionEnabled', () => {
+  it('defaults to true when unset', () => {
+    expect(readAuctionEnabled(undefined)).toBe(true);
+    expect(readAuctionEnabled('')).toBe(true);
+    expect(readAuctionEnabled('  ')).toBe(true);
+  });
+
+  it('parses disable and enable values', () => {
+    expect(readAuctionEnabled('0')).toBe(false);
+    expect(readAuctionEnabled('false')).toBe(false);
+    expect(readAuctionEnabled('FALSE')).toBe(false);
+    expect(readAuctionEnabled('1')).toBe(true);
+    expect(readAuctionEnabled('true')).toBe(true);
+  });
+
+  it('rejects invalid values', () => {
+    expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
 
 describe('backend RPC stdio entrypoint', () => {
   it('fails fast when the configured ACP runner directory does not exist', async () => {
