@@ -16,10 +16,22 @@ export interface CouncilParticipantResolver {
   resolve(input: CouncilParticipantResolutionInput): Promise<CouncilParticipantBinding[]>;
 }
 
+/**
+ * 固定 Council 席位映射。配置后按 role_id 精确绑定 4 个席位，杜绝复用；
+ * 未配置时回退到 board 顺序分配（向后兼容）。
+ */
+export interface CouncilSeatAssignments {
+  proposer0: string;
+  proposer1: string;
+  reviewer: string;
+  synthesizer: string;
+}
+
 export interface AgentBoardCouncilParticipantResolverOptions {
   boardQuery: AgentBoardQuery;
   allowedAgentIds: readonly string[];
   ensureAgent?: (agentId: string) => Promise<void>;
+  seatAssignments?: CouncilSeatAssignments;
 }
 
 /**
@@ -33,11 +45,13 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
   private readonly boardQuery: AgentBoardQuery;
   private readonly allowedAgentIds: ReadonlySet<string>;
   private readonly ensureAgent: ((agentId: string) => Promise<void>) | undefined;
+  private readonly seatAssignments: CouncilSeatAssignments | undefined;
 
   constructor(options: AgentBoardCouncilParticipantResolverOptions) {
     this.boardQuery = options.boardQuery;
     this.allowedAgentIds = new Set(options.allowedAgentIds);
     this.ensureAgent = options.ensureAgent;
+    this.seatAssignments = options.seatAssignments;
   }
 
   async resolve(
@@ -49,6 +63,9 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       }
     }
     const agents = await this.boardQuery.listAgents();
+    if (this.seatAssignments) {
+      return this.resolveFixedSeats(input, agents);
+    }
     const candidates = orderCandidates(
       agents.filter(
         (agent) =>
@@ -108,6 +125,53 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
         : {}),
     }));
   }
+
+  /**
+   * 按固定 seatAssignments 映射绑定 4 个席位。每个 role_id 必须存在、在
+   * allowed 名单内且 eligible；缺失直接抛错，不复用（保持 4 席位身份独立）。
+   */
+  private async resolveFixedSeats(
+    input: CouncilParticipantResolutionInput,
+    agents: readonly AgentBoardListItem[],
+  ): Promise<CouncilParticipantBinding[]> {
+    const assignments = this.seatAssignments!;
+    const agentByRole = new Map(agents.map((agent) => [agent.role_id, agent] as const));
+    const entries: Array<{ seat: CouncilSeat; seat_index: number; roleId: string }> = [
+      { seat: 'proposer', seat_index: 0, roleId: assignments.proposer0 },
+      { seat: 'proposer', seat_index: 1, roleId: assignments.proposer1 },
+      { seat: 'reviewer', seat_index: 0, roleId: assignments.reviewer },
+      { seat: 'synthesizer', seat_index: 0, roleId: assignments.synthesizer },
+    ];
+    const uniqueRoles = new Set(entries.map((entry) => entry.roleId));
+    if (uniqueRoles.size !== 4) {
+      throw new Error(
+        'Council seatAssignments must map to four distinct role_ids (proposer0/proposer1/reviewer/synthesizer).',
+      );
+    }
+    for (const entry of entries) {
+      if (!this.allowedAgentIds.has(entry.roleId)) {
+        throw new Error(`Council seat role_id ${entry.roleId} is not in the allowed roster`);
+      }
+      const agent = agentByRole.get(entry.roleId);
+      if (!agent || !['created', 'active', 'idle'].includes(agent.status)) {
+        throw new Error(
+          `Council seat role_id ${entry.roleId} has no eligible persisted Agent`,
+        );
+      }
+    }
+    return entries.map((entry) => ({
+      participant_id: createCouncilParticipantId(
+        input.run_id,
+        entry.seat,
+        entry.seat_index,
+        entry.roleId,
+      ),
+      seat: entry.seat,
+      seat_index: entry.seat_index,
+      agent_id: entry.roleId,
+      role_profile_ref: entry.roleId,
+    }));
+  }
 }
 
 function orderCandidates(
@@ -139,4 +203,29 @@ function compareCodeUnits(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+/**
+ * 从 NEWIDE_COUNCIL_SEATS 环境变量解析固定席位映射。
+ * 格式：<proposer0>,<proposer1>,<reviewer>,<synthesizer>（逗号分隔 4 个 role_id）。
+ * 未配置时返回 undefined（回退 board 顺序分配）。
+ */
+export function readCouncilSeatAssignments(
+  value: string | undefined,
+): CouncilSeatAssignments | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  const parts = raw.split(',').map((part) => part.trim());
+  if (parts.length !== 4 || parts.some((part) => !/^[A-Za-z0-9_-]+$/.test(part))) {
+    throw new Error(
+      'NEWIDE_COUNCIL_SEATS must be exactly four comma-separated role_ids: <proposer0>,<proposer1>,<reviewer>,<synthesizer>',
+    );
+  }
+  const [proposer0, proposer1, reviewer, synthesizer] = parts as [
+    string,
+    string,
+    string,
+    string,
+  ];
+  return { proposer0, proposer1, reviewer, synthesizer };
 }

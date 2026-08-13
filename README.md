@@ -30,6 +30,11 @@ NEWIDE_B_EMBEDDING_DIMENSIONS=32
 # NEWIDE_COUNCIL_STRATEGY=plan_first
 ```
 
+固定 Council 工作流（主/副出方案 + 评审 + 合成，主最后实现计划）：设
+`NEWIDE_COUNCIL_STRATEGY=plan_first`、`NEWIDE_DEFAULT_RUN_MODE=council`，
+并用 `NEWIDE_COUNCIL_SEATS` 固定 4 个席位；关闭竞标用
+`NEWIDE_AUCTION_ENABLED=0` + `NEWIDE_PRIMARY_AGENT_ID`。详见 `.env.example`。
+
 在 ACP Client 仓库的 `.env` 中配置对应 agent 的凭据。例如 `ACP_AGENT_ID=claude` 时：
 
 ```dotenv
