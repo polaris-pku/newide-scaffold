@@ -5,7 +5,7 @@
  * 持有共享 MemoryRepository 与 BufferRepository，为每个 Agent 创建独立 AgentMemoryScope。
  * 通过 AgentManagerOptions.tools 配置 LLM tool-calling。
  */
-import type { AgentHandle, CreateAgentSpec } from '../schemas';
+import { MARKET_POOL_ROLE_ID, type AgentHandle, type CreateAgentSpec } from '../schemas';
 import type { BufferRepository } from '../ports/buffer-repository';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { AgentTaskRequest } from '../agent-types';
@@ -571,6 +571,9 @@ export class AgentManager {
     const handle = await this.repository.getAgent(role_id).catch(() => null);
     if (!handle) {
       throw new Error(`Agent not found: ${role_id}`);
+    }
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot retire market pool agent: ${role_id}`);
     }
 
     const retiredAt = nowTimestamp();

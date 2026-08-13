@@ -154,6 +154,25 @@ export {
 } from './services/retirement';
 
 // ════════════════════════════════════════════════════════
+//  8.6 技能市场（Skill Market）
+//     skill.market_search / skill.market_import（Spec §6.2）
+// ════════════════════════════════════════════════════════
+
+export {
+  marketSearch,
+  marketImport,
+  DEFAULT_MARKET_TOP_K,
+  type MarketSearchQuery,
+} from './services/skill-market';
+export type {
+  MarketSearchOptions,
+  MarketImportResult,
+  TransferSkillToMarketOptions,
+} from './ports/memory-repository';
+/** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
+export { MARKET_POOL_ROLE_ID } from './schemas';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 

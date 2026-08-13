@@ -8,7 +8,8 @@
  *
  * Skills：
  * - review_status = 'rejected' → 丢弃（deleteSkill）
- * - 其他（approved / pending）→ 保留，并按市场状态标记：
+ * - 其他（approved / pending）→ 迁移到市场池（transferSkillToMarket，挂到
+ *   __market__ 固定 Agent 名下），并按市场状态标记：
  *   - 已被其他 Agent 引入（imported_by 非空）→ market_status = 'available'（归市场所有）
  *   - 否则 → market_status = 'retired_unique'（视为稀缺遗产，保留在市场中）
  *
@@ -69,13 +70,12 @@ export async function disposeRetiredAssets(
       skillsDiscarded += 1;
       continue;
     }
+    // 保留技能迁移到市场池（__market__ 名下），退休 Agent 之后可安全归档。
+    // market_status 决定其在市场中的推荐身份（available / retired_unique）。
     const marketOwned = (skill.imported_by?.length ?? 0) > 0;
-    const retained: SkillRecord = {
-      ...skill,
+    await repository.transferSkillToMarket(input.role_id, skill.id, {
       market_status: marketOwned ? 'available' : 'retired_unique',
-      updated_at: nowTimestamp(),
-    };
-    await repository.updateSkill(input.role_id, retained);
+    });
     skillsRetained += 1;
   }
 

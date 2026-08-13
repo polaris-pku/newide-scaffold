@@ -5,8 +5,8 @@
  *   1. 退休后状态置为 retired，写入 retired_at / retired_reason
  *   2. 退休后 dispatchTask 返回 blocked
  *   3. 退休后 collectCompetitionClaims 返回 unavailable
- *   4. 资产处置：approved Skill 保留并标记 retired_unique，rejected Skill 丢弃；
- *      高置信经验保留、低置信经验丢弃
+ *   4. 资产处置：保留 Skill 迁移到市场池（__market__，标记 retired_unique/available），
+ *      rejected Skill 丢弃；高置信经验保留、低置信经验丢弃
  *   5. seeded_slate 创建替代 Agent 并继承 Level A 经验
  *   6. 幂等：重复 retire 返回 retired 且不重复处置
  *   7. dispatchTask 会累计 Metrics（won/completed/partial）
@@ -17,7 +17,7 @@ import { nowTimestamp } from '../../core';
 import { AgentManager } from '../runtime/agent-manager';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { InMemoryBufferRepository } from '../adapters/in-memory-buffer-repository';
-import type { ExperienceRecord, SkillRecord } from '../schemas';
+import { MARKET_POOL_ROLE_ID, type ExperienceRecord, type SkillRecord } from '../schemas';
 import type { AgentToolConfig } from '../runtime/agent';
 import type { AgentTaskRequest } from '../agent-types';
 
@@ -125,7 +125,7 @@ describe('AgentManager.retireAgent', () => {
     expect(batch.claims).toHaveLength(0);
   });
 
-  it('资产处置：approved Skill 保留并标记 retired_unique，已引入技能归市场 available，rejected 丢弃；高置信经验保留、低置信丢弃', async () => {
+  it('资产处置：保留 Skill 迁移到市场池（__market__），rejected 丢弃；高置信经验保留、低置信丢弃', async () => {
     const { repository, manager } = await setup();
     const goodSkill = skill();
     const importedSkill = skill({ imported_by: ['role_other'] });
@@ -147,11 +147,22 @@ describe('AgentManager.retireAgent', () => {
       experiences_discarded: 1,
     });
 
-    const skills = await repository.listSkills(ROLE);
-    expect(skills).toHaveLength(2);
-    const byId = new Map(skills.map((s) => [s.id, s]));
+    // 保留的技能迁移到市场池，退休 Agent 名下技能清空
+    expect(await repository.listSkills(ROLE)).toHaveLength(0);
+
+    const pooled = await repository.listSkills(MARKET_POOL_ROLE_ID);
+    expect(pooled).toHaveLength(2);
+    const byId = new Map(pooled.map((s) => [s.id, s]));
     expect(byId.get(goodSkill.id)?.market_status).toBe('retired_unique');
     expect(byId.get(importedSkill.id)?.market_status).toBe('available');
+    for (const pooledSkill of pooled) {
+      expect(pooledSkill.agent_id).toBe(MARKET_POOL_ROLE_ID);
+      expect(pooledSkill.origin_agent_id).toBe(ROLE);
+    }
+
+    // 市场池 Agent 自动创建，但不暴露在普通 Agent 列表里
+    expect(await repository.getAgent(MARKET_POOL_ROLE_ID)).toBeDefined();
+    expect(await repository.listAgentIds()).not.toContain(MARKET_POOL_ROLE_ID);
 
     const experiences = await repository.listExperiences(ROLE);
     expect(experiences).toHaveLength(1);
