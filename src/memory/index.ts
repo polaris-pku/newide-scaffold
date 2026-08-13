@@ -174,8 +174,6 @@ export { ToolRegistry } from './runtime/tool';
 export { QueryMemoryTool as AgentQueryMemoryTool } from './runtime/tools/query-memory-tool';
 export { InvokeDriverTool } from './runtime/tools/invoke-driver-tool';
 export type { DriverTask, DriverHandler } from './runtime/tools/invoke-driver-tool';
-export { DeepSeekToolCallingClient } from './adapters/deepseek-tool-calling-client';
-export type { DeepSeekToolCallingClientOptions } from './adapters/deepseek-tool-calling-client';
 export { LiteLLMToolCallingClient } from './adapters/litellm-tool-calling-client';
 export type { LiteLLMToolCallingClientOptions } from './adapters/litellm-tool-calling-client';
 
@@ -223,12 +221,6 @@ export type { CompetitionClaimEvaluator } from './ports/competition-claim-evalua
 export { createMockCompetitionClaimEvaluator } from './adapters/mock-competition-claim-evaluator';
 
 // ════════════════════════════════════════════════════════
-//  19. Mock 适配器
-// ════════════════════════════════════════════════════════
-
-export { MockExperienceExtractor } from './mvp/adapters/mock-experience-extractor';
-
-// ════════════════════════════════════════════════════════
 //  20. Port 接口类型（供外部实现者使用）
 // ════════════════════════════════════════════════════════
 
@@ -238,7 +230,6 @@ export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';
 export type { EmbeddingProvider } from './ports/embedding-provider';
 export type { LlmClient, LlmMessage } from './ports/llm-client';
-export type { SkillMarketPort, SkillMarketSearchResult } from './ports/skill-market-port';
 export type { AgentContextCleaner, AgentContextCleanInput } from './ports/agent-context-cleaner';
 export type { BufferTriggerPolicy } from './ports/buffer-trigger-policy';
 export type { PromotionTriggerPolicy } from './ports/promotion-trigger-policy';
@@ -251,16 +242,6 @@ export type {
   SkillView,
   ExperienceView,
 } from './ports/agent-board-query';
-export type {
-  ExternalMemoryRepository,
-  SearchAccessibleMemoriesInput,
-  SearchAccessibleMemoriesOutput,
-  SearchAccessibleMemoryHit,
-  LoadAccessibleMemoriesInput,
-  LoadAccessibleMemoriesOutput,
-  RecordMemoryUsageFeedbackInput,
-  MemoryItemType,
-} from './ports/external-memory-repository';
 
 // ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型
