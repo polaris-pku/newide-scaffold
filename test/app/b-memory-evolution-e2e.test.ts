@@ -120,25 +120,6 @@ describe('B memory evolution end to end', () => {
       promoted_to: undefined,
     });
 
-    const promotion = await maintenance.promoteSkills({
-      role_id: 'role_ts_engineer',
-      requested_by: 'user',
-    });
-    expect(promotion).toMatchObject({
-      status: 'completed',
-      skills: [expect.objectContaining({ review_status: 'pending' })],
-    });
-    const [storedSkill] = await repository.listSkills('role_ts_engineer');
-    const [storedExperience] = await repository.listExperiences('role_ts_engineer');
-    expect(storedSkill).toMatchObject({
-      review_status: 'pending',
-      promoted_from: sourceExperience!.id,
-    });
-    expect(storedExperience).toMatchObject({
-      id: sourceExperience!.id,
-      promoted_to: storedSkill!.id,
-    });
-
     const dispatcher = memoryDispatcher(
       new BMemoryBackendService(
         createBPublicCapabilities(
@@ -162,6 +143,7 @@ describe('B memory evolution end to end', () => {
           dimensions: 4,
           readiness: 'verified',
         },
+        { autoApprovePromotedSkills: true },
       ),
     );
     await expect(
@@ -174,6 +156,7 @@ describe('B memory evolution end to end', () => {
     ).resolves.toMatchObject({
       result: {
         capabilities: {
+          skill_review: { mode: 'auto_approve' },
           embedding: {
             provider: 'test',
             model: 'test-embedding',
@@ -188,10 +171,41 @@ describe('B memory evolution end to end', () => {
         },
       },
     });
+    const promotionResponse = await dispatcher.dispatch({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'memory.promoteSkills',
+      params: { role_id: 'role_ts_engineer', requested_by: 'evaluation' },
+    });
+    expect(promotionResponse).toMatchObject({
+      result: {
+        maintenance: {
+          status: 'completed',
+          skills: [
+            expect.objectContaining({
+              review_status: 'approved',
+              reviewed_by: 'system:auto-approval',
+              reviewed_at: expect.any(String),
+            }),
+          ],
+        },
+      },
+    });
+    const [storedSkill] = await repository.listSkills('role_ts_engineer');
+    const [storedExperience] = await repository.listExperiences('role_ts_engineer');
+    expect(storedSkill).toMatchObject({
+      review_status: 'approved',
+      reviewed_by: 'system:auto-approval',
+      promoted_from: sourceExperience!.id,
+    });
+    expect(storedExperience).toMatchObject({
+      id: sourceExperience!.id,
+      promoted_to: storedSkill!.id,
+    });
     await expect(
       dispatcher.dispatch({
         jsonrpc: '2.0',
-        id: 1,
+        id: 2,
         method: 'memory.listExperiences',
         params: { role_id: 'role_ts_engineer' },
       }),
@@ -203,34 +217,13 @@ describe('B memory evolution end to end', () => {
     await expect(
       dispatcher.dispatch({
         jsonrpc: '2.0',
-        id: 2,
+        id: 3,
         method: 'memory.listSkills',
         params: { role_id: 'role_ts_engineer' },
       }),
     ).resolves.toMatchObject({
       result: {
-        skills: [{ id: storedSkill!.id, review_status: 'pending' }],
-      },
-    });
-    await expect(
-      dispatcher.dispatch({
-        jsonrpc: '2.0',
-        id: 3,
-        method: 'memory.approveSkill',
-        params: {
-          role_id: 'role_ts_engineer',
-          skill_id: storedSkill!.id,
-          reviewed_by: 'acceptance',
-        },
-      }),
-    ).resolves.toMatchObject({
-      result: {
-        skill: {
-          id: storedSkill!.id,
-          review_status: 'approved',
-          reviewed_by: 'acceptance',
-          reviewed_at: expect.any(String),
-        },
+        skills: [{ id: storedSkill!.id, review_status: 'approved' }],
       },
     });
 

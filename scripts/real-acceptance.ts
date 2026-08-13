@@ -126,9 +126,10 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
     );
     const capabilities = asRecord(capabilityResponse.capabilities) ?? {};
     const embedding = asRecord(capabilities.embedding) ?? {};
+    const skillReview = asRecord(capabilities.skill_review) ?? {};
     const operations = asRecord(capabilities.operations) ?? {};
     details.capabilities = capabilities;
-    validateMemoryCapabilities(operations, embedding, errors);
+    validateMemoryCapabilities(operations, embedding, skillReview, errors);
 
     const listed = await backend.request<{ agents?: Array<{ role_id?: string }> }>(
       'memory.listAgents',
@@ -201,18 +202,6 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
       const id = typeof skill.id === 'string' ? skill.id : undefined;
       return id && !beforeSkillIds[firstAgentId]?.includes(id);
     });
-    const reviewedSkills = await Promise.all(
-      promotedSkills.map(async (skill) => {
-        if (typeof skill.id !== 'string' || skill.review_status !== 'pending') return skill;
-        const reviewed = await backend.request<{ skill?: unknown }>('memory.approveSkill', {
-          role_id: firstAgentId,
-          skill_id: skill.id,
-          reviewed_by: 'real-acceptance',
-        });
-        return asRecord(reviewed.skill) ?? skill;
-      }),
-    );
-
     const second = await runMemoryTask(
       backend,
       [
@@ -244,7 +233,7 @@ async function runMemoryScenario(): Promise<ScenarioReport> {
     const reusedExperienceIds = firstExperienceIds.filter((id) =>
       retrievedExperienceIds.includes(id),
     );
-    const promotedSkillStates = reviewedSkills.map((skill) => ({
+    const promotedSkillStates = promotedSkills.map((skill) => ({
       id: skill.id,
       review_status: skill.review_status,
       market_status: skill.market_status,
@@ -1083,6 +1072,7 @@ async function runMemoryTask(
 function validateMemoryCapabilities(
   operations: Record<string, unknown>,
   embedding: Record<string, unknown>,
+  skillReview: Record<string, unknown>,
   errors: string[],
 ): void {
   for (const operation of [
@@ -1124,6 +1114,9 @@ function validateMemoryCapabilities(
     embedding.dimensions <= 0
   ) {
     errors.push('embedding dimensions are missing or invalid');
+  }
+  if (skillReview.mode !== 'auto_approve') {
+    errors.push('memory acceptance requires skill_review.mode=auto_approve');
   }
 }
 
@@ -1290,6 +1283,7 @@ async function startBackend(label: string): Promise<BackendClient> {
     env: {
       ...process.env,
       ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '300000',
+      NEWIDE_B_SKILL_AUTO_APPROVE: process.env.NEWIDE_B_SKILL_AUTO_APPROVE ?? '1',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     },

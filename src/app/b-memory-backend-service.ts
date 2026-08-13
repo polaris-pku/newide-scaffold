@@ -17,6 +17,9 @@ export interface BMemoryOperationCapability {
 export interface BMemoryCapabilities {
   schema_version: 'newide.b-memory-capabilities.v1';
   embedding: BEmbeddingRuntimeInfo;
+  skill_review: {
+    mode: 'manual' | 'auto_approve';
+  };
   operations: {
     list_agents: BMemoryOperationCapability;
     get_agent_persona: BMemoryOperationCapability;
@@ -30,6 +33,10 @@ export interface BMemoryCapabilities {
   };
 }
 
+export interface BMemoryBackendServiceOptions {
+  autoApprovePromotedSkills?: boolean;
+}
+
 export class BMemoryBackendService {
   constructor(
     private readonly capabilities: Pick<
@@ -37,12 +44,16 @@ export class BMemoryBackendService {
       'boardQuery' | 'maintenance' | 'reviewSkill'
     >,
     private readonly embeddingInfo: BEmbeddingRuntimeInfo,
+    private readonly options: BMemoryBackendServiceOptions = {},
   ) {}
 
   getCapabilities(): BMemoryCapabilities {
     return {
       schema_version: 'newide.b-memory-capabilities.v1',
       embedding: { ...this.embeddingInfo },
+      skill_review: {
+        mode: this.options.autoApprovePromotedSkills ? 'auto_approve' : 'manual',
+      },
       operations: {
         list_agents: { status: 'available' },
         get_agent_persona: { status: 'available' },
@@ -51,7 +62,9 @@ export class BMemoryBackendService {
         list_maintenance: { status: 'available' },
         promote_skills: {
           status: 'available',
-          reason: 'Promotion creates pending Skills for explicit review.',
+          reason: this.options.autoApprovePromotedSkills
+            ? 'Promoted Skills are approved automatically.'
+            : 'Promotion creates pending Skills for explicit review.',
         },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
@@ -85,11 +98,21 @@ export class BMemoryBackendService {
     return this.capabilities.maintenance.listEvidence(roleId);
   }
 
-  promoteSkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
-    return this.capabilities.maintenance.promoteSkills({
+  async promoteSkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
+    const promotion = await this.capabilities.maintenance.promoteSkills({
       role_id: roleId,
       requested_by: requestedBy,
     });
+    if (!this.options.autoApprovePromotedSkills || promotion.status !== 'completed') {
+      return promotion;
+    }
+    const skills = await Promise.all(
+      promotion.skills.map(async (skill) => {
+        if (!isPendingSkill(skill)) return skill;
+        return this.approveSkill(roleId, skill.id, 'system:auto-approval');
+      }),
+    );
+    return { ...promotion, skills };
   }
 
   approveSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
@@ -109,4 +132,10 @@ export class BMemoryBackendService {
       reviewer: reviewedBy,
     });
   }
+}
+
+function isPendingSkill(value: unknown): value is { id: string; review_status: 'pending' } {
+  if (!value || typeof value !== 'object') return false;
+  const skill = value as Record<string, unknown>;
+  return typeof skill.id === 'string' && skill.review_status === 'pending';
 }

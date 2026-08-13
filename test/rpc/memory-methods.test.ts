@@ -101,6 +101,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
   return {
     getMemoryCapabilities: () => ({
       schema_version: 'newide.b-memory-capabilities.v1',
+      skill_review: { mode: 'manual' },
       embedding: {
         provider: 'test',
         model: 'test-embedding',
