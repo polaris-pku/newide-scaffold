@@ -67,9 +67,15 @@ import type {
   SaveMailboxReplyResult,
 } from '../mailbox';
 import type { DriverStreamEvent } from '../driver/contract';
-import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
+import type {
+  AgentBoardAgentView,
+  AgentBoardListItem,
+  ExperienceView,
+  SkillView,
+} from '../memory';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
+import type { ReviewedSkill } from './b-public-capabilities';
 import {
   NoopDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
@@ -324,6 +330,14 @@ export class NewideBackendService {
 
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
+  }
+
+  approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().approveSkill(roleId, skillId, reviewedBy);
+  }
+
+  rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().rejectSkill(roleId, skillId, reviewedBy);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {
