@@ -133,6 +133,27 @@ export {
 } from './services/memory-cycle';
 
 // ════════════════════════════════════════════════════════
+//  8.5 Metrics 采集与退休（Agent 生命周期管理）
+// ════════════════════════════════════════════════════════
+
+export {
+  recordBid,
+  recordTaskOutcome,
+  evaluateRetirementSignals,
+  RETIREMENT_THRESHOLDS,
+  type TaskOutcome,
+  type RetirementSignals,
+} from './services/metrics';
+export {
+  disposeRetiredAssets,
+  createReplacementAgent,
+  type RetireOptions,
+  type RetireResult,
+  type RetireAssetDisposition,
+  type RetireAssetInput,
+} from './services/retirement';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 

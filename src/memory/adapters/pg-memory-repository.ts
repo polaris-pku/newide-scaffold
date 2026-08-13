@@ -14,9 +14,11 @@ import {
   SkillRecordSchema,
   type AgentHandle,
   type AgentMetrics,
+  type AgentStatus,
   type CreateAgentSpec,
   type ExperienceRecord,
   type PersonaDef,
+  type RetiredReason,
   type SkillRecord,
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
@@ -312,6 +314,106 @@ export class PgMemoryRepository implements MemoryRepository {
     if (result.rowCount === 0) {
       throw new Error(`Experience not found: ${experience.id}`);
     }
+  }
+
+  async deleteSkill(role_id: string, skill_id: string): Promise<void> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `DELETE FROM memory_skills WHERE role_id = $1 AND id = $2`,
+      [role_id, skill_id],
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Skill not found: ${skill_id}`);
+    }
+    await this.syncCounts(role_id);
+  }
+
+  async deleteExperience(role_id: string, experience_id: string): Promise<void> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `DELETE FROM memory_experiences WHERE role_id = $1 AND id = $2`,
+      [role_id, experience_id],
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Experience not found: ${experience_id}`);
+    }
+    await this.syncCounts(role_id);
+  }
+
+  async updateMetrics(
+    role_id: string,
+    update: (current: AgentMetrics) => AgentMetrics,
+  ): Promise<void> {
+    await this.ensureSchema();
+    const current = await this.getMetrics(role_id);
+    const next = update(current);
+    AgentMetricsSchema.parse(next);
+    const handle = await this.getAgent(role_id);
+    const nextHandle = { ...handle, metric: next };
+
+    const result = await this.pool.query(
+      `UPDATE memory_agents
+       SET metrics = $2::jsonb, handle = $3::jsonb
+       WHERE role_id = $1`,
+      [role_id, JSON.stringify(next), JSON.stringify(nextHandle)],
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
+  async updateAgentStatus(
+    role_id: string,
+    status: AgentStatus,
+    options?: { retired_at?: string; retired_reason?: RetiredReason },
+  ): Promise<void> {
+    await this.ensureSchema();
+    const handle = await this.getAgent(role_id);
+    const nextHandle = {
+      ...handle,
+      status,
+      ...(options?.retired_at !== undefined ? { retired_at: options.retired_at } : {}),
+      ...(options?.retired_reason !== undefined
+        ? { retired_reason: options.retired_reason }
+        : {}),
+    };
+    AgentHandleSchema.parse(nextHandle);
+
+    const result = await this.pool.query(
+      `UPDATE memory_agents
+       SET handle = $2::jsonb
+       WHERE role_id = $1`,
+      [role_id, JSON.stringify(nextHandle)],
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
+  /** 删除技能/经验后，同步 handle 与 metrics 中的计数（只读重算后写回） */
+  private async syncCounts(role_id: string): Promise<void> {
+    const [skills, experiences, handle, metrics] = await Promise.all([
+      this.listSkills(role_id),
+      this.listExperiences(role_id),
+      this.getAgent(role_id),
+      this.getMetrics(role_id),
+    ]);
+    const nextHandle: AgentHandle = {
+      ...handle,
+      skill_count: skills.length,
+      experience_count: experiences.length,
+      owned_skills: skills.map((skill) => skill.id),
+      owned_exps: experiences.map((experience) => experience.id),
+    };
+    const nextMetrics: AgentMetrics = {
+      ...metrics,
+      skill_count: skills.length,
+      experience_count: experiences.length,
+    };
+    await this.pool.query(
+      `UPDATE memory_agents SET handle = $2::jsonb, metrics = $3::jsonb WHERE role_id = $1`,
+      [role_id, JSON.stringify(nextHandle), JSON.stringify(nextMetrics)],
+    );
   }
 
   private async ensureSchema(): Promise<void> {

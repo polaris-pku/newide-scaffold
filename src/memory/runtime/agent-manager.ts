@@ -13,8 +13,15 @@ import type { MemoryCycleResult } from '../types';
 import type { AgentToolConfig } from './agent';
 import type { CompetitionClaimBatch, CollectCompetitionClaimsOptions } from '../competition-types';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
+import type { TaskOutcome } from '../services/metrics';
+import type { RetireOptions, RetireResult } from '../services/retirement';
 import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import { QueryMemoryTool } from './tools/query-memory-tool';
+import { recordBid, recordTaskOutcome } from '../services/metrics';
+import {
+  createReplacementAgent,
+  disposeRetiredAssets,
+} from '../services/retirement';
 import { Agent } from './agent';
 import { createId, nowTimestamp } from '../../core';
 
@@ -146,8 +153,18 @@ export class AgentManager {
 
   async createAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
     await this.repository.initializeAgent(spec);
-    await this.bufferRepository.ensureAgent(spec.role_id);
-    const memory = createAgentMemoryScope(this.repository, this.bufferRepository, spec.role_id);
+    const agent = await this.instantiateAgent(spec.role_id);
+    this.agents.set(spec.role_id, agent);
+    return agent.getHandle();
+  }
+
+  /**
+   * 为指定 role_id 装配运行时 Agent 实例：
+   * 确保 buffer 目录存在、创建 AgentMemoryScope、自动注入 QueryMemoryTool。
+   */
+  private async instantiateAgent(role_id: string): Promise<Agent> {
+    await this.bufferRepository.ensureAgent(role_id);
+    const memory = createAgentMemoryScope(this.repository, this.bufferRepository, role_id);
 
     // 自动注入 QueryMemoryTool（需要 AgentMemoryScope，只能在这里创建）
     const tools = {
@@ -155,9 +172,7 @@ export class AgentManager {
       tools: [new QueryMemoryTool(memory, this.options.embedding), ...this.options.tools.tools],
     };
 
-    const agent = new Agent(memory, tools);
-    this.agents.set(spec.role_id, agent);
-    return agent.getHandle();
+    return new Agent(memory, tools);
   }
 
   /**
@@ -241,6 +256,17 @@ export class AgentManager {
     const participating = allClaims
       .filter((c) => c.decision === 'participate')
       .sort((a, b) => a.role_id.localeCompare(b.role_id));
+
+    // Metrics：参与竞标 → tasks_bid++
+    // （这些 Agent 已声明"我可以参选"，即使最终未中标也算一次竞标经历）
+    // 指标采集失败不阻塞竞标收集（best-effort）
+    for (const claim of participating) {
+      try {
+        await recordBid(this.repository, claim.role_id);
+      } catch {
+        // ignore — metrics must not break the bidding path
+      }
+    }
 
     return {
       correlation_id,
@@ -459,20 +485,11 @@ export class AgentManager {
         dr.assumptions.length === 0 &&
         dr.summary.includes('without driver invocation');
 
-      if (noDriverInvocation) {
-        return {
-          role_id,
-          status: 'no_driver_invocation',
-          cycle,
-        };
-      }
-
-      return {
-        role_id,
-        status: 'completed',
-        cycle,
-      };
+      const status = noDriverInvocation ? 'no_driver_invocation' : 'completed';
+      await this.recordDispatchMetrics(role_id, status);
+      return { role_id, status, cycle };
     } catch (err) {
+      await this.recordDispatchMetrics(role_id, 'failed');
       return {
         role_id,
         status: 'failed',
@@ -539,7 +556,111 @@ export class AgentManager {
     return Promise.all([...this.agents.values()].map((agent) => agent.getHandle()));
   }
 
-  async retireAgent(_role_id: string): Promise<void> {
-    // TODO
+  /**
+   * 优雅退休（week3 RFC §12.1）：
+   *
+   * Phase 1 — drain：状态置为 'draining'（不再参与竞标 / 不再被派发）
+   * Phase 2 — preserve：资产处置（Skills 进入市场、Experiences 分级保留/丢弃）
+   * Phase 3 — archive：状态置为 'retired'，写入 retired_at / retired_reason
+   *
+   * 可选创建替代 Agent（clean_slate / seeded_slate）。
+   *
+   * 对已退休 Agent 幂等：再次调用直接返回当前归档状态，不做重复处置。
+   */
+  async retireAgent(role_id: string, options: RetireOptions = {}): Promise<RetireResult> {
+    const handle = await this.repository.getAgent(role_id).catch(() => null);
+    if (!handle) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+
+    const retiredAt = nowTimestamp();
+    const reason = options.reason ?? 'manual';
+
+    // 已退休 → 幂等返回（不做重复资产处置）
+    if (handle.status === 'retired') {
+      return {
+        role_id,
+        status: 'retired',
+        retired_at: handle.retired_at ?? retiredAt,
+        retired_reason: handle.retired_reason ?? reason,
+        asset_disposition: {
+          skills_retained: 0,
+          skills_discarded: 0,
+          experiences_retained: 0,
+          experiences_discarded: 0,
+        },
+      };
+    }
+
+    // Phase 1: draining
+    await this.repository.updateAgentStatus(role_id, 'draining');
+
+    // Phase 2: 资产处置
+    const [skills, experiences] = await Promise.all([
+      this.repository.listSkills(role_id),
+      this.repository.listExperiences(role_id),
+    ]);
+    const assetDisposition = await disposeRetiredAssets(this.repository, {
+      role_id,
+      skills,
+      experiences,
+    });
+
+    // Phase 3: archive
+    await this.repository.updateAgentStatus(role_id, 'retired', {
+      retired_at: retiredAt,
+      retired_reason: reason,
+    });
+
+    let replacementRoleId: string | undefined;
+    if (options.replacement && options.replacement !== 'none') {
+      replacementRoleId = await createReplacementAgent(
+        this.repository,
+        handle,
+        experiences,
+        options.replacement,
+      );
+      // 让替代 Agent 立即进入内存 map，可被后续竞标/派发使用
+      if (!this.agents.has(replacementRoleId)) {
+        this.agents.set(replacementRoleId, await this.instantiateAgent(replacementRoleId));
+      }
+    }
+
+    return {
+      role_id,
+      status: 'retired',
+      retired_at: retiredAt,
+      retired_reason: reason,
+      asset_disposition: assetDisposition,
+      ...(replacementRoleId ? { replacement_role_id: replacementRoleId } : {}),
+    };
+  }
+
+  /**
+   * 将一次派发结果落为 Metrics 增量。
+   * blocked / cancelled / max_rounds_exceeded 不记录（Agent 未实际执行）。
+   */
+  private async recordDispatchMetrics(
+    role_id: string,
+    status: DispatchTaskResult['status'],
+  ): Promise<void> {
+    let outcome: TaskOutcome | undefined;
+    if (status === 'completed') {
+      outcome = 'succeeded';
+    } else if (status === 'no_driver_invocation') {
+      outcome = 'partial';
+    } else if (status === 'failed') {
+      outcome = 'failed';
+    }
+    if (!outcome) {
+      return;
+    }
+    try {
+      await recordTaskOutcome(this.repository, role_id, outcome);
+    } catch {
+      // 指标采集失败不影响任务派发结果（best-effort）
+    }
   }
 }
+
+export type { RetireOptions, RetireResult } from '../services/retirement';

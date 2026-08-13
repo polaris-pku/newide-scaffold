@@ -7,9 +7,11 @@
 import type {
   AgentHandle,
   AgentMetrics,
+  AgentStatus,
   CreateAgentSpec,
   ExperienceRecord,
   PersonaDef,
+  RetiredReason,
   SkillRecord,
 } from '../schemas';
 
@@ -65,4 +67,31 @@ export interface MemoryRepository {
   updateSkill(role_id: string, skill: SkillRecord): Promise<void>;
   /** 更新已有经验（如晋升后写入 promoted_to） */
   updateExperience(role_id: string, experience: ExperienceRecord): Promise<void>;
+  /** 删除一条技能（如退休时资产处置丢弃 rejected Skill） */
+  deleteSkill(role_id: string, skill_id: string): Promise<void>;
+  /** 删除一条经验（如退休时资产处置丢弃低置信度 Experience） */
+  deleteExperience(role_id: string, experience_id: string): Promise<void>;
+
+  /**
+   * 原子更新 AgentMetrics。
+   *
+   * 采用函数式 updater：read-modify-write 由存储层保证，调用方只需描述增量。
+   * 实现必须同步 AgentHandle.metric 内嵌快照，保持聚合根一致。
+   */
+  updateMetrics(
+    role_id: string,
+    update: (current: AgentMetrics) => AgentMetrics,
+  ): Promise<void>;
+
+  /**
+   * 迁移 Agent 生命周期状态（created → active/idle → draining → retired）。
+   *
+   * @param options.retired_at    置 retired 时写入退休时间
+   * @param options.retired_reason 置 retired 时写入退休原因
+   */
+  updateAgentStatus(
+    role_id: string,
+    status: AgentStatus,
+    options?: { retired_at?: string; retired_reason?: RetiredReason },
+  ): Promise<void>;
 }

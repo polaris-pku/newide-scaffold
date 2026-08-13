@@ -8,9 +8,11 @@
 import type {
   AgentHandle,
   AgentMetrics,
+  AgentStatus,
   CreateAgentSpec,
   ExperienceRecord,
   PersonaDef,
+  RetiredReason,
   SkillRecord,
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
@@ -155,6 +157,65 @@ export class InMemoryRepository implements MemoryRepository {
       throw new Error(`Experience not found: ${experience.id}`);
     }
     store.experiences[index] = await this.withDescriptionEmbedding(experience);
+  }
+
+  async deleteSkill(role_id: string, skill_id: string): Promise<void> {
+    const store = this.requireStore(role_id);
+    const before = store.skills.length;
+    store.skills = store.skills.filter((item) => item.id !== skill_id);
+    if (store.skills.length === before) {
+      throw new Error(`Skill not found: ${skill_id}`);
+    }
+    store.handle = {
+      ...store.handle,
+      skill_count: store.skills.length,
+      owned_skills: store.handle.owned_skills.filter((id) => id !== skill_id),
+    };
+    store.metrics = { ...store.metrics, skill_count: store.skills.length };
+    store.handle = { ...store.handle, metric: store.metrics };
+  }
+
+  async deleteExperience(role_id: string, experience_id: string): Promise<void> {
+    const store = this.requireStore(role_id);
+    const before = store.experiences.length;
+    store.experiences = store.experiences.filter((item) => item.id !== experience_id);
+    if (store.experiences.length === before) {
+      throw new Error(`Experience not found: ${experience_id}`);
+    }
+    store.handle = {
+      ...store.handle,
+      experience_count: store.experiences.length,
+      owned_exps: store.handle.owned_exps.filter((id) => id !== experience_id),
+    };
+    store.metrics = { ...store.metrics, experience_count: store.experiences.length };
+    store.handle = { ...store.handle, metric: store.metrics };
+  }
+
+  async updateMetrics(
+    role_id: string,
+    update: (current: AgentMetrics) => AgentMetrics,
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    const next = update(store.metrics);
+    store.metrics = next;
+    // 同步聚合根内嵌指标快照
+    store.handle = { ...store.handle, metric: next };
+  }
+
+  async updateAgentStatus(
+    role_id: string,
+    status: AgentStatus,
+    options?: { retired_at?: string; retired_reason?: RetiredReason },
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    store.handle = {
+      ...store.handle,
+      status,
+      ...(options?.retired_at !== undefined ? { retired_at: options.retired_at } : {}),
+      ...(options?.retired_reason !== undefined
+        ? { retired_reason: options.retired_reason }
+        : {}),
+    };
   }
 
   private async withDescriptionEmbedding<T extends SkillRecord | ExperienceRecord>(
