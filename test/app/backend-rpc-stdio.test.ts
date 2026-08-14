@@ -670,7 +670,9 @@ describe('backend RPC stdio entrypoint', () => {
       env: {
         ...process.env,
         ACP_DRIVER_RUNNER_DIR: runnerDir,
-        NEWIDE_B_DATABASE_URL: '   ',
+        // Unreachable host: embedded PGlite fallback is disabled by an explicit URL,
+        // so the PostgreSQL readiness gate fails and stdio must stay closed.
+        NEWIDE_B_DATABASE_URL: 'postgresql://nobody:wrong@127.0.0.1:1/newide',
         NEWIDE_COORDINATION_DB: path.join(runnerDir, 'coordination.sqlite'),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -684,7 +686,7 @@ describe('backend RPC stdio entrypoint', () => {
 
     expect(code).toBe(1);
     expect(stdout).toBe('');
-    expect(stderr).toContain('NEWIDE_B_DATABASE_URL is required for the production B runtime');
+    expect(stderr).toContain('PostgreSQL B memory storage readiness check failed');
     rmSync(runnerDir, { recursive: true, force: true });
   }, 15_000);
 
