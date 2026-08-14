@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AppRunSnapshot } from './run-registry';
 import { projectRunSnapshot } from './run-snapshot-projector';
+import { projectTaskDriverUsage, type TaskDriverUsage } from './driver-usage-projector';
 
 export interface RunTerminalOutputWriter {
   finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | void>;
@@ -28,6 +29,7 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
     const frontendSnapshotPath = path.join(runDir, 'frontend-snapshot.json');
 
     const projected = projectRunSnapshot(snapshot);
+    const tokenUsage = await projectTaskDriverUsage(this.runsRoot, snapshot.task_id);
     const fallbackWrites = [
       writeJsonIfMissing(resultPath, {
         ...projected,
@@ -37,13 +39,20 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
         audit_path: path.join(runDir, 'audit.jsonl'),
         frontend_snapshot_path: frontendSnapshotPath,
       }),
-      writeJsonIfMissing(summaryPath, buildBackendSummary(projected, {
-        result_path: resultPath,
-        summary_path: summaryPath,
-        timeline_path: timelinePath,
-        audit_path: path.join(runDir, 'audit.jsonl'),
-        frontend_snapshot_path: frontendSnapshotPath,
-      })),
+      writeJsonIfMissing(
+        summaryPath,
+        buildBackendSummary(
+          projected,
+          {
+            result_path: resultPath,
+            summary_path: summaryPath,
+            timeline_path: timelinePath,
+            audit_path: path.join(runDir, 'audit.jsonl'),
+            frontend_snapshot_path: frontendSnapshotPath,
+          },
+          tokenUsage,
+        ),
+      ),
       writeJsonIfMissing(timelinePath, snapshot.events),
     ];
     const serializedSnapshot = JSON.stringify(projected, null, 2);
@@ -67,6 +76,7 @@ function buildBackendSummary(
     audit_path: string;
     frontend_snapshot_path: string;
   },
+  tokenUsage: TaskDriverUsage,
 ): Record<string, unknown> {
   const delivery = projected.delivery_report;
   const finalOutput = projected.final_output;
@@ -97,6 +107,7 @@ function buildBackendSummary(
     changed_files: [...changedFiles],
     artifact_refs: [...artifactRefs],
     artifacts_materialized: projected.artifacts.length,
+    token_usage: tokenUsage,
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     result_path: paths.result_path,
     summary_path: paths.summary_path,

@@ -64,6 +64,38 @@ describe('FileRunTerminalOutputWriter', () => {
     await expect(readJson(path.join(runDir, 'result.json'))).resolves.toEqual({ rich: true });
   });
 
+  it('includes the Task Driver usage aggregate in summary.json', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_failed');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, 'driver-stream.jsonl'),
+      `${JSON.stringify({
+        task_id: 'task_failed',
+        recorded_at: '2026-08-14T00:00:00Z',
+        event: {
+          event_type: 'usage_update',
+          session_id: 'session_usage',
+          role_id: 'role_usage',
+          payload: { update: { used: 321, size: 200_000 } },
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
+
+    await expect(readJson(path.join(runDir, 'summary.json'))).resolves.toMatchObject({
+      token_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        context_tokens_used: 321,
+        sessions: [{ session_id: 'session_usage', role_id: 'role_usage' }],
+      },
+    });
+  });
+
   it('replaces a completed legacy frontend snapshot without replacing its result manifest', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
     tempDirs.push(runsRoot);
