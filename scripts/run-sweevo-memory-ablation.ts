@@ -7,6 +7,7 @@
  *
  * Usage:
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
+ *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B0 --mode council --run-harness
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke
  */
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -22,6 +23,8 @@ import {
 } from '../eval/prepare-worktree';
 import { runEvalInstance } from '../eval/run-instance-core';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
+
+type EvaluationRunMode = 'single_agent' | 'council';
 
 interface JsonRpcMessage {
   jsonrpc: '2.0';
@@ -60,6 +63,7 @@ interface TokenUsage {
 
 interface InstanceRow {
   ablation: MemoryAblation;
+  run_mode: EvaluationRunMode;
   instance_id: string;
   repo: string;
   base_commit: string;
@@ -99,6 +103,7 @@ const mirrorsRoot = resolveMirrorsRoot(readFlag('--mirrors-root'));
 const subsetId = readFlag('--subset') ?? 'v0-smoke';
 const instanceIdFilter = readFlag('--instance-id');
 const ablations = parseAblations(readFlag('--ablations') ?? 'B0,B1,B2');
+const runMode = parseRunMode(readFlag('--mode') ?? 'single_agent');
 const modelName = readFlag('--model') ?? 'claude-acp-real';
 const runHarness = hasFlag('--run-harness');
 const harnessDryRun = hasFlag('--harness-dry-run');
@@ -134,6 +139,7 @@ const baseEnv = {
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
 log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')}`);
+log(`run mode=${runMode}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
 
 const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> = [];
@@ -148,6 +154,17 @@ for (const ablation of ablations) {
   const backend = await startBackend(ablation, {
     ...baseEnv,
     NEWIDE_B_DATABASE_URL: dbUrl,
+    ...(runMode === 'council'
+      ? {
+          NEWIDE_COUNCIL_STRATEGY: baseEnv.NEWIDE_COUNCIL_STRATEGY ?? 'plan_first',
+          NEWIDE_COUNCIL_SEATS:
+            baseEnv.NEWIDE_COUNCIL_SEATS ??
+            'role_fullstack_engineer,role_ts_engineer,role_code_reviewer,role_synthesis_engineer',
+          NEWIDE_AUCTION_ENABLED: baseEnv.NEWIDE_AUCTION_ENABLED ?? '0',
+          NEWIDE_PRIMARY_AGENT_ID:
+            baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
+        }
+      : {}),
   });
 
   const rows: InstanceRow[] = [];
@@ -156,6 +173,7 @@ for (const ablation of ablations) {
       const instance = getInstanceOrThrow(instancesById, instanceId);
       const row = await runOneInstance({
         ablation,
+        runMode,
         armDir,
         backend,
         instance,
@@ -199,6 +217,7 @@ const summary = {
   subset_id: subsetId,
   instance_ids: instanceIds,
   ablations,
+  run_mode: runMode,
   model_name: modelName,
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
@@ -224,13 +243,15 @@ if (failed) process.exitCode = 1;
 
 async function runOneInstance(input: {
   ablation: MemoryAblation;
+  runMode: EvaluationRunMode;
   armDir: string;
   backend: BackendClient;
   instance: SweEvoInstance;
 }): Promise<InstanceRow> {
-  const { ablation, armDir, backend, instance } = input;
+  const { ablation, runMode, armDir, backend, instance } = input;
   const row: InstanceRow = {
     ablation,
+    run_mode: runMode,
     instance_id: instance.instance_id,
     repo: instance.repo,
     base_commit: instance.base_commit,
@@ -265,7 +286,7 @@ async function runOneInstance(input: {
 
     const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
       prompt: buildPrompt(instance),
-      mode: 'single_agent',
+      mode: runMode,
       workspace_path: prepared.worktreePath,
       memory_ablation: ablation,
       title: `${ablation}-${instance.instance_id}`,
@@ -688,6 +709,11 @@ function parseAblations(raw: string): MemoryAblation[] {
   }
   if (out.length === 0) throw new Error('At least one ablation is required.');
   return out;
+}
+
+function parseRunMode(raw: string): EvaluationRunMode {
+  if (raw === 'single_agent' || raw === 'council') return raw;
+  throw new Error(`Invalid run mode "${raw}". Expected single_agent|council.`);
 }
 
 function sanitizeFileName(value: string): string {
