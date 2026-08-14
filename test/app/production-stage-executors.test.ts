@@ -140,6 +140,7 @@ describe('production stage executors', () => {
       mode: 'council' as const,
       task_request: { spec: 'implement result.ts', completion_criteria: [] },
       workspace_path: workspace,
+      memory_ablation: 'B0' as const,
     };
 
     const executed = await executors.execute_agent.execute({
@@ -160,6 +161,7 @@ describe('production stage executors', () => {
     expect(requests[0]).toMatchObject({
       role_id: 'role_primary',
       context_policy: 'council_primary_plan',
+      memory_ablation: 'B0',
     });
     expect(requests[0]?.instruction).toContain('council-plan.md');
     expect(requests[1]).toMatchObject({

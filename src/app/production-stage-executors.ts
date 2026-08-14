@@ -203,6 +203,7 @@ export function createProductionStageExecutors(
           input_artifact_refs: [],
           context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
           schema_version: SCHEMA_VERSION,
+          ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
           ...(context.session_id ? { session_id: context.session_id } : {}),
           ...(context.cursor_input.mailbox_delivery_id
             ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
@@ -227,6 +228,7 @@ export function createProductionStageExecutors(
           context_pack_ref: result.context_pack_ref,
           memory_buffer_ref: result.memory_buffer_ref,
           diagnostics: result.diagnostics,
+          ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
         });
         emit(context, 'agent.execution_completed', result.agent_run_id, {
           agent_id: result.agent_id ?? result.role_id,
@@ -240,6 +242,7 @@ export function createProductionStageExecutors(
           transcript_ref: result.transcript_ref.artifact_id,
           context_pack_ref: result.context_pack_ref,
           memory_buffer_ref: result.memory_buffer_ref,
+          ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
           driver_run_result_id: result.driver_run_result_id,
           diagnostics: result.diagnostics,
         });
@@ -351,6 +354,7 @@ export function createProductionStageExecutors(
         context_pack_ref: result.context_pack_ref,
         memory_buffer_ref: result.memory_buffer_ref,
         diagnostics: result.diagnostics,
+        ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
       });
       emit(context, 'agent.execution_completed', result.agent_run_id, {
         agent_id: result.agent_id ?? result.role_id,
