@@ -168,6 +168,7 @@ describe('production stage executors', () => {
       role_id: 'role_primary',
       session_id: 'session_primary',
       context_policy: 'council_plan_execution',
+      memory_ablation: 'B0',
       input_artifact_refs: [finalPlan.artifact_id],
       workspace_path: requests[0]?.workspace_path,
     });
@@ -276,6 +277,7 @@ describe('production stage executors', () => {
       mode: 'council' as const,
       task_request: { spec: 'implement result.ts', completion_criteria: [] },
       workspace_path: workspace,
+      memory_ablation: 'B0' as const,
     };
 
     const selected = await executors.select_agent.execute({
@@ -300,6 +302,7 @@ describe('production stage executors', () => {
     expect(requests[0]).toMatchObject({
       role_id: 'role_primary',
       context_policy: 'council_primary_plan',
+      memory_ablation: 'B0',
     });
     expect(requests[0]?.instruction).toContain('council-plan.md');
     // Council produced the fixed seats and concrete Plan artifacts.
@@ -322,6 +325,7 @@ describe('production stage executors', () => {
       };
     };
     const councilResult = state.selection.council_run_result;
+    expect(requests.every((request) => request.memory_ablation === 'B0')).toBe(true);
     expect(councilResult.participants.map(({ seat, agent_id }) => [seat, agent_id])).toEqual([
       ['proposer', 'role_primary'],
       ['proposer', 'role_deputy'],

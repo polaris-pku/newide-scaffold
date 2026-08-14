@@ -290,6 +290,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           input_artifact_refs: inputArtifactRefs,
           context_policy: `council_${participant.seat}`,
           schema_version: SCHEMA_VERSION,
+          ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         },
         options?.signal || options?.onDriverEvent
           ? {

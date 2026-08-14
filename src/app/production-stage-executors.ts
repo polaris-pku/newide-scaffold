@@ -445,6 +445,7 @@ export function createProductionStageExecutors(
           evidence_pack: evidencePack,
           question: context.task_request.spec,
           workspace_path: context.workspace_path,
+          ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
         },
         {
           ...(context.signal ? { signal: context.signal } : {}),
@@ -795,6 +796,9 @@ async function executeFinalCouncilPlan(input: {
       input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
       context_policy: 'council_plan_execution',
       schema_version: SCHEMA_VERSION,
+      ...(input.context.memory_ablation
+        ? { memory_ablation: input.context.memory_ablation }
+        : {}),
     },
     {
       ...(input.context.signal ? { signal: input.context.signal } : {}),
