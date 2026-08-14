@@ -1234,6 +1234,20 @@ export class NewideBackendService {
     }
   }
 
+  /**
+   * Wait through Mailbox continuation Runs until the long-lived Task itself is terminal.
+   * A Run completed with outcome=mailbox_wait is intentionally not a terminal Task result.
+   */
+  async waitForTaskTerminal(taskId: string): Promise<TaskSnapshot> {
+    for (;;) {
+      const snapshot = await this.getTask(taskId);
+      if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+        return snapshot;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   async cancelRun(
     runId: string,
     reason?: RunCancellationReason,

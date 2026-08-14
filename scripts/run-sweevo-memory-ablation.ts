@@ -35,7 +35,13 @@ interface JsonRpcMessage {
 interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
   waitForTerminal(runId: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  waitForTaskTerminal(taskId: string, timeoutMs: number): Promise<TaskTerminalSnapshot>;
   close(): Promise<void>;
+}
+
+interface TaskTerminalSnapshot {
+  task: { task_id: string; status: string };
+  run_history: Array<{ run_id: string; status: string }>;
 }
 
 interface TokenUsage {
@@ -60,6 +66,7 @@ interface InstanceRow {
   mirror_path?: string;
   worktree_path?: string;
   backend_run_id?: string;
+  final_backend_run_id?: string;
   backend_task_id?: string;
   snapshot_status?: string;
   summary_path?: string;
@@ -267,7 +274,10 @@ async function runOneInstance(input: {
     row.backend_task_id = created.task_id;
 
     await backend.request('run.subscribe', { run_id: created.run_id });
-    const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
+    const taskSnapshot = await backend.waitForTaskTerminal(created.task_id, runTimeoutMs);
+    const finalRunId = latestTerminalRunId(taskSnapshot);
+    row.final_backend_run_id = finalRunId;
+    const snapshot = await backend.waitForTerminal(finalRunId, runTimeoutMs);
     row.snapshot_status = String(snapshot.status ?? '');
 
     if (ablation !== 'B0') {
@@ -275,7 +285,7 @@ async function runOneInstance(input: {
       await sleep(maintenanceWaitMs);
     }
 
-    const summaryPath = path.join(repoRoot, '.newide', 'runs', created.run_id, 'summary.json');
+    const summaryPath = path.join(repoRoot, '.newide', 'runs', finalRunId, 'summary.json');
     row.summary_path = summaryPath;
     const summary = await readJsonIfExists(summaryPath);
     if (summary && typeof summary === 'object') {
@@ -631,6 +641,17 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
     },
+    waitForTaskTerminal: async (taskId, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const snapshot = await request<TaskTerminalSnapshot>('task.get', { task_id: taskId });
+        if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+          return snapshot;
+        }
+        await sleep(1_000);
+      }
+      throw new Error(`[${label}] task ${taskId} did not finish within ${String(timeoutMs)}ms`);
+    },
     close: async () => {
       child.stdin?.end();
       const result = await Promise.race([closed, sleep(5_000).then(() => 'timeout' as const)]);
@@ -644,6 +665,12 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }
     },
   };
+}
+
+function latestTerminalRunId(snapshot: TaskTerminalSnapshot): string {
+  const latest = snapshot.run_history[0];
+  if (!latest) throw new Error(`Task ${snapshot.task.task_id} has no terminal Run`);
+  return latest.run_id;
 }
 
 function parseAblations(raw: string): MemoryAblation[] {
