@@ -3,7 +3,8 @@
  *
  * Agent writes directly into an ephemeral git worktree @ base_commit.
  * After the run, eval collects the patch via git diff (collectWorktreePatch).
- * Repo mirrors are lazy-cloned under D:\newide-sweevo-mirrors (NEWIDE_SWE_MIRRORS_ROOT).
+ * Repo mirrors are lazy-cloned under NEWIDE_SWE_MIRRORS_ROOT. On non-Windows
+ * hosts the script defaults to .newide/eval-mirrors.
  *
  * Usage:
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
@@ -93,12 +94,18 @@ const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
   process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
-    'D:\\Code\\NewIDE\\.newide-experiments\\sweevo-ablation',
+    (process.platform === 'win32'
+      ? 'D:\\Code\\NewIDE\\.newide-experiments\\sweevo-ablation'
+      : path.join(repoRoot, '.newide', 'eval-runs', 'sweevo-ablation')),
   stamp,
 );
 const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 900_000);
 const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
-const mirrorsRoot = resolveMirrorsRoot(readFlag('--mirrors-root'));
+const mirrorsRoot = resolveMirrorsRoot(
+  readFlag('--mirrors-root') ??
+    process.env.NEWIDE_SWE_MIRRORS_ROOT ??
+    (process.platform === 'win32' ? undefined : path.join(repoRoot, '.newide', 'eval-mirrors')),
+);
 
 const subsetId = readFlag('--subset') ?? 'v0-smoke';
 const instanceIdFilter = readFlag('--instance-id');
@@ -146,6 +153,7 @@ const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> 
 
 for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
+  const stateRoot = path.join(armDir, 'state');
   await fs.mkdir(armDir, { recursive: true });
   const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
   log('');
@@ -154,6 +162,9 @@ for (const ablation of ablations) {
   const backend = await startBackend(ablation, {
     ...baseEnv,
     NEWIDE_B_DATABASE_URL: dbUrl,
+    NEWIDE_B_EMBEDDING_PROVIDER: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
+    NEWIDE_B_EMBEDDING_DIMENSIONS: baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32',
+    NEWIDE_STATE_ROOT: stateRoot,
     ...(runMode === 'council'
       ? {
           NEWIDE_COUNCIL_STRATEGY: baseEnv.NEWIDE_COUNCIL_STRATEGY ?? 'plan_first',
@@ -175,6 +186,7 @@ for (const ablation of ablations) {
         ablation,
         runMode,
         armDir,
+        stateRoot,
         backend,
         instance,
       });
@@ -245,10 +257,11 @@ async function runOneInstance(input: {
   ablation: MemoryAblation;
   runMode: EvaluationRunMode;
   armDir: string;
+  stateRoot: string;
   backend: BackendClient;
   instance: SweEvoInstance;
 }): Promise<InstanceRow> {
-  const { ablation, runMode, armDir, backend, instance } = input;
+  const { ablation, runMode, armDir, stateRoot, backend, instance } = input;
   const row: InstanceRow = {
     ablation,
     run_mode: runMode,
@@ -306,7 +319,7 @@ async function runOneInstance(input: {
       await sleep(maintenanceWaitMs);
     }
 
-    const summaryPath = path.join(repoRoot, '.newide', 'runs', finalRunId, 'summary.json');
+    const summaryPath = path.join(stateRoot, 'runs', finalRunId, 'summary.json');
     row.summary_path = summaryPath;
     const summary = await readJsonIfExists(summaryPath);
     if (summary && typeof summary === 'object') {
@@ -593,7 +606,7 @@ function summarizeTokens(rows: InstanceRow[]): {
 async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<BackendClient> {
   const child: ChildProcess = spawn(
     process.execPath,
-    ['--import', 'tsx', 'src/app/backend-rpc-stdio.ts'],
+    ['--import', 'tsx', 'src/app/backend-rpc-entry.ts'],
     {
       cwd: repoRoot,
       env,
@@ -610,6 +623,8 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
   const waiters = new Set<{
     predicate: (message: JsonRpcMessage) => boolean;
     resolve: (message: JsonRpcMessage) => void;
+    reject: (error: Error) => void;
+    timer?: NodeJS.Timeout;
   }>();
   createInterface({ input: child.stdout! }).on('line', (line) => {
     let message: JsonRpcMessage;
@@ -621,20 +636,38 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
     for (const waiter of waiters) {
       if (!waiter.predicate(message)) continue;
       waiters.delete(waiter);
+      if (waiter.timer) clearTimeout(waiter.timer);
       waiter.resolve(message);
     }
   });
+
+  const rejectWaiters = (reason: string) => {
+    for (const waiter of waiters) {
+      waiters.delete(waiter);
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.reject(new Error(`[${label}] backend ${reason}. stderr=${stderr.join('')}`));
+    }
+  };
+  child.once('error', (error) => rejectWaiters(`failed to start: ${error.message}`));
+  child.once('close', (code, signal) =>
+    rejectWaiters(`closed (code=${String(code)}, signal=${String(signal)})`),
+  );
 
   let nextId = 1;
   const request = async <T>(method: string, params: unknown): Promise<T> => {
     const id = nextId++;
     const waiting = new Promise<JsonRpcMessage>((resolve, reject) => {
-      const waiter = { predicate: (message: JsonRpcMessage) => message.id === id, resolve };
-      waiters.add(waiter);
-      setTimeout(() => {
+      const waiter = {
+        predicate: (message: JsonRpcMessage) => message.id === id,
+        resolve,
+        reject,
+        timer: undefined as NodeJS.Timeout | undefined,
+      };
+      waiter.timer = setTimeout(() => {
         if (!waiters.delete(waiter)) return;
         reject(new Error(`[${label}] timed out on ${method}. stderr=${stderr.join('')}`));
-      }, 60_000).unref();
+      }, 60_000);
+      waiters.add(waiter);
     });
     child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     const response = await waiting;

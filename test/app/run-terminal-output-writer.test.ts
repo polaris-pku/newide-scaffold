@@ -96,6 +96,29 @@ describe('FileRunTerminalOutputWriter', () => {
     });
   });
 
+  it('preserves memory ablation in summary when execution fails before context build', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events.unshift({
+      event_id: 'run_event_created',
+      sequence: 0,
+      run_id: snapshot.run_id,
+      task_id: snapshot.task_id,
+      type: 'run.created',
+      source: 'coordinator',
+      created_at: '2026-07-11T07:59:59.000Z',
+      payload: { mode: 'council', memory_ablation: 'B0' },
+      schema_version: 'v0',
+    });
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(snapshot);
+
+    await expect(readJson(path.join(runsRoot, 'run_failed', 'summary.json'))).resolves.toMatchObject({
+      memory_ablation: 'B0',
+    });
+  });
+
   it('replaces a completed legacy frontend snapshot without replacing its result manifest', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
     tempDirs.push(runsRoot);

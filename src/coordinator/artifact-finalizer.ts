@@ -62,6 +62,8 @@ export interface ArtifactSelectionInput {
   question?: string;
   workspace_path?: string;
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  /** Persisted Agent that produced the initial Driver proposal. */
+  proposal_agent_id?: string;
 }
 
 export interface ArtifactSelectionExecutionOptions {
@@ -148,6 +150,7 @@ export class ArtifactSelector {
       driver_result: input.driver_result,
       gate_results: input.gate_results,
     });
+    if (input.proposal_agent_id) proposal.agent_id = input.proposal_agent_id;
 
     const councilRequest = {
         run_id: input.run_id,

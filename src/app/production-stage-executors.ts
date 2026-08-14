@@ -303,6 +303,9 @@ export function createProductionStageExecutors(
           driver_run_result_id: result.driver_run_result_id,
           diagnostics: result.diagnostics,
         });
+        if (planFirst) {
+          throw new Error(`Primary Agent ended with status ${result.status}`);
+        }
         return {
           changeset_ref: selection.manifest_ref,
           expected_sha256: selection.expected_sha256,
@@ -445,6 +448,7 @@ export function createProductionStageExecutors(
           evidence_pack: evidencePack,
           question: context.task_request.spec,
           workspace_path: context.workspace_path,
+          proposal_agent_id: primary.agent_id ?? primary.role_id,
           ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
         },
         {

@@ -85,8 +85,7 @@ function buildBackendSummary(
   const changedFiles = finalOutput?.changed_files ?? delivery?.changed_files ?? [];
   const artifactRefs = finalOutput?.artifact_refs ?? [];
   const memoryAblation = projected.timeline
-    .filter((event) => event.type === 'memory.context_pack_built')
-    .map((event) => event.payload.ablation)
+    .map((event) => event.payload.memory_ablation ?? event.payload.ablation)
     .find((value): value is string => typeof value === 'string');
   const outcome =
     finalOutput?.outcome ??

@@ -102,8 +102,12 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     const generatedResults: AgentExecutionResult[] = [];
     const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];
+    const representedAgentIds = new Set(
+      input.proposals.flatMap((proposal) => (proposal.agent_id ? [proposal.agent_id] : [])),
+    );
 
     for (const participant of proposers) {
+      if (representedAgentIds.has(participant.agent_id)) continue;
       const label = String.fromCharCode(65 + participant.seat_index);
       const workspace = participantWorkspace(councilDir, participant);
       await prepareCouncilWorkspace(input.workspace_path, workspace);

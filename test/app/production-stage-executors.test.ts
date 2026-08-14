@@ -305,6 +305,13 @@ describe('production stage executors', () => {
       memory_ablation: 'B0',
     });
     expect(requests[0]?.instruction).toContain('council-plan.md');
+    expect(requests.map((request) => request.context_policy)).toEqual([
+      'council_primary_plan',
+      'council_proposer',
+      'council_reviewer',
+      'council_synthesizer',
+      'council_plan_execution',
+    ]);
     // Council produced the fixed seats and concrete Plan artifacts.
     const state = JSON.parse(
       await readFile(path.join(root, 'runs', 'run_plan_e2e', 'production-stage-state.json'), 'utf8'),
@@ -745,8 +752,8 @@ function boardQuery(agents: AgentBoardListItem[]): AgentBoardQuery {
 }
 
 /**
- * Scripted plan_first facade: primary writes a Plan, council proposers write
- * Plans, reviewer returns structured reviews, synthesizer writes final-plan.md,
+ * Scripted plan_first facade: primary writes the first Plan, the deputy writes
+ * the second, reviewer returns structured reviews, synthesizer writes final-plan.md,
  * and primary's second run implements src/result.ts.
  */
 function planFirstScriptedResponse(input: AgentExecutionRequest): AgentExecutionResult {
