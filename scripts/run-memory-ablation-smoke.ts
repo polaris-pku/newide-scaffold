@@ -2,7 +2,7 @@
  * §1 memory ablation smoke: B0 / B1 / B2 × 3 sequential related tasks.
  *
  * Uses production backend (real ACP driver + Postgres B memory).
- * Artifacts default to D:\Code\NewIDE\.newide-experiments\memory-ablation\<ts>\.
+ * Artifacts default to .newide/eval-runs/memory-ablation/<ts>/.
  *
  * Usage:
  *   pnpm exec tsx scripts/run-memory-ablation-smoke.ts
@@ -37,14 +37,29 @@ interface TaskTerminalSnapshot {
 }
 
 const repoRoot = process.cwd();
+const configuredEnv = {
+  ...loadEnvFile(path.join(repoRoot, '.env')),
+  ...loadEnvFile(path.join(repoRoot, '.env.local')),
+};
+const baseEnv = {
+  ...configuredEnv,
+  ...process.env,
+  ACP_DRIVER_RUNNER_DIR:
+    process.env.ACP_DRIVER_RUNNER_DIR ??
+    configuredEnv.ACP_DRIVER_RUNNER_DIR ??
+    path.resolve(repoRoot, '..', 'acp-client-prototype'),
+  ACP_DRIVER_TIMEOUT_MS:
+    process.env.ACP_DRIVER_TIMEOUT_MS ?? configuredEnv.ACP_DRIVER_TIMEOUT_MS ?? '300000',
+};
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
-  process.env.NEWIDE_ABLATION_ROOT ?? 'D:\\Code\\NewIDE\\.newide-experiments\\memory-ablation',
+  baseEnv.NEWIDE_ABLATION_ROOT ??
+    path.join(repoRoot, '.newide', 'eval-runs', 'memory-ablation'),
   stamp,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 600_000);
-const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
+const runTimeoutMs = readPositiveInt(baseEnv.ACCEPTANCE_RUN_TIMEOUT_MS, 600_000);
+const maintenanceWaitMs = readPositiveInt(baseEnv.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
 
 const TASKS = [
   {
@@ -74,14 +89,9 @@ const TASKS = [
 const ABLATIONS: MemoryAblation[] = ['B0', 'B1', 'B2'];
 
 await fs.mkdir(experimentRoot, { recursive: true });
-const baseEnv = {
-  ...process.env,
-  ...loadEnvFile(path.join(repoRoot, '.env')),
-  ...loadEnvFile(path.join(repoRoot, '.env.local')),
-  ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
-  ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '300000',
-};
+const databaseUrlTemplate =
+  baseEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
 
 log(`experiment root: ${experimentRoot}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
@@ -91,7 +101,7 @@ for (const ablation of ABLATIONS) {
   const armDir = path.join(experimentRoot, ablation);
   const workspace = path.join(armDir, 'workspace');
   await fs.mkdir(workspace, { recursive: true });
-  const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   log('');
   log(`=== arm ${ablation} db=${dbUrl.replace(/:[^:@]+@/, ':***@')} ===`);
 
@@ -392,6 +402,13 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
+  if (!template.includes('{ablation}')) {
+    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
+  }
+  return template.replaceAll('{ablation}', ablation.toLowerCase());
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {

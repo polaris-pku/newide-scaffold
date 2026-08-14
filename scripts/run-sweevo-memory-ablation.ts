@@ -90,21 +90,33 @@ interface InstanceRow {
 }
 
 const repoRoot = process.cwd();
+const configuredEnv = {
+  ...loadEnvFile(path.join(repoRoot, '.env')),
+  ...loadEnvFile(path.join(repoRoot, '.env.local')),
+};
+const baseEnv = {
+  ...configuredEnv,
+  ...process.env,
+  ACP_DRIVER_RUNNER_DIR:
+    process.env.ACP_DRIVER_RUNNER_DIR ??
+    configuredEnv.ACP_DRIVER_RUNNER_DIR ??
+    path.resolve(repoRoot, '..', 'acp-client-prototype'),
+  ACP_DRIVER_TIMEOUT_MS:
+    process.env.ACP_DRIVER_TIMEOUT_MS ?? configuredEnv.ACP_DRIVER_TIMEOUT_MS ?? '600000',
+};
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
-  process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
-    (process.platform === 'win32'
-      ? 'D:\\Code\\NewIDE\\.newide-experiments\\sweevo-ablation'
-      : path.join(repoRoot, '.newide', 'eval-runs', 'sweevo-ablation')),
+  baseEnv.NEWIDE_SWEEVO_ABLATION_ROOT ??
+    path.join(repoRoot, '.newide', 'eval-runs', 'sweevo-ablation'),
   stamp,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 900_000);
-const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
+const runTimeoutMs = readPositiveInt(baseEnv.ACCEPTANCE_RUN_TIMEOUT_MS, 900_000);
+const maintenanceWaitMs = readPositiveInt(baseEnv.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
 const mirrorsRoot = resolveMirrorsRoot(
   readFlag('--mirrors-root') ??
-    process.env.NEWIDE_SWE_MIRRORS_ROOT ??
-    (process.platform === 'win32' ? undefined : path.join(repoRoot, '.newide', 'eval-mirrors')),
+    baseEnv.NEWIDE_SWE_MIRRORS_ROOT ??
+    path.join(repoRoot, '.newide', 'eval-mirrors'),
 );
 
 const subsetId = readFlag('--subset') ?? 'v0-smoke';
@@ -134,20 +146,17 @@ for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
 
-const baseEnv = {
-  ...process.env,
-  ...loadEnvFile(path.join(repoRoot, '.env')),
-  ...loadEnvFile(path.join(repoRoot, '.env.local')),
-  ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
-  ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '600000',
-};
+const databaseUrlTemplate =
+  baseEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
+const claudeConfigDir = resolveClaudeConfigDir(baseEnv);
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
 log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')}`);
 log(`run mode=${runMode}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
+log(`CLAUDE_CONFIG_DIR: ${claudeConfigDir}`);
 
 const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> = [];
 
@@ -155,7 +164,7 @@ for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
   const stateRoot = path.join(armDir, 'state');
   await fs.mkdir(armDir, { recursive: true });
-  const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   log('');
   log(`=== arm ${ablation} ===`);
 
@@ -343,10 +352,14 @@ async function runOneInstance(input: {
     row.token_usage = await collectClaudeTokenUsage({
       sessionId: row.session_id,
       worktreePath: prepared.worktreePath,
+      claudeConfigDir,
     });
 
     if (skipEval) {
-      row.status = 'skipped_eval';
+      row.status =
+        row.snapshot_status === 'succeeded' || row.snapshot_status === 'completed'
+          ? 'skipped_eval'
+          : 'failed';
       return row;
     }
 
@@ -446,8 +459,9 @@ function encodeClaudeProjectDir(worktreePath: string): string {
 async function collectClaudeTokenUsage(input: {
   sessionId?: string;
   worktreePath: string;
+  claudeConfigDir: string;
 }): Promise<TokenUsage> {
-  const claudeRoot = path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.claude');
+  const claudeRoot = input.claudeConfigDir;
   if (!claudeRoot || !existsSync(claudeRoot)) return emptyTokenUsage();
 
   const candidates: string[] = [];
@@ -459,6 +473,13 @@ async function collectClaudeTokenUsage(input: {
     );
     candidates.push(path.join(projectDir, `${input.sessionId}.jsonl`));
     candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
+    const projectsRoot = path.join(claudeRoot, 'projects');
+    const projectDirectories = await fs.readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
+    for (const directory of projectDirectories) {
+      if (!directory.isDirectory()) continue;
+      const candidate = path.join(projectsRoot, directory.name, `${input.sessionId}.jsonl`);
+      if (existsSync(candidate) && !candidates.includes(candidate)) candidates.push(candidate);
+    }
   }
 
   // Fallback: newest jsonl under the encoded project dir (useful if session_id mapping drifts).
@@ -508,13 +529,14 @@ async function sumUsageFromClaudeJsonl(
   let cacheRead = 0;
   let assistantMessages = 0;
   let matchedSessionId = expectedSessionId;
+  const seenMessageIds = new Set<string>();
 
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let obj: {
       type?: string;
       sessionId?: string;
-      message?: { usage?: Record<string, unknown> };
+      message?: { id?: string; usage?: Record<string, unknown> };
       usage?: Record<string, unknown>;
     };
     try {
@@ -524,6 +546,8 @@ async function sumUsageFromClaudeJsonl(
     }
     if (expectedSessionId && obj.sessionId && obj.sessionId !== expectedSessionId) continue;
     if (obj.sessionId) matchedSessionId = obj.sessionId;
+    if (obj.message?.id && seenMessageIds.has(obj.message.id)) continue;
+    if (obj.message?.id) seenMessageIds.add(obj.message.id);
     const usage = obj.message?.usage ?? obj.usage;
     if (!usage || typeof usage !== 'object') continue;
     if (obj.type !== 'assistant' && !obj.message?.usage) continue;
@@ -787,6 +811,24 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
+  if (!template.includes('{ablation}')) {
+    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
+  }
+  return template.replaceAll('{ablation}', ablation.toLowerCase());
+}
+
+function resolveClaudeConfigDir(env: NodeJS.ProcessEnv): string {
+  const runnerDir = env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype');
+  const driverEnvFile = env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env');
+  const driverEnv = loadEnvFile(driverEnvFile);
+  return path.resolve(
+    driverEnv.CLAUDE_CONFIG_DIR ??
+      env.CLAUDE_CONFIG_DIR ??
+      path.join(env.USERPROFILE ?? env.HOME ?? '', '.claude'),
+  );
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {
