@@ -14,6 +14,12 @@ importers:
       '@ai-sdk/openai':
         specifier: 4.0.8
         version: 4.0.8(zod@4.4.3)
+      '@electric-sql/pglite':
+        specifier: ^0.5.5
+        version: 0.5.5
+      '@electric-sql/pglite-pgvector':
+        specifier: 0.0.6
+        version: 0.0.6(@electric-sql/pglite@0.5.5)
       ai:
         specifier: 7.0.17
         version: 7.0.17(zod@4.4.3)
@@ -203,6 +209,14 @@ packages:
         optional: true
       conventional-commits-parser:
         optional: true
+
+  '@electric-sql/pglite-pgvector@0.0.6':
+    resolution: {integrity: sha512-KiPeiS/BMmjO71igzgexJAu5aPb3Y2yUjNTSMdti4ZL3zlqZFl4eLgbzLBGyG5Cxr9xFwYFmHh61ZTq6w6hUJA==}
+    peerDependencies:
+      '@electric-sql/pglite': 0.5.5
+
+  '@electric-sql/pglite@0.5.5':
+    resolution: {integrity: sha512-QeZ+oB7QaU4EJj2awrB8hwFZ5TXxLRBQ9Gfq0dQauYDdWsRtuWRCERgtri35vRfL07KQHlVlc/4Qxvn7a5AXeA==}
 
   '@emnapi/core@1.10.0':
     resolution: {integrity: sha512-yq6OkJ4p82CAfPl0u9mQebQHKPJkY7WrIuk205cTYnYe+k2Z8YBh11FrbRG/H6ihirqcacOgl2BIO8oyMQLeXw==}
@@ -1761,6 +1775,12 @@ snapshots:
       semver: 7.8.4
     optionalDependencies:
       conventional-commits-parser: 6.4.0
+
+  '@electric-sql/pglite-pgvector@0.0.6(@electric-sql/pglite@0.5.5)':
+    dependencies:
+      '@electric-sql/pglite': 0.5.5
+
+  '@electric-sql/pglite@0.5.5': {}
 
   '@emnapi/core@1.10.0':
     dependencies:

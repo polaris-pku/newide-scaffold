@@ -1,2 +1,5 @@
 allowBuilds:
   esbuild: true
+minimumReleaseAgeExclude:
+  - '@electric-sql/pglite-pgvector@0.0.6'
+  - '@electric-sql/pglite@0.5.5'
