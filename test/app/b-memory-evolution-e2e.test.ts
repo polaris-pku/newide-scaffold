@@ -158,6 +158,7 @@ describe('B memory evolution end to end', () => {
           dimensions: 4,
           readiness: 'verified',
         },
+        repository,
       ),
     );
     await expect(
@@ -220,6 +221,10 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
     listMemoryExperiences: (roleId) => service.listExperiences(roleId),
     listMemoryMaintenance: (roleId) => service.listMaintenance(roleId),
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
+    marketSearchMemorySkills: (query) => service.marketSearch(query),
+    marketImportMemorySkill: (roleId, sourceSkillId) =>
+      service.marketImport(roleId, sourceSkillId),
+    retireMemoryAgent: (roleId, options) => service.retireAgent(roleId, options),
   }).register(dispatcher);
   return dispatcher;
 }

@@ -32,6 +32,8 @@ import {
   type EmbeddingProvider,
   type MemoryRetrievalResult,
   type MemoryRepository,
+  type RetireOptions,
+  type RetireResult,
   type ToolCallingClient,
 } from '../memory';
 import {
@@ -221,6 +223,17 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     options?: CollectCompetitionClaimsOptions,
   ): Promise<CompetitionClaimBatch> {
     return (await this.manager).collectCompetitionClaims(task, options);
+  }
+
+  /**
+   * 优雅退休（week3 RFC §12）：委托给持有该 role 的 AgentManager。
+   *
+   * 选择 roleReady 中该 role 当前的 Manager（可能因 abort 恢复而重建），
+   * 否则退回基座 Manager（create 时已从 Repository 预加载全部 Agent）。
+   */
+  async retireAgent(roleId: string, options: RetireOptions = {}): Promise<RetireResult> {
+    const manager = await (this.roleReady.get(roleId) ?? this.manager);
+    return manager.retireAgent(roleId, options);
   }
 
   async runAgent(

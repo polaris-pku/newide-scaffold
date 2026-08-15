@@ -67,7 +67,17 @@ import type {
   SaveMailboxReplyResult,
 } from '../mailbox';
 import type { DriverStreamEvent } from '../driver/contract';
-import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
+import type {
+  AgentBoardAgentView,
+  AgentBoardListItem,
+  ExperienceView,
+  MarketImportResult,
+  MarketSearchQuery,
+  RetireOptions,
+  RetireResult,
+  SkillView,
+} from '../memory';
+import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
 import {
@@ -324,6 +334,18 @@ export class NewideBackendService {
 
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
+  }
+
+  marketSearchMemorySkills(query: MarketSearchQuery): Promise<SkillRecord[]> {
+    return this.requireBMemoryService().marketSearch(query);
+  }
+
+  marketImportMemorySkill(roleId: string, sourceSkillId: string): Promise<MarketImportResult> {
+    return this.requireBMemoryService().marketImport(roleId, sourceSkillId);
+  }
+
+  retireMemoryAgent(roleId: string, options: RetireOptions): Promise<RetireResult> {
+    return this.requireBMemoryService().retireAgent(roleId, options);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

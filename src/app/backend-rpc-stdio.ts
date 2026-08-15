@@ -249,6 +249,11 @@ export async function createProductionBackendService(
     const bMemoryService = new BMemoryBackendService(
       bCapabilities,
       bRuntime.embedding_info,
+      bRuntime.repository,
+      {
+        retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
+      },
+      bRuntime.embedding,
     );
 
     try {
