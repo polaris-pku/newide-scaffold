@@ -125,6 +125,8 @@ const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
 const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
 const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
 const DEFAULT_MAILBOX_DEADLINE_SECONDS = 300;
+const PRODUCTION_EXECUTION_CONTRACT =
+  'Production execution contract: call invoke_driver for task work; a text-only answer is not task completion.';
 
 export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly manager: Promise<AgentManager>;
@@ -297,8 +299,21 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       queueKeys,
       async () => {
         throwIfAborted(options?.signal);
-        const manager = await this.ensureRole(runtimeRoleId);
-        const result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+        let manager = await this.ensureRole(runtimeRoleId);
+        if (manager.getAgent(runtimeRoleId)?.hasPendingTask()) {
+          await this.recoverRole(runtimeRoleId);
+          manager = await this.ensureRole(runtimeRoleId);
+        }
+        let result: AgentExecutionResult;
+        try {
+          result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+        } catch (error) {
+          await this.recoverRole(runtimeRoleId);
+          throw error;
+        }
+        if (result.status !== 'completed') {
+          await this.recoverRole(runtimeRoleId);
+        }
         const effectiveSessionId = scopedInput.session_id ?? result.session_id;
         if (
           effectiveSessionId &&
@@ -407,7 +422,6 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       );
 
       if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
-        await this.recoverRole(runtimeRoleId);
         throwIfAborted(invocation.signal);
       }
       const result = await this.buildResult(
@@ -1262,7 +1276,10 @@ function withTopLevelExecutionContext(
     messages: input.messages.map((message) => {
       if (injected || message.role !== 'user' || message.content === null) return message;
       injected = true;
-      return { ...message, content: `${message.content}\n\n${context}` };
+      return {
+        ...message,
+        content: `${PRODUCTION_EXECUTION_CONTRACT}\n\n${message.content}\n\n${context}`,
+      };
     }),
   };
 }
