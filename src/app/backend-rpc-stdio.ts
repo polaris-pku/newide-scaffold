@@ -198,7 +198,15 @@ export async function createProductionBackendService(
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
-      llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
+      llm:
+        dependencies.agentLlm ??
+        new ProductionAgentToolCallingClient(
+          new LiteLLMToolCallingClient({
+            ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
+              ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
+              : {}),
+          }),
+        ),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
@@ -543,6 +551,33 @@ function assertValidMarketAgentIds(value: unknown): asserts value is readonly st
     new Set(agentIds).size === agentIds.length;
   if (!valid) {
     throw new Error('Production B runtime must provide non-empty, unique market_agent_ids');
+  }
+}
+
+class ProductionAgentToolCallingClient implements ToolCallingClient {
+  constructor(private readonly delegate: ToolCallingClient) {}
+
+  async completeWithTools(
+    input: Parameters<ToolCallingClient['completeWithTools']>[0],
+  ): Promise<Awaited<ReturnType<ToolCallingClient['completeWithTools']>>> {
+    const result = await this.delegate.completeWithTools(input);
+    const exposesDriver = input.tools.some((tool) => tool.function.name === 'invoke_driver');
+    const driverAlreadyInvoked = input.messages.some((message) =>
+      message.tool_calls?.some((toolCall) => toolCall.function.name === 'invoke_driver'),
+    );
+    if (!exposesDriver || driverAlreadyInvoked || result.tool_calls?.length) return result;
+
+    return this.delegate.completeWithTools({
+      ...input,
+      messages: [
+        ...input.messages,
+        {
+          role: 'user',
+          content:
+            'The production task is not complete. Call invoke_driver now and delegate the concrete task.',
+        },
+      ],
+    });
   }
 }
 

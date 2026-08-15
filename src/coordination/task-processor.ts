@@ -1574,9 +1574,10 @@ function assertBeginRunIntent(
     const reply = requireMailboxEnvelope(mailboxStore, cursorInput.mailbox_delivery_id);
     if (
       source.message.task_id !== input.task_id ||
-      source.message.workspace_path !== input.workspace_path ||
       reply.message.task_id !== input.task_id ||
-      reply.message.workspace_path !== input.workspace_path ||
+      reply.message.workspace_path !== source.message.workspace_path ||
+      source.message.from_role_id !== existing.task.owner_agent_id ||
+      reply.message.from_role_id !== source.delivery.recipient_role_id ||
       reply.message.reply_to_message_id !== source.message.message_id ||
       reply.delivery.recipient_role_id !== existing.task.owner_agent_id
     ) {

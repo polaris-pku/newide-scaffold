@@ -164,9 +164,9 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   [[ -d "$REPO_ROOT/node_modules" ]] || fail "backend dependencies are missing; run: pnpm --dir $REPO_ROOT install"
   [[ -d "$DRIVER_RUNNER/node_modules" ]] || fail "ACP client dependencies are missing; run: pnpm --dir $DRIVER_RUNNER install"
   printf '[newide] Building ACP client...\n' >&2
-  pnpm --dir "$DRIVER_RUNNER" build >&2
+  (cd "$DRIVER_RUNNER" && corepack pnpm build) >&2
   printf '[newide] Building backend CLI...\n' >&2
-  pnpm --dir "$REPO_ROOT" build >&2
+  (cd "$REPO_ROOT" && corepack pnpm build) >&2
 else
   [[ -f "$DRIVER_RUNNER/dist/src/driver/contract-runner.js" ]] || fail 'ACP client build output is missing; remove --skip-build'
   [[ -f "$REPO_ROOT/dist/newide.mjs" ]] || fail 'backend CLI build output is missing; remove --skip-build'
