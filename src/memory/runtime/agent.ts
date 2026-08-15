@@ -21,7 +21,14 @@ import type { MemoryCycleResult } from '../types';
 import type { CompetitionClaimEvaluator } from '../ports/competition-claim-evaluator';
 import type { AgentCompetitionClaim } from '../competition-types';
 import { createMockCompetitionClaimEvaluator } from '../adapters/mock-competition-claim-evaluator';
-import { ToolRegistry, type Tool, type ToolCallMessage, type ToolCallingClient } from './tool';
+import {
+  ToolRegistry,
+  type Tool,
+  type ToolCallMessage,
+  type ToolCallResult,
+  type ToolCallingClient,
+} from './tool';
+import type { AgentLoopObserver } from './agent-loop-observer';
 import { createId, nowTimestamp } from '../../core';
 import { writePendingBuffer } from '../services/buffer-writer';
 import { buildAgentSystemPrompt } from '../prompts/agent-system-prompt';
@@ -43,6 +50,8 @@ export interface AgentToolConfig {
   systemPrompt?: string;
   /** 单次任务最大 tool-calling 轮次（防死循环，默认 20） */
   maxToolCalls?: number;
+  /** 可选的自循环观测端口（LLM 轮次 / 工具调用），默认不调用 */
+  observer?: AgentLoopObserver;
 }
 
 // ──────────────────────────────────────────────
@@ -193,11 +202,20 @@ export class Agent {
     }
 
     // 单步：一次 LLM 调用
-    const response = await this.toolConfig.llm.completeWithTools({
-      messages: this.loopMessages,
-      tools: this.toolRegistry.toToolDefinitions(),
-      tool_choice: 'auto',
-    });
+    const observer = this.toolConfig.observer;
+    const round = this.loopRound + 1;
+    observer?.onLlmTurnStart?.({ round, messageCount: this.loopMessages.length });
+    let response: ToolCallResult;
+    try {
+      response = await this.toolConfig.llm.completeWithTools({
+        messages: this.loopMessages,
+        tools: this.toolRegistry.toToolDefinitions(),
+        tool_choice: 'auto',
+      });
+    } catch (error) {
+      observer?.onLlmTurnError?.({ round, error });
+      throw error;
+    }
 
     this.loopRound++;
 
@@ -212,11 +230,25 @@ export class Agent {
 
       for (const toolCall of response.tool_calls) {
         const tool = this.toolRegistry.get(toolCall.function.name);
+        observer?.onToolCallStart?.({
+          round,
+          tool_call_id: toolCall.id,
+          tool_name: toolCall.function.name,
+          arguments: toolCall.function.arguments,
+          messages: this.loopMessages,
+        });
         if (!tool) {
           this.loopMessages.push({
             role: 'tool',
             content: `Error: unknown tool "${toolCall.function.name}"`,
             tool_call_id: toolCall.id,
+          });
+          observer?.onToolCallEnd?.({
+            round,
+            tool_call_id: toolCall.id,
+            tool_name: toolCall.function.name,
+            ok: false,
+            error: `unknown tool "${toolCall.function.name}"`,
           });
           continue;
         }
@@ -238,11 +270,25 @@ export class Agent {
             content,
             tool_call_id: toolCall.id,
           });
+          observer?.onToolCallEnd?.({
+            round,
+            tool_call_id: toolCall.id,
+            tool_name: tool.name,
+            ok: true,
+            result,
+          });
         } catch (error) {
           this.loopMessages.push({
             role: 'tool',
             content: `Error executing ${tool.name}: ${error instanceof Error ? error.message : String(error)}`,
             tool_call_id: toolCall.id,
+          });
+          observer?.onToolCallEnd?.({
+            round,
+            tool_call_id: toolCall.id,
+            tool_name: tool.name,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
           });
         }
       }
@@ -252,12 +298,19 @@ export class Agent {
         role: 'assistant',
         content: response.content,
       });
+    }
 
-      // 检查 LLM 是否表示任务完成
-      if (response.content && this.isTaskComplete(response.content)) {
-        await this.finalizeLoop();
-        return true;
-      }
+    // 轮次结束（含工具执行），在继续下一轮前关闭本轮的 LLM 轮次观测
+    observer?.onLlmTurnEnd?.({
+      round,
+      content: response.content,
+      toolCallCount: response.tool_calls?.length ?? 0,
+    });
+
+    // 文本回复且表示任务完成 → 收尾
+    if (!response.tool_calls && response.content && this.isTaskComplete(response.content)) {
+      await this.finalizeLoop();
+      return true;
     }
 
     return false; // 继续循环

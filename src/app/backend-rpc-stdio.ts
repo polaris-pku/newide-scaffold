@@ -34,7 +34,7 @@ import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-stor
 import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
 import { FileRunAuditWriter } from './run-audit-writer';
-import { FileTrajectoryWriter } from '../trace';
+import { FileTrajectoryWriter, TraceProjector } from '../trace';
 import { FileDriverStreamAuditWriter } from './driver-stream-audit-writer';
 import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
@@ -233,6 +233,10 @@ export async function createProductionBackendService(
     coordinationStore = new SqliteCoordinationStore(databasePath);
     const mailboxService = new PersistentMailboxService(coordinationStore);
     const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
+    // One shared projector writes both event-projected records and facade-emitted
+    // agent spans into the same per-run trajectory.jsonl with a shared sequence.
+    const traceStore = new FileTrajectoryWriter(runsRoot);
+    const traceProjector = new TraceProjector(traceStore);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       repository: bCapabilities.repository,
@@ -252,6 +256,7 @@ export async function createProductionBackendService(
         allowedRoleIds: bRuntime.market_agent_ids,
         sessionRegistry: participantSessions,
       },
+      trace: traceProjector,
     });
     const selectAgentHandler = new SelectAgentHandler({
       projectionSource: new BAgentProjectionAdapter({
@@ -379,7 +384,8 @@ export async function createProductionBackendService(
         participantSessions,
       ),
       (input) => agentExecutionFacade.provisionParticipantSession(input),
-      new FileTrajectoryWriter(runsRoot),
+      traceStore,
+      traceProjector,
     );
     await service.recoverMailboxWaits();
     return service;

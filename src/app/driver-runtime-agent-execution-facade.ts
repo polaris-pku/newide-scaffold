@@ -10,6 +10,11 @@ import {
   type AgentMessageType,
   type ArtifactRef,
 } from '../core';
+import type {
+  DirectTraceRecordInput,
+  TraceProjector,
+  TrajectorySpanStatus,
+} from '../trace';
 import {
   diffWorkspaceFiles,
   isDeliverableWorkspacePath,
@@ -24,7 +29,13 @@ import {
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
+  type AgentLlmTurnEndEvent,
+  type AgentLlmTurnErrorEvent,
+  type AgentLlmTurnStartEvent,
+  type AgentLoopObserver,
   type AgentTaskRequest,
+  type AgentToolCallEndEvent,
+  type AgentToolCallStartEvent,
   type BufferRepository,
   type CollectCompetitionClaimsOptions,
   type CompetitionClaimBatch,
@@ -68,6 +79,7 @@ import type {
 } from '../driver/contract';
 import {
   createDriverRuntimeInvoker,
+  type DriverRuntimeInvocationResult,
   type DriverRuntimeInvokerInput,
 } from '../driver/driver-runtime-invoker';
 import type {
@@ -93,6 +105,23 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
     defaultDeadlineSeconds?: number;
     sessionRegistry?: ParticipantSessionRegistry;
   };
+  /** Optional trajectory projector: emits agent.execution / turn / tool / driver.run spans. */
+  trace?: TraceProjector;
+}
+
+/** One open explicit trace span managed by the facade. */
+interface AgentTraceSpan {
+  span_id: string;
+  started_at: string;
+  summary?: string;
+}
+
+/** Per-invocation trace bookkeeping for agent.execution / agent.turn / agent.tool spans. */
+interface InvocationTraceState {
+  executionSpanId: string;
+  executionStartedAt: string;
+  turnStack: AgentTraceSpan[];
+  toolStack: AgentTraceSpan[];
 }
 
 interface InvocationContext {
@@ -118,6 +147,7 @@ interface InvocationContext {
   collaboration_brief?: string;
   driver_attempts: number;
   abortObserved: boolean;
+  trace?: InvocationTraceState;
 }
 
 const AGENT_RUNTIME_POLICY_ID = 'b-persona-tools-v1';
@@ -161,11 +191,23 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         },
         tools,
         maxToolCalls: this.options.mailbox ? 6 : 4,
+        ...(this.options.trace ? { observer: this.agentLoopObserver() } : {}),
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
       retirementEvaluator: createToolRetirementEvaluator(this.options.llm),
     });
+  }
+
+  /** Observer adapter forwarding Agent loop events into trajectory spans. */
+  private agentLoopObserver(): AgentLoopObserver {
+    return {
+      onLlmTurnStart: (event) => this.onAgentLlmTurnStart(event),
+      onLlmTurnEnd: (event) => this.onAgentLlmTurnEnd(event),
+      onLlmTurnError: (event) => this.onAgentLlmTurnError(event),
+      onToolCallStart: (event) => this.onAgentToolCallStart(event),
+      onToolCallEnd: (event) => this.onAgentToolCallEnd(event),
+    };
   }
 
   async ensureAgent(agentId: string): Promise<void> {
@@ -367,20 +409,23 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             )
         : [];
     return runWithMemoryAblationPolicy(ablationPolicy, async () => {
-      const retrieval = await withAbort(
-        repositoryRetrieveMemoryForTask(
-          createAgentMemoryScope(
-            this.options.repository,
-            this.options.bufferRepository,
-            runtimeRoleId,
-          ),
-          task,
-          input.task_id,
-          {
-            ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
-            selection: {
-              include_skills: ablationPolicy.include_skills,
-              include_recent_experience: ablationPolicy.include_recent_experience,
+      const executionSpan = this.openAgentExecutionSpan(input);
+      try {
+        const retrieval = await withAbort(
+          repositoryRetrieveMemoryForTask(
+            createAgentMemoryScope(
+              this.options.repository,
+              this.options.bufferRepository,
+              runtimeRoleId,
+            ),
+            task,
+            input.task_id,
+            {
+              ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
+              selection: {
+                include_skills: ablationPolicy.include_skills,
+                include_recent_experience: ablationPolicy.include_recent_experience,
+              },
             },
           },
         ),
@@ -409,6 +454,16 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           ? {
               onDriverEvent: (event: DriverStreamEvent) =>
                 options.onDriverEvent?.({ ...event, role_id: input.role_id }),
+            }
+          : {}),
+        ...(executionSpan
+          ? {
+              trace: {
+                executionSpanId: executionSpan.span_id,
+                executionStartedAt: executionSpan.started_at,
+                turnStack: [],
+                toolStack: [],
+              },
             }
           : {}),
       };
@@ -446,8 +501,94 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           invocation.mailbox_outcomes,
           input.session_id,
         );
+        );
+        throwIfAborted(options?.signal);
+        const invocation: InvocationContext = {
+          task_id: input.task_id,
+          run_id: input.run_id,
+          role_id: runtimeRoleId,
+          instruction: input.instruction,
+          driver_instruction: input.driver_instruction ?? input.instruction,
+          driver_instruction_locked: input.driver_instruction !== undefined,
+          ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+          ...(input.session_id ? { session_id: input.session_id } : {}),
+          retrieval,
+          ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
+          notice_mailboxes: noticeMailboxes,
+          mailbox_outcomes: [],
+          mailbox_sequence: 0,
+          driver_attempts: 0,
+          abortObserved: false,
+          ...(options?.signal ? { signal: options.signal } : {}),
+          ...(options?.onDriverEvent
+            ? {
+                onDriverEvent: (event: DriverStreamEvent) =>
+                  options.onDriverEvent?.({ ...event, role_id: input.role_id }),
+              }
+            : {}),
+          ...(executionSpan
+            ? {
+                trace: {
+                  executionSpanId: executionSpan.span_id,
+                  executionStartedAt: executionSpan.started_at,
+                  turnStack: [],
+                  toolStack: [],
+                },
+              }
+            : {}),
+        };
+        const workspaceBefore = input.workspace_path
+          ? await snapshotWorkspaceFiles(input.workspace_path)
+          : undefined;
+        const rawDispatch = await this.invocationContext.run(invocation, () =>
+          manager.dispatchTask(runtimeRoleId, task),
+        );
+        const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
+        const workspaceArtifacts = await collectWorkspaceArtifacts(
+          input,
+          workspaceBefore,
+          invocation.execution,
+        );
+
+        if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
+          await this.recoverRole(runtimeRoleId);
+          throwIfAborted(invocation.signal);
+        }
+        const result = await this.buildResult(
+          input,
+          dispatched,
+          runtimeRoleId,
+          invocation.execution,
+          workspaceArtifacts,
+          invocation.driver_attempts,
+          invocation.driver_invocation_context,
+          invocation.agent_system_prompt_sha256,
+          invocation.mailbox_outcomes,
+        );
+        this.closeAgentExecutionSpan(
+          executionSpan,
+          input,
+          agentExecutionTraceStatus(result.status),
+          agentExecutionTraceSummary(result),
+        );
+        if (inboundMailbox && result.status === 'completed') {
+          this.finishInboundMailbox(
+            inboundMailbox,
+            result,
+            invocation.mailbox_outcomes,
+            input.session_id,
+          );
+        }
+        return result;
+      } catch (error) {
+        this.closeAgentExecutionSpan(
+          executionSpan,
+          input,
+          options?.signal?.aborted ? 'cancelled' : 'error',
+          toErrorSummary(error),
+        );
+        throw error;
       }
-      return result;
     });
   }
 
@@ -823,22 +964,24 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       invocation.driver_invocation_context = driverInvocationContext;
       const invoke = () => {
         invocation.driver_attempts += 1;
-        return this.invokeDriverRuntime(
-          {
-            task_id: invocation.task_id,
-            run_id: invocation.run_id,
-            ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
-            ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
-            call_id: createId('call'),
-            source_driver: this.options.driver.driver_id,
-            driver_context: driverInvocationContext,
-          },
-          invocation.signal || invocation.onDriverEvent
-            ? {
-                ...(invocation.signal ? { signal: invocation.signal } : {}),
-                ...(invocation.onDriverEvent ? { onDriverEvent: invocation.onDriverEvent } : {}),
-              }
-            : undefined,
+        return this.traceDriverRun(invocation, () =>
+          this.invokeDriverRuntime(
+            {
+              task_id: invocation.task_id,
+              run_id: invocation.run_id,
+              ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
+              ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
+              call_id: createId('call'),
+              source_driver: this.options.driver.driver_id,
+              driver_context: driverInvocationContext,
+            },
+            invocation.signal || invocation.onDriverEvent
+              ? {
+                  ...(invocation.signal ? { signal: invocation.signal } : {}),
+                  ...(invocation.onDriverEvent ? { onDriverEvent: invocation.onDriverEvent } : {}),
+                }
+              : undefined,
+          ),
         );
       };
       let result = await invoke();
@@ -850,6 +993,245 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       return result.report;
     } catch (error) {
       if (invocation.signal?.aborted) invocation.abortObserved = true;
+      throw error;
+    }
+  }
+
+  // ────────────────────────────────────────────
+  // 轨迹埋点（AgentLoopObserver 适配 + span 管理）
+  // ────────────────────────────────────────────
+
+  private emitTrace(input: DirectTraceRecordInput): void {
+    void this.options.trace?.projectDirect(input);
+  }
+
+  private openAgentExecutionSpan(input: AgentExecutionRequest): AgentTraceSpan | undefined {
+    if (!this.options.trace) return undefined;
+    const spanId = createId('span');
+    const startedAt = nowTimestamp();
+    const summary = input.instruction
+      ? truncate(input.instruction, TRACE_INSTRUCTION_PREVIEW_LIMIT)
+      : undefined;
+    this.emitTrace({
+      span_id: spanId,
+      run_id: input.run_id,
+      task_id: input.task_id,
+      kind: 'agent.execution',
+      phase: 'start',
+      agent_id: input.role_id,
+      started_at: startedAt,
+      ...(summary ? { summary } : {}),
+    });
+    return { span_id: spanId, started_at: startedAt, ...(summary ? { summary } : {}) };
+  }
+
+  private closeAgentExecutionSpan(
+    handle: AgentTraceSpan | undefined,
+    input: AgentExecutionRequest,
+    status: TrajectorySpanStatus,
+    summary: string | undefined,
+  ): void {
+    if (!handle || !this.options.trace) return;
+    const endedAt = nowTimestamp();
+    const durationMsValue = computeDurationMs(handle.started_at, endedAt);
+    this.emitTrace({
+      span_id: handle.span_id,
+      run_id: input.run_id,
+      task_id: input.task_id,
+      kind: 'agent.execution',
+      phase: 'end',
+      agent_id: input.role_id,
+      status,
+      ended_at: endedAt,
+      ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
+      ...(summary ? { summary } : {}),
+    });
+  }
+
+  private onAgentLlmTurnStart(event: AgentLlmTurnStartEvent): void {
+    const invocation = this.invocationContext.getStore();
+    if (!invocation?.trace) return;
+    const spanId = createId('span');
+    const startedAt = nowTimestamp();
+    const summary = `round #${String(event.round)}`;
+    this.emitTrace({
+      span_id: spanId,
+      run_id: invocation.run_id,
+      task_id: invocation.task_id,
+      parent_span_id: invocation.trace.executionSpanId,
+      kind: 'agent.turn',
+      phase: 'start',
+      agent_id: invocation.role_id,
+      started_at: startedAt,
+      summary,
+      payload: { round: event.round, message_count: event.messageCount },
+    });
+    invocation.trace.turnStack.push({ span_id: spanId, started_at: startedAt, summary });
+  }
+
+  private onAgentLlmTurnEnd(event: AgentLlmTurnEndEvent): void {
+    const invocation = this.invocationContext.getStore();
+    if (!invocation?.trace) return;
+    const handle = invocation.trace.turnStack.pop();
+    if (!handle) return;
+    const endedAt = nowTimestamp();
+    const durationMsValue = computeDurationMs(handle.started_at, endedAt);
+    const tail = event.toolCallCount > 0 ? `${String(event.toolCallCount)} tool_calls` : 'text';
+    this.emitTrace({
+      span_id: handle.span_id,
+      run_id: invocation.run_id,
+      task_id: invocation.task_id,
+      kind: 'agent.turn',
+      phase: 'end',
+      agent_id: invocation.role_id,
+      status: 'ok',
+      ended_at: endedAt,
+      ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
+      ...(handle.summary ? { summary: `${handle.summary} → ${tail}` } : {}),
+    });
+  }
+
+  private onAgentLlmTurnError(event: AgentLlmTurnErrorEvent): void {
+    const invocation = this.invocationContext.getStore();
+    if (!invocation?.trace) return;
+    const handle = invocation.trace.turnStack.pop();
+    if (!handle) return;
+    const endedAt = nowTimestamp();
+    const durationMsValue = computeDurationMs(handle.started_at, endedAt);
+    const message = toErrorSummary(event.error);
+    this.emitTrace({
+      span_id: handle.span_id,
+      run_id: invocation.run_id,
+      task_id: invocation.task_id,
+      kind: 'agent.turn',
+      phase: 'end',
+      agent_id: invocation.role_id,
+      status: 'error',
+      ended_at: endedAt,
+      ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
+      ...(handle.summary ? { summary: `${handle.summary} → error: ${message}` } : {}),
+      ...(message ? { payload: { error: message } } : {}),
+    });
+  }
+
+  private onAgentToolCallStart(event: AgentToolCallStartEvent): void {
+    const invocation = this.invocationContext.getStore();
+    if (!invocation?.trace) return;
+    const spanId = createId('span');
+    const startedAt = nowTimestamp();
+    const parent =
+      invocation.trace.turnStack.at(-1)?.span_id ?? invocation.trace.executionSpanId;
+    this.emitTrace({
+      span_id: spanId,
+      run_id: invocation.run_id,
+      task_id: invocation.task_id,
+      parent_span_id: parent,
+      kind: 'agent.tool',
+      phase: 'start',
+      agent_id: invocation.role_id,
+      started_at: startedAt,
+      summary: event.tool_name,
+      payload: {
+        tool_call_id: event.tool_call_id,
+        args: truncate(event.arguments, TRACE_ARGS_PREVIEW_LIMIT),
+      },
+    });
+    invocation.trace.toolStack.push({
+      span_id: spanId,
+      started_at: startedAt,
+      summary: event.tool_name,
+    });
+  }
+
+  private onAgentToolCallEnd(event: AgentToolCallEndEvent): void {
+    const invocation = this.invocationContext.getStore();
+    if (!invocation?.trace) return;
+    const handle = invocation.trace.toolStack.pop();
+    if (!handle) return;
+    const endedAt = nowTimestamp();
+    const durationMsValue = computeDurationMs(handle.started_at, endedAt);
+    const name = handle.summary ?? event.tool_name;
+    this.emitTrace({
+      span_id: handle.span_id,
+      run_id: invocation.run_id,
+      task_id: invocation.task_id,
+      kind: 'agent.tool',
+      phase: 'end',
+      agent_id: invocation.role_id,
+      status: event.ok ? 'ok' : 'error',
+      ended_at: endedAt,
+      ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
+      ...(event.ok
+        ? { summary: `${name} → ok` }
+        : { summary: `${name} → error: ${truncate(event.error ?? 'unknown error', TRACE_ERROR_PREVIEW_LIMIT)}` }),
+      ...(event.ok
+        ? {}
+        : event.error
+          ? { payload: { error: truncate(event.error, TRACE_ERROR_PREVIEW_LIMIT) } }
+          : {}),
+    });
+  }
+
+  private async traceDriverRun(
+    invocation: InvocationContext,
+    run: () => Promise<DriverRuntimeInvocationResult>,
+  ): Promise<DriverRuntimeInvocationResult> {
+    if (!invocation.trace) return run();
+    const parent =
+      invocation.trace.toolStack.at(-1)?.span_id ??
+      invocation.trace.turnStack.at(-1)?.span_id ??
+      invocation.trace.executionSpanId;
+    const spanId = createId('span');
+    const startedAt = nowTimestamp();
+    this.emitTrace({
+      span_id: spanId,
+      run_id: invocation.run_id,
+      task_id: invocation.task_id,
+      parent_span_id: parent,
+      kind: 'driver.run',
+      phase: 'start',
+      agent_id: invocation.role_id,
+      started_at: startedAt,
+      summary: `attempt #${String(invocation.driver_attempts)}`,
+    });
+    try {
+      const result = await run();
+      const endedAt = nowTimestamp();
+      const durationMsValue = computeDurationMs(startedAt, endedAt);
+      this.emitTrace({
+        span_id: spanId,
+        run_id: invocation.run_id,
+        task_id: invocation.task_id,
+        kind: 'driver.run',
+        phase: 'end',
+        agent_id: invocation.role_id,
+        status: driverRunTraceStatus(result.execution.status),
+        ended_at: endedAt,
+        ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
+        summary: `${result.execution.status} (attempt #${String(invocation.driver_attempts)}, session ${result.execution.session_id})`,
+        payload: {
+          session_id: result.execution.session_id,
+          driver_id: result.execution.diagnostics.driver_id,
+          artifacts: result.execution.artifacts.length,
+          tool_events: result.execution.tool_events.length,
+        },
+      });
+      return result;
+    } catch (error) {
+      const endedAt = nowTimestamp();
+      const durationMsValue = computeDurationMs(startedAt, endedAt);
+      this.emitTrace({
+        span_id: spanId,
+        run_id: invocation.run_id,
+        task_id: invocation.task_id,
+        kind: 'driver.run',
+        phase: 'end',
+        agent_id: invocation.role_id,
+        status: invocation.signal?.aborted ? 'cancelled' : 'error',
+        ended_at: endedAt,
+        ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
+        summary: `error: ${toErrorSummary(error)}`,
+      });
       throw error;
     }
   }
@@ -1236,6 +1618,43 @@ function mapStatus(
       interrupted: 'interrupted',
     } as const
   )[driverStatus];
+}
+
+// ────────────────────────────────────────────
+// 轨迹埋点辅助
+// ────────────────────────────────────────────
+
+const TRACE_INSTRUCTION_PREVIEW_LIMIT = 120;
+const TRACE_ARGS_PREVIEW_LIMIT = 400;
+const TRACE_ERROR_PREVIEW_LIMIT = 200;
+
+function computeDurationMs(startedAt: string, endedAt: string): number | undefined {
+  const durationMs = Date.parse(endedAt) - Date.parse(startedAt);
+  return Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : undefined;
+}
+
+function toErrorSummary(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return truncate(error.message, TRACE_ERROR_PREVIEW_LIMIT);
+  }
+  if (typeof error === 'string') return truncate(error, TRACE_ERROR_PREVIEW_LIMIT);
+  return 'unknown error';
+}
+
+function agentExecutionTraceStatus(status: AgentExecutionStatus): TrajectorySpanStatus {
+  if (status === 'cancelled') return 'cancelled';
+  if (status === 'completed') return 'ok';
+  return 'error';
+}
+
+function agentExecutionTraceSummary(result: AgentExecutionResult): string | undefined {
+  return result.response ? truncate(result.response, TRACE_INSTRUCTION_PREVIEW_LIMIT) : undefined;
+}
+
+function driverRunTraceStatus(status: DriverRunStatus): TrajectorySpanStatus {
+  if (status === 'succeeded') return 'ok';
+  if (status === 'cancelled') return 'cancelled';
+  return 'error';
 }
 
 function toMemoryItems(prefix: string, values: string[] | undefined) {

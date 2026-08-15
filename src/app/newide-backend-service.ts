@@ -224,7 +224,6 @@ export class NewideBackendService {
   private readonly runWorkspaces = new Map<string, string>();
   private readonly taskListeners = new Map<string, Set<(event: AppRunEvent) => void>>();
   private readonly pendingRunStarts = new Set<PendingRunStart>();
-  private readonly traceProjector: TraceProjector;
   private closing = false;
   private closePromise?: Promise<void>;
 
@@ -245,9 +244,8 @@ export class NewideBackendService {
     private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
     private readonly participantSessionProvisioner?: ParticipantSessionProvisioner,
     private readonly traceStore: RunTraceStore = new NoopTraceStore(),
-  ) {
-    this.traceProjector = new TraceProjector(this.traceStore);
-  }
+    private readonly traceProjector: TraceProjector = new TraceProjector(traceStore),
+  ) {}
 
   async recoverMailboxWaits(): Promise<void> {
     await this.mailboxRecovery;

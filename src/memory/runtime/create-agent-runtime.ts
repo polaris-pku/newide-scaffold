@@ -39,6 +39,7 @@ import type { BufferRepository } from '../ports/buffer-repository';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type { ToolCallingClient } from './tool';
 import type { Tool } from './tool';
+import type { AgentLoopObserver } from './agent-loop-observer';
 
 // ──────────────────────────────────────────────
 // 配置类型
@@ -73,6 +74,8 @@ export interface AgentRuntimeConfig {
   llm: ToolCallingClient;
   /** 顶层 Agent 的系统提示词（可选覆盖） */
   systemPrompt?: string;
+  /** 可选的自循环观测端口（LLM 轮次 / 工具调用） */
+  observer?: AgentLoopObserver;
   /** 工具配置 */
   tools?: {
     /** 可选的 driver handler，包装为 InvokeDriverTool 注册 */
@@ -124,6 +127,7 @@ export async function createAgentRuntime(config: AgentRuntimeConfig): Promise<Ag
       llm: config.llm,
       tools,
       ...(config.systemPrompt ? { systemPrompt: config.systemPrompt } : {}),
+      ...(config.observer ? { observer: config.observer } : {}),
     },
     ...(config.embedding ? { embedding: config.embedding } : {}),
   };

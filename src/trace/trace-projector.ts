@@ -8,8 +8,21 @@
  * becomes a point record. Parallelism is a render-time projection in replay
  * (overlapping siblings by sequence order), matching the DeepSeek Harness
  * model of storing a linear stream and reconstructing structure later.
+ *
+ * projectDirect() is the explicit-instrumentation counterpart: it stamps a
+ * caller-built record with the shared per-run sequence counter so explicit
+ * spans (agent execution facade) and event-projected spans stay in one
+ * coherent per-run stream.
  */
-import { SCHEMA_VERSION, createId, nowTimestamp, type Event, type RunId } from '../core';
+import {
+  SCHEMA_VERSION,
+  createId,
+  nowTimestamp,
+  type Event,
+  type RunId,
+  type TaskId,
+  type Timestamp,
+} from '../core';
 import type { TraceSink } from './trace-store';
 import type {
   TrajectorySpanKind,
@@ -26,6 +39,28 @@ export interface TraceEventInput {
   task_id?: string;
   payload: Record<string, unknown>;
   created_at: string;
+}
+
+/**
+ * Direct trace record input: emitted by explicit instrumentation (e.g. the
+ * agent execution facade) instead of derived from a domain Event. sequence /
+ * created_at / schema_version are filled by TraceProjector.projectDirect so the
+ * direct records share the per-run sequence counter with projected events.
+ */
+export interface DirectTraceRecordInput {
+  span_id: string;
+  run_id: RunId;
+  task_id?: TaskId;
+  parent_span_id?: string;
+  kind: TrajectorySpanKind;
+  phase: TrajectorySpanPhase;
+  agent_id?: string;
+  status?: TrajectorySpanStatus;
+  started_at?: Timestamp;
+  ended_at?: Timestamp;
+  duration_ms?: number;
+  summary?: string;
+  payload?: Record<string, unknown>;
 }
 
 export function fromCoreEvent(event: Event): TraceEventInput {
@@ -305,6 +340,39 @@ export class TraceProjector {
     const records = this.emitEnd(input, mapping, sequence);
     for (const record of records) void this.sink.append(record);
     return records;
+  }
+
+  /**
+   * Append one explicit instrumentation record (not derived from a domain
+   * Event), stamped with the shared per-run sequence counter and schema. Used
+   * by the agent execution facade so its spans interleave cleanly with
+   * event-projected records in the same run's trajectory file.
+   */
+  projectDirect(input: DirectTraceRecordInput): TrajectorySpanRecord {
+    const runKey = input.run_id;
+    const sequence = (this.sequences.get(runKey) ?? 0) + 1;
+    this.sequences.set(runKey, sequence);
+    const created_at = input.ended_at ?? input.started_at ?? nowTimestamp();
+    const record: TrajectorySpanRecord = {
+      span_id: input.span_id,
+      run_id: input.run_id,
+      ...(input.task_id ? { task_id: input.task_id } : {}),
+      ...(input.parent_span_id ? { parent_span_id: input.parent_span_id } : {}),
+      kind: input.kind,
+      phase: input.phase,
+      ...(input.agent_id ? { agent_id: input.agent_id } : {}),
+      ...(input.status ? { status: input.status } : {}),
+      ...(input.started_at ? { started_at: input.started_at } : {}),
+      ...(input.ended_at ? { ended_at: input.ended_at } : {}),
+      ...(input.duration_ms !== undefined ? { duration_ms: input.duration_ms } : {}),
+      ...(input.summary ? { summary: input.summary } : {}),
+      ...(input.payload ? { payload: input.payload } : {}),
+      sequence,
+      created_at,
+      schema_version: SCHEMA_VERSION,
+    };
+    void this.sink.append(record);
+    return record;
   }
 
   /** Close any leftover open spans for a run (crash / terminal without end event). */

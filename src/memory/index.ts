@@ -322,6 +322,14 @@ export type {
 
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
 export type { AgentToolConfig } from './runtime/agent';
+export type {
+  AgentLoopObserver,
+  AgentLlmTurnStartEvent,
+  AgentLlmTurnEndEvent,
+  AgentLlmTurnErrorEvent,
+  AgentToolCallStartEvent,
+  AgentToolCallEndEvent,
+} from './runtime/agent-loop-observer';
 
 // ════════════════════════════════════════════════════════
 //  22. Tool-calling 类型

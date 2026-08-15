@@ -19,6 +19,8 @@ export type TrajectorySpanKind =
   | 'memory.retrieve'
   | 'memory.extract'
   | 'agent.execution'
+  | 'agent.turn'
+  | 'agent.tool'
   | 'agent.message'
   | 'checkpoint'
   | 'artifact'

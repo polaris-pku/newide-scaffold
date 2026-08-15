@@ -129,4 +129,61 @@ describe('TraceProjector', () => {
     expect(first.sequence).toBe(1);
     expect(second.sequence).toBe(2);
   });
+
+  it('projectDirect stamps shared sequence, timestamps and schema', () => {
+    const sink: TrajectorySpanRecord[] = [];
+    const projector = new TraceProjector({
+      append: (record) => sink.push(record),
+      flush: () => undefined,
+    });
+    projector.projectEvent(event('run.created', 'run_1'));
+    const direct = projector.projectDirect({
+      span_id: 'span_x',
+      run_id: 'run_1',
+      task_id: 'task_1',
+      parent_span_id: 'span_parent',
+      kind: 'agent.tool',
+      phase: 'start',
+      agent_id: 'role_a',
+      started_at: T1,
+      summary: 'invoke_driver',
+      payload: { tool_call_id: 'call_1' },
+    });
+    expect(direct.sequence).toBe(2);
+    expect(direct.created_at).toBe(T1);
+    expect(direct.schema_version).toBe('v0');
+    expect(direct.kind).toBe('agent.tool');
+    expect(direct.parent_span_id).toBe('span_parent');
+    expect(sink).toHaveLength(2);
+  });
+
+  it('projectDirect keeps per-run sequences independent of event projection', () => {
+    const projector = new TraceProjector({ append: () => undefined, flush: () => undefined });
+    projector.projectEvent(event('run.created', 'run_1'));
+    const direct = projector.projectDirect({
+      span_id: 'span_a',
+      run_id: 'run_1',
+      kind: 'agent.turn',
+      phase: 'start',
+    });
+    const otherRun = projector.projectEvent({ ...event('task.created', 'task_2'), run_id: 'run_2' })[0]!;
+    expect(direct.sequence).toBe(2);
+    expect(otherRun.sequence).toBe(1);
+  });
+
+  it('projectDirect omits absent optional fields', () => {
+    const projector = new TraceProjector({ append: () => undefined, flush: () => undefined });
+    const direct = projector.projectDirect({
+      span_id: 'span_b',
+      run_id: 'run_1',
+      kind: 'agent.execution',
+      phase: 'end',
+      status: 'ok',
+    });
+    expect(direct.agent_id).toBeUndefined();
+    expect(direct.parent_span_id).toBeUndefined();
+    expect(direct.summary).toBeUndefined();
+    expect(direct.status).toBe('ok');
+    expect(direct.sequence).toBe(1);
+  });
 });
