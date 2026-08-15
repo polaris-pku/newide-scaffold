@@ -170,6 +170,31 @@ describe('RunRpcMethods', () => {
       result: { run_id: 'run_1', status: 'running', timeline: [], errors: [] },
     });
   });
+
+  it('replays a run trajectory from run.trajectory', async () => {
+    const output: string[] = [];
+    const service = fakeService({
+      getRunTrajectory: async () => ({
+        run_id: 'run_1',
+        records: [],
+        spans: [],
+        tree: [],
+        rendered: '',
+      }),
+    });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, () => undefined).register(dispatcher);
+
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":1,"method":"run.trajectory","params":{"run_id":"run_1"}}',
+    );
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      id: 1,
+      result: { run_id: 'run_1', rendered: '' },
+    });
+  });
 });
 
 function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService {
@@ -180,6 +205,13 @@ function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService 
     },
     subscribe: () => () => undefined,
     cancelRun: async () => ({ cancelled: true }),
+    getRunTrajectory: async (runId) => ({
+      run_id: runId,
+      records: [],
+      spans: [],
+      tree: [],
+      rendered: '',
+    }),
     ...overrides,
   };
 }

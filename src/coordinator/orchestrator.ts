@@ -20,6 +20,7 @@ import {
   NoopTelemetrySink,
   type TelemetrySink,
 } from '../telemetry/telemetry-sink';
+import { fromCoreEvent, NoopTraceStore, TraceProjector, type TraceSink } from '../trace';
 import { InMemoryArtifactStore } from './artifact-store';
 import { InMemoryCheckpointStore } from './checkpoint-store';
 import { InMemoryEventStore } from './event-store';
@@ -34,6 +35,7 @@ export interface RuntimeStores {
 export interface RuntimeOrchestratorConfig {
   stores?: Partial<RuntimeStores>;
   telemetry?: TelemetrySink;
+  trace?: TraceSink;
   onEvent?: (event: Event) => void;
 }
 
@@ -49,6 +51,10 @@ export class RuntimeOrchestrator {
   readonly onEvent: ((event: Event) => void) | undefined;
   private readonly tasks = new Map<TaskId, Task>();
   private readonly runs = new Map<RunId, Run>();
+  private readonly taskRunIndex = new Map<TaskId, RunId>();
+  /** Events that arrived before any run existed; re-scoped when a run is created. */
+  private readonly pendingUnscopedEvents: Event[] = [];
+  private readonly traceProjector: TraceProjector;
 
   constructor(config?: Partial<RuntimeStores> | RuntimeOrchestratorConfig) {
     const normalized = normalizeOrchestratorConfig(config);
@@ -59,6 +65,7 @@ export class RuntimeOrchestrator {
     };
     this.telemetry = normalized.telemetry ?? new NoopTelemetrySink();
     this.onEvent = normalized.onEvent;
+    this.traceProjector = new TraceProjector(normalized.trace ?? new NoopTraceStore());
   }
 
   createTask(request: TaskCreateRequest): Task {
@@ -92,6 +99,15 @@ export class RuntimeOrchestrator {
     };
 
     this.runs.set(run.run_id, run);
+    this.taskRunIndex.set(run.task_id, run.run_id);
+    // Re-scope events that arrived before the run existed (e.g. task.created)
+    // so the trajectory keeps them inside the run instead of an unscoped bucket.
+    const pending = this.pendingUnscopedEvents.filter((event) => event.task_id === taskId);
+    for (const event of pending) {
+      const traceInput = fromCoreEvent(event);
+      traceInput.run_id = run.run_id;
+      void this.traceProjector.projectEvent(traceInput);
+    }
     this.appendEvent({
       event_type: 'run.created',
       subject_id: run.run_id,
@@ -111,6 +127,23 @@ export class RuntimeOrchestrator {
     const event = this.stores.events.append(input);
     this.onEvent?.(event);
     void mirrorEventToTelemetry(this.telemetry, event);
+    const traceInput = fromCoreEvent(event);
+    const resolvedRunId =
+      input.run_id ?? (input.task_id ? this.taskRunIndex.get(input.task_id) : undefined);
+    if (!resolvedRunId) {
+      // No run exists for this task yet; re-scope in createRun.
+      this.pendingUnscopedEvents.push(event);
+      return event;
+    }
+    if (!traceInput.run_id) traceInput.run_id = resolvedRunId;
+    void this.traceProjector.projectEvent(traceInput);
+    if (
+      input.event_type === 'run.completed' ||
+      input.event_type === 'run.failed' ||
+      input.event_type === 'run.cancelled'
+    ) {
+      void this.traceProjector.closeOpenSpans(resolvedRunId);
+    }
     return event;
   }
 
@@ -216,9 +249,10 @@ function normalizeOrchestratorConfig(
     return {};
   }
 
-  if ('telemetry' in config || 'onEvent' in config) {
+  if ('telemetry' in config || 'trace' in config || 'onEvent' in config) {
     const orchestratorConfig = config as RuntimeOrchestratorConfig & Partial<RuntimeStores>;
-    const { telemetry, onEvent, stores, events, artifacts, checkpoints } = orchestratorConfig;
+    const { telemetry, trace, onEvent, stores, events, artifacts, checkpoints } =
+      orchestratorConfig;
     const legacyStores: Partial<RuntimeStores> = {};
     if (events !== undefined) legacyStores.events = events;
     if (artifacts !== undefined) legacyStores.artifacts = artifacts;
@@ -228,6 +262,7 @@ function normalizeOrchestratorConfig(
 
     return {
       ...(telemetry ? { telemetry } : {}),
+      ...(trace ? { trace } : {}),
       ...(onEvent ? { onEvent } : {}),
       ...(resolvedStores ? { stores: resolvedStores } : {}),
     };

@@ -14,6 +14,7 @@ import type {
 import { RunNotFoundError, type AppRunEvent } from '../app/run-registry';
 import { RunRequestNotFoundError } from '../app/run-request-store';
 import type { RunSnapshot } from '../protocol/run-snapshot';
+import type { TrajectoryReplayResult } from '../trace';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 import { JsonRpcMethodError } from './json-rpc-dispatcher';
 import type { JsonRpcDispatcher } from './json-rpc-dispatcher';
@@ -25,6 +26,7 @@ export interface RunMethodsService {
   cancelRun(runId: string): Promise<{ cancelled: true }>;
   listRuns(): Promise<RunListResult>;
   restartRun(runId: string): Promise<RunRestartResult>;
+  getRunTrajectory(runId: string): Promise<TrajectoryReplayResult>;
 }
 
 const createParamsSchema = z
@@ -98,6 +100,10 @@ export class RunRpcMethods {
         }
         throw error;
       }
+    });
+    dispatcher.register('run.trajectory', (params) => {
+      const { run_id } = parseParams(runIdParamsSchema, params);
+      return this.callWithRunError(() => this.service.getRunTrajectory(run_id));
     });
   }
 

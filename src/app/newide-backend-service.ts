@@ -26,6 +26,14 @@ import {
 } from '../checkpoint';
 import type { TelemetryRecord, TelemetrySink } from '../telemetry/telemetry-sink';
 import {
+  NoopTraceStore,
+  TraceProjector,
+  replayTrajectory,
+  type RunTraceStore,
+  type TraceEventInput,
+  type TrajectoryReplayResult,
+} from '../trace';
+import {
   InMemoryRunRegistry,
   type AppRunEvent,
   type AppRunMode,
@@ -216,6 +224,7 @@ export class NewideBackendService {
   private readonly runWorkspaces = new Map<string, string>();
   private readonly taskListeners = new Map<string, Set<(event: AppRunEvent) => void>>();
   private readonly pendingRunStarts = new Set<PendingRunStart>();
+  private readonly traceProjector: TraceProjector;
   private closing = false;
   private closePromise?: Promise<void>;
 
@@ -235,7 +244,10 @@ export class NewideBackendService {
     private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
     private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
     private readonly participantSessionProvisioner?: ParticipantSessionProvisioner,
-  ) {}
+    private readonly traceStore: RunTraceStore = new NoopTraceStore(),
+  ) {
+    this.traceProjector = new TraceProjector(this.traceStore);
+  }
 
   async recoverMailboxWaits(): Promise<void> {
     await this.mailboxRecovery;
@@ -642,6 +654,7 @@ export class NewideBackendService {
     this.runWorkspaces.set(identity.run_id, workspacePath);
     this.registry.subscribe(identity.run_id, (event) => {
       void this.auditWriter.append(event).catch(() => undefined);
+      this.projectRunTrace(event);
       this.notifyTaskListeners(identity.task_id, event);
     });
     try {
@@ -1094,6 +1107,7 @@ export class NewideBackendService {
                 this.taskProcessor.recordRunEvent(created.run_id, toDomainEvent(event));
               }
               void this.auditWriter.append(event).catch(() => undefined);
+              this.projectRunTrace(event);
               this.notifyTaskListeners(created.task_id, event);
             });
             for (const event of pendingEvents) this.appendDomainEvent(created, event);
@@ -1412,6 +1426,24 @@ export class NewideBackendService {
     this.registry.appendEvent(identity.run_id, record.event_type, record.payload);
   }
 
+  /** Project one registry event into the run trajectory and close leftover spans on terminal. */
+  private projectRunTrace(event: AppRunEvent): void {
+    void this.traceProjector.projectEvent(toTraceEventInput(event));
+    if (
+      event.type === 'run.completed' ||
+      event.type === 'run.failed' ||
+      event.type === 'run.cancelled'
+    ) {
+      void this.traceProjector.closeOpenSpans(event.run_id);
+    }
+  }
+
+  /** Load and replay a run's trajectory for 复盘 (run.trajectory RPC). */
+  async getRunTrajectory(runId: string): Promise<TrajectoryReplayResult> {
+    const records = await this.traceStore.load(runId);
+    return replayTrajectory(records, runId);
+  }
+
   private appendDomainEvent(identity: { run_id: string; task_id: string }, event: Event): void {
     if (event.event_type === 'run.completed' || event.event_type === 'run.failed') return;
     if (event.run_id && event.run_id !== identity.run_id) return;
@@ -1437,6 +1469,7 @@ export class NewideBackendService {
     try {
       await this.driverStreamAuditWriter.flush(runId);
       await this.auditWriter.flush(runId);
+      await this.traceStore.flush(runId);
       const terminalEvidence = await this.terminalWriter.finalize(staged.snapshot);
       const projected = projectRunSnapshot(staged.snapshot);
       this.taskProcessor?.finishRun({
@@ -1592,6 +1625,19 @@ function toDomainEvent(event: AppRunEvent): Event {
     payload: { ...event.payload },
     created_at: event.created_at,
     schema_version: SCHEMA_VERSION,
+  };
+}
+
+function toTraceEventInput(event: AppRunEvent): TraceEventInput {
+  return {
+    event_type: event.type,
+    subject_id:
+      typeof event.payload.subject_id === 'string' ? event.payload.subject_id : event.run_id,
+    event_id: event.event_id,
+    run_id: event.run_id,
+    task_id: event.task_id,
+    payload: event.payload,
+    created_at: event.created_at,
   };
 }
 

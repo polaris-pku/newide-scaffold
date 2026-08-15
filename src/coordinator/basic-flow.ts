@@ -14,8 +14,9 @@ import { MockDriver, type DriverRunResult } from '../driver';
 import { HookEngine, type HookResult } from '../hook';
 import { DecisionAggregator, type GateRequest, type GateResult } from '../gate';
 import { MockMemoryProvider, type ContextPack } from '../memory';
-import { RuntimeOrchestrator } from './orchestrator';
+import { RuntimeOrchestrator, type RuntimeOrchestratorConfig } from './orchestrator';
 import type { TelemetrySink } from '../telemetry/telemetry-sink';
+import type { TraceSink } from '../trace';
 
 export interface TimelineItem {
   name: string;
@@ -38,11 +39,16 @@ export interface BasicFlowResult {
 
 export interface BasicFlowOptions {
   telemetry?: TelemetrySink;
+  trace?: TraceSink;
 }
 
 export async function runBasicFlow(options?: BasicFlowOptions): Promise<BasicFlowResult> {
+  const orchestratorConfig: RuntimeOrchestratorConfig = {
+    ...(options?.telemetry ? { telemetry: options.telemetry } : {}),
+    ...(options?.trace ? { trace: options.trace } : {}),
+  };
   const orchestrator = new RuntimeOrchestrator(
-    options?.telemetry ? { telemetry: options.telemetry } : undefined,
+    Object.keys(orchestratorConfig).length > 0 ? orchestratorConfig : undefined,
   );
   const timeline: TimelineItem[] = [];
 

@@ -29,6 +29,8 @@
     "example:basic": "tsx src/examples/basic-flow.ts",
     "example:integration-v0": "tsx src/examples/integration-v0.ts",
     "example:driver-adapter": "tsx src/examples/driver-adapter-flow.ts",
+    "example:trajectory": "tsx src/examples/trajectory-demo.ts",
+    "trace:replay": "tsx src/trace/replay-cli.ts",
     "backend:rpc": "node --import tsx src/app/backend-rpc-entry.ts",
     "rpc:smoke": "node --import tsx scripts/rpc-smoke.ts",
     "acceptance:real": "node --import tsx scripts/real-acceptance.ts",
