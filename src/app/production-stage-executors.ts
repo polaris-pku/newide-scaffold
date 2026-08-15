@@ -792,6 +792,7 @@ async function executeFinalCouncilPlan(input: {
       instruction: [
         'Implement the approved final Council Plan staged under inputs/.',
         'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
+        'Use paths relative to the current workspace for every product file; never construct an absolute path.',
         'Do not stop after rewriting or summarizing the Plan; produce the concrete implementation artifacts.',
         `Original Task: ${input.context.task_request.spec}`,
       ].join('\n'),
@@ -906,7 +907,8 @@ function agentExecutionInstruction(
     return [
       'Produce an independent implementation Plan for the original Task.',
       'Use your Persona, Skills, and Memory, but do not modify product files or implement the solution yet.',
-      'Write the complete Plan to council-plan.md, including affected files, ordered steps, risks, and verification.',
+      'Write the complete Plan to the relative path council-plan.md in the current workspace; never construct an absolute path.',
+      'Include affected files, ordered steps, risks, and verification.',
       `Original Task: ${context.task_request.spec}`,
     ].join('\n');
   }
