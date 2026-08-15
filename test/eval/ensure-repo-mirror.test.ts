@@ -26,11 +26,11 @@ describe('ensure-repo-mirror helpers', () => {
     expect(githubCloneUrl('conan-io/conan')).toBe('https://github.com/conan-io/conan.git');
   });
 
-  it('resolves D: default mirrors root unless overridden', () => {
+  it('uses a portable repo-local mirrors root unless overridden', () => {
     const previous = process.env.NEWIDE_SWE_MIRRORS_ROOT;
     delete process.env.NEWIDE_SWE_MIRRORS_ROOT;
     try {
-      expect(resolveMirrorsRoot()).toBe(path.resolve('D:\\newide-sweevo-mirrors'));
+      expect(resolveMirrorsRoot()).toBe(path.resolve('.newide', 'eval-mirrors'));
       expect(mirrorPathForRepo('dask/dask', 'D:\\cache')).toBe(
         path.join(path.resolve('D:\\cache'), 'dask__dask'),
       );
