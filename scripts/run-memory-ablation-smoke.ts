@@ -2,7 +2,7 @@
  * §1 memory ablation smoke: B0 / B1 / B2 × 3 sequential related tasks.
  *
  * Uses production backend (real ACP driver + Postgres B memory).
- * Artifacts default to D:\Code\NewIDE\.newide-experiments\memory-ablation\<ts>\.
+ * Artifacts default to .newide/eval-runs/memory-ablation/<ts>/.
  *
  * Usage:
  *   pnpm exec tsx scripts/run-memory-ablation-smoke.ts
@@ -27,18 +27,39 @@ interface JsonRpcMessage {
 interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
   waitForTerminal(runId: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  waitForTaskTerminal(taskId: string, timeoutMs: number): Promise<TaskTerminalSnapshot>;
   close(): Promise<void>;
 }
 
+interface TaskTerminalSnapshot {
+  task: { task_id: string; status: string };
+  run_history: Array<{ run_id: string; status: string }>;
+}
+
 const repoRoot = process.cwd();
+const configuredEnv = {
+  ...loadEnvFile(path.join(repoRoot, '.env')),
+  ...loadEnvFile(path.join(repoRoot, '.env.local')),
+};
+const baseEnv = {
+  ...configuredEnv,
+  ...process.env,
+  ACP_DRIVER_RUNNER_DIR:
+    process.env.ACP_DRIVER_RUNNER_DIR ??
+    configuredEnv.ACP_DRIVER_RUNNER_DIR ??
+    path.resolve(repoRoot, '..', 'acp-client-prototype'),
+  ACP_DRIVER_TIMEOUT_MS:
+    process.env.ACP_DRIVER_TIMEOUT_MS ?? configuredEnv.ACP_DRIVER_TIMEOUT_MS ?? '300000',
+};
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
-  process.env.NEWIDE_ABLATION_ROOT ?? 'D:\\Code\\NewIDE\\.newide-experiments\\memory-ablation',
+  baseEnv.NEWIDE_ABLATION_ROOT ??
+    path.join(repoRoot, '.newide', 'eval-runs', 'memory-ablation'),
   stamp,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 600_000);
-const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
+const runTimeoutMs = readPositiveInt(baseEnv.ACCEPTANCE_RUN_TIMEOUT_MS, 600_000);
+const maintenanceWaitMs = readPositiveInt(baseEnv.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
 
 const TASKS = [
   {
@@ -68,14 +89,9 @@ const TASKS = [
 const ABLATIONS: MemoryAblation[] = ['B0', 'B1', 'B2'];
 
 await fs.mkdir(experimentRoot, { recursive: true });
-const baseEnv = {
-  ...process.env,
-  ...loadEnvFile(path.join(repoRoot, '.env')),
-  ...loadEnvFile(path.join(repoRoot, '.env.local')),
-  ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
-  ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '300000',
-};
+const databaseUrlTemplate =
+  baseEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
 
 log(`experiment root: ${experimentRoot}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
@@ -85,7 +101,7 @@ for (const ablation of ABLATIONS) {
   const armDir = path.join(experimentRoot, ablation);
   const workspace = path.join(armDir, 'workspace');
   await fs.mkdir(workspace, { recursive: true });
-  const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   log('');
   log(`=== arm ${ablation} db=${dbUrl.replace(/:[^:@]+@/, ':***@')} ===`);
 
@@ -109,18 +125,21 @@ for (const ablation of ABLATIONS) {
         title: `${ablation}-${task.id}`,
       });
       await backend.request('run.subscribe', { run_id: created.run_id });
-      const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
+      const taskSnapshot = await backend.waitForTaskTerminal(created.task_id, runTimeoutMs);
+      const finalRunId = latestTerminalRunId(taskSnapshot);
+      const snapshot = await backend.waitForTerminal(finalRunId, runTimeoutMs);
       if (ablation !== 'B0') {
         await sleep(maintenanceWaitMs);
       }
       const afterFiles = await listWorkspaceFiles(workspace);
       const memory = await captureMemory(backend);
-      const summaryPath = path.join(repoRoot, '.newide', 'runs', created.run_id, 'summary.json');
+      const summaryPath = path.join(armDir, 'runs', finalRunId, 'summary.json');
       const summary = await readJsonIfExists(summaryPath);
       const row = {
         ablation,
         task_id: task.id,
         run_id: created.run_id,
+        final_run_id: finalRunId,
         backend_task_id: created.task_id,
         snapshot_status: snapshot.status,
         memory_ablation_in_summary:
@@ -246,6 +265,17 @@ async function startBackend(
       }
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
     },
+    waitForTaskTerminal: async (taskId, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const snapshot = await request<TaskTerminalSnapshot>('task.get', { task_id: taskId });
+        if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+          return snapshot;
+        }
+        await sleep(1_000);
+      }
+      throw new Error(`[${label}] task ${taskId} did not finish within ${String(timeoutMs)}ms`);
+    },
     close: async () => {
       child.stdin?.end();
       const result = await Promise.race([closed, sleep(5_000).then(() => 'timeout' as const)]);
@@ -259,6 +289,12 @@ async function startBackend(
       }
     },
   };
+}
+
+function latestTerminalRunId(snapshot: TaskTerminalSnapshot): string {
+  const latest = snapshot.run_history[0];
+  if (!latest) throw new Error(`Task ${snapshot.task.task_id} has no terminal Run`);
+  return latest.run_id;
 }
 
 async function captureMemory(backend: BackendClient): Promise<{
@@ -366,6 +402,13 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
+  if (!template.includes('{ablation}')) {
+    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
+  }
+  return template.replaceAll('{ablation}', ablation.toLowerCase());
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {

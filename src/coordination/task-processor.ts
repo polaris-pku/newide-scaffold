@@ -46,6 +46,7 @@ export interface BeginTaskRunInput {
   task_request: TaskCreateRequest;
   workspace_path: string;
   mode: PersistedRunMode;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   session_id?: string;
   restarted_from_run_id?: string;
   resume_checkpoint_id?: string;
@@ -101,6 +102,7 @@ export interface TaskRunExecutionState {
   task_id: string;
   run_id: string;
   mode: PersistedRunMode;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   task_request: TaskCreateRequest;
   workspace_path: string;
   resume_cursor: TaskResumeCursor;
@@ -128,6 +130,7 @@ export interface TaskLaunchContext {
   task_request: TaskCreateRequest;
   workspace_path: string;
   session_id?: string;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
 }
 
 export interface TaskResumeContext extends TaskLaunchContext {
@@ -289,10 +292,12 @@ export class TaskProcessor {
       input.run_created_event ??
         this.createEvent('run.created', input.run_id, input.task_id, input.run_id, {
           mode: input.mode,
+          ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         }),
       input.run_started_event ??
         this.createEvent('run.started', input.run_id, input.task_id, input.run_id, {
           mode: input.mode,
+          ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         }),
     ];
 
@@ -310,6 +315,7 @@ export class TaskProcessor {
         diagnostics: {
           mode: input.mode,
           run_intent: runIntent.type,
+          ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
           ...(runIntent.type === 'checkpoint_resume'
             ? { resume_strategy: runIntent.strategy }
             : {}),
@@ -590,10 +596,14 @@ export class TaskProcessor {
   getRunExecutionState(runId: string): TaskRunExecutionState {
     const aggregate = this.requireAggregateForRun(runId);
     const run = requireRun(aggregate, runId);
+    const memoryAblation = readMemoryAblation(
+      aggregate.runtime_state.diagnostics.memory_ablation,
+    );
     return {
       task_id: aggregate.task.task_id,
       run_id: runId,
       mode: run.mode,
+      ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
       task_request: {
         spec: aggregate.task.spec,
         ...(aggregate.task.role_id ? { role_id: aggregate.task.role_id } : {}),
@@ -759,6 +769,9 @@ export class TaskProcessor {
       const run = runId
         ? aggregate.runs.find((candidate) => candidate.run_id === runId)
         : undefined;
+      const memoryAblation = readMemoryAblation(
+        aggregate.runtime_state.diagnostics.memory_ablation,
+      );
       if (
         cursorInput?.cursor !== 'mailbox_wait' ||
         cursorInput.delivery_ids.length === 0 ||
@@ -783,6 +796,7 @@ export class TaskProcessor {
         ...(run.session_id ? { session_id: run.session_id } : {}),
         run_id: run.run_id,
         mode: run.mode,
+        ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
         sender_role_id: aggregate.task.owner_agent_id,
         delivery_ids: [...cursorInput.delivery_ids],
         waiting_reason: cursorInput.waiting_reason,
@@ -1049,6 +1063,9 @@ export class TaskProcessor {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
     const latestSession = aggregate.runs.find((run) => run.session_id)?.session_id;
+    const memoryAblation = readMemoryAblation(
+      aggregate.runtime_state.diagnostics.memory_ablation,
+    );
     return {
       task_request: {
         spec: aggregate.task.spec,
@@ -1061,11 +1078,15 @@ export class TaskProcessor {
       },
       workspace_path: aggregate.task.workspace_path,
       ...(latestSession ? { session_id: latestSession } : {}),
+      ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     };
   }
 
   getTaskResumeContext(taskId: string): TaskResumeContext {
     const resumePackage = this.buildResumePackage(taskId);
+    const memoryAblation = readMemoryAblation(
+      this.store.getTaskAggregate(taskId)?.runtime_state.diagnostics.memory_ablation,
+    );
     return {
       task_request: {
         spec: resumePackage.task_request.spec,
@@ -1084,6 +1105,7 @@ export class TaskProcessor {
       },
       workspace_path: resumePackage.workspace_path,
       ...(resumePackage.session_id ? { session_id: resumePackage.session_id } : {}),
+      ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
       checkpoint_id: resumePackage.checkpoint_id,
       resume_cursor: resumePackage.resume_cursor,
       cursor_input: resumePackage.cursor_input,
@@ -1789,6 +1811,12 @@ function cursorAfterEvent(
 function readPayloadString(payload: Record<string, unknown>, key: string): string | undefined {
   const value = payload[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function readMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | undefined {
+  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3'
+    ? value
+    : undefined;
 }
 
 function readPayloadStringArray(payload: Record<string, unknown>, key: string): string[] {

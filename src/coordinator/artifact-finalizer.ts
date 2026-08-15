@@ -61,6 +61,9 @@ export interface ArtifactSelectionInput {
   evidence_pack?: EvidencePack;
   question?: string;
   workspace_path?: string;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  /** Persisted Agent that produced the initial Driver proposal. */
+  proposal_agent_id?: string;
 }
 
 export interface ArtifactSelectionExecutionOptions {
@@ -147,6 +150,7 @@ export class ArtifactSelector {
       driver_result: input.driver_result,
       gate_results: input.gate_results,
     });
+    if (input.proposal_agent_id) proposal.agent_id = input.proposal_agent_id;
 
     const councilRequest = {
         run_id: input.run_id,
@@ -155,6 +159,7 @@ export class ArtifactSelector {
         decision_mode: 'advisory' as const,
         question: input.question ?? 'Select the best driver output artifact for v0 integration.',
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+        ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         candidate_artifacts: [...input.driver_result.artifacts],
         proposals: [proposal],
         evidence_pack: input.evidence_pack,
