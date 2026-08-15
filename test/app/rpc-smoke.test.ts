@@ -13,7 +13,7 @@ describe('production RPC composition smoke script', () => {
       mode: 'all',
       single_agent: { artifacts: 1 },
       council: { artifacts: 1 },
-      driver_invocations: 12,
+      driver_invocations: 10,
       cancelled: { status: 'cancelled' },
       malformed_json_error: -32700,
       unknown_method_error: -32601,
@@ -22,7 +22,7 @@ describe('production RPC composition smoke script', () => {
 
   it.each([
     ['single_agent', 2],
-    ['council', 10],
+    ['council', 8],
   ] as const)(
     'runs %s as an independent frontend mode',
     async (mode, invocations) => {
