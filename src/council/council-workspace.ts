@@ -53,20 +53,35 @@ export async function prepareCouncilWorkspace(
         maxBuffer: 10 * 1024 * 1024,
       },
     );
-    return;
+  } else {
+    await fs.cp(source, target, {
+      recursive: true,
+      force: true,
+      filter(candidate) {
+        const resolved = path.resolve(candidate);
+        if (resolved === target || resolved.startsWith(`${target}${path.sep}`)) return false;
+        const relative = path.relative(source, resolved);
+        const rootEntry = relative.split(path.sep)[0];
+        return rootEntry !== '.git' && rootEntry !== '.newide';
+      },
+    });
   }
+  // git worktree add does not copy untracked eval files such as .claude/settings.json
+  // (gitignored so they never enter the scored patch). ACP still needs them in cwd.
+  await copyEvalClaudeSettings(source, target);
+}
 
-  await fs.cp(source, target, {
-    recursive: true,
-    force: true,
-    filter(candidate) {
-      const resolved = path.resolve(candidate);
-      if (resolved === target || resolved.startsWith(`${target}${path.sep}`)) return false;
-      const relative = path.relative(source, resolved);
-      const rootEntry = relative.split(path.sep)[0];
-      return rootEntry !== '.git' && rootEntry !== '.newide';
-    },
-  });
+async function copyEvalClaudeSettings(source: string, target: string): Promise<void> {
+  const relative = path.join('.claude', 'settings.json');
+  const from = path.join(source, relative);
+  const to = path.join(target, relative);
+  try {
+    await fs.mkdir(path.dirname(to), { recursive: true });
+    await fs.copyFile(from, to);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
 }
 
 export async function stageCouncilArtifacts(

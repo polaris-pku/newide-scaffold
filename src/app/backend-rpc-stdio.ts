@@ -169,7 +169,9 @@ export async function createProductionBackendService(
       },
       unsetEnv: [
         'NEWIDE_B_DATABASE_URL',
-        ...MODEL_OVERRIDE_ENV.filter((key) => driverEnv[key] === undefined),
+        ...MODEL_OVERRIDE_ENV.filter(
+          (key) => driverEnv[key] === undefined && env[key] === undefined,
+        ),
       ],
       timeoutMs: readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS),
     }),
@@ -233,7 +235,9 @@ export async function createProductionBackendService(
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
-      llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
+      llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient({
+        ...(env.DEEPSEEK_MODEL?.trim() ? { model: env.DEEPSEEK_MODEL.trim() } : {}),
+      }),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),

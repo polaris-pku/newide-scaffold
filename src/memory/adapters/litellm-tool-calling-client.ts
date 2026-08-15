@@ -98,8 +98,17 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
       }).chat(modelId) as LanguageModel;
     }
     case 'anthropic': {
-      const { anthropic } = await import('@ai-sdk/anthropic');
-      return anthropic(modelId) as LanguageModel;
+      const { createAnthropic } = await import('@ai-sdk/anthropic');
+      const apiKey =
+        process.env.ANTHROPIC_AUTH_TOKEN ||
+        process.env.ANTHROPIC_API_KEY ||
+        process.env.DEEPSEEK_API_KEY;
+      return createAnthropic({
+        ...(apiKey ? { apiKey } : {}),
+        ...(process.env.ANTHROPIC_BASE_URL
+          ? { baseURL: process.env.ANTHROPIC_BASE_URL.replace(/\/+$/, '') }
+          : {}),
+      })(modelId) as LanguageModel;
     }
     default:
       throw new Error(
@@ -107,6 +116,11 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
           `Supported: openai, anthropic.`,
       );
   }
+}
+
+function preferAnthropicCompat(): boolean {
+  const base = process.env.ANTHROPIC_BASE_URL?.trim() ?? '';
+  return base.length > 0 && /deepseek|anthropic/i.test(base);
 }
 
 // ──────────────────────────────────────────────
@@ -152,8 +166,9 @@ export interface LiteLLMToolCallingClientOptions {
   loadEnv?: boolean;
 
   /**
-   * 模型名称覆盖（如 'deepseek-chat'、'deepseek-reasoner'）。
+   * 模型名称覆盖（如 'deepseek-v4-flash'）。
    * 设此值后忽略 YAML 配置中的 model，但温度/超时等仍从 YAML 读取。
+   * 未传时回退 DEEPSEEK_MODEL，避免 eval 仍打已下线的 deepseek-chat。
    */
   model?: string;
   /**
@@ -177,7 +192,6 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
 
   constructor(options: LiteLLMToolCallingClientOptions = {}) {
     this.taskName = options.taskName ?? 'memory-query';
-    this.modelOverride = options.model;
 
     // 构造参数覆盖环境变量
     if (options.apiKey) {
@@ -191,6 +205,8 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     if (options.loadEnv !== false) {
       loadLocalEnv();
     }
+
+    this.modelOverride = options.model?.trim() || process.env.DEEPSEEK_MODEL?.trim() || undefined;
 
     this.client = new LiteLLMClient();
     this.client.registerProvider('openai', async (modelId: string) => {
@@ -214,7 +230,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     let maxTokens: number;
 
     if (this.modelOverride) {
-      providerName = 'openai';
+      providerName = preferAnthropicCompat() ? 'anthropic' : 'openai';
       modelId = this.modelOverride;
       temperature = 0.3;
       maxTokens = 2000;
@@ -224,6 +240,9 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       modelId = resolved.model;
       temperature = resolved.temperature;
       maxTokens = resolved.maxTokens;
+      if (preferAnthropicCompat() && providerName === 'openai') {
+        providerName = 'anthropic';
+      }
     }
 
     // 2. 解析 provider 得到 AI SDK model 实例

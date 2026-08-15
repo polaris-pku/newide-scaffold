@@ -271,6 +271,20 @@ const jailBuildPath = path.join(
   'security',
   'eval-fs-jail.js',
 );
+if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1' && !baseEnv.ACP_PROCESS_SANDBOX_HOME) {
+  const evalClaudeHome = path.join(experimentRoot, 'claude-home');
+  await fs.mkdir(path.join(evalClaudeHome, '.claude'), { recursive: true });
+  const settings = buildEvalClaudeSettings();
+  if (Object.keys(settings).length > 0) {
+    await fs.writeFile(
+      path.join(evalClaudeHome, '.claude', 'settings.json'),
+      `${JSON.stringify(settings, null, 2)}\n`,
+      'utf-8',
+    );
+  }
+  baseEnv.ACP_PROCESS_SANDBOX_HOME = evalClaudeHome;
+  log(`eval Claude home: ${evalClaudeHome}`);
+}
 if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
   if (!existsSync(jailBuildPath)) {
     throw new Error(
@@ -640,13 +654,10 @@ function buildPrompt(instance: SweEvoInstance): string {
   ].join('\n');
 }
 
-/** Defense-in-depth Claude Code deny list for SWE-EVO offline eval. */
-async function writeEvalOfflineClaudeSettings(worktreePath: string): Promise<void> {
-  if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET !== '1') return;
-  const claudeDir = path.join(worktreePath, '.claude');
-  await fs.mkdir(claudeDir, { recursive: true });
-  const settings = {
-    permissions: {
+function buildEvalClaudeSettings(): Record<string, unknown> {
+  const settings: Record<string, unknown> = {};
+  if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1') {
+    settings.permissions = {
       deny: [
         'WebFetch',
         'WebSearch',
@@ -657,8 +668,43 @@ async function writeEvalOfflineClaudeSettings(worktreePath: string): Promise<voi
         'Bash(Invoke-WebRequest *)',
         'Bash(iwr *)',
       ],
-    },
-  };
+    };
+  }
+  const model = baseEnv.ANTHROPIC_MODEL?.trim();
+  if (model) {
+    settings.model = model;
+  }
+  const env: Record<string, string> = {};
+  for (const key of [
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'CLAUDE_CODE_SUBAGENT_MODEL',
+    'CLAUDE_CODE_EFFORT_LEVEL',
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+    'CLAUDE_CONFIG_DIR',
+  ] as const) {
+    const value = baseEnv[key]?.trim();
+    if (value) env[key] = value;
+  }
+  if (!env.CLAUDE_CODE_EFFORT_LEVEL) env.CLAUDE_CODE_EFFORT_LEVEL = 'max';
+  if (!env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC) {
+    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+  }
+  if (Object.keys(env).length > 0) settings.env = env;
+  return settings;
+}
+
+/** Defense-in-depth Claude Code deny list for SWE-EVO offline eval. */
+async function writeEvalOfflineClaudeSettings(worktreePath: string): Promise<void> {
+  const settings = buildEvalClaudeSettings();
+  if (Object.keys(settings).length === 0) return;
+  const claudeDir = path.join(worktreePath, '.claude');
+  await fs.mkdir(claudeDir, { recursive: true });
   await fs.writeFile(
     path.join(claudeDir, 'settings.json'),
     `${JSON.stringify(settings, null, 2)}\n`,
