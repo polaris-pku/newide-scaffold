@@ -331,7 +331,7 @@ describe('TaskProcessor', () => {
     });
     const sent = await mailbox.send({
       task_id: 'task_mailbox_continue',
-      workspace_path: '/workspace',
+      workspace_path: '/workspace/.newide/council/primary',
       thread_id: 'thread_mailbox_continue',
       from_role_id: 'agent_a',
       to_role_id: 'agent_reviewer',
