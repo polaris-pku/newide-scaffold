@@ -106,8 +106,21 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     const generatedResults: AgentExecutionResult[] = [];
     const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];
+    const representedAgentIds = new Set(
+      input.proposals.flatMap((proposal) => (proposal.agent_id ? [proposal.agent_id] : [])),
+    );
+
+    for (const proposal of input.proposals) {
+      const participant = proposers.find(
+        (candidate) => candidate.agent_id === proposal.agent_id,
+      );
+      if (participant) {
+        await emitLifecycle(options, completedReusedProposalEvent(proposal, participant));
+      }
+    }
 
     for (const participant of proposers) {
+      if (representedAgentIds.has(participant.agent_id)) continue;
       const label = String.fromCharCode(65 + participant.seat_index);
       const workspace = participantWorkspace(councilDir, participant);
       await prepareCouncilWorkspace(input.workspace_path, workspace);
@@ -389,6 +402,21 @@ function completedProposalEvent(
       session_id: result.session_id,
       proposal_id: proposal.proposal_id,
       artifact_refs: proposal.artifact_refs,
+    },
+  };
+}
+
+function completedReusedProposalEvent(
+  proposal: Proposal,
+  participant: CouncilParticipantBinding,
+): CouncilLifecycleEvent {
+  return {
+    type: 'council.proposal.completed',
+    payload: {
+      ...participantAuditPayload(participant),
+      proposal_id: proposal.proposal_id,
+      artifact_refs: proposal.artifact_refs,
+      reused: true,
     },
   };
 }

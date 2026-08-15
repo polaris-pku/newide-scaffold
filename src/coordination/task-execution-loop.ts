@@ -25,9 +25,9 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   task_id: string;
   run_id: string;
   mode: PersistedRunMode;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   task_request: TaskCreateRequest;
   workspace_path: string;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   session_id?: string;
   cursor_input: CursorInput<TCursor>;
   /**
@@ -508,6 +508,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     task_id: state.task_id,
     run_id: state.run_id,
     mode: state.mode,
+    ...(state.memory_ablation ? { memory_ablation: state.memory_ablation } : {}),
     task_request: state.task_request,
     workspace_path: state.workspace_path,
     ...(controls.memory_ablation

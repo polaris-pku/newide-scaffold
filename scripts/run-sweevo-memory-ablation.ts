@@ -8,6 +8,7 @@
  * Usage:
  *   pnpm eval:sweevo-ablation -- --subset v0-requests-3-prctx --mode council --ablations B0,B1,B2 --run-harness
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
+ *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B0 --mode council --run-harness
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, promises as fs, readFileSync } from 'node:fs';
@@ -40,10 +41,18 @@ interface JsonRpcMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
+type EvaluationRunMode = 'single_agent' | 'council';
+
 interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
   waitForTerminal(runId: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  waitForTaskTerminal(taskId: string, timeoutMs: number): Promise<TaskTerminalSnapshot>;
   close(): Promise<void>;
+}
+
+interface TaskTerminalSnapshot {
+  task: { task_id: string; status: string };
+  run_history: Array<{ run_id: string; status: string }>;
 }
 
 interface TokenUsage extends RunTokenUsageSummary {
@@ -53,6 +62,7 @@ interface TokenUsage extends RunTokenUsageSummary {
 
 interface InstanceRow {
   ablation: MemoryAblation;
+  run_mode: EvaluationRunMode;
   instance_id: string;
   /** 1-based position within the arm; memory accumulates across the sequence. */
   instance_seq: number;
@@ -61,6 +71,7 @@ interface InstanceRow {
   mirror_path?: string;
   worktree_path?: string;
   backend_run_id?: string;
+  final_backend_run_id?: string;
   backend_task_id?: string;
   snapshot_status?: string;
   summary_path?: string;
@@ -125,9 +136,9 @@ const experimentDirOverride = readFlag('--experiment-dir');
 const experimentRoot = experimentDirOverride
   ? path.resolve(repoRoot, experimentDirOverride)
   : path.resolve(
-      repoRoot,
       process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
-        path.join('..', '.newide-experiments', 'sweevo-ablation'),
+        fileEnv.NEWIDE_SWEEVO_ABLATION_ROOT ??
+        path.join(repoRoot, '.newide', 'eval-runs', 'sweevo-ablation'),
       stamp,
     );
 
@@ -147,6 +158,11 @@ if (instanceIds.length === 0) {
 for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
+
+const databaseUrlTemplate =
+  process.env.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  fileEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
 
 const driverRunnerRaw =
   process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
@@ -293,7 +309,7 @@ const armReports: Array<{
 for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
   await fs.mkdir(armDir, { recursive: true });
-  const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   const isolation = await prepareAblationArmIsolation({
     experiment_root: experimentRoot,
     arm: ablation,
@@ -308,7 +324,20 @@ for (const ablation of ablations) {
   const backend = await startBackend(ablation, {
     ...baseEnv,
     NEWIDE_B_DATABASE_URL: isolation.database_url,
+    NEWIDE_B_EMBEDDING_PROVIDER: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
+    NEWIDE_B_EMBEDDING_DIMENSIONS: baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32',
     NEWIDE_STATE_ROOT: isolation.state_root,
+    ...(runMode === 'council'
+      ? {
+          NEWIDE_COUNCIL_STRATEGY: baseEnv.NEWIDE_COUNCIL_STRATEGY ?? 'plan_first',
+          NEWIDE_COUNCIL_SEATS:
+            baseEnv.NEWIDE_COUNCIL_SEATS ??
+            'role_fullstack_engineer,role_ts_engineer,role_code_reviewer,role_synthesis_engineer',
+          NEWIDE_AUCTION_ENABLED: baseEnv.NEWIDE_AUCTION_ENABLED ?? '0',
+          NEWIDE_PRIMARY_AGENT_ID:
+            baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
+        }
+      : {}),
   });
 
   const rows: InstanceRow[] = [];
@@ -412,6 +441,7 @@ async function runOneInstance(input: {
   const { ablation, armDir, backend, instance, instanceSeq, stateRoot } = input;
   const row: InstanceRow = {
     ablation,
+    run_mode: runMode,
     instance_id: instance.instance_id,
     instance_seq: instanceSeq,
     repo: instance.repo,
@@ -461,14 +491,17 @@ async function runOneInstance(input: {
     row.backend_task_id = created.task_id;
 
     await backend.request('run.subscribe', { run_id: created.run_id });
-    const snapshot = await backend.waitForTerminal(created.run_id, runWaitMs);
+    const taskSnapshot = await backend.waitForTaskTerminal(created.task_id, runWaitMs);
+    const finalRunId = latestTerminalRunId(taskSnapshot);
+    row.final_backend_run_id = finalRunId;
+    const snapshot = await backend.waitForTerminal(finalRunId, runWaitMs);
     row.snapshot_status = String(snapshot.status ?? '');
 
     if (ablation !== 'B0') {
       row.maintenance_wait_ms = maintenanceWaitMs;
       const maintenance = await waitForRunMaintenance(
         backend.request,
-        created.run_id,
+        finalRunId,
         maintenanceWaitMs,
       );
       row.maintenance_ref = maintenance.maintenance_ref;
@@ -482,7 +515,7 @@ async function runOneInstance(input: {
       }
     }
 
-    const summaryPath = path.join(stateRoot, 'runs', created.run_id, 'summary.json');
+    const summaryPath = path.join(stateRoot, 'runs', finalRunId, 'summary.json');
     row.summary_path = summaryPath;
     const summary = await readJsonIfExists(summaryPath);
     if (summary && typeof summary === 'object') {
@@ -831,6 +864,18 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
 
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
     },
+    waitForTaskTerminal: async (taskId, timeoutMs) => {
+      const unlimited = !Number.isFinite(timeoutMs) || timeoutMs <= 0;
+      const deadline = unlimited ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const snapshot = await request<TaskTerminalSnapshot>('task.get', { task_id: taskId });
+        if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+          return snapshot;
+        }
+        await sleep(1_000);
+      }
+      throw new Error(`[${label}] task ${taskId} did not finish within ${String(timeoutMs)}ms`);
+    },
     close: async () => {
       child.stdin?.end();
       const result = await Promise.race([closed, sleep(5_000).then(() => 'timeout' as const)]);
@@ -844,6 +889,12 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }
     },
   };
+}
+
+function latestTerminalRunId(snapshot: TaskTerminalSnapshot): string {
+  const latest = snapshot.run_history[0];
+  if (!latest) throw new Error(`Task ${snapshot.task.task_id} has no terminal Run`);
+  return latest.run_id;
 }
 
 function parseAblations(raw: string): MemoryAblation[] {
@@ -863,7 +914,7 @@ function parseAblations(raw: string): MemoryAblation[] {
   return out;
 }
 
-function parseRunMode(raw: string): 'single_agent' | 'council' {
+function parseRunMode(raw: string): EvaluationRunMode {
   if (raw === 'single_agent' || raw === 'council') return raw;
   throw new Error(`Invalid --mode "${raw}". Expected single_agent|council.`);
 }
@@ -935,6 +986,13 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
+  if (!template.includes('{ablation}')) {
+    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
+  }
+  return template.replaceAll('{ablation}', ablation.toLowerCase());
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {

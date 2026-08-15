@@ -140,6 +140,61 @@ describe('FileRunTerminalOutputWriter', () => {
     await expect(readJson(path.join(runDir, 'result.json'))).resolves.toEqual({ rich: true });
   });
 
+  it('includes the Task Driver usage aggregate in summary.json', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_failed');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, 'driver-stream.jsonl'),
+      `${JSON.stringify({
+        task_id: 'task_failed',
+        recorded_at: '2026-08-14T00:00:00Z',
+        event: {
+          event_type: 'usage_update',
+          session_id: 'session_usage',
+          role_id: 'role_usage',
+          payload: { update: { used: 321, size: 200_000 } },
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
+
+    await expect(readJson(path.join(runDir, 'summary.json'))).resolves.toMatchObject({
+      token_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        context_tokens_used: 321,
+        sessions: [{ session_id: 'session_usage', role_id: 'role_usage' }],
+      },
+    });
+  });
+
+  it('preserves memory ablation in summary when execution fails before context build', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events.unshift({
+      event_id: 'run_event_created',
+      sequence: 0,
+      run_id: snapshot.run_id,
+      task_id: snapshot.task_id,
+      type: 'run.created',
+      source: 'coordinator',
+      created_at: '2026-07-11T07:59:59.000Z',
+      payload: { mode: 'council', memory_ablation: 'B0' },
+      schema_version: 'v0',
+    });
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(snapshot);
+
+    await expect(readJson(path.join(runsRoot, 'run_failed', 'summary.json'))).resolves.toMatchObject({
+      memory_ablation: 'B0',
+    });
+  });
+
   it('replaces a completed legacy frontend snapshot without replacing its result manifest', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
     tempDirs.push(runsRoot);

@@ -6,6 +6,7 @@ import {
   HashEmbeddingProvider,
   LiteLLMEmbeddingProvider,
   PgMemoryRepository,
+  createPGlitePool,
   type BufferRepository,
   type EmbeddingProvider,
   type MemoryRepository,
@@ -89,12 +90,8 @@ export async function createProductionBRuntime(
   const appStateRoot = path.resolve(repoRoot, options.appStateRoot ?? '.newide');
   let storage: BMemoryStorage | undefined;
 
-  if (!options.storage && !env.NEWIDE_B_DATABASE_URL?.trim()) {
-    throw new Error('NEWIDE_B_DATABASE_URL is required for the production B runtime');
-  }
-
   try {
-    storage = options.storage ?? (await createPostgresStorage(env, options));
+    storage = options.storage ?? (await createDefaultStorage(env, options, appStateRoot));
     const bufferRepository = new FileBufferRepository({
       agentStateRoot: path.join(appStateRoot, 'b', 'agent-state'),
     });
@@ -117,15 +114,27 @@ export async function createProductionBRuntime(
   }
 }
 
+/**
+ * 存储选型：NEWIDE_B_DATABASE_URL 存在时使用外部 PostgreSQL；
+ * 否则使用嵌入式 PGlite（WASM PostgreSQL + pgvector），无需 Docker 或外部服务。
+ */
+async function createDefaultStorage(
+  env: NodeJS.ProcessEnv,
+  options: ProductionBRuntimeFactoryOptions,
+  appStateRoot: string,
+): Promise<BMemoryStorage> {
+  const databaseUrl = env.NEWIDE_B_DATABASE_URL?.trim();
+  if (databaseUrl) {
+    return createPostgresStorage(env, options, databaseUrl);
+  }
+  return createPGliteStorage(env, options, appStateRoot);
+}
+
 async function createPostgresStorage(
   env: NodeJS.ProcessEnv,
   options: ProductionBRuntimeFactoryOptions,
+  databaseUrl: string,
 ): Promise<BMemoryStorage> {
-  const databaseUrl = env.NEWIDE_B_DATABASE_URL?.trim();
-  if (!databaseUrl) {
-    throw new Error('NEWIDE_B_DATABASE_URL is required for the production B runtime');
-  }
-
   const pool =
     options.createPool?.(databaseUrl) ??
     new Pool({ connectionString: databaseUrl, connectionTimeoutMillis: 10_000 });
@@ -148,6 +157,35 @@ async function createPostgresStorage(
       error,
       databaseUrl,
     );
+  }
+}
+
+async function createPGliteStorage(
+  env: NodeJS.ProcessEnv,
+  options: ProductionBRuntimeFactoryOptions,
+  appStateRoot: string,
+): Promise<BMemoryStorage> {
+  const configuredDir = env.NEWIDE_B_PGLITE_DATA_DIR?.trim();
+  const dataDir =
+    configuredDir === ':memory:'
+      ? undefined
+      : path.resolve(options.repoRoot ?? process.cwd(), configuredDir ?? path.join(appStateRoot, 'b', 'pglite'));
+  const pool = await createPGlitePool(dataDir ? { dataDir } : {});
+  const close = onceAsync(() => pool.end());
+  try {
+    const embedding = resolveProductionEmbedding(env, options);
+    await verifyEmbeddingReadiness(embedding.provider);
+    const repository = new PgMemoryRepository({ pool, embedding: embedding.provider });
+    await repository.listAgentIds();
+    return {
+      repository,
+      embedding: embedding.provider,
+      close,
+      embedding_info: embedding.info,
+    };
+  } catch (error) {
+    await close().catch(() => undefined);
+    throw operationalError('Embedded PGlite B memory storage readiness check failed', error);
   }
 }
 

@@ -129,7 +129,8 @@ try {
   if (cancelled) await waitForCancellationEffects();
   const driverInvocations = usesTemporaryRunner ? await countDriverInvocations() : undefined;
   if (driverInvocations !== undefined) {
-    const expectedInvocations = smokeMode === 'all' ? 12 : smokeMode === 'single_agent' ? 2 : 10;
+    // Plan-first reuses Primary's initial plan as proposer 0 instead of invoking it twice.
+    const expectedInvocations = smokeMode === 'all' ? 10 : smokeMode === 'single_agent' ? 2 : 8;
     assert(
       driverInvocations === expectedInvocations,
       `Expected ${expectedInvocations} driver invocations, received ${driverInvocations}`,

@@ -202,9 +202,19 @@ Persona 演化与 Agent 解耦：Agent 只读 `getPersona()`，演化由外部�
 
 `createAgentMemoryScope(repository, buffers, role_id)` 把两个仓库绑定到单个 Agent，供工具、Processor 和服务层使用。
 
-### PostgreSQL
+### PostgreSQL / 嵌入式 PGlite
 
-`PgMemoryRepository` 使用 PostgreSQL 和 `pgvector`。默认 `autoMigrate: true`，首次访问时会调用 `ensurePgMemorySchema()` 创建扩展、表和索引；数据库用户需要具备相应权限。默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，不是语义嵌入模型。生产环境应通过 `PgMemoryRepository` 构造参数注入合适的 `EmbeddingProvider`。
+`PgMemoryRepository` 使用 PostgreSQL 和 `pgvector`，但只依赖最小 `SqlPool` 端口，
+因此同一个仓库实现可对接两种引擎：
+
+- **外部 PostgreSQL**：`NEWIDE_B_DATABASE_URL` 指向自托管/云托管（Neon、Supabase、RDS）实例；
+- **嵌入式 PGlite**：不设置 `NEWIDE_B_DATABASE_URL` 时，`createProductionBRuntime` 自动使用
+  `PGlitePool`（WASM PostgreSQL + pgvector），进程内运行、零安装、无需 Docker，
+  数据持久化到 `<appStateRoot>/b/pglite`（可用 `NEWIDE_B_PGLITE_DATA_DIR` 覆盖，`:memory:` 表示内存）。
+
+两者共享同一套 SQL 与 `ensurePgMemorySchema()` 建表逻辑。默认 `autoMigrate: true`，首次访问时自动建表；
+数据库用户需要具备相应权限。默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，
+不是语义嵌入模型。生产环境应通过 `PgMemoryRepository` 构造参数注入合适的 `EmbeddingProvider`。
 
 ### 文件 Buffer
 

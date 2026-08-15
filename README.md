@@ -7,7 +7,8 @@ durable Task/Run state, and Council proposal/review/synthesis/delivery.
 ## Quick Start
 
 只保留两个正式入口：后端 CLI 和 Polaris Electron。需要 Node.js `>=22.22.1`、
-pnpm `>=11.8.0`；使用本地 B PostgreSQL 时还需要 Docker。
+pnpm `>=11.8.0`。B 记忆存储默认使用嵌入式 PGlite（WASM PostgreSQL + pgvector），
+零安装、无需 Docker；只有显式选择外部 PostgreSQL 时才需要 Docker 或云数据库。
 
 ### Backend CLI
 
@@ -41,18 +42,17 @@ NEWIDE_B_EMBEDDING_DIMENSIONS=32
 ANTHROPIC_API_KEY=replace-with-your-key
 ```
 
-运行一次真实 Council 任务：
+运行一次真实 Council 任务（省略 `--local-postgres` 时使用嵌入式 PGlite，无需 Docker）：
 
 ```bash
 pnpm task:run -- \
   --workspace ./task-workspace \
-  --prompt "实现需求并把最终文件写入 workspace" \
-  --local-postgres
+  --prompt "实现需求并把最终文件写入 workspace"
 ```
 
-脚本会构建 ACP Client 和后端 CLI，并启动或复用本地 PostgreSQL。已有数据库时，在
-`.env.local` 设置 `NEWIDE_B_DATABASE_URL` 并省略 `--local-postgres`。ACP Client 不在
-默认相邻目录时传 `--driver-runner /path/to/acp-client`。
+脚本会构建 ACP Client 和后端 CLI。需要外部 PostgreSQL（自托管或云托管）时，在
+`.env.local` 设置 `NEWIDE_B_DATABASE_URL` 并加 `--local-postgres` 启动开发容器。
+ACP Client 不在默认相邻目录时传 `--driver-runner /path/to/acp-client`。
 
 过程日志写到 stderr，终态 JSON 写到 stdout；运行证据默认位于
 `.newide/task-runs/<timestamp>/`，生成文件位于 `--workspace`。完整参数见：

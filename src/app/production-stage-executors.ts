@@ -212,9 +212,7 @@ export function createProductionStageExecutors(
           input_artifact_refs: [],
           context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
           schema_version: SCHEMA_VERSION,
-          ...(context.memory_ablation
-            ? { memory_ablation: context.memory_ablation }
-            : {}),
+          ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
           ...(context.session_id ? { session_id: context.session_id } : {}),
           ...(context.cursor_input.mailbox_delivery_id
             ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
@@ -239,6 +237,7 @@ export function createProductionStageExecutors(
           context_pack_ref: result.context_pack_ref,
           memory_buffer_ref: result.memory_buffer_ref,
           diagnostics: result.diagnostics,
+          ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
         });
         emit(context, 'agent.execution_completed', result.agent_run_id, {
           agent_id: result.agent_id ?? result.role_id,
@@ -252,6 +251,7 @@ export function createProductionStageExecutors(
           transcript_ref: result.transcript_ref.artifact_id,
           context_pack_ref: result.context_pack_ref,
           memory_buffer_ref: result.memory_buffer_ref,
+          ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
           driver_run_result_id: result.driver_run_result_id,
           diagnostics: result.diagnostics,
         });
@@ -328,6 +328,9 @@ export function createProductionStageExecutors(
             ? { ablation: context.memory_ablation }
             : {}),
         });
+        if (planFirst) {
+          throw new Error(`Primary Agent ended with status ${result.status}`);
+        }
         return {
           changeset_ref: selection.manifest_ref,
           expected_sha256: selection.expected_sha256,
@@ -379,9 +382,7 @@ export function createProductionStageExecutors(
         context_pack_ref: result.context_pack_ref,
         memory_buffer_ref: result.memory_buffer_ref,
         diagnostics: result.diagnostics,
-        ...(context.memory_ablation
-          ? { ablation: context.memory_ablation }
-          : {}),
+        ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
       });
       emit(context, 'agent.execution_completed', result.agent_run_id, {
         agent_id: result.agent_id ?? result.role_id,
@@ -472,6 +473,7 @@ export function createProductionStageExecutors(
           evidence_pack: evidencePack,
           question: context.task_request.spec,
           workspace_path: context.workspace_path,
+          proposal_agent_id: primary.agent_id ?? primary.role_id,
           ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
         },
         {
@@ -828,6 +830,9 @@ async function executeFinalCouncilPlan(input: {
       input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
       context_policy: 'council_plan_execution',
       schema_version: SCHEMA_VERSION,
+      ...(input.context.memory_ablation
+        ? { memory_ablation: input.context.memory_ablation }
+        : {}),
     },
     {
       ...(input.context.signal ? { signal: input.context.signal } : {}),

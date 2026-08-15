@@ -198,7 +198,7 @@ pnpm eval:instance -- --instance-id <instance-id> --mode real --model <name> `
 
 ## 方向一：SWE-EVO 记忆消融批跑（agent 直写 worktree）
 
-能力向闭环：**按需懒 clone mirror → ephemeral worktree @ `base_commit` → agent 直接改盘 → 结束后 `git diff` 收 patch → predictions（可选 harness）**。
+能力向闭环：**按需懒 clone mirror（路径可配置）→ ephemeral worktree @ `base_commit` → agent 直接改盘 → 结束后 `git diff` 收 patch → predictions（可选 harness）**。
 
 不默认「先把 subset 里所有 repo 一次缓存满」。Mirror 根目录默认 `.newide/eval-mirrors`（`NEWIDE_SWE_MIRRORS_ROOT` 可改）。同 repo 多 instance / 多 ablation 共用 mirror；每任务另开 ephemeral，跑完默认删除 worktree。
 
@@ -248,7 +248,7 @@ pnpm eval:build-pr-context -- --subset v0-repo-full
 pnpm eval:sweevo-ablation -- --subset v0-repo-full-prctx --ablations "B0,B1,B2" --run-harness
 ```
 
-产物：`../.newide-experiments/sweevo-ablation/<ts>/`（可用 `NEWIDE_SWEEVO_ABLATION_ROOT` 改根）。后端 `summary.worktree_path` 在传入 `workspace_path` 时绑定 agent 的 git 树；评测用 `--allow-dirty-worktree` 从该树相对 `base_commit` 收集 patch。契约见 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)。
+产物默认写入 `.newide/eval-runs/sweevo-ablation/<ts>/`（可用 `NEWIDE_SWEEVO_ABLATION_ROOT` 改根）。后端 `summary.worktree_path` 在传入 `workspace_path` 时绑定 agent 的 git 树；评测用 `--allow-dirty-worktree` 从该树相对 `base_commit` 收集 patch。契约见 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)。
 
 ## 怎么理解这套系统
 

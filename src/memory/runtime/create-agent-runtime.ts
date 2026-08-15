@@ -32,6 +32,7 @@ import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { InMemoryBufferRepository } from '../adapters/in-memory-buffer-repository';
 import { PgMemoryRepository } from '../adapters/pg-memory-repository';
 import { FileBufferRepository } from '../adapters/file-buffer-repository';
+import { createPGlitePool } from '../adapters/pglite-pool';
 import { InvokeDriverTool, type DriverHandler } from './tools/invoke-driver-tool';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { BufferRepository } from '../ports/buffer-repository';
@@ -56,8 +57,13 @@ export interface PgPoolConfig {
 export interface AgentRuntimeConfig {
   /** 存储配置 */
   storage?: {
-    /** 提供则使用 PgMemoryRepository；不提供则使用 InMemoryRepository */
+    /** 提供则使用 PgMemoryRepository + 外部 PostgreSQL；不提供则视 pglite 与默认策略而定 */
     pg?: PgPoolConfig;
+    /** 提供则使用 PgMemoryRepository + 嵌入式 PGlite（WASM PostgreSQL，无需 Docker） */
+    pglite?: {
+      /** PGlite 数据目录；省略则使用内存数据库 */
+      dataDir?: string;
+    };
     /** 提供则使用 FileBufferRepository（存储路径）；不提供则使用 InMemoryBufferRepository */
     agentStateRoot?: string;
   };
@@ -88,7 +94,7 @@ export interface AgentRuntimeConfig {
  */
 export async function createAgentRuntime(config: AgentRuntimeConfig): Promise<AgentManager> {
   // 1. 选择存储实现
-  const repository = createMemoryRepository(config.storage, config.embedding);
+  const repository = await createMemoryRepository(config.storage, config.embedding);
   const bufferRepository = createBufferRepository(config.storage);
 
   // 2. 构建工具列表
@@ -130,10 +136,10 @@ export async function createAgentRuntime(config: AgentRuntimeConfig): Promise<Ag
 // 内部工厂
 // ──────────────────────────────────────────────
 
-function createMemoryRepository(
+async function createMemoryRepository(
   storage?: AgentRuntimeConfig['storage'],
   embedding?: EmbeddingProvider,
-): MemoryRepository {
+): Promise<MemoryRepository> {
   if (storage?.pg) {
     const pool = new Pool({
       connectionString: storage.pg.connectionString,
@@ -144,6 +150,12 @@ function createMemoryRepository(
       password: storage.pg.password,
       max: storage.pg.max ?? 10,
     });
+    return new PgMemoryRepository({ pool, ...(embedding ? { embedding } : {}) });
+  }
+  if (storage?.pglite) {
+    const pool = await createPGlitePool(
+      storage.pglite.dataDir ? { dataDir: storage.pglite.dataDir } : {},
+    );
     return new PgMemoryRepository({ pool, ...(embedding ? { embedding } : {}) });
   }
   return new InMemoryRepository(embedding);

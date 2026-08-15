@@ -89,8 +89,13 @@ function loadLocalEnv(): void {
 async function resolveProviderModel(provider: string, modelId: string): Promise<LanguageModel> {
   switch (provider) {
     case 'openai': {
-      const { openai } = await import('@ai-sdk/openai');
-      return openai.chat(modelId) as LanguageModel;
+      const { createOpenAI } = await import('@ai-sdk/openai');
+      // 显式按当前 env 创建 provider：模块级默认 `openai` 实例在模块加载时
+      // 读取 OPENAI_BASE_URL，若当时未设置会被钉死在 api.openai.com。
+      return createOpenAI({
+        ...(process.env.OPENAI_API_KEY ? { apiKey: process.env.OPENAI_API_KEY } : {}),
+        ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
+      }).chat(modelId) as LanguageModel;
     }
     case 'anthropic': {
       const { anthropic } = await import('@ai-sdk/anthropic');

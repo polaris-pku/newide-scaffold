@@ -131,6 +131,19 @@ function loadEnvFiles(configDir?: string): void {
       // skip unreadable files
     }
   }
+
+  // deepseek 凭证 → OpenAI 兼容环境（与 src/memory 下 adapter 的映射一致）。
+  // 必须在任何 `@ai-sdk/openai` 首次 import 之前完成：该包在模块加载时创建
+  // 默认 provider 并读取 OPENAI_BASE_URL，若此时未设置会把 baseURL 钉死在
+  // https://api.openai.com/v1，之后所有 LLM 调用都会连到 api.openai.com。
+  if (process.env.LLM_PROVIDER === 'deepseek' && process.env.DEEPSEEK_API_KEY) {
+    if (!process.env.OPENAI_API_KEY) {
+      process.env.OPENAI_API_KEY = process.env.DEEPSEEK_API_KEY;
+    }
+    if (!process.env.OPENAI_BASE_URL) {
+      process.env.OPENAI_BASE_URL = 'https://api.deepseek.com/v1';
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -206,8 +219,14 @@ export class LiteLLMClient {
     let factory: ProviderFactory;
     switch (provider) {
       case 'openai': {
-        const { openai } = await import('@ai-sdk/openai');
-        factory = (id) => openai(id);
+        const { createOpenAI } = await import('@ai-sdk/openai');
+        // 显式按当前 env 创建 provider，而不是使用模块级默认 `openai` 实例
+        // （后者在模块加载时读取 OPENAI_BASE_URL，可能已被钉死为 api.openai.com）。
+        factory = (id) =>
+          createOpenAI({
+            ...(process.env.OPENAI_API_KEY ? { apiKey: process.env.OPENAI_API_KEY } : {}),
+            ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
+          })(id);
         break;
       }
       case 'anthropic': {

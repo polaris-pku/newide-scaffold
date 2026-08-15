@@ -314,6 +314,7 @@ describe('TaskProcessor', () => {
       task_request: taskRequest,
       workspace_path: '/workspace',
       mode: 'single_agent',
+      memory_ablation: 'B0',
       cursor_input: selectInput,
     });
     processor.startStage({
@@ -382,6 +383,7 @@ describe('TaskProcessor', () => {
       task_request: taskRequest,
       workspace_path: '/workspace',
       mode: 'single_agent',
+      memory_ablation: 'B0',
       session_id: 'session_sender',
       restarted_from_run_id: 'run_mailbox_sender',
       run_intent: {
@@ -397,6 +399,7 @@ describe('TaskProcessor', () => {
 
     expect(processor.getRunExecutionState('run_mailbox_continuation')).toMatchObject({
       task_id: 'task_mailbox_continue',
+      memory_ablation: 'B0',
       resume_cursor: 'execute_agent',
       cursor_input: {
         winner_agent_id: 'agent_a',

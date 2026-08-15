@@ -11,6 +11,7 @@ import {
 } from '../app/backend-rpc-stdio';
 import type { NewideBackendService } from '../app/newide-backend-service';
 import type { RunSnapshot } from '../protocol/run-snapshot';
+import type { TaskSnapshot } from '../protocol/task-snapshot';
 import type { CapabilityStatusV1 } from '../protocol/system-status';
 
 const COUNCIL_CLI_CONTRACT = 'newide.eval.council.v1';
@@ -80,14 +81,24 @@ async function runCouncilCli(args: string[]): Promise<number> {
     runId = created.run_id;
     process.stderr.write(`[newide] Council run created: ${created.run_id}\n`);
 
-    await waitForTerminal(service, created.run_id, options.timeout_ms);
-    const snapshot = service.getRunSnapshot(created.run_id);
+    const task = await waitForTaskTerminal(service, created.task_id, options.timeout_ms);
+    const terminalRunId = latestTerminalRunId(task);
+    runId = terminalRunId;
+    await waitForTerminal(service, terminalRunId, options.timeout_ms);
+    const snapshot = service.getRunSnapshot(terminalRunId);
     process.stdout.write(
       `${JSON.stringify(
-        buildCouncilCliResult(snapshot, options, councilCapability, readiness.service.status),
+        buildCouncilCliResult(
+          snapshot,
+          options,
+          councilCapability,
+          readiness.service.status,
+          undefined,
+          task.task.status,
+        ),
       )}\n`,
     );
-    return snapshot.status === 'completed' ? 0 : 1;
+    return task.task.status === 'completed' && snapshot.status === 'completed' ? 0 : 1;
   } catch (error) {
     const message = toMessage(error);
     if (service && runId) {
@@ -221,12 +232,13 @@ function buildCouncilCliResult(
   capability: CapabilityStatusV1,
   serviceStatus: string,
   cliError?: { code: string; message: string },
+  taskStatus?: string,
 ): Record<string, unknown> {
   const links = snapshot.links ?? {};
   const councilResult = snapshot.council?.result ?? {};
   return {
     contract_version: COUNCIL_CLI_CONTRACT,
-    status: snapshot.status,
+    status: taskStatus ?? snapshot.status,
     quality: snapshot.council?.result?.quality ?? snapshot.quality?.status ?? null,
     run_id: snapshot.run_id,
     task_id: snapshot.task_id,
@@ -272,6 +284,33 @@ async function waitForTerminal(
   }
 }
 
+async function waitForTaskTerminal(
+  service: NewideBackendService,
+  taskId: string,
+  timeoutMs: number,
+): Promise<TaskSnapshot> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      service.waitForTaskTerminal(taskId),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`Council task timed out after ${String(timeoutMs)}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function latestTerminalRunId(task: TaskSnapshot): string {
+  const latest = task.run_history[0];
+  if (!latest) throw new Error(`Task ${task.task.task_id} has no terminal Run`);
+  return latest.run_id;
+}
+
 function withStateRoot(env: NodeJS.ProcessEnv, stateRoot?: string): NodeJS.ProcessEnv {
   return stateRoot ? { ...env, NEWIDE_STATE_ROOT: path.resolve(stateRoot) } : env;
 }
@@ -306,7 +345,10 @@ function toMessage(error: unknown): string {
 }
 
 function isTimeoutError(message: string): boolean {
-  return message.startsWith('Council run timed out after ');
+  return (
+    message.startsWith('Council run timed out after ') ||
+    message.startsWith('Council task timed out after ')
+  );
 }
 
 function writeUsage(): void {

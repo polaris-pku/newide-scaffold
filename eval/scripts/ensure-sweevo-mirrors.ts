@@ -44,7 +44,7 @@ async function main(): Promise<void> {
       [
         'Usage: pnpm eval:ensure-mirrors -- --instance-id <id> [--subset v0-smoke]',
         '   or: pnpm eval:ensure-mirrors -- --repo owner/name --base-commit <sha>',
-        'Mirrors land under .newide/eval-mirrors (NEWIDE_SWE_MIRRORS_ROOT).',
+        'Mirrors default to .newide/eval-mirrors (NEWIDE_SWE_MIRRORS_ROOT overrides it).',
         'Do not pass a whole subset without --instance-id — that would pull every repo.',
       ].join('\n'),
     );

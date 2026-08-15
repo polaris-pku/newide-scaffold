@@ -3,10 +3,11 @@
  *
  * 索引层 description_embedding 与载荷 JSON 同库（Spec §7.1）。
  * 调用 ensurePgMemorySchema 创建 extension 与表结构。
+ * 只依赖最小 SqlPool 接口，pg.Pool 与 PGlite 适配器均可满足。
  */
-import type { Pool } from 'pg';
+import type { SqlPool } from '../ports/sql-pool';
 
-export async function ensurePgMemorySchema(pool: Pool, dimensions: number): Promise<void> {
+export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): Promise<void> {
   if (!Number.isInteger(dimensions) || dimensions <= 0) {
     throw new Error(`Invalid embedding dimensions: ${dimensions}`);
   }

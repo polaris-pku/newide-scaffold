@@ -1,7 +1,15 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-const IGNORED_DIRECTORIES = new Set(['.git', '.newide', 'node_modules']);
+const IGNORED_DIRECTORIES = new Set([
+  '.git',
+  '.newide',
+  'node_modules',
+  '__pycache__',
+  '.pytest_cache',
+  '.mypy_cache',
+  '.ruff_cache',
+]);
 
 export type WorkspaceFileSnapshot = ReadonlyMap<string, string>;
 
@@ -41,6 +49,27 @@ export function diffWorkspaceFiles(
   return [...candidates]
     .filter((file) => before.get(file) !== after.get(file))
     .sort((left, right) => left.localeCompare(right));
+}
+
+/** Files that can represent intentional source changes and may become delivery artifacts. */
+export function isDeliverableWorkspacePath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  return (
+    parts.every(
+      (part) =>
+        part !== '.claude' &&
+        part !== '.newide' &&
+        part !== '__pycache__' &&
+        part !== '.pytest_cache' &&
+        part !== '.mypy_cache' &&
+        part !== '.ruff_cache',
+    ) &&
+    !parts.some((part) => part.startsWith('.')) &&
+    !/\.py[co]$/i.test(normalized) &&
+    !normalized.endsWith('_report.txt') &&
+    path.basename(normalized) !== '.DS_Store'
+  );
 }
 
 function toWorkspaceRelativePath(workspacePath: string, absolutePath: string): string {

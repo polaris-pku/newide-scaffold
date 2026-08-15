@@ -15,6 +15,7 @@ const DEFAULT_MIRROR_LOCK_STALE_MS = 60 * 60 * 1000;
  * (override with NEWIDE_SWE_MIRRORS_ROOT or --mirrors-root).
  */
 export const DEFAULT_SWE_MIRRORS_ROOT_SEGMENTS = ['.newide', 'eval-mirrors'] as const;
+export const DEFAULT_SWE_MIRRORS_ROOT = path.join(...DEFAULT_SWE_MIRRORS_ROOT_SEGMENTS);
 
 export interface EnsureRepoMirrorOptions {
   /** GitHub-style repo id, e.g. `conan-io/conan`. */
