@@ -907,6 +907,39 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(repository.managerLoadCount).toBe(2);
   });
 
+  it('recovers a failed role before the next queued execution', async () => {
+    const roleId = 'failed_then_recovered_role';
+    const repository = new CountingManagerLoadRepository();
+    const delegate = invokeDriverLlm();
+    let failFirstCall = true;
+    const llm: ToolCallingClient = {
+      completeWithTools(input) {
+        if (failFirstCall) {
+          failFirstCall = false;
+          throw new Error('Transient top-level LLM failure');
+        }
+        return delegate.completeWithTools(input);
+      },
+    };
+    const { facade } = createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      llm,
+      repository,
+    );
+
+    await expect(facade.runAgent(request('task_failed_once', roleId))).resolves.toMatchObject({
+      status: 'failed',
+      diagnostics: { dispatch_status: 'failed' },
+    });
+    await expect(facade.runAgent(request('task_after_failure', roleId))).resolves.toMatchObject({
+      status: 'completed',
+      agent_id: roleId,
+      memory_buffer_ref: `${roleId}:1`,
+    });
+    expect(repository.managerLoadCount).toBe(2);
+  });
+
   it('continues a queued role execution after the active execution is aborted', async () => {
     const controller = new AbortController();
     const driver = new AbortOnceDriver();
