@@ -31,6 +31,7 @@ import {
   InMemoryRepository,
   MARKET_POOL_ROLE_ID,
   RepositoryAgentBoardQuery,
+  reviewSkill,
 } from '../../src/memory';
 import type { SkillRecord } from '../../src/memory/schemas';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../../src/rpc/json-rpc-dispatcher';
@@ -70,8 +71,13 @@ describe('memory RPC market and retire wiring', () => {
     );
 
     const service = new BMemoryBackendService(
-      { boardQuery: new RepositoryAgentBoardQuery(repository), maintenance: fakeMaintenance() },
+      {
+        boardQuery: new RepositoryAgentBoardQuery(repository),
+        maintenance: fakeMaintenance(),
+        reviewSkill: (input) => reviewSkill(repository, input),
+      },
       { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
+      {},
       repository,
       {
         retireAgent: (roleId, options) => manager.retireAgent(roleId, options),
@@ -254,8 +260,13 @@ describe('memory RPC market and retire wiring', () => {
     await facade.ready();
 
     const bMemoryService = new BMemoryBackendService(
-      { boardQuery: new RepositoryAgentBoardQuery(repository), maintenance: fakeMaintenance() },
+      {
+        boardQuery: new RepositoryAgentBoardQuery(repository),
+        maintenance: fakeMaintenance(),
+        reviewSkill: (input) => reviewSkill(repository, input),
+      },
       { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
+      {},
       repository,
       {
         retireAgent: (roleId, options) => facade.retireAgent(roleId, options),
@@ -361,6 +372,10 @@ function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
       service.marketImport(roleId, sourceSkillId),
     retireMemoryAgent: (roleId, options) => service.retireAgent(roleId, options),
     runRetirementScan: (roleId) => service.runRetirementScan(roleId),
+    approveMemorySkill: (roleId, skillId, reviewedBy) =>
+      service.approveSkill(roleId, skillId, reviewedBy),
+    rejectMemorySkill: (roleId, skillId, reviewedBy) =>
+      service.rejectSkill(roleId, skillId, reviewedBy),
   }).register(dispatcher);
   return dispatcher;
 }
