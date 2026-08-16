@@ -25,6 +25,7 @@ export interface PersistedRunRequest {
   session_id?: string;
   task_request?: TaskCreateRequest;
   mode: AppRunMode;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   project_id?: string;
   client_task_id?: string;
   title?: string;
@@ -40,6 +41,7 @@ export interface RunHistoryEntry {
   restartable: boolean;
   task_id?: string;
   mode?: AppRunMode;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   prompt?: string;
   workspace_path?: string;
   session_id?: string;
@@ -145,6 +147,9 @@ export class FileRunRequestStore implements RunRequestStore {
         ? {
             task_id: request.task_id,
             mode: request.mode,
+            ...(request.memory_ablation
+              ? { memory_ablation: request.memory_ablation }
+              : {}),
             prompt: request.prompt,
             workspace_path: request.workspace_path,
             created_at: request.created_at,
@@ -236,6 +241,7 @@ function isPersistedRunRequest(value: unknown): value is PersistedRunRequest {
     typeof record.prompt === 'string' &&
     typeof record.workspace_path === 'string' &&
     (record.task_request === undefined || isTaskCreateRequest(record.task_request)) &&
+    (record.memory_ablation === undefined || asMemoryAblation(record.memory_ablation) !== undefined) &&
     asRunMode(record.mode) !== undefined
   );
 }
@@ -267,6 +273,12 @@ function asTerminalStatus(value: unknown): 'completed' | 'failed' | 'cancelled' 
 
 function asRunMode(value: unknown): AppRunMode | undefined {
   return value === 'single_agent' || value === 'council' ? value : undefined;
+}
+
+function asMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | undefined {
+  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3'
+    ? value
+    : undefined;
 }
 
 function asString(value: unknown): string | undefined {

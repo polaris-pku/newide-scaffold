@@ -4,10 +4,13 @@
  * 长期记忆（Persona / Skills / Experiences）落盘至 PostgreSQL；
  * description_embedding 使用 pgvector 做余弦相似度 top-K 检索。
  * Buffer 队列见 BufferRepository。
+ * 只依赖最小 SqlPool 接口，pg.Pool（外部 PostgreSQL）与 PGlitePool（嵌入式）
+ * 均可注入；SQL 与 pgvector 语义完全一致。
  */
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import { nowTimestamp } from '../../core';
+import type { SqlPool } from '../ports/sql-pool';
 import {
   AgentHandleSchema,
   AgentMetricsSchema,
@@ -45,8 +48,8 @@ import { ensurePgMemorySchema } from './pg-memory-schema';
 
 /** PgMemoryRepository 构造选项 */
 export interface PgMemoryRepositoryOptions {
-  /** 已配置的 PostgreSQL 连接池 */
-  pool: Pool;
+  /** 已配置的 SQL 连接池（pg.Pool 或 PGlite 适配器） */
+  pool: SqlPool;
   /** 写入时补全 description_embedding；默认 HashEmbeddingProvider */
   embedding?: EmbeddingProvider;
   /** 首次访问前自动建表（默认 true） */
@@ -58,7 +61,7 @@ function toPgVector(values: number[]): string {
 }
 
 export class PgMemoryRepository implements MemoryRepository {
-  private readonly pool: Pool;
+  private readonly pool: SqlPool;
   private readonly embedding: EmbeddingProvider;
   private readonly autoMigrate: boolean;
   private schemaReady: Promise<void> | undefined;

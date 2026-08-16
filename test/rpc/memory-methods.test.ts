@@ -47,6 +47,17 @@ describe('MemoryRpcMethods', () => {
       retireMemoryAgent,
       runRetirementScan,
     });
+    const approveMemorySkill = vi.fn(async () => ({
+      id: 'skill_1',
+      review_status: 'approved',
+      reviewed_by: 'reviewer',
+    }) as never);
+    const rejectMemorySkill = vi.fn(async () => ({
+      id: 'skill_2',
+      review_status: 'rejected',
+      reviewed_by: 'reviewer',
+    }) as never);
+    const service = fakeService({ promoteMemorySkills, approveMemorySkill, rejectMemorySkill });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
     const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
@@ -71,28 +82,34 @@ describe('MemoryRpcMethods', () => {
       '{"jsonrpc":"2.0","id":6,"method":"memory.promoteSkills","params":{"role_id":"role_ts_engineer","requested_by":"user"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":7,"method":"memory.listSkills","params":{"role_id":"role_ts_engineer","extra":true}}',
+      '{"jsonrpc":"2.0","id":7,"method":"memory.approveSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1","reviewed_by":"reviewer"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":8,"method":"memory.marketSearch","params":{"query":"typescript","top_k":5,"exclude_agent_id":"role_ts_engineer"}}',
+      '{"jsonrpc":"2.0","id":8,"method":"memory.rejectSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_2","reviewed_by":"reviewer"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":9,"method":"memory.marketImport","params":{"role_id":"role_ts_engineer","source_skill_id":"skill_source"}}',
+      '{"jsonrpc":"2.0","id":9,"method":"memory.listSkills","params":{"role_id":"role_ts_engineer","extra":true}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":10,"method":"memory.retireAgent","params":{"role_id":"role_ts_engineer","reason":"performance_degradation","replacement":"seeded_slate"}}',
+      '{"jsonrpc":"2.0","id":10,"method":"memory.marketSearch","params":{"query":"typescript","top_k":5,"exclude_agent_id":"role_ts_engineer"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":11,"method":"memory.retireAgent","params":{"role_id":"role_ts_engineer","reason":"bogus"}}',
+      '{"jsonrpc":"2.0","id":11,"method":"memory.marketImport","params":{"role_id":"role_ts_engineer","source_skill_id":"skill_source"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":12,"method":"memory.retirementScan","params":{}}',
+      '{"jsonrpc":"2.0","id":12,"method":"memory.retireAgent","params":{"role_id":"role_ts_engineer","reason":"performance_degradation","replacement":"seeded_slate"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":13,"method":"memory.retirementScan","params":{"role_id":"role_ts_engineer"}}',
+      '{"jsonrpc":"2.0","id":13,"method":"memory.retireAgent","params":{"role_id":"role_ts_engineer","reason":"bogus"}}',
     );
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":14,"method":"memory.retirementScan","params":{"role_id":"","extra":true}}',
+      '{"jsonrpc":"2.0","id":14,"method":"memory.retirementScan","params":{}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":15,"method":"memory.retirementScan","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":16,"method":"memory.retirementScan","params":{"role_id":"","extra":true}}',
     );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
@@ -104,8 +121,7 @@ describe('MemoryRpcMethods', () => {
             operations: {
               list_experiences: { status: 'available' },
               approve_skill: {
-                status: 'unavailable',
-                reason: expect.any(String),
+                status: 'available',
               },
               update_persona: {
                 status: 'unavailable',
@@ -121,11 +137,13 @@ describe('MemoryRpcMethods', () => {
       { id: 4, result: { skills: [{ id: 'skill_1' }] } },
       { id: 5, result: { maintenance: [{ maintenance_ref: 'b_maintenance_1' }] } },
       { id: 6, result: { maintenance: { requested_by: 'user' } } },
-      { id: 7, error: { code: -32602, message: 'Invalid params' } },
-      { id: 8, result: { skills: [{ id: 'skill_market_1' }] } },
-      { id: 9, result: { import: { imported: { id: 'skill_imported' }, created: true } } },
+      { id: 7, result: { skill: { id: 'skill_1', review_status: 'approved' } } },
+      { id: 8, result: { skill: { id: 'skill_2', review_status: 'rejected' } } },
+      { id: 9, error: { code: -32602, message: 'Invalid params' } },
+      { id: 10, result: { skills: [{ id: 'skill_market_1' }] } },
+      { id: 11, result: { import: { imported: { id: 'skill_imported' }, created: true } } },
       {
-        id: 10,
+        id: 12,
         result: {
           retire: {
             role_id: 'role_ts_engineer',
@@ -134,12 +152,22 @@ describe('MemoryRpcMethods', () => {
           },
         },
       },
-      { id: 11, error: { code: -32602, message: 'Invalid params' } },
-      { id: 12, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
-      { id: 13, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
-      { id: 14, error: { code: -32602, message: 'Invalid params' } },
+      { id: 13, error: { code: -32602, message: 'Invalid params' } },
+      { id: 14, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
+      { id: 15, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
+      { id: 16, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
+    expect(approveMemorySkill).toHaveBeenCalledWith(
+      'role_ts_engineer',
+      'skill_1',
+      'reviewer',
+    );
+    expect(rejectMemorySkill).toHaveBeenCalledWith(
+      'role_ts_engineer',
+      'skill_2',
+      'reviewer',
+    );
     expect(marketSearchMemorySkills).toHaveBeenCalledWith({
       query: 'typescript',
       top_k: 5,
@@ -159,6 +187,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
   return {
     getMemoryCapabilities: () => ({
       schema_version: 'newide.b-memory-capabilities.v1',
+      skill_review: { mode: 'manual' },
       embedding: {
         provider: 'test',
         model: 'test-embedding',
@@ -172,8 +201,8 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         list_skills: { status: 'available' },
         list_maintenance: { status: 'available' },
         promote_skills: { status: 'available' },
-        approve_skill: { status: 'unavailable', reason: 'not exposed' },
-        reject_skill: { status: 'unavailable', reason: 'not exposed' },
+        approve_skill: { status: 'available' },
+        reject_skill: { status: 'available' },
         update_persona: { status: 'unavailable', reason: 'not exposed' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
@@ -225,6 +254,8 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
       },
     }),
     runRetirementScan: async () => [scanResult()],
+    approveMemorySkill: async () => ({ id: 'skill_1' } as never),
+    rejectMemorySkill: async () => ({ id: 'skill_1' } as never),
     ...overrides,
   };
 }

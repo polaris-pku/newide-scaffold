@@ -3,10 +3,12 @@
  *
  * Agent writes directly into an ephemeral git worktree @ base_commit.
  * After the run, eval collects the patch via git diff (collectWorktreePatch).
- * Repo mirrors are lazy-cloned under D:\newide-sweevo-mirrors (NEWIDE_SWE_MIRRORS_ROOT).
+ * Repo mirrors are lazy-cloned under NEWIDE_SWE_MIRRORS_ROOT. On non-Windows
+ * hosts the script defaults to .newide/eval-mirrors.
  *
  * Usage:
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
+ *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B0 --mode council --run-harness
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke
  */
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -23,6 +25,8 @@ import {
 import { runEvalInstance } from '../eval/run-instance-core';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
 
+type EvaluationRunMode = 'single_agent' | 'council';
+
 interface JsonRpcMessage {
   jsonrpc: '2.0';
   id?: number | null;
@@ -35,7 +39,13 @@ interface JsonRpcMessage {
 interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
   waitForTerminal(runId: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  waitForTaskTerminal(taskId: string, timeoutMs: number): Promise<TaskTerminalSnapshot>;
   close(): Promise<void>;
+}
+
+interface TaskTerminalSnapshot {
+  task: { task_id: string; status: string };
+  run_history: Array<{ run_id: string; status: string }>;
 }
 
 interface TokenUsage {
@@ -54,12 +64,14 @@ interface TokenUsage {
 
 interface InstanceRow {
   ablation: MemoryAblation;
+  run_mode: EvaluationRunMode;
   instance_id: string;
   repo: string;
   base_commit: string;
   mirror_path?: string;
   worktree_path?: string;
   backend_run_id?: string;
+  final_backend_run_id?: string;
   backend_task_id?: string;
   snapshot_status?: string;
   summary_path?: string;
@@ -78,20 +90,39 @@ interface InstanceRow {
 }
 
 const repoRoot = process.cwd();
+const configuredEnv = {
+  ...loadEnvFile(path.join(repoRoot, '.env')),
+  ...loadEnvFile(path.join(repoRoot, '.env.local')),
+};
+const baseEnv = {
+  ...configuredEnv,
+  ...process.env,
+  ACP_DRIVER_RUNNER_DIR:
+    process.env.ACP_DRIVER_RUNNER_DIR ??
+    configuredEnv.ACP_DRIVER_RUNNER_DIR ??
+    path.resolve(repoRoot, '..', 'acp-client-prototype'),
+  ACP_DRIVER_TIMEOUT_MS:
+    process.env.ACP_DRIVER_TIMEOUT_MS ?? configuredEnv.ACP_DRIVER_TIMEOUT_MS ?? '600000',
+};
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
-  process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
-    'D:\\Code\\NewIDE\\.newide-experiments\\sweevo-ablation',
+  baseEnv.NEWIDE_SWEEVO_ABLATION_ROOT ??
+    path.join(repoRoot, '.newide', 'eval-runs', 'sweevo-ablation'),
   stamp,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 900_000);
-const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
-const mirrorsRoot = resolveMirrorsRoot(readFlag('--mirrors-root'));
+const runTimeoutMs = readPositiveInt(baseEnv.ACCEPTANCE_RUN_TIMEOUT_MS, 900_000);
+const maintenanceWaitMs = readPositiveInt(baseEnv.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
+const mirrorsRoot = resolveMirrorsRoot(
+  readFlag('--mirrors-root') ??
+    baseEnv.NEWIDE_SWE_MIRRORS_ROOT ??
+    path.join(repoRoot, '.newide', 'eval-mirrors'),
+);
 
 const subsetId = readFlag('--subset') ?? 'v0-smoke';
 const instanceIdFilter = readFlag('--instance-id');
 const ablations = parseAblations(readFlag('--ablations') ?? 'B0,B1,B2');
+const runMode = parseRunMode(readFlag('--mode') ?? 'single_agent');
 const modelName = readFlag('--model') ?? 'claude-acp-real';
 const runHarness = hasFlag('--run-harness');
 const harnessDryRun = hasFlag('--harness-dry-run');
@@ -115,32 +146,45 @@ for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
 
-const baseEnv = {
-  ...process.env,
-  ...loadEnvFile(path.join(repoRoot, '.env')),
-  ...loadEnvFile(path.join(repoRoot, '.env.local')),
-  ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
-  ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '600000',
-};
+const databaseUrlTemplate =
+  baseEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
+const claudeConfigDir = resolveClaudeConfigDir(baseEnv);
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
 log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')}`);
+log(`run mode=${runMode}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
+log(`CLAUDE_CONFIG_DIR: ${claudeConfigDir}`);
 
 const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> = [];
 
 for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
+  const stateRoot = path.join(armDir, 'state');
   await fs.mkdir(armDir, { recursive: true });
-  const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   log('');
   log(`=== arm ${ablation} ===`);
 
   const backend = await startBackend(ablation, {
     ...baseEnv,
     NEWIDE_B_DATABASE_URL: dbUrl,
+    NEWIDE_B_EMBEDDING_PROVIDER: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
+    NEWIDE_B_EMBEDDING_DIMENSIONS: baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32',
+    NEWIDE_STATE_ROOT: stateRoot,
+    ...(runMode === 'council'
+      ? {
+          NEWIDE_COUNCIL_STRATEGY: baseEnv.NEWIDE_COUNCIL_STRATEGY ?? 'plan_first',
+          NEWIDE_COUNCIL_SEATS:
+            baseEnv.NEWIDE_COUNCIL_SEATS ??
+            'role_fullstack_engineer,role_ts_engineer,role_code_reviewer,role_synthesis_engineer',
+          NEWIDE_AUCTION_ENABLED: baseEnv.NEWIDE_AUCTION_ENABLED ?? '0',
+          NEWIDE_PRIMARY_AGENT_ID:
+            baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
+        }
+      : {}),
   });
 
   const rows: InstanceRow[] = [];
@@ -149,7 +193,9 @@ for (const ablation of ablations) {
       const instance = getInstanceOrThrow(instancesById, instanceId);
       const row = await runOneInstance({
         ablation,
+        runMode,
         armDir,
+        stateRoot,
         backend,
         instance,
       });
@@ -192,6 +238,7 @@ const summary = {
   subset_id: subsetId,
   instance_ids: instanceIds,
   ablations,
+  run_mode: runMode,
   model_name: modelName,
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
@@ -217,13 +264,16 @@ if (failed) process.exitCode = 1;
 
 async function runOneInstance(input: {
   ablation: MemoryAblation;
+  runMode: EvaluationRunMode;
   armDir: string;
+  stateRoot: string;
   backend: BackendClient;
   instance: SweEvoInstance;
 }): Promise<InstanceRow> {
-  const { ablation, armDir, backend, instance } = input;
+  const { ablation, runMode, armDir, stateRoot, backend, instance } = input;
   const row: InstanceRow = {
     ablation,
+    run_mode: runMode,
     instance_id: instance.instance_id,
     repo: instance.repo,
     base_commit: instance.base_commit,
@@ -258,7 +308,7 @@ async function runOneInstance(input: {
 
     const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
       prompt: buildPrompt(instance),
-      mode: 'single_agent',
+      mode: runMode,
       workspace_path: prepared.worktreePath,
       memory_ablation: ablation,
       title: `${ablation}-${instance.instance_id}`,
@@ -267,7 +317,10 @@ async function runOneInstance(input: {
     row.backend_task_id = created.task_id;
 
     await backend.request('run.subscribe', { run_id: created.run_id });
-    const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
+    const taskSnapshot = await backend.waitForTaskTerminal(created.task_id, runTimeoutMs);
+    const finalRunId = latestTerminalRunId(taskSnapshot);
+    row.final_backend_run_id = finalRunId;
+    const snapshot = await backend.waitForTerminal(finalRunId, runTimeoutMs);
     row.snapshot_status = String(snapshot.status ?? '');
 
     if (ablation !== 'B0') {
@@ -275,7 +328,7 @@ async function runOneInstance(input: {
       await sleep(maintenanceWaitMs);
     }
 
-    const summaryPath = path.join(repoRoot, '.newide', 'runs', created.run_id, 'summary.json');
+    const summaryPath = path.join(stateRoot, 'runs', finalRunId, 'summary.json');
     row.summary_path = summaryPath;
     const summary = await readJsonIfExists(summaryPath);
     if (summary && typeof summary === 'object') {
@@ -299,10 +352,14 @@ async function runOneInstance(input: {
     row.token_usage = await collectClaudeTokenUsage({
       sessionId: row.session_id,
       worktreePath: prepared.worktreePath,
+      claudeConfigDir,
     });
 
     if (skipEval) {
-      row.status = 'skipped_eval';
+      row.status =
+        row.snapshot_status === 'succeeded' || row.snapshot_status === 'completed'
+          ? 'skipped_eval'
+          : 'failed';
       return row;
     }
 
@@ -402,8 +459,9 @@ function encodeClaudeProjectDir(worktreePath: string): string {
 async function collectClaudeTokenUsage(input: {
   sessionId?: string;
   worktreePath: string;
+  claudeConfigDir: string;
 }): Promise<TokenUsage> {
-  const claudeRoot = path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.claude');
+  const claudeRoot = input.claudeConfigDir;
   if (!claudeRoot || !existsSync(claudeRoot)) return emptyTokenUsage();
 
   const candidates: string[] = [];
@@ -415,6 +473,13 @@ async function collectClaudeTokenUsage(input: {
     );
     candidates.push(path.join(projectDir, `${input.sessionId}.jsonl`));
     candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
+    const projectsRoot = path.join(claudeRoot, 'projects');
+    const projectDirectories = await fs.readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
+    for (const directory of projectDirectories) {
+      if (!directory.isDirectory()) continue;
+      const candidate = path.join(projectsRoot, directory.name, `${input.sessionId}.jsonl`);
+      if (existsSync(candidate) && !candidates.includes(candidate)) candidates.push(candidate);
+    }
   }
 
   // Fallback: newest jsonl under the encoded project dir (useful if session_id mapping drifts).
@@ -464,13 +529,14 @@ async function sumUsageFromClaudeJsonl(
   let cacheRead = 0;
   let assistantMessages = 0;
   let matchedSessionId = expectedSessionId;
+  const seenMessageIds = new Set<string>();
 
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let obj: {
       type?: string;
       sessionId?: string;
-      message?: { usage?: Record<string, unknown> };
+      message?: { id?: string; usage?: Record<string, unknown> };
       usage?: Record<string, unknown>;
     };
     try {
@@ -480,6 +546,8 @@ async function sumUsageFromClaudeJsonl(
     }
     if (expectedSessionId && obj.sessionId && obj.sessionId !== expectedSessionId) continue;
     if (obj.sessionId) matchedSessionId = obj.sessionId;
+    if (obj.message?.id && seenMessageIds.has(obj.message.id)) continue;
+    if (obj.message?.id) seenMessageIds.add(obj.message.id);
     const usage = obj.message?.usage ?? obj.usage;
     if (!usage || typeof usage !== 'object') continue;
     if (obj.type !== 'assistant' && !obj.message?.usage) continue;
@@ -562,7 +630,7 @@ function summarizeTokens(rows: InstanceRow[]): {
 async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<BackendClient> {
   const child: ChildProcess = spawn(
     process.execPath,
-    ['--import', 'tsx', 'src/app/backend-rpc-stdio.ts'],
+    ['--import', 'tsx', 'src/app/backend-rpc-entry.ts'],
     {
       cwd: repoRoot,
       env,
@@ -579,6 +647,8 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
   const waiters = new Set<{
     predicate: (message: JsonRpcMessage) => boolean;
     resolve: (message: JsonRpcMessage) => void;
+    reject: (error: Error) => void;
+    timer?: NodeJS.Timeout;
   }>();
   createInterface({ input: child.stdout! }).on('line', (line) => {
     let message: JsonRpcMessage;
@@ -590,20 +660,38 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
     for (const waiter of waiters) {
       if (!waiter.predicate(message)) continue;
       waiters.delete(waiter);
+      if (waiter.timer) clearTimeout(waiter.timer);
       waiter.resolve(message);
     }
   });
+
+  const rejectWaiters = (reason: string) => {
+    for (const waiter of waiters) {
+      waiters.delete(waiter);
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.reject(new Error(`[${label}] backend ${reason}. stderr=${stderr.join('')}`));
+    }
+  };
+  child.once('error', (error) => rejectWaiters(`failed to start: ${error.message}`));
+  child.once('close', (code, signal) =>
+    rejectWaiters(`closed (code=${String(code)}, signal=${String(signal)})`),
+  );
 
   let nextId = 1;
   const request = async <T>(method: string, params: unknown): Promise<T> => {
     const id = nextId++;
     const waiting = new Promise<JsonRpcMessage>((resolve, reject) => {
-      const waiter = { predicate: (message: JsonRpcMessage) => message.id === id, resolve };
-      waiters.add(waiter);
-      setTimeout(() => {
+      const waiter = {
+        predicate: (message: JsonRpcMessage) => message.id === id,
+        resolve,
+        reject,
+        timer: undefined as NodeJS.Timeout | undefined,
+      };
+      waiter.timer = setTimeout(() => {
         if (!waiters.delete(waiter)) return;
         reject(new Error(`[${label}] timed out on ${method}. stderr=${stderr.join('')}`));
-      }, 60_000).unref();
+      }, 60_000);
+      waiters.add(waiter);
     });
     child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     const response = await waiting;
@@ -631,6 +719,17 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
     },
+    waitForTaskTerminal: async (taskId, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const snapshot = await request<TaskTerminalSnapshot>('task.get', { task_id: taskId });
+        if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+          return snapshot;
+        }
+        await sleep(1_000);
+      }
+      throw new Error(`[${label}] task ${taskId} did not finish within ${String(timeoutMs)}ms`);
+    },
     close: async () => {
       child.stdin?.end();
       const result = await Promise.race([closed, sleep(5_000).then(() => 'timeout' as const)]);
@@ -644,6 +743,12 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }
     },
   };
+}
+
+function latestTerminalRunId(snapshot: TaskTerminalSnapshot): string {
+  const latest = snapshot.run_history[0];
+  if (!latest) throw new Error(`Task ${snapshot.task.task_id} has no terminal Run`);
+  return latest.run_id;
 }
 
 function parseAblations(raw: string): MemoryAblation[] {
@@ -661,6 +766,11 @@ function parseAblations(raw: string): MemoryAblation[] {
   }
   if (out.length === 0) throw new Error('At least one ablation is required.');
   return out;
+}
+
+function parseRunMode(raw: string): EvaluationRunMode {
+  if (raw === 'single_agent' || raw === 'council') return raw;
+  throw new Error(`Invalid run mode "${raw}". Expected single_agent|council.`);
 }
 
 function sanitizeFileName(value: string): string {
@@ -701,6 +811,24 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
+  if (!template.includes('{ablation}')) {
+    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
+  }
+  return template.replaceAll('{ablation}', ablation.toLowerCase());
+}
+
+function resolveClaudeConfigDir(env: NodeJS.ProcessEnv): string {
+  const runnerDir = env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype');
+  const driverEnvFile = env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env');
+  const driverEnv = loadEnvFile(driverEnvFile);
+  return path.resolve(
+    driverEnv.CLAUDE_CONFIG_DIR ??
+      env.CLAUDE_CONFIG_DIR ??
+      path.join(env.USERPROFILE ?? env.HOME ?? '', '.claude'),
+  );
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {

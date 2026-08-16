@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createProductionBackendService,
   parseDriverEnv,
+  readAuctionEnabled,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
 import type { NewideBackendService } from '../../src/app/newide-backend-service';
@@ -29,6 +30,26 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
 } from '../../src/app/b-memory-maintenance-runner';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
+
+describe('readAuctionEnabled', () => {
+  it('defaults to true when unset', () => {
+    expect(readAuctionEnabled(undefined)).toBe(true);
+    expect(readAuctionEnabled('')).toBe(true);
+    expect(readAuctionEnabled('  ')).toBe(true);
+  });
+
+  it('parses disable and enable values', () => {
+    expect(readAuctionEnabled('0')).toBe(false);
+    expect(readAuctionEnabled('false')).toBe(false);
+    expect(readAuctionEnabled('FALSE')).toBe(false);
+    expect(readAuctionEnabled('1')).toBe(true);
+    expect(readAuctionEnabled('true')).toBe(true);
+  });
+
+  it('rejects invalid values', () => {
+    expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
 
 describe('backend RPC stdio entrypoint', () => {
   it('fails fast when the configured ACP runner directory does not exist', async () => {
@@ -527,9 +548,9 @@ describe('backend RPC stdio entrypoint', () => {
       expect(postCouncilSequence(councilEventTypes)).toEqual(expectedOrder);
       expect(
         readFileSync(path.join(runnerDir, 'invocations.log'), 'utf8').trim().split('\n'),
-      ).toHaveLength(12);
+      ).toHaveLength(10);
       expect(readFileSync(path.join(runnerDir, 'b-env.log'), 'utf8').trim().split('\n')).toEqual(
-        Array.from({ length: 12 }, () => 'absent'),
+        Array.from({ length: 10 }, () => 'absent'),
       );
       const driverPrompts = readFileSync(path.join(runnerDir, 'prompts.log'), 'utf8');
       expect(driverPrompts).toContain('Exercise production composition.');
@@ -649,7 +670,9 @@ describe('backend RPC stdio entrypoint', () => {
       env: {
         ...process.env,
         ACP_DRIVER_RUNNER_DIR: runnerDir,
-        NEWIDE_B_DATABASE_URL: '   ',
+        // Unreachable host: embedded PGlite fallback is disabled by an explicit URL,
+        // so the PostgreSQL readiness gate fails and stdio must stay closed.
+        NEWIDE_B_DATABASE_URL: 'postgresql://nobody:wrong@127.0.0.1:1/newide',
         NEWIDE_COORDINATION_DB: path.join(runnerDir, 'coordination.sqlite'),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -663,7 +686,7 @@ describe('backend RPC stdio entrypoint', () => {
 
     expect(code).toBe(1);
     expect(stdout).toBe('');
-    expect(stderr).toContain('NEWIDE_B_DATABASE_URL is required for the production B runtime');
+    expect(stderr).toContain('PostgreSQL B memory storage readiness check failed');
     rmSync(runnerDir, { recursive: true, force: true });
   }, 15_000);
 

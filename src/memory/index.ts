@@ -54,6 +54,12 @@ export {
 } from './adapters/pg-memory-repository';
 export { ensurePgMemorySchema } from './adapters/pg-memory-schema';
 export {
+  createPGlitePool,
+  PGlitePool,
+  type PGlitePoolOptions,
+} from './adapters/pglite-pool';
+export type { SqlPool, SqlClient, SqlQueryResult } from './ports/sql-pool';
+export {
   FileBufferRepository,
   type FileBufferRepositoryOptions,
 } from './adapters/file-buffer-repository';

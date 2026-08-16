@@ -12,6 +12,7 @@ import {
 } from '../core';
 import {
   diffWorkspaceFiles,
+  isDeliverableWorkspacePath,
   snapshotWorkspaceFiles,
   type WorkspaceFileSnapshot,
 } from '../coordinator/workspace-change-detector';
@@ -1403,16 +1404,6 @@ export function mergeArtifacts(
     result.push(artifact);
   }
   return result;
-}
-
-function isDeliverableWorkspacePath(relativePath: string): boolean {
-  const parts = relativePath.split('/');
-  return (
-    parts.every((part) => part !== '.claude' && part !== '.newide') &&
-    !parts.some((part) => part.startsWith('.')) &&
-    !relativePath.endsWith('_report.txt') &&
-    path.basename(relativePath) !== '.DS_Store'
-  );
 }
 
 function mediaTypeFor(relativePath: string): string {

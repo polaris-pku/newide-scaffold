@@ -81,6 +81,7 @@ import type {
 import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
+import type { ReviewedSkill } from './b-public-capabilities';
 import {
   NoopDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
@@ -353,6 +354,14 @@ export class NewideBackendService {
     return this.requireBMemoryService().runRetirementScan(roleId);
   }
 
+  approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().approveSkill(roleId, skillId, reviewedBy);
+  }
+
+  rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().rejectSkill(roleId, skillId, reviewedBy);
+  }
+
   createRun(params: RunCreateParams): Promise<RunCreateResult> {
     return this.startRun(params);
   }
@@ -422,6 +431,9 @@ export class NewideBackendService {
           workspace_path: durableLaunch.workspace_path,
           mode: 'council',
           ...(durableLaunch.session_id ? { session_id: durableLaunch.session_id } : {}),
+          ...(durableLaunch.memory_ablation
+            ? { memory_ablation: durableLaunch.memory_ablation }
+            : {}),
         },
         { run_intent: { type: 'council_refinement' } },
       );
@@ -440,6 +452,7 @@ export class NewideBackendService {
         workspace_path: launch.workspace_path,
         mode: 'council',
         ...(launch.session_id ? { session_id: launch.session_id } : {}),
+        ...(launch.memory_ablation ? { memory_ablation: launch.memory_ablation } : {}),
       },
       { run_intent: { type: 'create' } },
     );
@@ -471,6 +484,7 @@ export class NewideBackendService {
         workspace_path: resume.workspace_path,
         mode: resume.mode,
         ...(resume.session_id ? { session_id: resume.session_id } : {}),
+        ...(resume.memory_ablation ? { memory_ablation: resume.memory_ablation } : {}),
       },
       {
         run_intent: { type: 'checkpoint_resume', strategy: 'from_checkpoint' },
@@ -591,6 +605,7 @@ export class NewideBackendService {
         ...(request.project_id ? { project_id: request.project_id } : {}),
         ...(request.client_task_id ? { client_task_id: request.client_task_id } : {}),
         ...(request.title ? { title: request.title } : {}),
+        ...(request.memory_ablation ? { memory_ablation: request.memory_ablation } : {}),
       },
       {
         run_intent: { type: 'create' },
@@ -615,7 +630,7 @@ export class NewideBackendService {
     if (this.closing) throw new Error('Backend service is closing');
     const processor = this.taskProcessor!;
     const loop = this.taskExecutionLoop!;
-    const mode = params.mode ?? 'single_agent';
+    const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
     const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
     const identity = {
@@ -635,6 +650,7 @@ export class NewideBackendService {
         task_request: taskRequest,
         workspace_path: workspacePath,
         mode,
+        ...(params.memory_ablation ? { memory_ablation: params.memory_ablation } : {}),
         run_intent: lineage?.run_intent ?? { type: 'create' },
         ...(params.session_id ? { session_id: params.session_id } : {}),
         ...(lineage?.restarted_from_run_id &&
@@ -658,6 +674,7 @@ export class NewideBackendService {
         workspace_path: workspacePath,
         mode,
         task_request: taskRequest,
+        ...(params.memory_ablation ? { memory_ablation: params.memory_ablation } : {}),
         ...(params.session_id ? { session_id: params.session_id } : {}),
         ...(params.project_id ? { project_id: params.project_id } : {}),
         ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
@@ -898,6 +915,7 @@ export class NewideBackendService {
         workspace_path: context.workspace_path,
         mode: context.mode,
         ...(context.session_id ? { session_id: context.session_id } : {}),
+        ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
       },
       {
         run_intent: { type: 'mailbox_continuation', source_delivery_id: sourceDeliveryId },
@@ -924,7 +942,7 @@ export class NewideBackendService {
     if (this.closing) {
       return Promise.reject(new Error('Backend service is closing'));
     }
-    const mode = params.mode ?? 'single_agent';
+    const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
     const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
     const controller = new AbortController();
@@ -1061,6 +1079,7 @@ export class NewideBackendService {
                 workspace_path: workspacePath,
                 mode,
                 task_request: taskRequest,
+                ...(params.memory_ablation ? { memory_ablation: params.memory_ablation } : {}),
                 ...(params.session_id ? { session_id: params.session_id } : {}),
                 ...(params.project_id ? { project_id: params.project_id } : {}),
                 ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
@@ -1234,6 +1253,20 @@ export class NewideBackendService {
     }
     if (before.status === 'running' && snapshot.status === 'running') {
       throw new Error(`Run ${runId} did not reach a terminal state`);
+    }
+  }
+
+  /**
+   * Wait through Mailbox continuation Runs until the long-lived Task itself is terminal.
+   * A Run completed with outcome=mailbox_wait is intentionally not a terminal Task result.
+   */
+  async waitForTaskTerminal(taskId: string): Promise<TaskSnapshot> {
+    for (;;) {
+      const snapshot = await this.getTask(taskId);
+      if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+        return snapshot;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
   }
 
@@ -1655,4 +1688,15 @@ function normalizeWorkspacePath(input: string): string {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * NEWIDE_DEFAULT_RUN_MODE 解析：run.create 未显式传 mode 时用该值决定
+ * single_agent / council。默认 single_agent。
+ */
+export function readDefaultRunMode(env: NodeJS.ProcessEnv): AppRunMode {
+  const raw = env.NEWIDE_DEFAULT_RUN_MODE?.trim();
+  if (!raw) return 'single_agent';
+  if (raw === 'council' || raw === 'single_agent') return raw;
+  throw new Error(`Invalid NEWIDE_DEFAULT_RUN_MODE: ${raw}. Expected council or single_agent.`);
 }

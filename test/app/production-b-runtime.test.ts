@@ -29,9 +29,19 @@ describe('createProductionBRuntime', () => {
     });
 
     expect(runtime.app_state_root).toBe(appStateRoot);
-    expect(runtime.market_agent_ids).toEqual(['role_fullstack_engineer', 'role_ts_engineer']);
+    expect(runtime.market_agent_ids).toEqual([
+      'role_fullstack_engineer',
+      'role_ts_engineer',
+      'role_code_reviewer',
+      'role_synthesis_engineer',
+    ]);
     expect(new Set(await runtime.repository.listAgentIds())).toEqual(
-      new Set(['role_fullstack_engineer', 'role_ts_engineer']),
+      new Set([
+        'role_fullstack_engineer',
+        'role_ts_engineer',
+        'role_code_reviewer',
+        'role_synthesis_engineer',
+      ]),
     );
     await expect(runtime.repository.getAgent('role_fullstack_engineer')).resolves.toMatchObject({
       tags: expect.arrayContaining(['market_eligible']),
@@ -49,10 +59,27 @@ describe('createProductionBRuntime', () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
-  it('requires PostgreSQL storage unless a host injects B public ports', async () => {
-    await expect(
-      createProductionBRuntime({}, { appStateRoot: await temporaryRoot() }),
-    ).rejects.toThrow('NEWIDE_B_DATABASE_URL is required for the production B runtime');
+  it('falls back to embedded PGlite when no database URL is configured', async () => {
+    const runtime = await createProductionBRuntime(
+      { NEWIDE_B_EMBEDDING_PROVIDER: 'hash' },
+      { appStateRoot: await temporaryRoot() },
+    );
+
+    expect(runtime.market_agent_ids).toEqual([
+      'role_fullstack_engineer',
+      'role_ts_engineer',
+      'role_code_reviewer',
+      'role_synthesis_engineer',
+    ]);
+    expect(new Set(await runtime.repository.listAgentIds())).toEqual(
+      new Set([
+        'role_fullstack_engineer',
+        'role_ts_engineer',
+        'role_code_reviewer',
+        'role_synthesis_engineer',
+      ]),
+    );
+    await runtime.close();
   });
 });
 

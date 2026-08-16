@@ -58,6 +58,8 @@
   "dependencies": {
     "@ai-sdk/anthropic": "4.0.9",
     "@ai-sdk/openai": "4.0.8",
+    "@electric-sql/pglite": "^0.5.5",
+    "@electric-sql/pglite-pgvector": "0.0.6",
     "ai": "7.0.17",
     "expr-eval": "2.0.2",
     "js-yaml": "5.2.1",

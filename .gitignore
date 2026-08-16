@@ -5,6 +5,8 @@ build/
 coverage/
 *.tsbuildinfo
 .vite/
+.pnpm-store/
+.npm-tmp-cache/
 
 # env & secrets —— 永远不要进仓
 .env

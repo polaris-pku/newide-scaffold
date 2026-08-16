@@ -15,7 +15,7 @@ import {
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
-import type { BPublicCapabilities } from './b-public-capabilities';
+import type { BPublicCapabilities, ReviewedSkill } from './b-public-capabilities';
 import { filterLegacyCouncilPseudoAgents } from './council-legacy-agent-filter';
 import type { BEmbeddingRuntimeInfo } from './production-b-runtime';
 
@@ -27,6 +27,9 @@ export interface BMemoryOperationCapability {
 export interface BMemoryCapabilities {
   schema_version: 'newide.b-memory-capabilities.v1';
   embedding: BEmbeddingRuntimeInfo;
+  skill_review: {
+    mode: 'manual' | 'auto_approve';
+  };
   operations: {
     list_agents: BMemoryOperationCapability;
     get_agent_persona: BMemoryOperationCapability;
@@ -53,22 +56,32 @@ export interface BMemoryLifecycle {
   /** 三重门控退休检测（week3 RFC §8.2）：只产出建议，不自动退休。 */
   runRetirementScan(roleId?: string): Promise<RetirementScanResult[]>;
 }
+export interface BMemoryBackendServiceOptions {
+  autoApprovePromotedSkills?: boolean;
+}
 
 export class BMemoryBackendService {
   constructor(
-    private readonly capabilities: Pick<BPublicCapabilities, 'boardQuery' | 'maintenance'>,
+    private readonly capabilities: Pick<
+      BPublicCapabilities,
+      'boardQuery' | 'maintenance' | 'reviewSkill'
+    >,
     private readonly embeddingInfo: BEmbeddingRuntimeInfo,
     // 以下三个为可选注入：不注入时对应能力在 getCapabilities() 里报告 unavailable，
     // 调用对应方法时抛出明确错误。保持与旧的两参构造签名向后兼容。
     private readonly repository?: MemoryRepository,
     private readonly lifecycle?: BMemoryLifecycle,
     private readonly embedding?: EmbeddingProvider,
+    private readonly options: BMemoryBackendServiceOptions = {},
   ) {}
 
   getCapabilities(): BMemoryCapabilities {
     return {
       schema_version: 'newide.b-memory-capabilities.v1',
       embedding: { ...this.embeddingInfo },
+      skill_review: {
+        mode: this.options.autoApprovePromotedSkills ? 'auto_approve' : 'manual',
+      },
       operations: {
         list_agents: { status: 'available' },
         get_agent_persona: { status: 'available' },
@@ -77,16 +90,12 @@ export class BMemoryBackendService {
         list_maintenance: { status: 'available' },
         promote_skills: {
           status: 'available',
-          reason: 'Promotion creates pending Skills; it does not approve them.',
+          reason: this.options.autoApprovePromotedSkills
+            ? 'Promoted Skills are approved automatically.'
+            : 'Promotion creates pending Skills for explicit review.',
         },
-        approve_skill: {
-          status: 'unavailable',
-          reason: 'B does not expose a public Skill approval transition.',
-        },
-        reject_skill: {
-          status: 'unavailable',
-          reason: 'B does not expose a public Skill rejection transition.',
-        },
+        approve_skill: { status: 'available' },
+        reject_skill: { status: 'available' },
         update_persona: {
           status: 'unavailable',
           reason: 'B does not expose a public Persona update transition.',
@@ -142,11 +151,21 @@ export class BMemoryBackendService {
     return this.capabilities.maintenance.listEvidence(roleId);
   }
 
-  promoteSkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
-    return this.capabilities.maintenance.promoteSkills({
+  async promoteSkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
+    const promotion = await this.capabilities.maintenance.promoteSkills({
       role_id: roleId,
       requested_by: requestedBy,
     });
+    if (!this.options.autoApprovePromotedSkills || promotion.status !== 'completed') {
+      return promotion;
+    }
+    const skills = await Promise.all(
+      promotion.skills.map(async (skill) => {
+        if (!isPendingSkill(skill)) return skill;
+        return this.approveSkill(roleId, skill.id, 'system:auto-approval');
+      }),
+    );
+    return { ...promotion, skills };
   }
 
   /** 技能市场检索：query 文本 → embedding → 全库 top-K 召回（Spec §6.2）。 */
@@ -183,4 +202,27 @@ export class BMemoryBackendService {
     }
     return this.lifecycle.runRetirementScan(roleId);
   }
+  approveSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.capabilities.reviewSkill({
+      role_id: roleId,
+      skill_id: skillId,
+      decision: 'approved',
+      reviewer: reviewedBy,
+    });
+  }
+
+  rejectSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.capabilities.reviewSkill({
+      role_id: roleId,
+      skill_id: skillId,
+      decision: 'rejected',
+      reviewer: reviewedBy,
+    });
+  }
+}
+
+function isPendingSkill(value: unknown): value is { id: string; review_status: 'pending' } {
+  if (!value || typeof value !== 'object') return false;
+  const skill = value as Record<string, unknown>;
+  return typeof skill.id === 'string' && skill.review_status === 'pending';
 }

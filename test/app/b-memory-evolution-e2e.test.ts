@@ -37,7 +37,8 @@ describe('B memory evolution end to end', () => {
   it('feeds an automatically persisted Experience into the next A DriverContext', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-evolution-'));
     roots.push(root);
-    const repository = new InMemoryRepository(alwaysRelevantEmbedding());
+    const embedding = alwaysRelevantEmbedding();
+    const repository = new InMemoryRepository(embedding);
     const bufferRepository = new InMemoryBufferRepository();
     const driver = new CapturingDriver();
     const maintenance = new BMemoryMaintenanceRunner({
@@ -51,6 +52,7 @@ describe('B memory evolution end to end', () => {
       repository,
       bufferRepository,
       llm: invokeDriverLlm(),
+      embedding,
       memoryMaintenance: maintenance,
     });
 
@@ -87,10 +89,11 @@ describe('B memory evolution end to end', () => {
     );
   });
 
-  it('persists an explicitly promoted pending Skill and exposes it through memory RPC', async () => {
+  it('promotes, approves, and retrieves a Skill through memory RPC', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-pending-skill-'));
     roots.push(root);
-    const repository = new InMemoryRepository(alwaysRelevantEmbedding());
+    const embedding = alwaysRelevantEmbedding();
+    const repository = new InMemoryRepository(embedding);
     const bufferRepository = new InMemoryBufferRepository();
     const driver = new CapturingDriver();
     const maintenance = new BMemoryMaintenanceRunner({
@@ -104,6 +107,7 @@ describe('B memory evolution end to end', () => {
       repository,
       bufferRepository,
       llm: invokeDriverLlm(),
+      embedding,
       memoryMaintenance: maintenance,
     });
 
@@ -114,25 +118,6 @@ describe('B memory evolution end to end', () => {
       content: 'Keep B behind public application ports.',
       confidence: 0.99,
       promoted_to: undefined,
-    });
-
-    const promotion = await maintenance.promoteSkills({
-      role_id: 'role_ts_engineer',
-      requested_by: 'user',
-    });
-    expect(promotion).toMatchObject({
-      status: 'completed',
-      skills: [expect.objectContaining({ review_status: 'pending' })],
-    });
-    const [storedSkill] = await repository.listSkills('role_ts_engineer');
-    const [storedExperience] = await repository.listExperiences('role_ts_engineer');
-    expect(storedSkill).toMatchObject({
-      review_status: 'pending',
-      promoted_from: sourceExperience!.id,
-    });
-    expect(storedExperience).toMatchObject({
-      id: sourceExperience!.id,
-      promoted_to: storedSkill!.id,
     });
 
     const dispatcher = memoryDispatcher(
@@ -159,6 +144,7 @@ describe('B memory evolution end to end', () => {
           readiness: 'verified',
         },
         repository,
+        { autoApprovePromotedSkills: true },
       ),
     );
     await expect(
@@ -171,6 +157,7 @@ describe('B memory evolution end to end', () => {
     ).resolves.toMatchObject({
       result: {
         capabilities: {
+          skill_review: { mode: 'auto_approve' },
           embedding: {
             provider: 'test',
             model: 'test-embedding',
@@ -178,16 +165,48 @@ describe('B memory evolution end to end', () => {
           },
           operations: {
             promote_skills: { status: 'available' },
-            approve_skill: { status: 'unavailable', reason: expect.any(String) },
+            approve_skill: { status: 'available' },
+            reject_skill: { status: 'available' },
             update_persona: { status: 'unavailable', reason: expect.any(String) },
           },
         },
       },
     });
+    const promotionResponse = await dispatcher.dispatch({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'memory.promoteSkills',
+      params: { role_id: 'role_ts_engineer', requested_by: 'evaluation' },
+    });
+    expect(promotionResponse).toMatchObject({
+      result: {
+        maintenance: {
+          status: 'completed',
+          skills: [
+            expect.objectContaining({
+              review_status: 'approved',
+              reviewed_by: 'system:auto-approval',
+              reviewed_at: expect.any(String),
+            }),
+          ],
+        },
+      },
+    });
+    const [storedSkill] = await repository.listSkills('role_ts_engineer');
+    const [storedExperience] = await repository.listExperiences('role_ts_engineer');
+    expect(storedSkill).toMatchObject({
+      review_status: 'approved',
+      reviewed_by: 'system:auto-approval',
+      promoted_from: sourceExperience!.id,
+    });
+    expect(storedExperience).toMatchObject({
+      id: sourceExperience!.id,
+      promoted_to: storedSkill!.id,
+    });
     await expect(
       dispatcher.dispatch({
         jsonrpc: '2.0',
-        id: 1,
+        id: 2,
         method: 'memory.listExperiences',
         params: { role_id: 'role_ts_engineer' },
       }),
@@ -199,15 +218,24 @@ describe('B memory evolution end to end', () => {
     await expect(
       dispatcher.dispatch({
         jsonrpc: '2.0',
-        id: 2,
+        id: 3,
         method: 'memory.listSkills',
         params: { role_id: 'role_ts_engineer' },
       }),
     ).resolves.toMatchObject({
       result: {
-        skills: [{ id: storedSkill!.id, review_status: 'pending' }],
+        skills: [{ id: storedSkill!.id, review_status: 'approved' }],
       },
     });
+
+    await facade.runAgent(request('task_reuse_approved_skill', 'Reuse the approved Skill.'));
+    await maintenance.waitForIdle();
+    const nextDriverContext = parseDriverContext(driver.prompts[1]!.prompt) as {
+      skills: Array<{ id: string }>;
+    };
+    expect(nextDriverContext.skills).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: storedSkill!.id })]),
+    );
   });
 });
 
@@ -226,6 +254,10 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
       service.marketImport(roleId, sourceSkillId),
     retireMemoryAgent: (roleId, options) => service.retireAgent(roleId, options),
     runRetirementScan: (roleId) => service.runRetirementScan(roleId),
+    approveMemorySkill: (roleId, skillId, reviewedBy) =>
+      service.approveSkill(roleId, skillId, reviewedBy),
+    rejectMemorySkill: (roleId, skillId, reviewedBy) =>
+      service.rejectSkill(roleId, skillId, reviewedBy),
   }).register(dispatcher);
   return dispatcher;
 }

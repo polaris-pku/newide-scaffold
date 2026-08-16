@@ -78,6 +78,7 @@ describe('CLI task E2E through the production composition', () => {
         {
           ACP_DRIVER_RUNNER_DIR: runnerDir,
           NEWIDE_COORDINATION_DB: ':memory:',
+          NEWIDE_B_SKILL_AUTO_APPROVE: '1',
         },
         {
           bRuntime,
@@ -131,7 +132,7 @@ describe('CLI task E2E through the production composition', () => {
         promoted_to: undefined,
       });
 
-      // ── 3. 显式晋升：高置信度正经验 → pending Skill ──
+      // ── 3. 显式晋升：评测配置将高置信度正经验自动批准为可复用 Skill ──
       const promotion = await service.promoteMemorySkills(agentId, 'cli-task-e2e');
       expect(promotion.status).toBe('completed');
       expect(promotion.kind).toBe('skill_promotion');
@@ -139,7 +140,9 @@ describe('CLI task E2E through the production composition', () => {
 
       const promotedSkill = promotion.skills[0];
       expect(promotedSkill).toMatchObject({
-        review_status: 'pending',
+        review_status: 'approved',
+        reviewed_by: 'system:auto-approval',
+        reviewed_at: expect.any(String),
         promoted_from: promotedCandidate!.id,
         content: 'Fake ACP completed the request.',
         market_status: 'available',
