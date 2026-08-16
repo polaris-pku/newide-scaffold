@@ -139,6 +139,73 @@ export {
 } from './services/memory-cycle';
 
 // ════════════════════════════════════════════════════════
+//  8.5 Metrics 采集与退休（Agent 生命周期管理）
+// ════════════════════════════════════════════════════════
+
+export {
+  recordBid,
+  recordTaskOutcome,
+  evaluateRetirementSignals,
+  RETIREMENT_THRESHOLDS,
+  type TaskOutcome,
+  type RetirementSignals,
+} from './services/metrics';
+export {
+  disposeRetiredAssets,
+  createReplacementAgent,
+  type RetireOptions,
+  type RetireResult,
+  type RetireAssetDisposition,
+  type RetireAssetInput,
+} from './services/retirement';
+
+// ════════════════════════════════════════════════════════
+//  8.6 技能市场（Skill Market）
+//     skill.market_search / skill.market_import（Spec §6.2）
+// ════════════════════════════════════════════════════════
+
+export {
+  marketSearch,
+  marketImport,
+  DEFAULT_MARKET_TOP_K,
+  type MarketSearchQuery,
+} from './services/skill-market';
+export type {
+  MarketSearchOptions,
+  MarketImportResult,
+  TransferSkillToMarketOptions,
+} from './ports/memory-repository';
+/** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
+export { MARKET_POOL_ROLE_ID } from './schemas';
+
+// ════════════════════════════════════════════════════════
+//  8.7 三重门控退休检测（week3 RFC §8.2 触发机制）
+//     RetirementDetector + 统计 / Persona 漂移 / LLM 三层评估器
+// ════════════════════════════════════════════════════════
+
+export { RetirementDetector } from './services/retirement-detection';
+export { StatisticalRetirementEvaluator } from './services/retirement-detection';
+export { PersonaDriftEvaluator, computePersonaDrift } from './services/retirement-detection';
+export { LlmRetirementEvaluator } from './services/retirement-detection';
+export {
+  parseRetirementEvaluation,
+  buildRetirementEvaluationUserPrompt,
+  suggestRetireReason,
+} from './services/retirement-detection';
+export {
+  RETIREMENT_COOLDOWNS,
+  PERSONA_DRIFT_THRESHOLDS,
+  type RetirementAction,
+  type RetirementLayer,
+  type RetirementEvaluation,
+  type RetirementEvaluationInput,
+  type RetirementEvaluator,
+  type RetirementLayerOutcome,
+  type RetirementScanResult,
+  type RetirementDetectorOptions,
+} from './services/retirement-detection';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 

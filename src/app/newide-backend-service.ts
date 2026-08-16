@@ -71,8 +71,14 @@ import type {
   AgentBoardAgentView,
   AgentBoardListItem,
   ExperienceView,
+  MarketImportResult,
+  MarketSearchQuery,
+  RetireOptions,
+  RetireResult,
+  RetirementScanResult,
   SkillView,
 } from '../memory';
+import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BMemoryBackendService } from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
@@ -330,6 +336,22 @@ export class NewideBackendService {
 
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
+  }
+
+  marketSearchMemorySkills(query: MarketSearchQuery): Promise<SkillRecord[]> {
+    return this.requireBMemoryService().marketSearch(query);
+  }
+
+  marketImportMemorySkill(roleId: string, sourceSkillId: string): Promise<MarketImportResult> {
+    return this.requireBMemoryService().marketImport(roleId, sourceSkillId);
+  }
+
+  retireMemoryAgent(roleId: string, options: RetireOptions): Promise<RetireResult> {
+    return this.requireBMemoryService().retireAgent(roleId, options);
+  }
+
+  runRetirementScan(roleId?: string): Promise<RetirementScanResult[]> {
+    return this.requireBMemoryService().runRetirementScan(roleId);
   }
 
   approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {

@@ -28,6 +28,7 @@ function toSkillView(s: SkillRecord): SkillView {
     promoted_from: s.promoted_from,
     promoted_at: s.promoted_at,
     agent_id: s.agent_id,
+    origin_agent_id: s.origin_agent_id,
     imported_by: s.imported_by,
     linked_negative_exp: s.linked_negative_exp,
     market_status: s.market_status,

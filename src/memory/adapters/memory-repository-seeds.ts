@@ -74,6 +74,16 @@ export function isEligibleSkill(skill: SkillRecord): boolean {
   return skill.review_status === 'approved' && skill.market_status !== 'superseded';
 }
 
+/**
+ * 技能市场资格（Spec §3.2 / §7.7）。
+ *
+ * 市场中的技能 = 已审核通过 且 未被 superseded 淘汰。
+ * 注意：retired_unique（稀缺遗产）同样在市场中，且应获得更高推荐优先级。
+ */
+export function isMarketEligibleSkill(skill: SkillRecord): boolean {
+  return skill.review_status === 'approved' && skill.market_status !== 'superseded';
+}
+
 export function isEligibleExperience(
   experience: ExperienceRecord,
   min_confidence: number,
