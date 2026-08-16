@@ -105,9 +105,13 @@ export class MailboxDeliveryWorker {
         return { status: 'replied', source_delivery: this.mailbox.getEnvelope(injected.delivery_id).delivery, recipient_result: result, reply };
       }
       if (expectsBusinessReply(envelope)) {
+        const attempted = this.mailbox.recordDeliveryAttempt(injected.delivery_id, {
+          code: 'RECIPIENT_REPLY_MISSING',
+          message: 'Recipient Agent completed without a required business reply',
+        });
         return {
           status: 'retryable_failure',
-          source_delivery: injected,
+          source_delivery: attempted,
           recipient_result: result,
           error: 'Recipient Agent completed without a required business reply',
         };
@@ -120,7 +124,7 @@ export class MailboxDeliveryWorker {
     } catch (cause) {
       const error = cause instanceof Error ? cause.message : String(cause);
       const current = this.mailbox.getEnvelope(envelope.delivery.delivery_id).delivery;
-      if (current.status !== 'pending') {
+      if (current.status === 'acknowledged' || current.status === 'failed') {
         return {
           status: current.status === 'acknowledged' ? 'acknowledged' : 'retryable_failure',
           source_delivery: current,

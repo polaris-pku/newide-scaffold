@@ -18,7 +18,6 @@ import {
 } from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
 import {
-  LiteLLMClientAdapter,
   LiteLLMToolCallingClient,
   type LlmClient,
   type ToolCallingClient,
@@ -112,6 +111,7 @@ export async function createProductionBackendService(
   }
 
   const driverEnv = loadEnvFile(env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env'));
+  const productionLlm = resolveProductionLlmRuntime(env, driverEnv);
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     capabilities: {
@@ -173,7 +173,9 @@ export async function createProductionBackendService(
       new BMemoryMaintenanceRunner({
         repository: bRuntime.repository,
         bufferRepository: bRuntime.bufferRepository,
-        llm: dependencies.memoryLlm ?? new LiteLLMClientAdapter('memory-query'),
+        llm:
+          dependencies.memoryLlm ??
+          new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env)),
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
@@ -201,11 +203,7 @@ export async function createProductionBackendService(
       llm:
         dependencies.agentLlm ??
         new ProductionAgentToolCallingClient(
-          new LiteLLMToolCallingClient({
-            ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
-              ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
-              : {}),
-          }),
+          createProductionToolCallingClient(productionLlm, env),
         ),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
@@ -359,6 +357,69 @@ const MODEL_OVERRIDE_ENV = [
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'CLAUDE_CODE_SUBAGENT_MODEL',
 ];
+
+export interface ProductionLlmRuntime {
+  readonly model: string;
+  readonly apiKey: string;
+  /** OpenAI-compatible base URL without the trailing `/v1`. */
+  readonly baseUrl: string;
+}
+
+/**
+ * The ACP runner is the local source of truth for the coding model. Reuse its
+ * MiniMax credentials for B's text/tool calls so one Council does not silently
+ * split between MiniMax for Driver work and a stale DeepSeek configuration for
+ * planning or maintenance.
+ */
+export function resolveProductionLlmRuntime(
+  env: NodeJS.ProcessEnv,
+  driverEnv: NodeJS.ProcessEnv,
+): ProductionLlmRuntime | undefined {
+  const model = firstNonBlank(
+    env.NEWIDE_AGENT_LLM_MODEL,
+    driverEnv.ANTHROPIC_MODEL,
+  );
+  const apiKey = firstNonBlank(
+    env.OPENAI_API_KEY,
+    driverEnv.ANTHROPIC_AUTH_TOKEN,
+    driverEnv.ANTHROPIC_API_KEY,
+  );
+  const baseUrl = firstNonBlank(
+    toOpenAiCompatibleBaseUrl(env.OPENAI_BASE_URL),
+    toOpenAiCompatibleBaseUrl(driverEnv.ANTHROPIC_BASE_URL),
+  );
+
+  if (!model || !apiKey || !baseUrl) return undefined;
+  return { model, apiKey, baseUrl };
+}
+
+function createProductionToolCallingClient(
+  runtime: ProductionLlmRuntime | undefined,
+  env: NodeJS.ProcessEnv,
+): LiteLLMToolCallingClient {
+  if (runtime) {
+    return new LiteLLMToolCallingClient({
+      model: runtime.model,
+      apiKey: runtime.apiKey,
+      baseUrl: runtime.baseUrl,
+    });
+  }
+  return new LiteLLMToolCallingClient({
+    ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
+      ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
+      : {}),
+  });
+}
+
+function firstNonBlank(...values: Array<string | undefined>): string | undefined {
+  return values.find((value): value is string => Boolean(value?.trim()))?.trim();
+}
+
+function toOpenAiCompatibleBaseUrl(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\/+$/, '');
+  if (!normalized) return undefined;
+  return normalized.replace(/\/(?:anthropic|v1)$/i, '');
+}
 
 function readDriverTimeout(value: string | undefined): number {
   if (value === undefined) return 120_000;
@@ -554,30 +615,119 @@ function assertValidMarketAgentIds(value: unknown): asserts value is readonly st
   }
 }
 
-class ProductionAgentToolCallingClient implements ToolCallingClient {
+export class ProductionAgentToolCallingClient implements ToolCallingClient {
   constructor(private readonly delegate: ToolCallingClient) {}
 
   async completeWithTools(
     input: Parameters<ToolCallingClient['completeWithTools']>[0],
   ): Promise<Awaited<ReturnType<ToolCallingClient['completeWithTools']>>> {
-    const result = await this.delegate.completeWithTools(input);
     const exposesDriver = input.tools.some((tool) => tool.function.name === 'invoke_driver');
     const driverAlreadyInvoked = input.messages.some((message) =>
       message.tool_calls?.some((toolCall) => toolCall.function.name === 'invoke_driver'),
     );
+    let result: Awaited<ReturnType<ToolCallingClient['completeWithTools']>>;
+    try {
+      result = await this.completeWithRetry(input);
+    } catch (error) {
+      if (exposesDriver && !driverAlreadyInvoked && isMalformedToolArgumentsError(error)) {
+        return forcedDriverToolCall(input);
+      }
+      throw error;
+    }
     if (!exposesDriver || driverAlreadyInvoked || result.tool_calls?.length) return result;
 
-    return this.delegate.completeWithTools({
-      ...input,
-      messages: [
-        ...input.messages,
-        {
-          role: 'user',
-          content:
-            'The production task is not complete. Call invoke_driver now and delegate the concrete task.',
+    let prompted: Awaited<ReturnType<ToolCallingClient['completeWithTools']>>;
+    try {
+      prompted = await this.completeWithRetry({
+        ...input,
+        messages: [
+          ...input.messages,
+          {
+            role: 'user',
+            content:
+              'The production task is not complete. Call invoke_driver now and delegate the concrete task.',
+          },
+        ],
+      });
+    } catch (error) {
+      if (isMalformedToolArgumentsError(error)) return forcedDriverToolCall(input);
+      throw error;
+    }
+    if (prompted.tool_calls?.length) return prompted;
+
+    // A text-only response cannot satisfy the production execution contract.
+    // Keep the fallback inside the Agent tool loop so it still invokes the
+    // real Driver and produces the ordinary B buffer evidence.
+    return forcedDriverToolCall(input, prompted.content);
+  }
+
+  private async completeWithRetry(
+    input: Parameters<ToolCallingClient['completeWithTools']>[0],
+  ): Promise<Awaited<ReturnType<ToolCallingClient['completeWithTools']>>> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await this.delegate.completeWithTools(input);
+      } catch (error) {
+        if (attempt === 0 && isMalformedToolArgumentsError(error)) continue;
+        throw error;
+      }
+    }
+    throw new Error('Unreachable ToolCallingClient retry state');
+  }
+}
+
+function isMalformedToolArgumentsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /invalid function arguments json string/i.test(message);
+}
+
+function fallbackDriverInstruction(
+  input: Parameters<ToolCallingClient['completeWithTools']>[0],
+): string {
+  const message = input.messages.find(
+    (candidate) => candidate.role === 'user' && typeof candidate.content === 'string',
+  )?.content;
+  const match = message?.match(/(?:^|\n)Task:\s*([\s\S]*?)(?:\n\n(?:Retrieved memory|Collaboration brief):|$)/);
+  return match?.[1]?.trim() || 'Execute the assigned production task.';
+}
+
+function forcedDriverToolCall(
+  input: Parameters<ToolCallingClient['completeWithTools']>[0],
+  content?: string | null,
+): Awaited<ReturnType<ToolCallingClient['completeWithTools']>> {
+  return {
+    content: content ?? null,
+    tool_calls: [
+      {
+        id: `production_forced_driver_${String(input.messages.length)}`,
+        type: 'function',
+        function: {
+          name: 'invoke_driver',
+          arguments: JSON.stringify({ instruction: fallbackDriverInstruction(input) }),
         },
-      ],
+      },
+    ],
+  };
+}
+
+/**
+ * B maintenance only needs text completion. Keeping this adapter in the
+ * composition layer lets it share the production MiniMax tool client without
+ * changing B's own memory implementation.
+ */
+class ProductionTextLlmAdapter implements LlmClient {
+  constructor(private readonly delegate: ToolCallingClient) {}
+
+  async complete(input: Parameters<LlmClient['complete']>[0]): Promise<string> {
+    const result = await this.delegate.completeWithTools({
+      messages: input.messages,
+      tools: [],
+      tool_choice: 'none',
     });
+    if (!result.content?.trim()) {
+      throw new Error('Production LLM returned an empty maintenance response');
+    }
+    return result.content;
   }
 }
 

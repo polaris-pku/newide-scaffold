@@ -10,7 +10,10 @@ PROMPT=''
 PROMPT_FILE_INPUT=''
 STATE_ROOT_INPUT=''
 DRIVER_RUNNER_INPUT="${ACP_DRIVER_RUNNER_DIR:-$REPO_ROOT/../acp-client-prototype}"
-RUN_TIMEOUT_MS='900000'
+# A four-role plan-first Council has five real ACP turns (two Plans, review,
+# synthesis, and implementation). Fifteen minutes can terminate a healthy M3
+# run during the final implementation turn.
+RUN_TIMEOUT_MS='1800000'
 DRIVER_TIMEOUT_MS="${ACP_DRIVER_TIMEOUT_MS:-300000}"
 USE_LOCAL_POSTGRES=0
 SKIP_BUILD=0
@@ -31,7 +34,7 @@ Required:
 Options:
   --state-root PATH         Runtime state and evidence directory
   --driver-runner PATH      ACP client checkout (default: sibling directory)
-  --timeout-ms NUMBER       Whole-task timeout (default: 900000)
+  --timeout-ms NUMBER       Whole-task timeout (default: 1800000)
   --driver-timeout-ms NUM   Timeout for each ACP driver call (default: 300000)
   --local-postgres          Start/reuse the repository's local PostgreSQL container
   --skip-build              Use existing backend and ACP client build output
