@@ -8,7 +8,6 @@
  * 均可注入；SQL 与 pgvector 语义完全一致。
  */
 import { randomUUID } from 'node:crypto';
-import type { Pool } from 'pg';
 import { nowTimestamp } from '../../core';
 import type { SqlPool } from '../ports/sql-pool';
 import {
