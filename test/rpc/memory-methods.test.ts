@@ -40,13 +40,6 @@ describe('MemoryRpcMethods', () => {
     const runRetirementScan = vi.fn(async (roleId?: string) => [
       scanResult({ role_id: roleId ?? 'role_ts_engineer' }),
     ]);
-    const service = fakeService({
-      promoteMemorySkills,
-      marketSearchMemorySkills,
-      marketImportMemorySkill,
-      retireMemoryAgent,
-      runRetirementScan,
-    });
     const approveMemorySkill = vi.fn(async () => ({
       id: 'skill_1',
       review_status: 'approved',
@@ -57,7 +50,16 @@ describe('MemoryRpcMethods', () => {
       review_status: 'rejected',
       reviewed_by: 'reviewer',
     }) as never);
-    const service = fakeService({ promoteMemorySkills, approveMemorySkill, rejectMemorySkill });
+    
+    const service = fakeService({
+      promoteMemorySkills,
+      marketSearchMemorySkills,
+      marketImportMemorySkill,
+      retireMemoryAgent,
+      runRetirementScan,
+      approveMemorySkill,
+      rejectMemorySkill,
+    });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
     const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
