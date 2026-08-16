@@ -143,8 +143,8 @@ describe('B memory evolution end to end', () => {
           dimensions: 4,
           readiness: 'verified',
         },
-        repository,
         { autoApprovePromotedSkills: true },
+        repository,
       ),
     );
     await expect(

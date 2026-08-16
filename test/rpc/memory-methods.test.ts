@@ -209,6 +209,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         market_search: { status: 'available' },
         market_import: { status: 'available' },
         retire_agent: { status: 'available' },
+        retirement_scan: { status: 'available' },
       },
     }),
     listMemoryAgents: async () => [
