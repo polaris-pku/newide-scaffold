@@ -242,7 +242,7 @@ export class SqliteCoordinationStore
       .prepare(
         `UPDATE deliveries
          SET status = 'failed', last_error_json = ?, updated_at = ?
-         WHERE delivery_id = ? AND status = 'pending'`,
+         WHERE delivery_id = ? AND status IN ('pending', 'injected')`,
       )
       .run(toJson(input.error), input.failed_at, deliveryId);
     if (result.changes === 0) {
@@ -332,7 +332,7 @@ export class SqliteCoordinationStore
       .prepare(
         `UPDATE deliveries
          SET retry_count = retry_count + 1, last_error_json = ?, updated_at = ?
-         WHERE delivery_id = ? AND status = 'pending'`,
+         WHERE delivery_id = ? AND status IN ('pending', 'injected')`,
       )
       .run(input.error ? toJson(input.error) : null, input.attempted_at, deliveryId);
     if (result.changes === 0) {

@@ -99,6 +99,7 @@ interface InvocationContext {
   task_id: string;
   run_id: string;
   role_id: string;
+  context_policy: string;
   instruction: string;
   driver_instruction: string;
   driver_instruction_locked: boolean;
@@ -388,6 +389,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         task_id: input.task_id,
         run_id: input.run_id,
         role_id: runtimeRoleId,
+        context_policy: input.context_policy,
         instruction: input.instruction,
         driver_instruction: input.driver_instruction ?? input.instruction,
         driver_instruction_locked: input.driver_instruction !== undefined,
@@ -505,6 +507,18 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           tool_calls: undefined,
         };
       }
+      if (
+        invocation.context_policy?.startsWith('council_') &&
+        invocation.execution?.status === 'succeeded'
+      ) {
+        // Council phases persist their substantive result through the Driver.
+        // A second top-level model turn only restates completion and can fail
+        // independently after the artifact was already written.
+        return {
+          content: 'The Council Driver phase completed successfully. [done]',
+          tool_calls: undefined,
+        };
+      }
       invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
       return await withAbort(
         this.options.llm.completeWithTools(
@@ -558,8 +572,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (!mailbox.allowedRoleIds.includes(input.to_role_id)) {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
-    invocation.mailbox_sequence += 1;
     const waitForReply = expectsMailboxReply(kind);
+    if (waitForReply && invocation.context_policy === 'council_primary_plan') {
+      throw new Error(
+        'Council primary planning is independent: write council-plan.md instead of waiting for a Mailbox reply',
+      );
+    }
+    invocation.mailbox_sequence += 1;
     if (
       waitForReply &&
       invocation.mailbox_outcomes.some(
