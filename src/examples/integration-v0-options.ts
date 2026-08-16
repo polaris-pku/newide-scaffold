@@ -13,6 +13,9 @@ export interface IntegrationV0CliOptions {
   driverPrompt: string;
   memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
   worktreePath?: string;
+  /** Record the run trajectory to NEWIDE_TRACE_ROOT (default .newide/runs) and print the replay. */
+  trace: boolean;
+  traceRoot?: string;
 }
 
 const DEFAULT_PROMPT = 'Produce a mock patch artifact for integration v0 test';
@@ -54,7 +57,7 @@ export function parseIntegrationV0CliArgs(args: string[]): IntegrationV0CliOptio
       continue;
     }
 
-    if (arg === '--ablation' || arg === '--worktree-path') {
+    if (arg === '--ablation' || arg === '--worktree-path' || arg === '--trace-root') {
       const value = args[index + 1];
       if (!value || value.startsWith('--')) {
         throw new Error(`${arg} requires a value`);
@@ -74,6 +77,7 @@ export function parseIntegrationV0CliArgs(args: string[]): IntegrationV0CliOptio
   );
   const memoryAblation = readMemoryAblation(parsed.get('--ablation'));
   const worktreePath = readOptionalString(parsed.get('--worktree-path'));
+  const traceRoot = readOptionalString(parsed.get('--trace-root'));
   return {
     enableCouncil: Boolean(parsed.get('--enable-council')) || councilProviderMode !== 'mock',
     useExternalDriver: Boolean(parsed.get('--external-driver')),
@@ -81,6 +85,8 @@ export function parseIntegrationV0CliArgs(args: string[]): IntegrationV0CliOptio
     ...(externalDriverTimeoutMs !== undefined ? { externalDriverTimeoutMs } : {}),
     ...(memoryAblation ? { memoryAblation } : {}),
     ...(worktreePath ? { worktreePath } : {}),
+    trace: Boolean(parsed.get('--trace')),
+    ...(traceRoot ? { traceRoot } : {}),
     driverPrompt: positional[0] ?? DEFAULT_PROMPT,
   };
 }

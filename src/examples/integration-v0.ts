@@ -25,6 +25,10 @@
  *   # External driver + council + per-call timeout
  *   ACP_DRIVER_RUNNER_DIR=/path/to/acp-client-prototype pnpm example:integration-v0 --external-driver --enable-council --council-provider synthesis-agent --external-driver-timeout-ms 60000 "Optimize database queries"
  *
+ *   # Record and print the run trajectory (trajectory.jsonl under .newide/runs)
+ *   pnpm example:integration-v0 --trace "Simple task"
+ *   # custom root: --trace-root /path/to/traces
+ *
  * Environment variables:
  *   - ACP_DRIVER_RUNNER_DIR: Path to acp-client-prototype (required for --external-driver)
  *   - ACP_DRIVER_ENV_FILE: Env file loaded for the external runner (default: <ACP_DRIVER_RUNNER_DIR>/.env)
@@ -47,6 +51,7 @@ import {
   type CouncilParticipantResolver,
 } from '../council';
 import { InMemoryBufferRepository, InMemoryRepository, LiteLLMToolCallingClient } from '../memory';
+import { FileTrajectoryWriter, TraceProjector, replayTrajectory } from '../trace';
 import { parseIntegrationV0CliArgs } from './integration-v0-options';
 
 const CLAUDE_MODEL_OVERRIDE_ENV = [
@@ -101,8 +106,14 @@ if (cliOptions.useExternalDriver) {
   driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     transport: new CommandDriverTransport({
-      command: 'pnpm',
-      args: ['--dir', driverRunnerDir, 'driver:run'],
+      // On Windows the pnpm batch shim swallows stdin under cmd.exe; run the
+      // ACP contract runner directly with node.exe so the DriverPrompt JSON
+      // reaches the runner reliably.
+      command: process.platform === 'win32' ? process.execPath : 'pnpm',
+      args:
+        process.platform === 'win32'
+          ? [path.join(driverRunnerDir, 'dist', 'src', 'driver', 'contract-runner.js')]
+          : ['--dir', driverRunnerDir, 'driver:run'],
       cwd: process.cwd(),
       env: {
         ...driverEnv,
@@ -121,11 +132,19 @@ if (cliOptions.useExternalDriver) {
 
 // Run integration flow
 try {
+  const traceWriter = cliOptions.trace
+    ? new FileTrajectoryWriter(
+        path.resolve(cliOptions.traceRoot ?? process.env.NEWIDE_TRACE_ROOT ?? '.newide/runs'),
+      )
+    : undefined;
+  const traceProjector = traceWriter ? new TraceProjector(traceWriter) : undefined;
+
   const flowOptions: IntegrationV0Options = {
     enableCouncil: cliOptions.enableCouncil,
     driverPrompt: cliOptions.driverPrompt,
     ...(cliOptions.memoryAblation ? { memoryAblation: cliOptions.memoryAblation } : {}),
     ...(cliOptions.worktreePath ? { worktreePath: cliOptions.worktreePath } : {}),
+    ...(traceProjector ? { traceProjector } : {}),
   };
 
   if (driver) {
@@ -141,6 +160,7 @@ try {
         repository: new InMemoryRepository(),
         bufferRepository: new InMemoryBufferRepository(),
         llm: new LiteLLMToolCallingClient(),
+        ...(traceProjector ? { trace: traceProjector } : {}),
       }),
       participantResolver: exampleParticipantResolver(),
     });
@@ -177,6 +197,16 @@ try {
   console.log(`  ${result.result_manifest.timeline_path}`);
   console.log(`  ${result.result_manifest.message_thread_path}`);
   console.log(`  ${result.result_manifest.frontend_snapshot_path}`);
+
+  if (traceWriter && traceProjector) {
+    await traceWriter.flush(result.run_id);
+    const records = await traceWriter.load(result.run_id);
+    const replay = replayTrajectory(records, result.run_id);
+    console.log(
+      `\n🧭 Trajectory (${replay.records.length} records, ${replay.spans.length} spans):`,
+    );
+    console.log(replay.rendered);
+  }
 
   console.log('\n✨ Done!');
 } catch (error) {

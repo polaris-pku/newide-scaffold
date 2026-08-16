@@ -290,6 +290,14 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       stdio: ['pipe', 'pipe', 'pipe'],
     };
 
+    // On Windows, bare command names that ship only as batch shims (pnpm.cmd,
+    // npm.cmd, ...) cannot be launched by CreateProcess directly. Route them
+    // through cmd.exe so PATHEXT resolution works; paths and command names
+    // that already carry an extension or a directory are spawned directly.
+    if (process.platform === 'win32' && needsCmdShell(this.command)) {
+      options.shell = true;
+    }
+
     if (this.timeoutMs !== undefined && process.platform !== 'win32') {
       options.detached = true;
     }
@@ -320,8 +328,16 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   }
 }
 
-function terminateAndWait(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+/** True when a bare command name needs cmd.exe resolution on Windows. */
+function needsCmdShell(command: string): boolean {
+  const isAbsolute = /^[A-Za-z]:[\\/]/.test(command) || command.startsWith('/');
+  if (isAbsolute || command.includes('\\') || command.includes('/')) return false;
+  // Bare names with an explicit extension (node.exe, pnpm.cmd) are spawned
+  // directly; bare names without one need PATHEXT lookup via the shell.
+  return !command.includes('.');
+}
+
+function terminateAndWait(child: ChildProcess): Promise<void> {  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
 
   return new Promise((resolve) => {
     let settled = false;
