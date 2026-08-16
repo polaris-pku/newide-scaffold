@@ -67,12 +67,12 @@ export class BMemoryBackendService {
       'boardQuery' | 'maintenance' | 'reviewSkill'
     >,
     private readonly embeddingInfo: BEmbeddingRuntimeInfo,
+    private readonly options: BMemoryBackendServiceOptions = {},
     // 以下三个为可选注入：不注入时对应能力在 getCapabilities() 里报告 unavailable，
     // 调用对应方法时抛出明确错误。保持与旧的两参构造签名向后兼容。
     private readonly repository?: MemoryRepository,
     private readonly lifecycle?: BMemoryLifecycle,
     private readonly embedding?: EmbeddingProvider,
-    private readonly options: BMemoryBackendServiceOptions = {},
   ) {}
 
   getCapabilities(): BMemoryCapabilities {
