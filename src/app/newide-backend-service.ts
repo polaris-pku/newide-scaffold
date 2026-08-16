@@ -92,6 +92,8 @@ import type {
   SystemVersionV1,
 } from '../protocol/system-status';
 
+const MAX_MAILBOX_RECIPIENT_ATTEMPTS = 2;
+
 export interface RunCreateParams {
   prompt: string;
   workspace_path?: string;
@@ -865,25 +867,38 @@ export class NewideBackendService {
           return;
         }
       }
-      const handled = await worker.process({
-        delivery_id: sourceDeliveryId,
-        run_id: context.run_id,
-      });
-      if (
-        handled.status === 'retryable_failure' &&
-        handled.error?.startsWith('COLLABORATION_DEADLOCK')
-      ) {
+      while (!reply) {
+        const handled = await worker.process({
+          delivery_id: sourceDeliveryId,
+          run_id: context.run_id,
+        });
+        if (
+          handled.status === 'retryable_failure' &&
+          handled.error?.startsWith('COLLABORATION_DEADLOCK')
+        ) {
+          processor.blockMailboxDeadlock(taskId, handled.error);
+          return;
+        }
+        reply =
+          handled.status === 'replied' && handled.reply
+            ? mailbox.getEnvelope(handled.reply.delivery_id)
+            : mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+        if (reply) break;
+        if (handled.status !== 'retryable_failure') return;
+        if (handled.source_delivery.retry_count < MAX_MAILBOX_RECIPIENT_ATTEMPTS) continue;
+
+        const failed = mailbox.markFailed(sourceDeliveryId, {
+          code: 'RECIPIENT_REPLY_MISSING',
+          message:
+            `Recipient ${handled.source_delivery.recipient_role_id} did not reply after ` +
+            `${String(handled.source_delivery.retry_count)} delivery attempts`,
+        });
         processor.blockMailboxDeadlock(
           taskId,
-          handled.error,
+          `COLLABORATION_DEADLOCK: ${failed.last_error?.message ?? 'recipient reply missing'}`,
         );
         return;
       }
-      reply =
-        handled.status === 'replied' && handled.reply
-          ? mailbox.getEnvelope(handled.reply.delivery_id)
-          : mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
-      if (!reply) return;
     }
     await this.startRun(
       {
