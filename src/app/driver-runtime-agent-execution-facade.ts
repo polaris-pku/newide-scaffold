@@ -18,6 +18,7 @@ import {
 import {
   AgentManager,
   InvokeDriverTool,
+  LlmRetirementEvaluator,
   createAgentMemoryScope,
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
@@ -30,10 +31,13 @@ import {
   type DriverContext,
   type DriverTask,
   type EmbeddingProvider,
+  type LlmClient,
   type MemoryRetrievalResult,
   type MemoryRepository,
   type RetireOptions,
   type RetireResult,
+  type RetirementEvaluator,
+  type RetirementScanResult,
   type ToolCallingClient,
 } from '../memory';
 import {
@@ -155,6 +159,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         maxToolCalls: this.options.mailbox ? 6 : 4,
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
+      // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
+      retirementEvaluator: createToolRetirementEvaluator(this.options.llm),
     });
   }
 
@@ -234,6 +240,17 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   async retireAgent(roleId: string, options: RetireOptions = {}): Promise<RetireResult> {
     const manager = await (this.roleReady.get(roleId) ?? this.manager);
     return manager.retireAgent(roleId, options);
+  }
+
+  /**
+   * 三重门控退休检测（week3 RFC §8.2）：委托给持有该 role 的 AgentManager。
+   *
+   * 只产出 recommended_action 与逐层证据，不自动退休。
+   * @param roleId 指定扫描单个 Agent；缺省扫描全部活跃 Agent。
+   */
+  async runRetirementScan(roleId?: string): Promise<RetirementScanResult[]> {
+    const manager = roleId ? (this.roleReady.get(roleId) ?? this.manager) : this.manager;
+    return (await manager).scanForRetirements(roleId);
   }
 
   async runAgent(
@@ -1339,6 +1356,30 @@ async function collectWorkspaceArtifacts(
     });
   }
   return artifacts;
+}
+
+/**
+ * 把 ToolCallingClient 适配为退休评估的 LlmClient，并构建三重门控的 LLM 层评估器。
+ *
+ * 生产路径：DriverRuntimeAgentExecutionFacade 持有的是 ToolCallingClient，
+ * 而记忆模块的 LlmRetirementEvaluator 需要 LlmClient；这里做最小适配，
+ * 不带工具调用（退休评估是纯文本 JSON 输出）。
+ */
+export function createToolRetirementEvaluator(llm: ToolCallingClient): RetirementEvaluator {
+  const adapter: LlmClient = {
+    async complete(input) {
+      const result = await llm.completeWithTools({
+        messages: input.messages.map((message) => ({
+          role: message.role,
+          content: message.content ?? '',
+        })),
+        tools: [],
+        tool_choice: 'none',
+      });
+      return result.content ?? '';
+    },
+  };
+  return new LlmRetirementEvaluator(adapter);
 }
 
 /** Normalize artifact target paths so Windows `\` and POSIX `/` compare equal. */

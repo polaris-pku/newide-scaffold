@@ -10,6 +10,7 @@ import {
   type MemoryRepository,
   type RetireOptions,
   type RetireResult,
+  type RetirementScanResult,
   type SkillView,
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
@@ -39,6 +40,7 @@ export interface BMemoryCapabilities {
     market_search: BMemoryOperationCapability;
     market_import: BMemoryOperationCapability;
     retire_agent: BMemoryOperationCapability;
+    retirement_scan: BMemoryOperationCapability;
   };
 }
 
@@ -48,6 +50,8 @@ export interface BMemoryCapabilities {
  */
 export interface BMemoryLifecycle {
   retireAgent(roleId: string, options: RetireOptions): Promise<RetireResult>;
+  /** 三重门控退休检测（week3 RFC §8.2）：只产出建议，不自动退休。 */
+  runRetirementScan(roleId?: string): Promise<RetirementScanResult[]>;
 }
 
 export class BMemoryBackendService {
@@ -105,6 +109,12 @@ export class BMemoryBackendService {
         retire_agent: {
           status: this.lifecycle ? 'available' : 'unavailable',
           ...(this.lifecycle ? {} : { reason: 'B runtime does not expose Agent retirement.' }),
+        },
+        retirement_scan: {
+          status: this.lifecycle ? 'available' : 'unavailable',
+          ...(this.lifecycle
+            ? {}
+            : { reason: 'B runtime does not expose retirement scanning.' }),
         },
       },
     };
@@ -164,5 +174,13 @@ export class BMemoryBackendService {
       throw new Error('Agent retirement is not available in this B runtime');
     }
     return this.lifecycle.retireAgent(roleId, options);
+  }
+
+  /** 三重门控退休检测（week3 RFC §8.2），委托给注入的 lifecycle，不自动退休。 */
+  runRetirementScan(roleId?: string): Promise<RetirementScanResult[]> {
+    if (!this.lifecycle) {
+      throw new Error('Retirement scanning is not available in this B runtime');
+    }
+    return this.lifecycle.runRetirementScan(roleId);
   }
 }

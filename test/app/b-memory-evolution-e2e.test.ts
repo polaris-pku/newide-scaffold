@@ -225,6 +225,7 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
     marketImportMemorySkill: (roleId, sourceSkillId) =>
       service.marketImport(roleId, sourceSkillId),
     retireMemoryAgent: (roleId, options) => service.retireAgent(roleId, options),
+    runRetirementScan: (roleId) => service.runRetirementScan(roleId),
   }).register(dispatcher);
   return dispatcher;
 }

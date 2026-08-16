@@ -37,11 +37,15 @@ describe('MemoryRpcMethods', () => {
         },
       }),
     );
+    const runRetirementScan = vi.fn(async (roleId?: string) => [
+      scanResult({ role_id: roleId ?? 'role_ts_engineer' }),
+    ]);
     const service = fakeService({
       promoteMemorySkills,
       marketSearchMemorySkills,
       marketImportMemorySkill,
       retireMemoryAgent,
+      runRetirementScan,
     });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
@@ -80,6 +84,15 @@ describe('MemoryRpcMethods', () => {
     );
     await session.handleLine(
       '{"jsonrpc":"2.0","id":11,"method":"memory.retireAgent","params":{"role_id":"role_ts_engineer","reason":"bogus"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":12,"method":"memory.retirementScan","params":{}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":13,"method":"memory.retirementScan","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":14,"method":"memory.retirementScan","params":{"role_id":"","extra":true}}',
     );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
@@ -122,6 +135,9 @@ describe('MemoryRpcMethods', () => {
         },
       },
       { id: 11, error: { code: -32602, message: 'Invalid params' } },
+      { id: 12, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
+      { id: 13, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
+      { id: 14, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(marketSearchMemorySkills).toHaveBeenCalledWith({
@@ -134,6 +150,8 @@ describe('MemoryRpcMethods', () => {
       reason: 'performance_degradation',
       replacement: 'seeded_slate',
     });
+    expect(runRetirementScan).toHaveBeenCalledTimes(2);
+    expect(runRetirementScan).toHaveBeenLastCalledWith('role_ts_engineer');
   });
 });
 
@@ -206,6 +224,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         experiences_discarded: 0,
       },
     }),
+    runRetirementScan: async () => [scanResult()],
     ...overrides,
   };
 }
@@ -238,5 +257,24 @@ function marketSkill() {
     agent_id: 'role_ts_engineer',
     created_at: '2026-07-21T00:00:00.000Z',
     updated_at: '2026-07-21T00:00:00.000Z',
+  };
+}
+
+function scanResult(overrides: { role_id?: string; action?: 'retire' | 'warn' | 'keep' } = {}) {
+  return {
+    scan_id: 'scan_1',
+    role_id: overrides.role_id ?? 'role_ts_engineer',
+    scanned_at: '2026-07-21T00:00:00.000Z',
+    action: overrides.action ?? 'keep',
+    confidence: 0.9,
+    reasons: ['Statistical signals are healthy.'],
+    layers: [
+      {
+        layer: 'statistical' as const,
+        action: (overrides.action ?? 'keep') as 'retire' | 'warn' | 'keep',
+        confidence: 0.9,
+        reasons: ['Statistical signals are healthy.'],
+      },
+    ],
   };
 }

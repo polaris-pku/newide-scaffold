@@ -75,6 +75,7 @@ import type {
   MarketSearchQuery,
   RetireOptions,
   RetireResult,
+  RetirementScanResult,
   SkillView,
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
@@ -346,6 +347,10 @@ export class NewideBackendService {
 
   retireMemoryAgent(roleId: string, options: RetireOptions): Promise<RetireResult> {
     return this.requireBMemoryService().retireAgent(roleId, options);
+  }
+
+  runRetirementScan(roleId?: string): Promise<RetirementScanResult[]> {
+    return this.requireBMemoryService().runRetirementScan(roleId);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

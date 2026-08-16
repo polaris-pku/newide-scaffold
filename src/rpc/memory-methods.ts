@@ -10,6 +10,7 @@ import type {
   MarketSearchQuery,
   RetireOptions,
   RetireResult,
+  RetirementScanResult,
   SkillView,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
@@ -30,6 +31,8 @@ export interface MemoryMethodsService {
   marketImportMemorySkill(roleId: string, sourceSkillId: string): Promise<MarketImportResult>;
   /** Agent 退休（week3 RFC §12） */
   retireMemoryAgent(roleId: string, options: RetireOptions): Promise<RetireResult>;
+  /** 三重门控退休检测（week3 RFC §8.2）：只产出建议，不自动退休 */
+  runRetirementScan(roleId?: string): Promise<RetirementScanResult[]>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -63,6 +66,9 @@ const retireAgentParamsSchema = z
     reason: RetiredReasonSchema.optional(),
     replacement: z.enum(['clean_slate', 'seeded_slate', 'none']).optional(),
   })
+  .strict();
+const retirementScanParamsSchema = z
+  .object({ role_id: z.string().trim().min(1).optional() })
   .strict();
 
 export class MemoryRpcMethods {
@@ -132,6 +138,12 @@ export class MemoryRpcMethods {
           ...(parsed.replacement !== undefined ? { replacement: parsed.replacement } : {}),
         })
         .then((result) => ({ retire: result }));
+    });
+    dispatcher.register('memory.retirementScan', (params) => {
+      const parsed = parseParams(retirementScanParamsSchema, params ?? {});
+      return this.service
+        .runRetirementScan(parsed.role_id)
+        .then((scans) => ({ scans }));
     });
   }
 }

@@ -173,6 +173,33 @@ export type {
 export { MARKET_POOL_ROLE_ID } from './schemas';
 
 // ════════════════════════════════════════════════════════
+//  8.7 三重门控退休检测（week3 RFC §8.2 触发机制）
+//     RetirementDetector + 统计 / Persona 漂移 / LLM 三层评估器
+// ════════════════════════════════════════════════════════
+
+export { RetirementDetector } from './services/retirement-detection';
+export { StatisticalRetirementEvaluator } from './services/retirement-detection';
+export { PersonaDriftEvaluator, computePersonaDrift } from './services/retirement-detection';
+export { LlmRetirementEvaluator } from './services/retirement-detection';
+export {
+  parseRetirementEvaluation,
+  buildRetirementEvaluationUserPrompt,
+  suggestRetireReason,
+} from './services/retirement-detection';
+export {
+  RETIREMENT_COOLDOWNS,
+  PERSONA_DRIFT_THRESHOLDS,
+  type RetirementAction,
+  type RetirementLayer,
+  type RetirementEvaluation,
+  type RetirementEvaluationInput,
+  type RetirementEvaluator,
+  type RetirementLayerOutcome,
+  type RetirementScanResult,
+  type RetirementDetectorOptions,
+} from './services/retirement-detection';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 

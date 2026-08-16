@@ -15,6 +15,11 @@ import type { CompetitionClaimBatch, CollectCompetitionClaimsOptions } from '../
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type { TaskOutcome } from '../services/metrics';
 import type { RetireOptions, RetireResult } from '../services/retirement';
+import {
+  RetirementDetector,
+  type RetirementEvaluator,
+  type RetirementScanResult,
+} from '../services/retirement-detection';
 import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import { QueryMemoryTool } from './tools/query-memory-tool';
 import { recordBid, recordTaskOutcome } from '../services/metrics';
@@ -30,10 +35,15 @@ import { createId, nowTimestamp } from '../../core';
  *
  * - `tools`: LLM tool-calling 配置（必选）
  * - `embedding`: 透传给 QueryMemoryTool，确保查询向量与写入向量维度一致
+ * - `retirementEvaluator`: 三重门控退休检测的 LLM 层评估器（可选）。不注入则
+ *   scanForRetirements 只跑统计层 + Persona 漂移层。
+ * - `retirementDetector`: 退休检测器（可选，覆盖默认构建；测试注入用）。
  */
 export interface AgentManagerOptions {
   tools: AgentToolConfig;
   embedding?: EmbeddingProvider;
+  retirementEvaluator?: RetirementEvaluator;
+  retirementDetector?: RetirementDetector;
 }
 
 /**
@@ -554,6 +564,26 @@ export class AgentManager {
 
   async listAgentHandles(): Promise<AgentHandle[]> {
     return Promise.all([...this.agents.values()].map((agent) => agent.getHandle()));
+  }
+
+  /**
+   * 三重门控退休检测（week3 RFC §8.2 触发机制）。
+   *
+   * 委托给 RetirementDetector（默认构建，可注入覆盖）；不自动退休，
+   * 只产出 recommended_action 与逐层证据，供上层决定是否调用 retireAgent。
+   *
+   * @param roleId 指定扫描单个 Agent；缺省扫描全部活跃 Agent。
+   */
+  async scanForRetirements(roleId?: string): Promise<RetirementScanResult[]> {
+    const detector =
+      this.options.retirementDetector ??
+      new RetirementDetector(this.repository, {
+        ...(this.options.retirementEvaluator ? { llm: this.options.retirementEvaluator } : {}),
+      });
+    if (roleId) {
+      return [await detector.scan(roleId)];
+    }
+    return detector.scanAll();
   }
 
   /**

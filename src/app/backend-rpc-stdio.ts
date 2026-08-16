@@ -252,6 +252,7 @@ export async function createProductionBackendService(
       bRuntime.repository,
       {
         retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
+        runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
       },
       bRuntime.embedding,
     );

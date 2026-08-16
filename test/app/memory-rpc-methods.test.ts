@@ -73,7 +73,10 @@ describe('memory RPC market and retire wiring', () => {
       { boardQuery: new RepositoryAgentBoardQuery(repository), maintenance: fakeMaintenance() },
       { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
       repository,
-      { retireAgent: (roleId, options) => manager.retireAgent(roleId, options) },
+      {
+        retireAgent: (roleId, options) => manager.retireAgent(roleId, options),
+        runRetirementScan: (roleId) => manager.scanForRetirements(roleId),
+      },
       embedding,
     );
 
@@ -97,6 +100,7 @@ describe('memory RPC market and retire wiring', () => {
             market_search: { status: 'available' },
             market_import: { status: 'available' },
             retire_agent: { status: 'available' },
+            retirement_scan: { status: 'available' },
           },
         },
       },
@@ -203,6 +207,25 @@ describe('memory RPC market and retire wiring', () => {
       id: 9,
       error: { code: -32602, message: 'Invalid params' },
     });
+
+    // retirementScan：三重门控。role_alpha（无任务历史）→ keep；role_beta 已退休 → 跳过/抛错
+    const [scanAll, scanOne, scanRetired] = await send(
+      '{"jsonrpc":"2.0","id":10,"method":"memory.retirementScan","params":{}}',
+      '{"jsonrpc":"2.0","id":11,"method":"memory.retirementScan","params":{"role_id":"role_alpha"}}',
+      '{"jsonrpc":"2.0","id":12,"method":"memory.retirementScan","params":{"role_id":"role_beta"}}',
+    );
+    const scanAllScans = (scanAll!.result as { scans: Array<{ role_id: string; action: string }> })
+      .scans;
+    expect(scanAllScans).toHaveLength(1);
+    expect(scanAllScans[0]).toMatchObject({ role_id: 'role_alpha', action: 'keep' });
+    expect(scanOne!).toMatchObject({
+      id: 11,
+      result: { scans: [{ role_id: 'role_alpha', action: 'keep' }] },
+    });
+    expect(scanRetired!).toMatchObject({
+      id: 12,
+      error: { code: -32603 },
+    });
   });
 
   it('routes market import and retire through NewideBackendService + DriverRuntimeAgentExecutionFacade', async () => {
@@ -234,7 +257,10 @@ describe('memory RPC market and retire wiring', () => {
       { boardQuery: new RepositoryAgentBoardQuery(repository), maintenance: fakeMaintenance() },
       { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
       repository,
-      { retireAgent: (roleId, options) => facade.retireAgent(roleId, options) },
+      {
+        retireAgent: (roleId, options) => facade.retireAgent(roleId, options),
+        runRetirementScan: (roleId) => facade.runRetirementScan(roleId),
+      },
       embedding,
     );
 
@@ -307,6 +333,15 @@ describe('memory RPC market and retire wiring', () => {
       }),
     );
 
+    // retirementScan 走 NewideBackendService → BMemoryBackendService → facade → AgentManager
+    const [scanned] = await send(
+      '{"jsonrpc":"2.0","id":2,"method":"memory.retirementScan","params":{"role_id":"role_alpha"}}',
+    );
+    expect(scanned!).toMatchObject({
+      id: 2,
+      result: { scans: [{ role_id: 'role_alpha', action: 'keep' }] },
+    });
+
     await service.close();
   });
 });
@@ -325,6 +360,7 @@ function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
     marketImportMemorySkill: (roleId, sourceSkillId) =>
       service.marketImport(roleId, sourceSkillId),
     retireMemoryAgent: (roleId, options) => service.retireAgent(roleId, options),
+    runRetirementScan: (roleId) => service.runRetirementScan(roleId),
   }).register(dispatcher);
   return dispatcher;
 }

@@ -449,6 +449,12 @@ export const AgentMetricsSchema = z.object({
   persona_drift: z.number().min(0).max(1).optional(),
   /** Persona 最近一次保持稳定的时间点 */
   persona_stable_since: z.iso.datetime().optional(),
+  /** 最近一次退休扫描时间（三重门控触发机制的状态持久化） */
+  last_retirement_scan_at: z.iso.datetime().optional(),
+  /** 最近一次 Persona 漂移层评估时间（第二层门控冷却起点） */
+  last_persona_drift_eval_at: z.iso.datetime().optional(),
+  /** 最近一次 LLM 全面评估时间（第三层门控冷却起点） */
+  last_llm_eval_at: z.iso.datetime().optional(),
 });
 export type AgentMetrics = z.infer<typeof AgentMetricsSchema>;
 
