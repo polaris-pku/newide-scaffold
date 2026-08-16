@@ -154,6 +154,7 @@ export class MemoryRpcMethods {
       return this.service
         .runRetirementScan(parsed.role_id)
         .then((scans) => ({ scans }));
+    });
     dispatcher.register('memory.approveSkill', (params) => {
       const parsed = parseParams(reviewParamsSchema, params);
       return this.service
