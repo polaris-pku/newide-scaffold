@@ -252,13 +252,13 @@ export async function createProductionBackendService(
     const bMemoryService = new BMemoryBackendService(
       bCapabilities,
       bRuntime.embedding_info,
+      { autoApprovePromotedSkills: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1' },
       bRuntime.repository,
       {
         retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
         runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
       },
       bRuntime.embedding,
-      { autoApprovePromotedSkills: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1' },
     );
 
     try {
