@@ -130,6 +130,41 @@ describe('TraceProjector', () => {
     expect(second.sequence).toBe(2);
   });
 
+  it('projects bounded input/output payloads from event payloads', () => {
+    const projector = new TraceProjector({ append: () => undefined, flush: () => undefined });
+    const start = projector.projectEvent(
+      event('task.created', 'task_1', { spec: 'Do the thing', risk_level: 'low' }),
+    )[0]!;
+    expect(start.payload).toEqual({ input: { spec: 'Do the thing', risk_level: 'low' } });
+
+    const end = projector.projectEvent(
+      event('task.completed', 'task_1', { summary: 'done', artifact_refs: ['a1', 'a2'] }, T1),
+    )[0]!;
+    expect(end.payload).toEqual({ output: { summary: 'done', artifact_refs: ['a1', 'a2'] } });
+
+    const point = projector.projectEvent(
+      event('gate.result', 'g', { decision: 'allow', reason: 'ok' }),
+    )[0]!;
+    expect(point.payload).toEqual({ decision: 'allow', reason: 'ok' });
+  });
+
+  it('bounds event payload previews to keep records small', () => {
+    const projector = new TraceProjector({ append: () => undefined, flush: () => undefined });
+    const long = 'x'.repeat(1000);
+    const start = projector.projectEvent(
+      event('task.created', 'task_1', { spec: long }),
+    )[0]!;
+    const input = start.payload?.input as { spec: string };
+    expect(input.spec.length).toBeLessThanOrEqual(401);
+    expect(input.spec).toContain('…');
+  });
+
+  it('omits payload when the event payload is empty', () => {
+    const projector = new TraceProjector({ append: () => undefined, flush: () => undefined });
+    const start = projector.projectEvent(event('task.created', 'task_1', {}))[0]!;
+    expect(start.payload).toBeUndefined();
+  });
+
   it('projectDirect stamps shared sequence, timestamps and schema', () => {
     const sink: TrajectorySpanRecord[] = [];
     const projector = new TraceProjector({

@@ -1,4 +1,5 @@
 export * from './types';
+export * from './io-preview';
 export * from './trace-store';
 export * from './trace-writer';
 export * from './auto-span';

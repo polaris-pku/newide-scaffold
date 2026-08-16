@@ -36,6 +36,8 @@ export interface RuntimeOrchestratorConfig {
   stores?: Partial<RuntimeStores>;
   telemetry?: TelemetrySink;
   trace?: TraceSink;
+  /** Shared projector so explicit spans (facade) and event-projected spans share one sequence. */
+  traceProjector?: TraceProjector;
   onEvent?: (event: Event) => void;
 }
 
@@ -65,7 +67,8 @@ export class RuntimeOrchestrator {
     };
     this.telemetry = normalized.telemetry ?? new NoopTelemetrySink();
     this.onEvent = normalized.onEvent;
-    this.traceProjector = new TraceProjector(normalized.trace ?? new NoopTraceStore());
+    this.traceProjector =
+      normalized.traceProjector ?? new TraceProjector(normalized.trace ?? new NoopTraceStore());
   }
 
   createTask(request: TaskCreateRequest): Task {
@@ -249,9 +252,9 @@ function normalizeOrchestratorConfig(
     return {};
   }
 
-  if ('telemetry' in config || 'trace' in config || 'onEvent' in config) {
+  if ('telemetry' in config || 'trace' in config || 'traceProjector' in config || 'onEvent' in config) {
     const orchestratorConfig = config as RuntimeOrchestratorConfig & Partial<RuntimeStores>;
-    const { telemetry, trace, onEvent, stores, events, artifacts, checkpoints } =
+    const { telemetry, trace, traceProjector, onEvent, stores, events, artifacts, checkpoints } =
       orchestratorConfig;
     const legacyStores: Partial<RuntimeStores> = {};
     if (events !== undefined) legacyStores.events = events;
@@ -263,6 +266,7 @@ function normalizeOrchestratorConfig(
     return {
       ...(telemetry ? { telemetry } : {}),
       ...(trace ? { trace } : {}),
+      ...(traceProjector ? { traceProjector } : {}),
       ...(onEvent ? { onEvent } : {}),
       ...(resolvedStores ? { stores: resolvedStores } : {}),
     };

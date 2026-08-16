@@ -57,6 +57,12 @@ export interface TrajectorySpanRecord {
   duration_ms?: number;
   /** Bounded human-readable summary; full content stays in artifacts/audit. */
   summary?: string;
+  /**
+   * Bounded IO preview: interval spans carry `input` on the start record and
+   * `output` on the end record; point records carry the raw bounded payload.
+   * Values go through `boundedPreview` (truncated strings/arrays, total
+   * budget) — full content stays in artifacts / audit (`source_event_id`).
+   */
   payload?: Record<string, unknown>;
   /** Event id of the source Event that produced this record, when available. */
   source_event_id?: string;

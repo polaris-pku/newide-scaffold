@@ -31,6 +31,7 @@
     "example:driver-adapter": "tsx src/examples/driver-adapter-flow.ts",
     "example:trajectory": "tsx src/examples/trajectory-demo.ts",
     "example:agent-trace": "tsx src/examples/agent-trace-demo.ts",
+    "example:full-trajectory": "tsx src/examples/full-trajectory-demo.ts",
     "trace:replay": "tsx src/trace/replay-cli.ts",
     "backend:rpc": "node --import tsx src/app/backend-rpc-entry.ts",
     "rpc:smoke": "node --import tsx scripts/rpc-smoke.ts",

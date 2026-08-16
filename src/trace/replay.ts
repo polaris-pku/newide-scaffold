@@ -8,6 +8,7 @@
  * parallel group, matching the DeepSeek Harness render-time projection.
  */
 import type { RunId } from '../core';
+import { truncatePreview } from './io-preview';
 import type { MergedTrajectorySpan, TrajectorySpanRecord } from './types';
 
 export interface TrajectoryTreeNode {
@@ -68,6 +69,9 @@ export function mergeSpans(records: TrajectorySpanRecord[]): MergedTrajectorySpa
     const end = builder.end;
     const isSpan = end === undefined ? start.phase === 'start' : end !== start;
     const ordinal = builder.ordinal;
+    // Merge start (input) and end (output) payloads so the replayed span keeps
+    // both sides instead of the end record overwriting the start payload.
+    const mergedPayload = { ...(start.payload ?? {}), ...(end?.payload ?? {}) };
     const base: MergedTrajectorySpan = {
       span_id: spanId,
       kind: start.kind,
@@ -79,6 +83,7 @@ export function mergeSpans(records: TrajectorySpanRecord[]): MergedTrajectorySpa
       ...(start.agent_id ? { agent_id: start.agent_id } : {}),
       ...(start.summary ? { summary: start.summary } : {}),
       ...(start.started_at ? { started_at: start.started_at } : {}),
+      ...(Object.keys(mergedPayload).length > 0 ? { payload: mergedPayload } : {}),
       sequence: start.sequence,
       created_at: start.created_at,
     };
@@ -89,7 +94,6 @@ export function mergeSpans(records: TrajectorySpanRecord[]): MergedTrajectorySpa
         ...(end?.ended_at ? { ended_at: end.ended_at } : {}),
         ...(end?.duration_ms !== undefined ? { duration_ms: end.duration_ms } : {}),
         ...(end?.summary && end.summary !== start.summary ? { summary: end.summary } : {}),
-        ...(end?.payload ? { payload: end.payload } : {}),
         ordinal,
         endOrdinal: builder.endOrdinal ?? ordinal,
       });
@@ -108,8 +112,8 @@ export function buildSpanTree(spans: MergedTrajectorySpan[]): TrajectoryTreeNode
 
   // Resolve the effective parent: the explicit parent link when valid, else the
   // deepest lifecycle span that is still open at this span's ordinal. This keeps
-  // parentless point records (checkpoint, artifact, ...) inside the enclosing
-  // span instead of leaking to the root of the tree.
+  // parentless records (checkpoint, artifact, agent.execution, ...) inside the
+  // enclosing span instead of leaking to the root of the tree.
   const effectiveParents = new Map<string, string | undefined>();
   const openStack: InternalMergedSpan[] = [];
   for (const span of ordered) {
@@ -118,11 +122,8 @@ export function buildSpanTree(spans: MergedTrajectorySpan[]): TrajectoryTreeNode
     }
     const explicit =
       span.parent_span_id && byId.has(span.parent_span_id) ? span.parent_span_id : undefined;
-    // Parentless point records (checkpoint, artifact, ...) attach to the deepest
-    // open lifecycle span; lifecycle spans keep their explicit parent (or root).
     const parent =
-      explicit ??
-      (span.phase === 'point' && openStack.length > 0 ? openStack.at(-1)!.span_id : undefined);
+      explicit ?? (openStack.length > 0 ? openStack.at(-1)!.span_id : undefined);
     effectiveParents.set(span.span_id, parent);
     if (span.phase === 'span') openStack.push(span);
   }
@@ -153,6 +154,24 @@ export function buildSpanTree(spans: MergedTrajectorySpan[]): TrajectoryTreeNode
   return buildChildren(undefined);
 }
 
+/** Max characters of an io line kept in the rendered waterfall (display only). */
+const IO_LINE_LIMIT = 240;
+
+function compactJson(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function renderIoLine(label: 'in' | 'out' | 'io', value: unknown, indent: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = compactJson(value).trim();
+  if (text.length === 0 || text === '{}') return undefined;
+  return `${indent}${label}: ${truncatePreview(text, IO_LINE_LIMIT)}`;
+}
+
 /** Render the replay tree as a readable ASCII waterfall. */
 export function renderTrajectory(tree: TrajectoryTreeNode[]): string {
   const lines: string[] = [];
@@ -168,6 +187,19 @@ export function renderTrajectory(tree: TrajectoryTreeNode[]): string {
         : '';
     const summary = span.summary ? `  ${span.summary}` : '';
     lines.push(`${indent}${marker} ${span.kind}${agent}${status}${duration}${summary}`);
+    // IO previews: `in` (start record), `out` (end record), `io` for anything
+    // else in the payload (e.g. point-record payloads).
+    const payload = span.payload ?? {};
+    const ioIndent = '  '.repeat(depth + 1);
+    const rest: Record<string, unknown> = { ...payload };
+    delete rest.input;
+    delete rest.output;
+    const inLine = renderIoLine('in', payload.input, ioIndent);
+    if (inLine) lines.push(inLine);
+    const outLine = renderIoLine('out', payload.output, ioIndent);
+    if (outLine) lines.push(outLine);
+    const ioLine = renderIoLine('io', rest, ioIndent);
+    if (ioLine) lines.push(ioLine);
     for (const child of node.children) renderNode(child, depth + 1, child.parallel);
   };
   for (const node of tree) renderNode(node, 0, false);

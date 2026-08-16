@@ -230,6 +230,78 @@ describe('DriverRuntimeAgentExecutionFacade trace', () => {
     expect(driverEnd.summary).toContain('succeeded');
   });
 
+  it('records bounded input/output payloads for each key action', async () => {
+    const { store } = await runTraced({
+      llm: scriptedLlm([
+        toolCall('query_memory', 'call_query', { query: 'past experience' }),
+        toolCall('invoke_driver', 'call_driver', { instruction: 'Build the feature' }),
+        { content: 'Task completed. [done]', tool_calls: undefined },
+      ]),
+    });
+
+    const records = await store.load(RUN_ID);
+
+    const executionStart = records.find(
+      (record) => record.kind === 'agent.execution' && record.phase === 'start',
+    )!;
+    const executionInput = executionStart.payload?.input as Record<string, unknown>;
+    expect(executionInput.instruction).toBe('Execute through B runtime with tool calls.');
+    expect(executionInput.context_policy).toBe('default');
+
+    const executionEnd = records.find(
+      (record) => record.kind === 'agent.execution' && record.phase === 'end',
+    )!;
+    const executionOutput = executionEnd.payload?.output as Record<string, unknown>;
+    expect(executionOutput.status).toBe('completed');
+    // result.response is the driver's response, not the LLM's final text.
+    expect(executionOutput.response).toBeTypeOf('string');
+    expect(typeof (executionOutput.retrieval as { skills: number }).skills).toBe('number');
+
+    const turnEnd = records.find(
+      (record) =>
+        record.kind === 'agent.turn' &&
+        record.phase === 'end' &&
+        record.summary?.includes('text'),
+    )!;
+    const turnOutput = turnEnd.payload?.output as { content: string; tool_call_count: number };
+    expect(turnOutput.content).toBe('Task completed. [done]');
+    expect(turnOutput.tool_call_count).toBe(0);
+
+    const toolStarts = records.filter(
+      (record) => record.kind === 'agent.tool' && record.phase === 'start',
+    );
+    for (const toolStart of toolStarts) {
+      const toolInput = toolStart.payload?.input as Record<string, unknown>;
+      expect(toolInput.tool_call_id).toBeTypeOf('string');
+      expect(toolInput.args).toBeTypeOf('string');
+    }
+
+    const queryToolEnd = records.find(
+      (record) =>
+        record.kind === 'agent.tool' && record.phase === 'end' && record.summary === 'query_memory → ok',
+    )!;
+    const queryOutput = queryToolEnd.payload?.output as { skills: unknown[]; experiences: unknown[] };
+    expect(Array.isArray(queryOutput.skills)).toBe(true);
+    expect(Array.isArray(queryOutput.experiences)).toBe(true);
+
+    const driverToolEnd = records.find(
+      (record) =>
+        record.kind === 'agent.tool' && record.phase === 'end' && record.summary === 'invoke_driver → ok',
+    )!;
+    const driverOutput = driverToolEnd.payload?.output as Record<string, unknown>;
+    // invoke_driver returns the six-field driver report preview.
+    expect(driverOutput.summary).toBeTypeOf('string');
+
+    const driverEnd = records.find(
+      (record) => record.kind === 'driver.run' && record.phase === 'end',
+    )!;
+    const driverRunOutput = driverEnd.payload?.output as Record<string, unknown>;
+    expect(driverRunOutput.status).toBe('succeeded');
+    expect(driverRunOutput.driver_id).toBe('mock-driver');
+    expect(driverRunOutput.report_summary).toBeTypeOf('string');
+    expect(Array.isArray(driverRunOutput.artifact_refs)).toBe(true);
+  });
+
   it('replays the spans as a nested waterfall', async () => {
     const { store } = await runTraced({
       llm: scriptedLlm([

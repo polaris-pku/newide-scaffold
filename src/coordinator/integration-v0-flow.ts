@@ -40,6 +40,7 @@ import {
   type RunTokenUsageSummary,
 } from '../telemetry';
 import type { TelemetrySink } from '../telemetry/telemetry-sink';
+import type { TraceProjector, TraceSink } from '../trace';
 import type { DriverStreamEventListener } from '../driver/contract';
 import {
   ArtifactSelector,
@@ -199,6 +200,14 @@ export interface IntegrationV0Options {
   runsRoot?: string;
   /** F Harness memory ablation; recorded on summary + context_pack events. */
   memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+  /** Trajectory sink: the run's full event chain is projected into it. */
+  trace?: TraceSink;
+  /**
+   * Shared trajectory projector: when set, the orchestrator projects events
+   * through it so explicit facade spans and event-projected spans share one
+   * per-run sequence counter in the same trajectory file.
+   */
+  traceProjector?: TraceProjector;
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
@@ -256,6 +265,8 @@ async function runIntegrationV0FlowBody(
   options?.signal?.throwIfAborted();
   const memoryAblation = options?.memoryAblation;
   const orchestrator = new RuntimeOrchestrator({
+    ...(options?.traceProjector ? { traceProjector: options.traceProjector } : {}),
+    ...(options?.trace ? { trace: options.trace } : {}),
     ...(options?.telemetry ? { telemetry: options.telemetry } : {}),
     ...(options?.onEvent ? { onEvent: options.onEvent } : {}),
   });

@@ -10,10 +10,12 @@ import {
   type AgentMessageType,
   type ArtifactRef,
 } from '../core';
-import type {
-  DirectTraceRecordInput,
-  TraceProjector,
-  TrajectorySpanStatus,
+import {
+  boundedPreview,
+  ioPayload,
+  type DirectTraceRecordInput,
+  type TraceProjector,
+  type TrajectorySpanStatus,
 } from '../trace';
 import {
   diffWorkspaceFiles,
@@ -570,6 +572,17 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           input,
           agentExecutionTraceStatus(result.status),
           agentExecutionTraceSummary(result),
+          ioPayload({
+            output: {
+              status: result.status,
+              response: result.response,
+              artifact_refs: result.artifact_refs.map((ref) => ref.uri),
+              driver_attempts: result.diagnostics.driver_attempts,
+              dispatch_status: result.diagnostics.dispatch_status,
+              driver_status: result.diagnostics.driver_status,
+              retrieval: result.diagnostics.retrieval,
+            },
+          }),
         );
         if (inboundMailbox && result.status === 'completed') {
           this.finishInboundMailbox(
@@ -586,6 +599,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           input,
           options?.signal?.aborted ? 'cancelled' : 'error',
           toErrorSummary(error),
+          ioPayload({ output: { error: toErrorSummary(error) } }),
         );
         throw error;
       }
@@ -1012,6 +1026,18 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const summary = input.instruction
       ? truncate(input.instruction, TRACE_INSTRUCTION_PREVIEW_LIMIT)
       : undefined;
+    const inputPayload = ioPayload({
+      input: {
+        instruction: input.instruction,
+        ...(input.driver_instruction ? { driver_instruction: input.driver_instruction } : {}),
+        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+        ...(input.session_id ? { session_id: input.session_id } : {}),
+        context_policy: input.context_policy,
+        ...(input.input_artifact_refs.length > 0
+          ? { input_artifact_refs: input.input_artifact_refs }
+          : {}),
+      },
+    });
     this.emitTrace({
       span_id: spanId,
       run_id: input.run_id,
@@ -1021,6 +1047,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       agent_id: input.role_id,
       started_at: startedAt,
       ...(summary ? { summary } : {}),
+      ...(inputPayload ? { payload: inputPayload } : {}),
     });
     return { span_id: spanId, started_at: startedAt, ...(summary ? { summary } : {}) };
   }
@@ -1030,6 +1057,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     input: AgentExecutionRequest,
     status: TrajectorySpanStatus,
     summary: string | undefined,
+    payload?: Record<string, unknown>,
   ): void {
     if (!handle || !this.options.trace) return;
     const endedAt = nowTimestamp();
@@ -1045,6 +1073,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ended_at: endedAt,
       ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
       ...(summary ? { summary } : {}),
+      ...(payload ? { payload } : {}),
     });
   }
 
@@ -1054,6 +1083,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const spanId = createId('span');
     const startedAt = nowTimestamp();
     const summary = `round #${String(event.round)}`;
+    const inputPayload = ioPayload({
+      input: { round: event.round, message_count: event.messageCount },
+    });
     this.emitTrace({
       span_id: spanId,
       run_id: invocation.run_id,
@@ -1064,7 +1096,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       agent_id: invocation.role_id,
       started_at: startedAt,
       summary,
-      payload: { round: event.round, message_count: event.messageCount },
+      ...(inputPayload ? { payload: inputPayload } : {}),
     });
     invocation.trace.turnStack.push({ span_id: spanId, started_at: startedAt, summary });
   }
@@ -1077,6 +1109,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const endedAt = nowTimestamp();
     const durationMsValue = computeDurationMs(handle.started_at, endedAt);
     const tail = event.toolCallCount > 0 ? `${String(event.toolCallCount)} tool_calls` : 'text';
+    const outputPayload = ioPayload({
+      output: {
+        ...(event.content ? { content: event.content } : {}),
+        tool_call_count: event.toolCallCount,
+      },
+    });
     this.emitTrace({
       span_id: handle.span_id,
       run_id: invocation.run_id,
@@ -1088,6 +1126,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ended_at: endedAt,
       ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
       ...(handle.summary ? { summary: `${handle.summary} → ${tail}` } : {}),
+      ...(outputPayload ? { payload: outputPayload } : {}),
     });
   }
 
@@ -1099,6 +1138,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const endedAt = nowTimestamp();
     const durationMsValue = computeDurationMs(handle.started_at, endedAt);
     const message = toErrorSummary(event.error);
+    const outputPayload = ioPayload({ output: { error: message } });
     this.emitTrace({
       span_id: handle.span_id,
       run_id: invocation.run_id,
@@ -1110,7 +1150,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ended_at: endedAt,
       ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
       ...(handle.summary ? { summary: `${handle.summary} → error: ${message}` } : {}),
-      ...(message ? { payload: { error: message } } : {}),
+      ...(outputPayload ? { payload: outputPayload } : {}),
     });
   }
 
@@ -1121,6 +1161,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const startedAt = nowTimestamp();
     const parent =
       invocation.trace.turnStack.at(-1)?.span_id ?? invocation.trace.executionSpanId;
+    const inputPayload = ioPayload({
+      input: {
+        tool_call_id: event.tool_call_id,
+        args: event.arguments,
+      },
+    });
     this.emitTrace({
       span_id: spanId,
       run_id: invocation.run_id,
@@ -1131,10 +1177,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       agent_id: invocation.role_id,
       started_at: startedAt,
       summary: event.tool_name,
-      payload: {
-        tool_call_id: event.tool_call_id,
-        args: truncate(event.arguments, TRACE_ARGS_PREVIEW_LIMIT),
-      },
+      ...(inputPayload ? { payload: inputPayload } : {}),
     });
     invocation.trace.toolStack.push({
       span_id: spanId,
@@ -1151,6 +1194,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const endedAt = nowTimestamp();
     const durationMsValue = computeDurationMs(handle.started_at, endedAt);
     const name = handle.summary ?? event.tool_name;
+    const outputPayload = event.ok
+      ? ioPayload({ output: event.result !== undefined ? boundedPreview(event.result) : undefined })
+      : ioPayload({ output: { error: event.error ?? 'unknown error' } });
     this.emitTrace({
       span_id: handle.span_id,
       run_id: invocation.run_id,
@@ -1164,11 +1210,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ...(event.ok
         ? { summary: `${name} → ok` }
         : { summary: `${name} → error: ${truncate(event.error ?? 'unknown error', TRACE_ERROR_PREVIEW_LIMIT)}` }),
-      ...(event.ok
-        ? {}
-        : event.error
-          ? { payload: { error: truncate(event.error, TRACE_ERROR_PREVIEW_LIMIT) } }
-          : {}),
+      ...(outputPayload ? { payload: outputPayload } : {}),
     });
   }
 
@@ -1183,6 +1225,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       invocation.trace.executionSpanId;
     const spanId = createId('span');
     const startedAt = nowTimestamp();
+    const inputPayload = ioPayload({
+      input: {
+        attempt: invocation.driver_attempts,
+        driver_instruction: invocation.driver_instruction,
+      },
+    });
     this.emitTrace({
       span_id: spanId,
       run_id: invocation.run_id,
@@ -1193,11 +1241,30 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       agent_id: invocation.role_id,
       started_at: startedAt,
       summary: `attempt #${String(invocation.driver_attempts)}`,
+      ...(inputPayload ? { payload: inputPayload } : {}),
     });
     try {
       const result = await run();
       const endedAt = nowTimestamp();
       const durationMsValue = computeDurationMs(startedAt, endedAt);
+      const outputPayload = ioPayload({
+        output: {
+          status: result.execution.status,
+          session_id: result.execution.session_id,
+          driver_id: result.execution.diagnostics.driver_id,
+          artifact_refs: result.execution.artifacts.map((ref) => ref.uri),
+          tool_events: result.execution.tool_events.length,
+          report_summary: result.report.summary,
+          report: {
+            decisions: result.report.decisions.length,
+            assumptions: result.report.assumptions.length,
+            referenced_experiences: result.report.referenced_experiences.length,
+            unresolved_blockers: result.report.blockers
+              .filter((blocker) => !blocker.resolved)
+              .map((blocker) => blocker.blocker),
+          },
+        },
+      });
       this.emitTrace({
         span_id: spanId,
         run_id: invocation.run_id,
@@ -1209,17 +1276,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ended_at: endedAt,
         ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
         summary: `${result.execution.status} (attempt #${String(invocation.driver_attempts)}, session ${result.execution.session_id})`,
-        payload: {
-          session_id: result.execution.session_id,
-          driver_id: result.execution.diagnostics.driver_id,
-          artifacts: result.execution.artifacts.length,
-          tool_events: result.execution.tool_events.length,
-        },
+        ...(outputPayload ? { payload: outputPayload } : {}),
       });
       return result;
     } catch (error) {
       const endedAt = nowTimestamp();
       const durationMsValue = computeDurationMs(startedAt, endedAt);
+      const outputPayload = ioPayload({ output: { error: toErrorSummary(error) } });
       this.emitTrace({
         span_id: spanId,
         run_id: invocation.run_id,
@@ -1231,6 +1294,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ended_at: endedAt,
         ...(durationMsValue !== undefined ? { duration_ms: durationMsValue } : {}),
         summary: `error: ${toErrorSummary(error)}`,
+        ...(outputPayload ? { payload: outputPayload } : {}),
       });
       throw error;
     }
@@ -1625,7 +1689,6 @@ function mapStatus(
 // ────────────────────────────────────────────
 
 const TRACE_INSTRUCTION_PREVIEW_LIMIT = 120;
-const TRACE_ARGS_PREVIEW_LIMIT = 400;
 const TRACE_ERROR_PREVIEW_LIMIT = 200;
 
 function computeDurationMs(startedAt: string, endedAt: string): number | undefined {

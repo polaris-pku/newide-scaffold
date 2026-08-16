@@ -24,6 +24,7 @@ import {
   type Timestamp,
 } from '../core';
 import type { TraceSink } from './trace-store';
+import { boundedPreview, ioPayload } from './io-preview';
 import type {
   TrajectorySpanKind,
   TrajectorySpanPhase,
@@ -280,6 +281,31 @@ const MAPPING: Readonly<Record<string, SpanMapping>> = {
   'hook.matched': { kind: 'hook', phase: 'point' },
   'agent.message_send': { kind: 'agent.message', phase: 'point' },
   'agent.message_recv': { kind: 'agent.message', phase: 'point' },
+  'mailbox.message_sent': {
+    kind: 'agent.message',
+    phase: 'point',
+    summary: (input) => payloadString(input, 'message_type'),
+  },
+  'mailbox.message_acked': {
+    kind: 'agent.message',
+    phase: 'point',
+    status: 'ok',
+    summary: (input) => payloadString(input, 'message_type'),
+  },
+  'workspace.changed': {
+    kind: 'worktree',
+    phase: 'point',
+    summary: (input) => {
+      const count = payloadString(input, 'changed_file_count');
+      return count !== undefined ? `${count} files changed` : undefined;
+    },
+  },
+  'agent.primary_completed': {
+    kind: 'agent.execution',
+    phase: 'point',
+    status: 'ok',
+    summary: (input) => payloadString(input, 'summary'),
+  },
   'agent.execution_requested': {
     kind: 'agent.execution',
     phase: 'point',
@@ -408,6 +434,7 @@ export class TraceProjector {
     };
     stack.push(span);
     this.open.set(runKey, stack);
+    const inputPayload = ioPayload({ input: input.payload });
     return {
       span_id: span.span_id,
       kind: mapping.kind,
@@ -418,6 +445,7 @@ export class TraceProjector {
       ...(agentId !== undefined ? { agent_id: agentId } : {}),
       ...(summary !== undefined ? { summary } : {}),
       ...(span.started_at ? { started_at: span.started_at } : {}),
+      ...(inputPayload ? { payload: inputPayload } : {}),
       source_event_id: span.source_event_id,
       sequence,
       created_at: input.created_at,
@@ -445,7 +473,10 @@ export class TraceProjector {
     this.open.set(runKey, stack);
     const status = mapping.statusFromPayload?.(input.payload) ?? mapping.status ?? 'ok';
     const summary = mapping.summary?.(input) ?? span.summary;
-    return [this.buildEndRecord(span, status, input.created_at, summary, sequence)];
+    const outputPayload = ioPayload({ output: input.payload });
+    return [
+      this.buildEndRecord(span, status, input.created_at, summary, sequence, outputPayload),
+    ];
   }
 
   private findOpenSpan(
@@ -474,6 +505,14 @@ export class TraceProjector {
     const agentId = mapping?.agentId?.(input);
     const summary = mapping?.summary?.(input);
     const status = mapping?.statusFromPayload?.(input.payload) ?? mapping?.status;
+    const preview = boundedPreview(input.payload);
+    const payload =
+      preview !== null &&
+      typeof preview === 'object' &&
+      !Array.isArray(preview) &&
+      Object.keys(preview).length > 0
+        ? (preview as Record<string, unknown>)
+        : undefined;
     return {
       span_id: createId('span'),
       kind,
@@ -483,6 +522,7 @@ export class TraceProjector {
       ...(status !== undefined ? { status } : {}),
       ...(agentId !== undefined ? { agent_id: agentId } : {}),
       ...(summary !== undefined ? { summary } : {}),
+      ...(payload ? { payload } : {}),
       source_event_id: input.event_id ?? input.subject_id,
       sequence,
       created_at: input.created_at,
@@ -496,6 +536,7 @@ export class TraceProjector {
     endedAt: string,
     summary: string | undefined,
     sequence?: number,
+    payload?: Record<string, unknown>,
   ): TrajectorySpanRecord {
     const durationMs = parseTimestampMs(endedAt) - parseTimestampMs(span.started_at);
     return {
@@ -511,6 +552,7 @@ export class TraceProjector {
       started_at: span.started_at,
       ended_at: endedAt,
       ...(Number.isFinite(durationMs) && durationMs >= 0 ? { duration_ms: durationMs } : {}),
+      ...(payload ? { payload } : {}),
       ...(span.source_event_id ? { source_event_id: span.source_event_id } : {}),
       sequence: sequence ?? 0,
       created_at: endedAt,
