@@ -213,6 +213,33 @@ describe('analyzeTrajectory — materialization', () => {
     expect(diag.findings.some((f) => f.code === 'materialization.missing')).toBe(false);
   });
 
+  it('accepts production-style manifest payloads as materialization evidence', () => {
+    // Production TaskExecutionLoop emits worktree.materialized with a
+    // changeset_manifest_ref and a deliver-stage artifact point with
+    // manifest_id instead of a file count.
+    const fixture = healthyFixture().filter(
+      (r) => r.span_id !== 'wt' && r.span_id !== 'art',
+    );
+    fixture.push(
+      record('wt_prod', 'point', 'worktree', 11, T3, {
+        status: 'ok',
+        payload: {
+          changeset_manifest_ref:
+            'file:///runs/run_test/changeset-manifest.json',
+          worktree_path: 'D:\\worktrees\\task_test',
+        },
+      }),
+      record('art_prod', 'point', 'artifact', 12, T3, {
+        payload: {
+          manifest_id: 'changeset_123',
+          changeset_manifest_ref: 'file:///runs/run_test/changeset-manifest.json',
+        },
+      }),
+    );
+    const diag = analyzeTrajectory(fixture);
+    expect(diag.findings.some((f) => f.code === 'materialization.missing')).toBe(false);
+  });
+
   it('does not warn when the run itself failed (no ok completion to contradict)', () => {
     const fixture = healthyFixture().filter((r) => r.span_id !== 'wt' && r.span_id !== 'art');
     const end = fixture.find((r) => r.span_id === 'task' && r.phase === 'end')!;

@@ -482,12 +482,23 @@ function findingsForUsage(points: ContextUsagePoint[]): TrajectoryFinding[] {
 
 function hasMaterializationEvidence(spans: MergedTrajectorySpan[]): boolean {
   for (const span of spans) {
-    if (span.kind === 'artifact' && span.phase === 'point' && span.status === 'ok') return true;
+    if (span.kind === 'artifact' && span.phase === 'point') {
+      const payload = payloadOf(span);
+      // Example flow: artifact.delivered (status ok). Production flow: the
+      // deliver stage emits an artifact point carrying manifest references.
+      if (span.status === 'ok') return true;
+      if (payload.manifest_id !== undefined || payload.changeset_manifest_ref !== undefined) {
+        return true;
+      }
+    }
     if (span.kind === 'worktree' && span.phase === 'point') {
       const payload = payloadOf(span);
       const filesWritten =
         typeof payload.files_written === 'number' ? payload.files_written : undefined;
       if (filesWritten !== undefined && filesWritten > 0) return true;
+      // Production worktree.materialized carries a changeset manifest ref
+      // instead of a file count.
+      if (payload.changeset_manifest_ref !== undefined) return true;
     }
   }
   return false;
