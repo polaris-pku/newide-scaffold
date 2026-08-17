@@ -5,16 +5,27 @@
  * 含 experiences、skills、persona 等；buffer 见 InMemoryBufferRepository。
  * 生产向持久化见 PgMemoryRepository。
  */
-import type {
-  AgentHandle,
-  AgentMetrics,
-  CreateAgentSpec,
-  ExperienceRecord,
-  PersonaDef,
-  SkillRecord,
+import { randomUUID } from 'node:crypto';
+import { nowTimestamp } from '../../core';
+import {
+  MARKET_POOL_ROLE_ID,
+  type AgentHandle,
+  type AgentMetrics,
+  type AgentStatus,
+  type CreateAgentSpec,
+  type ExperienceRecord,
+  type PersonaDef,
+  type RetiredReason,
+  type SkillRecord,
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
-import type { MemoryRepository, MemoryVectorSearchOptions } from '../ports/memory-repository';
+import type {
+  MarketImportResult,
+  MarketSearchOptions,
+  MemoryRepository,
+  MemoryVectorSearchOptions,
+  TransferSkillToMarketOptions,
+} from '../ports/memory-repository';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 import { cosineSimilarity } from '../utils/vector';
 import {
@@ -25,6 +36,7 @@ import {
   DEFAULT_MIN_SIMILARITY,
   isEligibleExperience,
   isEligibleSkill,
+  isMarketEligibleSkill,
 } from './memory-repository-seeds';
 
 interface AgentStore {
@@ -74,7 +86,8 @@ export class InMemoryRepository implements MemoryRepository {
   }
 
   async listAgentIds(): Promise<string[]> {
-    return [...this.agents.keys()];
+    // 隐藏市场池 Agent（方案 A）：它只作为技能的归属容器，不参与竞标/派发/展示
+    return [...this.agents.keys()].filter((id) => id !== MARKET_POOL_ROLE_ID);
   }
 
   async getAgent(role_id: string): Promise<AgentHandle> {
@@ -111,6 +124,121 @@ export class InMemoryRepository implements MemoryRepository {
       isEligibleExperience(experience, min_confidence),
     );
     return rankByVectorSimilarity(eligible, options, this.embedding);
+  }
+
+  async marketSearchSkills(options: MarketSearchOptions): Promise<SkillRecord[]> {
+    const candidates: SkillRecord[] = [];
+    for (const [agentId, store] of this.agents) {
+      if (options.exclude_agent_id === agentId) {
+        continue;
+      }
+      for (const skill of store.skills) {
+        if (isMarketEligibleSkill(skill)) {
+          candidates.push(skill);
+        }
+      }
+    }
+    return rankByVectorSimilarity(candidates, options, this.embedding);
+  }
+
+  async marketImportSkill(role_id: string, source_skill_id: string): Promise<MarketImportResult> {
+    // 1. 定位源技能（跨 Agent 全库查找）
+    const sourceOwner = this.findSkillOwner(source_skill_id);
+    if (!sourceOwner) {
+      throw new Error(`Market skill not found: ${source_skill_id}`);
+    }
+    const source = sourceOwner.skill;
+    if (!isMarketEligibleSkill(source)) {
+      throw new Error(`Market skill not importable (review/status): ${source_skill_id}`);
+    }
+
+    const importer = this.requireStore(role_id);
+
+    // 2. 幂等：引入方已存在该源技能的副本 → 直接返回已有副本
+    const existing = importer.skills.find((skill) => skill.imported_from === source_skill_id);
+    if (existing) {
+      return { imported: existing, source, created: false };
+    }
+
+    // 3. 克隆副本
+    const now = nowTimestamp();
+    const copy: SkillRecord = {
+      ...source,
+      id: randomUUID(),
+      agent_id: role_id,
+      imported_from: source_skill_id,
+      // 副本归引入方所有，provenance 记录在源技能的 imported_by 上
+      imported_by: undefined,
+      promoted_from: undefined,
+      created_at: now,
+      updated_at: now,
+    };
+    const stored = await this.withDescriptionEmbedding(copy);
+
+    importer.skills.push(stored);
+    importer.handle.skill_count = importer.skills.length;
+    importer.handle.owned_skills.push(stored.id);
+    importer.metrics.skill_count = importer.skills.length;
+    importer.metrics.imported_skill_count += 1;
+    importer.handle = { ...importer.handle, metric: importer.metrics };
+
+    // 4. 更新源技能 imported_by（retirement 决策树依赖该字段）
+    const updatedSource: SkillRecord = {
+      ...source,
+      imported_by: [...(source.imported_by ?? []), role_id],
+      updated_at: now,
+    };
+    sourceOwner.store.skills[sourceOwner.index] = updatedSource;
+
+    return { imported: stored, source: updatedSource, created: true };
+  }
+
+  async transferSkillToMarket(
+    fromRoleId: string,
+    skillId: string,
+    options: TransferSkillToMarketOptions = {},
+  ): Promise<SkillRecord> {
+    const source = this.requireStore(fromRoleId);
+    const index = source.skills.findIndex((skill) => skill.id === skillId);
+    if (index === -1) {
+      throw new Error(`Skill not found: ${skillId}`);
+    }
+
+    // 首次迁移时自动初始化市场池 Agent
+    await this.ensureAgent(MARKET_POOL_ROLE_ID);
+    const market = this.requireStore(MARKET_POOL_ROLE_ID);
+
+    const now = nowTimestamp();
+    const original = source.skills[index]!;
+    const moved: SkillRecord = {
+      ...original,
+      agent_id: MARKET_POOL_ROLE_ID,
+      market_status: options.market_status ?? original.market_status,
+      origin_agent_id: original.origin_agent_id ?? original.agent_id,
+      updated_at: now,
+    };
+
+    // 从源 Agent 移除
+    source.skills.splice(index, 1);
+    source.handle = {
+      ...source.handle,
+      skill_count: source.skills.length,
+      owned_skills: source.handle.owned_skills.filter((id) => id !== skillId),
+    };
+    source.metrics = { ...source.metrics, skill_count: source.skills.length };
+    source.handle = { ...source.handle, metric: source.metrics };
+
+    // 挂载到市场池
+    market.skills.push(moved);
+    market.handle = {
+      ...market.handle,
+      skill_count: market.skills.length,
+      owned_skills: [...market.handle.owned_skills, moved.id],
+    };
+    market.metrics = { ...market.metrics, skill_count: market.skills.length };
+    market.handle = { ...market.handle, metric: market.metrics };
+
+    return moved;
   }
 
   async saveExperience(role_id: string, experience: ExperienceRecord): Promise<void> {
@@ -157,6 +285,65 @@ export class InMemoryRepository implements MemoryRepository {
     store.experiences[index] = await this.withDescriptionEmbedding(experience);
   }
 
+  async deleteSkill(role_id: string, skill_id: string): Promise<void> {
+    const store = this.requireStore(role_id);
+    const before = store.skills.length;
+    store.skills = store.skills.filter((item) => item.id !== skill_id);
+    if (store.skills.length === before) {
+      throw new Error(`Skill not found: ${skill_id}`);
+    }
+    store.handle = {
+      ...store.handle,
+      skill_count: store.skills.length,
+      owned_skills: store.handle.owned_skills.filter((id) => id !== skill_id),
+    };
+    store.metrics = { ...store.metrics, skill_count: store.skills.length };
+    store.handle = { ...store.handle, metric: store.metrics };
+  }
+
+  async deleteExperience(role_id: string, experience_id: string): Promise<void> {
+    const store = this.requireStore(role_id);
+    const before = store.experiences.length;
+    store.experiences = store.experiences.filter((item) => item.id !== experience_id);
+    if (store.experiences.length === before) {
+      throw new Error(`Experience not found: ${experience_id}`);
+    }
+    store.handle = {
+      ...store.handle,
+      experience_count: store.experiences.length,
+      owned_exps: store.handle.owned_exps.filter((id) => id !== experience_id),
+    };
+    store.metrics = { ...store.metrics, experience_count: store.experiences.length };
+    store.handle = { ...store.handle, metric: store.metrics };
+  }
+
+  async updateMetrics(
+    role_id: string,
+    update: (current: AgentMetrics) => AgentMetrics,
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    const next = update(store.metrics);
+    store.metrics = next;
+    // 同步聚合根内嵌指标快照
+    store.handle = { ...store.handle, metric: next };
+  }
+
+  async updateAgentStatus(
+    role_id: string,
+    status: AgentStatus,
+    options?: { retired_at?: string; retired_reason?: RetiredReason },
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    store.handle = {
+      ...store.handle,
+      status,
+      ...(options?.retired_at !== undefined ? { retired_at: options.retired_at } : {}),
+      ...(options?.retired_reason !== undefined
+        ? { retired_reason: options.retired_reason }
+        : {}),
+    };
+  }
+
   private async withDescriptionEmbedding<T extends SkillRecord | ExperienceRecord>(
     record: T,
   ): Promise<T> {
@@ -175,6 +362,19 @@ export class InMemoryRepository implements MemoryRepository {
       throw new Error(`Agent not found: ${role_id}`);
     }
     return store;
+  }
+
+  /** 跨 Agent 查找一条技能所属的 store 与下标；未找到返回 undefined */
+  private findSkillOwner(
+    skill_id: string,
+  ): { store: AgentStore; index: number; skill: SkillRecord } | undefined {
+    for (const store of this.agents.values()) {
+      const index = store.skills.findIndex((skill) => skill.id === skill_id);
+      if (index !== -1) {
+        return { store, index, skill: store.skills[index]! };
+      }
+    }
+    return undefined;
   }
 }
 

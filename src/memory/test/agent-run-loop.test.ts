@@ -12,6 +12,7 @@
  *   8. runOnce 向后兼容
  *   9. hasPendingTask 状态报告
  *   10. AgentManager.dispatchTask 异步派单
+ *   11. executeTask 失败后释放 currentTask，避免后续 B_BLOCKED
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect } from 'vitest';
@@ -221,6 +222,39 @@ describe('Agent self-loop (executeTask)', () => {
     });
   });
 
+  describe('executeTask 失败后释放任务', () => {
+    it('LLM 抛错后释放 currentTask，同一 Agent 可再接任务', async () => {
+      const { memory } = await createTestInfra('role_throw_release');
+      const failing = new Agent(memory, createToolConfig(createMockToolClient([])));
+
+      await expect(failing.executeTask(createTestTask())).rejects.toThrow('Unexpected call');
+      expect(failing.getState()).toBe('sleeping');
+      expect(failing.hasPendingTask()).toBe(false);
+
+      const retryLlm = createMockToolClient([textResponse('Task completed. [done]')]);
+      const retry = new Agent(memory, createToolConfig(retryLlm));
+      // Same memory scope is fine; the regression is hasPendingTask staying true
+      // on the agent that threw.
+      await expect(
+        retry.executeTask(createTestTask({ task_id: 'task_retry' })),
+      ).resolves.toMatchObject({ agent_id: 'role_throw_release' });
+      expect(retry.hasPendingTask()).toBe(false);
+    });
+
+    it('assignTask 冲突时不清除已有任务', async () => {
+      const { memory } = await createTestInfra('role_assign_keep');
+      const agent = new Agent(memory, createToolConfig(createMockToolClient([])));
+      const held = createTestTask({ task_id: 'task_held' });
+      await (agent as any).assignTask(held);
+
+      await expect(
+        agent.executeTask(createTestTask({ task_id: 'task_other' })),
+      ).rejects.toThrow('already has a running task');
+      expect(agent.hasPendingTask()).toBe(true);
+      expect((agent as any).currentTask.task_id).toBe('task_held');
+    });
+  });
+
   describe('executeTask 最大轮次保护', () => {
     it('达到 maxToolCalls 时强制完成', async () => {
       const { memory } = await createTestInfra('role_maxrounds');
@@ -310,5 +344,37 @@ describe('AgentManager dispatchTask', () => {
     // 验证 buffer 已写入（pending 状态，提取由离线 Processor 处理）
     const meta = await bufferRepository.getBufferMeta('role_async_task');
     expect(meta.pending_count).toBe(1);
+  });
+
+  it('executeTask 失败后同一 Agent 可再次 dispatch，不会 blocked', async () => {
+    const { AgentManager } = await import('../runtime/agent-manager');
+    const repository = new InMemoryRepository();
+    const bufferRepository = new InMemoryBufferRepository();
+    let calls = 0;
+    const mockLlm: ToolCallingClient = {
+      completeWithTools: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error('driver exploded');
+        return textResponse('Task completed. [done]');
+      },
+    };
+    const manager = await AgentManager.create(repository, bufferRepository, {
+      tools: { llm: mockLlm, tools: [] },
+    });
+    await manager.createAgent({ role_id: 'role_busy_leak', name: 'Busy', tags: [] });
+
+    const first = await manager.dispatchTask('role_busy_leak', createTestTask({ task_id: 'task_fail' }));
+    expect(first.status).toBe('failed');
+    expect(manager.getAgent('role_busy_leak')!.hasPendingTask()).toBe(false);
+
+    const second = await manager.dispatchTask(
+      'role_busy_leak',
+      createTestTask({ task_id: 'task_retry' }),
+    );
+    expect(second.status).not.toBe('blocked');
+    expect(second.cycle.buffer_snapshot.driver_return.summary).not.toContain(
+      'Agent is busy with another task.',
+    );
+    expect(manager.getAgent('role_busy_leak')!.hasPendingTask()).toBe(false);
   });
 });

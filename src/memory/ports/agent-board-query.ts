@@ -46,6 +46,7 @@ export interface SkillView {
   promoted_from: string | undefined;
   promoted_at: string;
   agent_id: string;
+  origin_agent_id: string | undefined;
   imported_by: string[] | undefined;
   linked_negative_exp: string[] | undefined;
   market_status: string | undefined;

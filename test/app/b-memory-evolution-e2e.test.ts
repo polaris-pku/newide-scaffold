@@ -144,6 +144,7 @@ describe('B memory evolution end to end', () => {
           readiness: 'verified',
         },
         { autoApprovePromotedSkills: true },
+        repository,
       ),
     );
     await expect(
@@ -248,6 +249,11 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
     listMemoryExperiences: (roleId) => service.listExperiences(roleId),
     listMemoryMaintenance: (roleId) => service.listMaintenance(roleId),
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
+    marketSearchMemorySkills: (query) => service.marketSearch(query),
+    marketImportMemorySkill: (roleId, sourceSkillId) =>
+      service.marketImport(roleId, sourceSkillId),
+    retireMemoryAgent: (roleId, options) => service.retireAgent(roleId, options),
+    runRetirementScan: (roleId) => service.runRetirementScan(roleId),
     approveMemorySkill: (roleId, skillId, reviewedBy) =>
       service.approveSkill(roleId, skillId, reviewedBy),
     rejectMemorySkill: (roleId, skillId, reviewedBy) =>

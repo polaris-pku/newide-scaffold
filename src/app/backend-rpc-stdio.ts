@@ -292,6 +292,12 @@ export async function createProductionBackendService(
       bCapabilities,
       bRuntime.embedding_info,
       { autoApprovePromotedSkills: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1' },
+      bRuntime.repository,
+      {
+        retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
+        runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
+      },
+      bRuntime.embedding,
     );
 
     try {

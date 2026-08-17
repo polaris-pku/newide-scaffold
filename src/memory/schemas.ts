@@ -46,6 +46,16 @@ export type ReviewStatus = z.infer<typeof ReviewStatusSchema>;
 export const MarketStatusSchema = z.enum(['available', 'superseded', 'retired_unique']);
 export type MarketStatus = z.infer<typeof MarketStatusSchema>;
 
+/**
+ * 技能市场池 Agent 的固定 role_id（方案 A）。
+ *
+ * 退休时保留的技能会被迁移到这个固定 Agent 名下，使技能始终「属于某个
+ * Agent」（满足 Pg FK），同时退休 Agent 可安全归档。该 Agent 是隐藏的
+ * 系统角色：listAgentIds() 会过滤掉它，因此不会出现在 Agent Board、
+ * loadAllAgents 实例化、竞标或派发中。
+ */
+export const MARKET_POOL_ROLE_ID = '__market__';
+
 /** 经验类型：正经验记录成功方案，负经验记录失败教训 */
 export const ExperienceTypeSchema = z.enum(['positive', 'negative']);
 export type ExperienceType = z.infer<typeof ExperienceTypeSchema>;
@@ -333,10 +343,19 @@ export const SkillRecordSchema = z.object({
   tags: z.array(z.string()),
   /** 若由经验晋升而来，记录来源经验 ID */
   promoted_from: z.uuid().optional(),
+  /** 若从技能市场引入而来，记录来源市场 Skill 的 ID（用于溯源与幂等） */
+  imported_from: z.uuid().optional(),
   /** 晋升时间 */
   promoted_at: z.iso.datetime(),
   /** 创造者 Agent ID */
   agent_id: z.string(),
+  /**
+   * 技能的最初创建者 Agent ID。
+   *
+   * 技能归入市场池（__market__）时记录原创建者；通过市场引入的副本沿袭
+   * 源技能的原创建者，从而溯源到技能谱系的根创建者。
+   */
+  origin_agent_id: z.string().optional(),
   /** 导入该技能的其他 Agent ID 列表 */
   imported_by: z.array(z.string()).optional(),
   /** 关联的负经验 ID 列表（记录了该技能不适用的情况） */
@@ -430,6 +449,12 @@ export const AgentMetricsSchema = z.object({
   persona_drift: z.number().min(0).max(1).optional(),
   /** Persona 最近一次保持稳定的时间点 */
   persona_stable_since: z.iso.datetime().optional(),
+  /** 最近一次退休扫描时间（三重门控触发机制的状态持久化） */
+  last_retirement_scan_at: z.iso.datetime().optional(),
+  /** 最近一次 Persona 漂移层评估时间（第二层门控冷却起点） */
+  last_persona_drift_eval_at: z.iso.datetime().optional(),
+  /** 最近一次 LLM 全面评估时间（第三层门控冷却起点） */
+  last_llm_eval_at: z.iso.datetime().optional(),
 });
 export type AgentMetrics = z.infer<typeof AgentMetricsSchema>;
 

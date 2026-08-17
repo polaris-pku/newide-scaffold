@@ -138,7 +138,7 @@ if (selected) {
 
 `dispatchTask()` 当前实际会返回 `completed`、`no_driver_invocation`、`blocked` 或 `failed`。类型中还保留了 `cancelled`、`max_rounds_exceeded` 等状态，但当前实现没有对应返回分支；达到最大轮次后会完成循环，再按是否调用 Driver 返回状态。
 
-`retireAgent()` 目前是空实现。运行时也没有公开的 `start()`、`stop()`、`wakeAll()` 或 `tickAll()` 调度 API；`dispatchTask()` 会在一次调用内同步跑完整个循环。
+`retireAgent(role_id, options?)` 执行优雅退休（draining → 资产处置 → retired），可选创建替代 Agent（clean_slate / seeded_slate）；对已退休 Agent 幂等。运行时没有公开的 `start()`、`stop()`、`wakeAll()` 或 `tickAll()` 调度 API；`dispatchTask()` 会在一次调用内同步跑完整个循环。
 
 ### 工具
 
@@ -328,9 +328,9 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 
 > **测试用临时方案**：`src/memory/test/drivers/llm-driver.ts` 提供了一个基于本地 `claude` CLI 的简单 `DriverHandler` 实现，用于集成测试。它不适用于生产环境，仅用于在缺少真实 Driver 时验证 Agent → Driver 的完整调用链路。
 
-### 4. Agent 生命周期管理不完整
+### 4. 退休检测管线不完整
 
-`AgentManager.retireAgent()` 当前为**空实现**（仅含 `// TODO` 注释），调用后不会执行任何清理操作（如移除 Agent 状态、释放资源、通知存储层等）。退役 Agent 的完整生命周期管理尚未实现。
+`AgentManager.retireAgent()` 已实现优雅退休（状态迁移 + 资产处置 + 可选替代 Agent），Metrics 采集也已接入 `collectCompetitionClaims`（竞标）与 `dispatchTask`（任务结果）。但 week3 RFC 的**三层退休检测管线**（统计扫描 → Persona 漂移 → 全面评估）尚未实现——当前只有 `evaluateRetirementSignals()` 这个轻量统计层，调用方（维护 runner / 定时器）需要自行决定何时触发退休。Persona 漂移（`persona_drift`）字段也尚未被 Persona 演化填充。
 
 ### 5. 任务完成检测是简单启发式
 

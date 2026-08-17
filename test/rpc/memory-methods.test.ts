@@ -10,6 +10,36 @@ describe('MemoryRpcMethods', () => {
       role_id: roleId,
       requested_by: requestedBy,
     }));
+    const marketSearchMemorySkills = vi.fn(async () => [marketSkill()]);
+    const marketImportMemorySkill = vi.fn(
+      async (roleId: string, sourceSkillId: string) => ({
+        imported: { ...marketSkill(), id: 'skill_imported' },
+        source: { ...marketSkill(), id: sourceSkillId },
+        created: true,
+      }),
+    );
+    const retireMemoryAgent = vi.fn(
+      async (roleId: string, options: { reason?: string; replacement?: string }) => ({
+        role_id: roleId,
+        status: 'retired' as const,
+        retired_at: '2026-07-21T00:00:00.000Z',
+        retired_reason: (options.reason ?? 'manual') as
+          | 'performance_degradation'
+          | 'inactivity'
+          | 'persona_drift'
+          | 'manual'
+          | 'split',
+        asset_disposition: {
+          skills_retained: 0,
+          skills_discarded: 0,
+          experiences_retained: 0,
+          experiences_discarded: 0,
+        },
+      }),
+    );
+    const runRetirementScan = vi.fn(async (roleId?: string) => [
+      scanResult({ role_id: roleId ?? 'role_ts_engineer' }),
+    ]);
     const approveMemorySkill = vi.fn(async () => ({
       id: 'skill_1',
       review_status: 'approved',
@@ -20,7 +50,16 @@ describe('MemoryRpcMethods', () => {
       review_status: 'rejected',
       reviewed_by: 'reviewer',
     }) as never);
-    const service = fakeService({ promoteMemorySkills, approveMemorySkill, rejectMemorySkill });
+    
+    const service = fakeService({
+      promoteMemorySkills,
+      marketSearchMemorySkills,
+      marketImportMemorySkill,
+      retireMemoryAgent,
+      runRetirementScan,
+      approveMemorySkill,
+      rejectMemorySkill,
+    });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
     const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
@@ -53,6 +92,27 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":9,"method":"memory.listSkills","params":{"role_id":"role_ts_engineer","extra":true}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":10,"method":"memory.marketSearch","params":{"query":"typescript","top_k":5,"exclude_agent_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":11,"method":"memory.marketImport","params":{"role_id":"role_ts_engineer","source_skill_id":"skill_source"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":12,"method":"memory.retireAgent","params":{"role_id":"role_ts_engineer","reason":"performance_degradation","replacement":"seeded_slate"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":13,"method":"memory.retireAgent","params":{"role_id":"role_ts_engineer","reason":"bogus"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":14,"method":"memory.retirementScan","params":{}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":15,"method":"memory.retirementScan","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":16,"method":"memory.retirementScan","params":{"role_id":"","extra":true}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -82,6 +142,22 @@ describe('MemoryRpcMethods', () => {
       { id: 7, result: { skill: { id: 'skill_1', review_status: 'approved' } } },
       { id: 8, result: { skill: { id: 'skill_2', review_status: 'rejected' } } },
       { id: 9, error: { code: -32602, message: 'Invalid params' } },
+      { id: 10, result: { skills: [{ id: 'skill_market_1' }] } },
+      { id: 11, result: { import: { imported: { id: 'skill_imported' }, created: true } } },
+      {
+        id: 12,
+        result: {
+          retire: {
+            role_id: 'role_ts_engineer',
+            status: 'retired',
+            retired_reason: 'performance_degradation',
+          },
+        },
+      },
+      { id: 13, error: { code: -32602, message: 'Invalid params' } },
+      { id: 14, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
+      { id: 15, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
+      { id: 16, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -94,6 +170,18 @@ describe('MemoryRpcMethods', () => {
       'skill_2',
       'reviewer',
     );
+    expect(marketSearchMemorySkills).toHaveBeenCalledWith({
+      query: 'typescript',
+      top_k: 5,
+      exclude_agent_id: 'role_ts_engineer',
+    });
+    expect(marketImportMemorySkill).toHaveBeenCalledWith('role_ts_engineer', 'skill_source');
+    expect(retireMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', {
+      reason: 'performance_degradation',
+      replacement: 'seeded_slate',
+    });
+    expect(runRetirementScan).toHaveBeenCalledTimes(2);
+    expect(runRetirementScan).toHaveBeenLastCalledWith('role_ts_engineer');
   });
 });
 
@@ -118,6 +206,10 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
         update_persona: { status: 'unavailable', reason: 'not exposed' },
+        market_search: { status: 'available' },
+        market_import: { status: 'available' },
+        retire_agent: { status: 'available' },
+        retirement_scan: { status: 'available' },
       },
     }),
     listMemoryAgents: async () => [
@@ -146,6 +238,25 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     listMemoryExperiences: async () => [{ id: 'experience_1' } as never],
     listMemoryMaintenance: async () => [maintenance()],
     promoteMemorySkills: async () => maintenance(),
+    marketSearchMemorySkills: async () => [marketSkill()],
+    marketImportMemorySkill: async () => ({
+      imported: marketSkill(),
+      source: marketSkill(),
+      created: true,
+    }),
+    retireMemoryAgent: async () => ({
+      role_id: 'role_ts_engineer',
+      status: 'retired',
+      retired_at: '2026-07-21T00:00:00.000Z',
+      retired_reason: 'manual',
+      asset_disposition: {
+        skills_retained: 0,
+        skills_discarded: 0,
+        experiences_retained: 0,
+        experiences_discarded: 0,
+      },
+    }),
+    runRetirementScan: async () => [scanResult()],
     approveMemorySkill: async () => ({ id: 'skill_1' } as never),
     rejectMemorySkill: async () => ({ id: 'skill_1' } as never),
     ...overrides,
@@ -164,5 +275,40 @@ function maintenance() {
     created_at: '2026-07-21T00:00:00.000Z',
     completed_at: '2026-07-21T00:00:01.000Z',
     schema_version: 'v0',
+  };
+}
+
+function marketSkill() {
+  return {
+    id: 'skill_market_1',
+    description: 'TypeScript service patterns',
+    description_embedding: [0.1, 0.2, 0.3, 0.4],
+    content: 'Define explicit contracts and tests.',
+    version: '1.0.0',
+    review_status: 'approved' as const,
+    tags: ['typescript'],
+    promoted_at: '2026-07-21T00:00:00.000Z',
+    agent_id: 'role_ts_engineer',
+    created_at: '2026-07-21T00:00:00.000Z',
+    updated_at: '2026-07-21T00:00:00.000Z',
+  };
+}
+
+function scanResult(overrides: { role_id?: string; action?: 'retire' | 'warn' | 'keep' } = {}) {
+  return {
+    scan_id: 'scan_1',
+    role_id: overrides.role_id ?? 'role_ts_engineer',
+    scanned_at: '2026-07-21T00:00:00.000Z',
+    action: overrides.action ?? 'keep',
+    confidence: 0.9,
+    reasons: ['Statistical signals are healthy.'],
+    layers: [
+      {
+        layer: 'statistical' as const,
+        action: (overrides.action ?? 'keep') as 'retire' | 'warn' | 'keep',
+        confidence: 0.9,
+        reasons: ['Statistical signals are healthy.'],
+      },
+    ],
   };
 }
