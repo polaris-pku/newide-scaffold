@@ -5,3 +5,5 @@ export * from './trace-writer';
 export * from './auto-span';
 export * from './trace-projector';
 export * from './replay';
+export * from './analysis';
+export * from './render';

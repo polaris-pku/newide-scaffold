@@ -84,6 +84,12 @@ export interface SpanMapping {
   key?: (input: TraceEventInput) => string | undefined;
   summary?: (input: TraceEventInput) => string | undefined;
   agentId?: (input: TraceEventInput) => string | undefined;
+  /**
+   * Extra fields merged into a point record's payload before bounding.
+   * Used to carry identity the domain event only stores in subject_id
+   * (e.g. mailbox message_id) so replay analyzers can correlate records.
+   */
+  augmentPayload?: (input: TraceEventInput) => Record<string, unknown> | undefined;
 }
 
 function payloadValue(payload: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -285,6 +291,9 @@ const MAPPING: Readonly<Record<string, SpanMapping>> = {
     kind: 'agent.message',
     phase: 'point',
     summary: (input) => payloadString(input, 'message_type'),
+    // The domain event stores the mailbox message id in subject_id only.
+    augmentPayload: (input) =>
+      input.payload.message_id === undefined ? { message_id: input.subject_id } : undefined,
   },
   'mailbox.message_acked': {
     kind: 'agent.message',
@@ -505,7 +514,11 @@ export class TraceProjector {
     const agentId = mapping?.agentId?.(input);
     const summary = mapping?.summary?.(input);
     const status = mapping?.statusFromPayload?.(input.payload) ?? mapping?.status;
-    const preview = boundedPreview(input.payload);
+    const augmented =
+      mapping?.augmentPayload !== undefined
+        ? { ...input.payload, ...(mapping.augmentPayload(input) ?? {}) }
+        : input.payload;
+    const preview = boundedPreview(augmented);
     const payload =
       preview !== null &&
       typeof preview === 'object' &&

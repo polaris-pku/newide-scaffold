@@ -305,6 +305,7 @@ export class Agent {
       round,
       content: response.content,
       toolCallCount: response.tool_calls?.length ?? 0,
+      ...(response.usage ? { usage: response.usage } : {}),
     });
 
     // 文本回复且表示任务完成 → 收尾

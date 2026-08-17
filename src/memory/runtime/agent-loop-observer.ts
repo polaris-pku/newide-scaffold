@@ -6,7 +6,7 @@
  * 因此不配置 observer 时零行为变化。Memory 模块只定义端口，
  * 由应用层（如 DriverRuntimeAgentExecutionFacade）实现并转发到轨迹系统。
  */
-import type { ToolCallMessage } from './tool';
+import type { LlmUsage, ToolCallMessage } from './tool';
 
 /** 一次 LLM 轮次开始。 */
 export interface AgentLlmTurnStartEvent {
@@ -22,6 +22,8 @@ export interface AgentLlmTurnEndEvent {
   content: string | null;
   /** 该轮次 LLM 请求的工具调用数量 */
   toolCallCount: number;
+  /** 可选用量统计（token / 上下文占用），来自 LLM 响应。 */
+  usage?: LlmUsage;
 }
 
 /** 一次 LLM 轮次抛出异常。 */

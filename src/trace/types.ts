@@ -21,6 +21,7 @@ export type TrajectorySpanKind =
   | 'agent.execution'
   | 'agent.turn'
   | 'agent.tool'
+  | 'agent.llm'
   | 'agent.message'
   | 'checkpoint'
   | 'artifact'

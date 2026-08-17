@@ -55,6 +55,7 @@ import {
   type ToolCallingClient,
 } from '../memory';
 import {
+  MAILBOX_SEND_TOOL_NAME,
   MailboxSendTool,
   expectsMailboxReply,
   type MailboxSendToolInput,
@@ -169,9 +170,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
   private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
+  /** Agent 会话实际挂载的工具集名称（写进 agent.execution 轨迹供诊断）。 */
+  private readonly agentToolNames: readonly string[];
 
   constructor(private readonly options: DriverRuntimeAgentExecutionFacadeOptions) {
     this.invokeDriverRuntime = createDriverRuntimeInvoker(options.driver);
+    this.agentToolNames = [
+      'invoke_driver',
+      ...(options.mailbox ? [MAILBOX_SEND_TOOL_NAME] : []),
+    ];
     this.manager = this.createManager();
   }
 
@@ -1033,6 +1040,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         context_policy: input.context_policy,
+        tools: [...this.agentToolNames],
         ...(input.input_artifact_refs.length > 0
           ? { input_artifact_refs: input.input_artifact_refs }
           : {}),
@@ -1128,6 +1136,33 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ...(handle.summary ? { summary: `${handle.summary} → ${tail}` } : {}),
       ...(outputPayload ? { payload: outputPayload } : {}),
     });
+    // 上下文用量点：LLM 提供 usage 时投影 agent.llm，供回放画用量曲线。
+    if (event.usage) {
+      this.emitTrace({
+        span_id: createId('span'),
+        run_id: invocation.run_id,
+        task_id: invocation.task_id,
+        parent_span_id: invocation.trace.executionSpanId,
+        kind: 'agent.llm',
+        phase: 'point',
+        agent_id: invocation.role_id,
+        summary: `round #${String(event.round)} usage`,
+        payload: {
+          round: event.round,
+          ...(event.usage.tokens_in !== undefined ? { tokens_in: event.usage.tokens_in } : {}),
+          ...(event.usage.tokens_out !== undefined ? { tokens_out: event.usage.tokens_out } : {}),
+          ...(event.usage.context_size !== undefined
+            ? { context_size: event.usage.context_size }
+            : {}),
+          ...(event.usage.context_limit !== undefined
+            ? { context_limit: event.usage.context_limit }
+            : {}),
+          ...(event.usage.context_pct !== undefined
+            ? { context_pct: event.usage.context_pct }
+            : {}),
+        },
+      });
+    }
   }
 
   private onAgentLlmTurnError(event: AgentLlmTurnErrorEvent): void {

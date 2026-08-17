@@ -21,7 +21,13 @@ import {
   type ToolCallResult,
   type ToolCallingClient,
 } from '../memory';
-import { FileTrajectoryWriter, TraceProjector, replayTrajectory } from '../trace';
+import {
+  FileTrajectoryWriter,
+  TraceProjector,
+  analyzeTrajectory,
+  renderDiagnostics,
+  replayTrajectory,
+} from '../trace';
 
 /** Scripted tool-calling LLM: round 1 invokes the driver, round 2 finishes. */
 class ScriptedToolCallingClient implements ToolCallingClient {
@@ -44,9 +50,27 @@ class ScriptedToolCallingClient implements ToolCallingClient {
             },
           },
         ],
+        // Fake context usage so the diagnostics view has a curve to draw.
+        usage: {
+          tokens_in: 4200,
+          tokens_out: 380,
+          context_size: 26_400,
+          context_limit: 128_000,
+          context_pct: 21,
+        },
       };
     }
-    return { content: 'Task completed. [done]', tool_calls: undefined };
+    return {
+      content: 'Task completed. [done]',
+      tool_calls: undefined,
+      usage: {
+        tokens_in: 9000,
+        tokens_out: 210,
+        context_size: 58_300,
+        context_limit: 128_000,
+        context_pct: 46,
+      },
+    };
   }
 }
 
@@ -83,11 +107,13 @@ export async function main(): Promise<number> {
   await writer.flush(runId);
   const records = await writer.load(runId);
   const replay = replayTrajectory(records, runId);
+  const diag = analyzeTrajectory(records);
   process.stdout.write(
     `run ${replay.run_id} — ${replay.records.length} records, ${replay.spans.length} spans ` +
       `(status ${result.summary.status})\n\n`,
   );
   process.stdout.write(`${replay.rendered}\n`);
+  process.stdout.write(`\n${renderDiagnostics(diag)}\n`);
   return 0;
 }
 

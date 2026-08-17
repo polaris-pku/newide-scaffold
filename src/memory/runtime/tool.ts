@@ -58,10 +58,30 @@ export interface ToolDefinition {
   };
 }
 
+/**
+ * 一次 LLM 调用的 token / 上下文用量（可选）。实现方（LLM adapter）能拿到
+ * usage 统计时就填，拿不到则为 undefined；轨迹诊断层用它在回放时画上下文
+ * 用量曲线并报警（>70% 上下文爆掉风险）。
+ */
+export interface LlmUsage {
+  /** 本轮请求 token 数（输入）。 */
+  tokens_in?: number;
+  /** 本轮响应 token 数（输出）。 */
+  tokens_out?: number;
+  /** 当前上下文窗口已用 token 数。 */
+  context_size?: number;
+  /** 当前上下文窗口上限 token 数。 */
+  context_limit?: number;
+  /** 已用比例 0..100；缺省时按 context_size / context_limit 推算。 */
+  context_pct?: number;
+}
+
 /** Tool-calling 调用的返回 */
 export interface ToolCallResult {
   content: string | null;
   tool_calls: ToolCall[] | undefined;
+  /** 可选用量统计，用于轨迹的上下文用量曲线。 */
+  usage?: LlmUsage;
 }
 
 /**

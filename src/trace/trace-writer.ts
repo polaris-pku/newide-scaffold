@@ -16,10 +16,15 @@ export const TRAJECTORY_FILE_NAME = 'trajectory.jsonl';
 export class FileTrajectoryWriter {
   private readonly queues = new Map<RunId, Promise<void>>();
 
-  constructor(private readonly runsRoot = '.newide/runs') {}
+  constructor(private readonly runsRootPath = '.newide/runs') {}
+
+  /** Configured runs root directory (exposed for CLI messages). */
+  runsRoot(): string {
+    return this.runsRootPath;
+  }
 
   private runDir(runId: RunId): string {
-    return path.join(this.runsRoot, runId);
+    return path.join(this.runsRootPath, runId);
   }
 
   private filePath(runId: RunId): string {
@@ -30,7 +35,6 @@ export class FileTrajectoryWriter {
     await fs.mkdir(this.runDir(runId), { recursive: true });
     await fs.open(this.filePath(runId), 'a').then((handle) => handle.close());
   }
-
   append(record: TrajectorySpanRecord): Promise<void> {
     const runId = record.run_id ?? '__unscoped__';
     const previous = this.queues.get(runId) ?? Promise.resolve();
