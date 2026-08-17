@@ -51,7 +51,7 @@ import {
   type CouncilParticipantResolver,
 } from '../council';
 import { InMemoryBufferRepository, InMemoryRepository, LiteLLMToolCallingClient } from '../memory';
-import { FileTrajectoryWriter, TraceProjector, replayTrajectory } from '../trace';
+import { FileTrajectoryWriter, TraceProjector, analyzeTrajectory, renderDiagnostics, replayTrajectory } from '../trace';
 import { parseIntegrationV0CliArgs } from './integration-v0-options';
 
 const CLAUDE_MODEL_OVERRIDE_ENV = [
@@ -202,10 +202,13 @@ try {
     await traceWriter.flush(result.run_id);
     const records = await traceWriter.load(result.run_id);
     const replay = replayTrajectory(records, result.run_id);
+    const diag = analyzeTrajectory(records);
     console.log(
       `\n🧭 Trajectory (${replay.records.length} records, ${replay.spans.length} spans):`,
     );
     console.log(replay.rendered);
+    console.log(`\n🔍 Diagnostics (${diag.findings.length} finding(s)):`);
+    console.log(renderDiagnostics(diag));
   }
 
   console.log('\n✨ Done!');
