@@ -418,7 +418,7 @@ function completedReusedProposalEvent(
 }
 
 function failedEvent(error: CouncilRoleExecutionError): CouncilLifecycleEvent {
-  return { type: 'council.failed', payload: { code: error.code, ...error.details } };
+  return { type: 'council.role.failed', payload: { code: error.code, ...error.details } };
 }
 
 async function emitLifecycle(

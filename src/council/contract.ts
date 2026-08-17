@@ -216,6 +216,7 @@ export interface CouncilLifecycleEvent {
     | 'council.proposal.completed'
     | 'council.review.completed'
     | 'council.synthesis.completed'
+    | 'council.role.failed'
     | 'council.failed';
   payload: Record<string, unknown>;
 }
