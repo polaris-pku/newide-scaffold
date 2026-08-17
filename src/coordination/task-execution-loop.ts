@@ -145,6 +145,7 @@ export interface RunTaskExecutionInput {
   task_id: string;
   run_id: string;
   council_override?: boolean;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   session_id?: string;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
@@ -191,7 +192,12 @@ export class TaskExecutionLoop {
     cursorInput: Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>,
     controls: Pick<
       RunTaskExecutionInput,
-      'session_id' | 'signal' | 'on_driver_event' | 'on_event' | 'on_committed_events'
+      | 'memory_ablation'
+      | 'session_id'
+      | 'signal'
+      | 'on_driver_event'
+      | 'on_event'
+      | 'on_committed_events'
     >,
   ): Promise<TaskStageCommitResult> {
     const invocationId = this.createInvocationId(cursorInput.cursor);
@@ -495,7 +501,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
   cursorInput: CursorInput<TCursor>,
   controls: Pick<
     RunTaskExecutionInput,
-    'session_id' | 'signal' | 'on_driver_event' | 'on_event'
+    'memory_ablation' | 'session_id' | 'signal' | 'on_driver_event' | 'on_event'
   >,
 ): TaskStageExecutionContext<TCursor> {
   return {
@@ -505,6 +511,9 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     ...(state.memory_ablation ? { memory_ablation: state.memory_ablation } : {}),
     task_request: state.task_request,
     workspace_path: state.workspace_path,
+    ...(controls.memory_ablation
+      ? { memory_ablation: controls.memory_ablation }
+      : {}),
     ...(controls.session_id ? { session_id: controls.session_id } : {}),
     cursor_input: cursorInput,
     ...(state.restarted_from_run_id

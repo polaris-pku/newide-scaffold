@@ -31,6 +31,14 @@ import type { HookEvent, HookResult } from '../hook';
 import type { GateResult } from '../gate';
 import { MockMemoryProvider } from '../memory';
 import { RuntimeOrchestrator } from './orchestrator';
+import {
+  bindActiveLlmUsageIdentity,
+  collectClaudeSessionUsage,
+  mergeTokenUsageSummaries,
+  runWithLlmUsageLedger,
+  snapshotActiveLedgerUsage,
+  type RunTokenUsageSummary,
+} from '../telemetry';
 import type { TelemetrySink } from '../telemetry/telemetry-sink';
 import type { DriverStreamEventListener } from '../driver/contract';
 import {
@@ -48,6 +56,7 @@ import {
 } from './worktree-materializer';
 import {
   MockCouncil,
+  councilRunWorkspaceRoot,
   type CouncilDecision,
   type CouncilResult,
   type CouncilProvider,
@@ -104,6 +113,8 @@ export interface IntegrationV0Summary {
   worktree_path: string;
   /** F-eval ablation tag (B0–B3); echoed for --backend-summary alignment. */
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  /** Aggregated LLM token usage (LiteLLM proxy + optional Claude session scrape). */
+  token_usage?: RunTokenUsageSummary;
   artifacts_materialized: number;
   files_written: string[];
   task_worktree_files: string[];
@@ -229,6 +240,19 @@ export interface IntegrationV0Result {
 export async function runIntegrationV0Flow(
   options?: IntegrationV0Options,
 ): Promise<IntegrationV0Result> {
+  return runWithLlmUsageLedger(
+    {
+      case_id: options?.taskId ?? options?.sessionId ?? 'integration_v0',
+      ...(options?.telemetry ? { sink: options.telemetry } : {}),
+      scaffold_variant: 'full_system',
+    },
+    () => runIntegrationV0FlowBody(options),
+  );
+}
+
+async function runIntegrationV0FlowBody(
+  options?: IntegrationV0Options,
+): Promise<IntegrationV0Result> {
   options?.signal?.throwIfAborted();
   const memoryAblation = options?.memoryAblation;
   const orchestrator = new RuntimeOrchestrator({
@@ -248,6 +272,11 @@ export async function runIntegrationV0Flow(
 
   // 2. Create run
   const run = orchestrator.createRun(task.task_id);
+  bindActiveLlmUsageIdentity({
+    run_id: run.run_id,
+    task_id: task.task_id,
+    case_id: task.task_id,
+  });
   options?.onRunCreated?.({ run_id: run.run_id, task_id: task.task_id });
   const threadId = run.run_id; // Use run_id as thread_id for v0
   timeline.push({ name: 'RunCreated', id: run.run_id });
@@ -440,7 +469,10 @@ export async function runIntegrationV0Flow(
   let driverResult: DriverRunResult;
   if (options?.agentExecutionFacade) {
     const executionWorkspace = options.enableCouncil
-      ? path.join(options.councilRoot ?? '.newide/council', run.run_id, 'primary')
+      ? path.join(
+          councilRunWorkspaceRoot(options.councilRoot ?? '.newide/council', run.run_id),
+          'primary',
+        )
       : options.workspacePath;
     const agentExecutionRequest = {
       task_id: task.task_id,
@@ -744,6 +776,7 @@ export async function runIntegrationV0Flow(
       evidence_pack: evidencePack,
       question: task.spec,
       ...(options?.workspacePath ? { workspace_path: options.workspacePath } : {}),
+      ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     },
     {
       ...(options?.signal ? { signal: options.signal } : {}),
@@ -1255,6 +1288,10 @@ export async function runIntegrationV0Flow(
     ...(failure ? { failure } : {}),
     worktree_path: evalWorktreePath,
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
+    token_usage: await resolveRunTokenUsage({
+      sessionId: driverResult.session_id,
+      worktreePath: options?.workspacePath ?? evalWorktreePath,
+    }),
     artifacts_materialized: materializationResult.materialized_artifacts.length,
     files_written:
       deliveryResult?.files.map((file) => file.file_path) ??
@@ -1550,4 +1587,16 @@ function buildIntegrationFailure(input: {
     };
   }
   return undefined;
+}
+
+async function resolveRunTokenUsage(input: {
+  sessionId?: string;
+  worktreePath: string;
+}): Promise<RunTokenUsageSummary> {
+  const proxy = snapshotActiveLedgerUsage();
+  const claude = await collectClaudeSessionUsage({
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    worktreePath: input.worktreePath,
+  });
+  return mergeTokenUsageSummaries([proxy, claude]);
 }

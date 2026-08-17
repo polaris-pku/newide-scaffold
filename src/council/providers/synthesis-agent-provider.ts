@@ -27,7 +27,11 @@ import type {
   Proposal,
   Review,
 } from '../contract';
-import { prepareCouncilWorkspace, stageCouncilArtifacts } from '../council-workspace';
+import {
+  councilRunWorkspaceRoot,
+  prepareCouncilWorkspace,
+  stageCouncilArtifacts,
+} from '../council-workspace';
 import { assertCouncilPlanArtifacts } from '../plan-artifact';
 
 export type CouncilRoleFailureCode =
@@ -98,7 +102,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       .sort((left, right) => left.seat_index - right.seat_index);
     const reviewerParticipant = requireSeat(participants, 'reviewer');
     const synthesizerParticipant = requireSeat(participants, 'synthesizer');
-    const councilDir = path.join(this.councilRoot, executionRunId);
+    const councilDir = councilRunWorkspaceRoot(this.councilRoot, executionRunId);
     const generatedResults: AgentExecutionResult[] = [];
     const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];

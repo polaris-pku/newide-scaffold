@@ -189,6 +189,7 @@ export interface CouncilRunRequest {
   decision_mode: CouncilDecisionMode;
   question: string;
   workspace_path?: string;
+  /** Propagate F-eval memory ablation into council seat agent runs. */
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   candidate_artifacts?: ArtifactRef[];
   context_pack_ref?: string;

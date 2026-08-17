@@ -33,7 +33,11 @@ import {
   type CouncilRunResult,
   type EvidencePack,
 } from '../council';
-import { prepareCouncilWorkspace, stageCouncilArtifacts } from '../council/council-workspace';
+import {
+  councilRunWorkspaceRoot,
+  prepareCouncilWorkspace,
+  stageCouncilArtifacts,
+} from '../council/council-workspace';
 import type { GateResult } from '../gate';
 import type { TaskResumeCursor } from '../persistence';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../protocol/agent-execution';
@@ -177,8 +181,10 @@ export function createProductionStageExecutors(
       const executionWorkspace =
         context.mode === 'council'
           ? path.join(
-              dependencies.councilRoot,
-              context.restarted_from_run_id ?? context.run_id,
+              councilRunWorkspaceRoot(
+                dependencies.councilRoot,
+                context.restarted_from_run_id ?? context.run_id,
+              ),
               'primary',
             )
           : context.workspace_path;
@@ -192,6 +198,9 @@ export function createProductionStageExecutors(
       emit(context, 'agent.execution_requested', context.run_id, {
         role_id: context.cursor_input.winner_agent_id,
         workspace_path: executionWorkspace,
+        ...(context.memory_ablation
+          ? { ablation: context.memory_ablation }
+          : {}),
       });
       const result = await dependencies.agentExecutionFacade.runAgent(
         {
@@ -290,6 +299,19 @@ export function createProductionStageExecutors(
           context.task_id,
           { primary: { result }, selection },
         );
+        // Keep ablation on the timeline even when primary fails so fallback
+        // summary writers (and --backend-summary checks) still see B0–B3.
+        emit(context, 'memory.context_pack_built', result.context_pack_ref, {
+          agent_id: result.agent_id ?? result.role_id,
+          role_id: result.role_id,
+          context_pack_ref: result.context_pack_ref,
+          memory_buffer_ref: result.memory_buffer_ref,
+          diagnostics: result.diagnostics,
+          primary_status: result.status,
+          ...(context.memory_ablation
+            ? { ablation: context.memory_ablation }
+            : {}),
+        });
         emit(context, 'agent.execution_completed', result.agent_run_id, {
           agent_id: result.agent_id ?? result.role_id,
           role_id: result.role_id,
@@ -302,6 +324,9 @@ export function createProductionStageExecutors(
           memory_buffer_ref: result.memory_buffer_ref,
           driver_run_result_id: result.driver_run_result_id,
           diagnostics: result.diagnostics,
+          ...(context.memory_ablation
+            ? { ablation: context.memory_ablation }
+            : {}),
         });
         if (planFirst) {
           throw new Error(`Primary Agent ended with status ${result.status}`);
@@ -591,7 +616,10 @@ export function createProductionStageExecutors(
         user_workspace_path: context.workspace_path,
         ...(context.mode === 'council'
           ? {
-              council_workspace_path: path.join(dependencies.councilRoot, context.run_id),
+              council_workspace_path: councilRunWorkspaceRoot(
+                dependencies.councilRoot,
+                context.run_id,
+              ),
             }
           : {}),
       });
@@ -772,8 +800,10 @@ async function executeFinalCouncilPlan(input: {
   dependencies: ProductionStageExecutorDependencies;
 }): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[] }> {
   const workspace = path.join(
-    input.dependencies.councilRoot,
-    input.context.restarted_from_run_id ?? input.context.run_id,
+    councilRunWorkspaceRoot(
+      input.dependencies.councilRoot,
+      input.context.restarted_from_run_id ?? input.context.run_id,
+    ),
     'primary',
   );
   await stageCouncilArtifacts(workspace, input.finalPlans);

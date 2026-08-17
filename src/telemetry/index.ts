@@ -5,3 +5,5 @@ export * from './emit';
 export * from './memory-cycle-observer';
 export * from './harness-port';
 export * from './adapters';
+export * from './llm-usage-ledger';
+export * from './collect-claude-session-usage';

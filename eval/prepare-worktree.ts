@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { getScaffoldRoot } from './paths';
 
@@ -44,8 +46,11 @@ export async function assertWorktreeClean(worktreePath: string): Promise<void> {
 }
 
 /**
- * Create a detached git worktree at base_commit under
- * `.newide/eval-workspaces/<runId>/` (gitignored via `.newide/`).
+ * Create a base-commit-only clone under `.newide/eval-workspaces/<runId>/`.
+ *
+ * The clone deliberately does not share refs or objects with the source mirror.
+ * This prevents an evaluation agent from reading the target release tag or its
+ * gold delta through local Git history.
  */
 export async function prepareEphemeralWorktree(
   options: PrepareEphemeralWorktreeOptions,
@@ -66,14 +71,36 @@ export async function prepareEphemeralWorktree(
 
   await fs.mkdir(parent, { recursive: true });
   await removePathIfExists(worktreePath);
-  // Drop stale worktree registration if a previous run died mid-way.
+  const temporaryBranch = `newide-eval/${randomUUID()}`;
+  const temporaryRef = `refs/heads/${temporaryBranch}`;
   try {
-    await runGit(sourceRepo, ['worktree', 'prune']);
-  } catch {
-    // ignore
+    await runGit(sourceRepo, ['update-ref', temporaryRef, baseCommit]);
+    await runGit(parent, [
+      'clone',
+      '--no-local',
+      '--depth',
+      '1',
+      '--single-branch',
+      '--no-tags',
+      '--branch',
+      temporaryBranch,
+      pathToFileURL(sourceRepo).href,
+      worktreePath,
+    ]);
+  } finally {
+    await runGit(sourceRepo, ['update-ref', '-d', temporaryRef]).catch(() => undefined);
   }
 
-  await runGit(sourceRepo, ['worktree', 'add', '--detach', worktreePath, baseCommit]);
+  await runGit(worktreePath, ['checkout', '--detach', 'HEAD']);
+  await runGit(worktreePath, ['branch', '-D', temporaryBranch]);
+  await runGit(worktreePath, ['remote', 'remove', 'origin']);
+  await runGit(worktreePath, ['reflog', 'expire', '--expire=now', '--all']);
+  await runGit(worktreePath, ['gc', '--prune=now']);
+  await fs.appendFile(
+    path.join(worktreePath, '.git', 'info', 'exclude'),
+    '\n.claude/settings.json\n',
+    'utf-8',
+  );
   await assertWorktreeClean(worktreePath);
 
   return {

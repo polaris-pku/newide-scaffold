@@ -6,6 +6,11 @@
   "subsets": {
     "v0-smoke": "eval/datasets/v0-smoke.json",
     "v0-dev": "eval/datasets/v0-dev.json",
+    "v0-repo-full": "eval/datasets/v0-repo-full.json",
+    "v0-repo-full-b0-rest": "eval/datasets/v0-repo-full-b0-rest.json",
+    "v0-repo-full-prctx": "eval/datasets/v0-repo-full-prctx.json",
+    "v0-repo-full-prctx-b0-rest": "eval/datasets/v0-repo-full-prctx-b0-rest.json",
+    "v0-requests-3-prctx": "eval/datasets/v0-requests-3-prctx.json",
     "verified-30": "eval/datasets/verified-30.json"
   },
   "default_model_name": "unspecified"

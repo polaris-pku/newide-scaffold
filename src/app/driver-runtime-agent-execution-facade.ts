@@ -205,12 +205,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     });
-    if (
-      result.status !== 'succeeded' ||
-      !result.session_id ||
-      result.session_id === this.options.driver.session_id ||
-      result.session_id === 'session-unavailable'
-    ) {
+    const usableSession =
+      Boolean(result.session_id) &&
+      result.session_id !== this.options.driver.session_id &&
+      result.session_id !== 'session-unavailable';
+    // Claude Agent SDK can stream SESSION_READY then throw a DeepSeek 402 on a
+    // follow-up (title / telemetry). The init turn already succeeded.
+    const sessionReady = /\bSESSION_READY\b/.test(result.response ?? '');
+    if (!usableSession || (result.status !== 'succeeded' && !sessionReady)) {
       const detail = result.error?.message ?? result.diagnostics.notes.join('; ');
       throw new Error(
         `ACP did not create a usable Session for ${input.role_id} (status=${result.status}${detail ? `, detail=${detail}` : ''})`,

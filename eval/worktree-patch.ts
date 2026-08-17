@@ -3,6 +3,7 @@ import { promises as fs, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { assertNoProtectedEvalPaths, assertSafeCandidatePatch } from './patch-policy';
 
 const execFileAsync = promisify(execFile);
 const MAX_PATCH_BUFFER = 100 * 1024 * 1024;
@@ -25,6 +26,17 @@ export async function collectWorktreePatch(
     await runGit(root, ['rev-parse', '--verify', `${baseRef}^{commit}`]);
     await runGit(root, ['read-tree', baseRef], env);
     await runGit(root, ['add', '-A', '--', '.'], env);
+    const changedFiles = await runGitBuffer(
+      root,
+      ['diff', '--cached', '--name-only', '-z', baseRef, '--'],
+      env,
+    );
+    assertNoProtectedEvalPaths(
+      changedFiles
+        .toString('utf-8')
+        .split('\0')
+        .filter(Boolean),
+    );
     const patch = await runGit(
       root,
       ['diff', '--cached', '--binary', '--full-index', '--no-ext-diff', baseRef, '--'],
@@ -33,6 +45,7 @@ export async function collectWorktreePatch(
     if (!patch.trim()) {
       throw new Error(`No changes found in worktree "${root}" relative to ${baseRef}.`);
     }
+    assertSafeCandidatePatch(patch);
     return patch;
   } finally {
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
@@ -72,6 +85,20 @@ async function runGit(
     cwd,
     env,
     encoding: 'utf-8',
+    maxBuffer: MAX_PATCH_BUFFER,
+  });
+  return stdout;
+}
+
+async function runGitBuffer(
+  cwd: string,
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Buffer> {
+  const { stdout } = await execFileAsync('git', args, {
+    cwd,
+    env,
+    encoding: 'buffer',
     maxBuffer: MAX_PATCH_BUFFER,
   });
   return stdout;

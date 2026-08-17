@@ -111,7 +111,10 @@ export async function createProductionBackendService(
     );
   }
 
-  const driverEnv = loadEnvFile(env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env'));
+  const driverEnvFile = env.ACP_DRIVER_ENV_FILE
+    ? path.resolve(repoRoot, env.ACP_DRIVER_ENV_FILE)
+    : path.join(runnerDir, '.env');
+  const driverEnv = loadEnvFile(driverEnvFile);
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     capabilities: {
@@ -132,10 +135,43 @@ export async function createProductionBackendService(
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
+        // NewIDE owns benchmark policy; ACP receives only generic enforcement settings.
+        ...(env.ACP_DENY_NETWORK_TOOLS !== undefined
+          ? { ACP_DENY_NETWORK_TOOLS: env.ACP_DENY_NETWORK_TOOLS }
+          : {}),
+        ...(env.ACP_DENY_PATH_SUBSTRINGS_JSON !== undefined
+          ? { ACP_DENY_PATH_SUBSTRINGS_JSON: env.ACP_DENY_PATH_SUBSTRINGS_JSON }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX !== undefined
+          ? { ACP_PROCESS_SANDBOX: env.ACP_PROCESS_SANDBOX }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_BWRAP !== undefined
+          ? { ACP_PROCESS_SANDBOX_BWRAP: env.ACP_PROCESS_SANDBOX_BWRAP }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_NPM_CACHE !== undefined
+          ? { ACP_PROCESS_SANDBOX_NPM_CACHE: env.ACP_PROCESS_SANDBOX_NPM_CACHE }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON !== undefined
+          ? {
+              ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON:
+                env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
+            }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON !== undefined
+          ? { ACP_PROCESS_SANDBOX_RO_PATHS_JSON: env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES !== undefined
+          ? {
+              ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES:
+                env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES,
+            }
+          : {}),
       },
       unsetEnv: [
         'NEWIDE_B_DATABASE_URL',
-        ...MODEL_OVERRIDE_ENV.filter((key) => driverEnv[key] === undefined),
+        ...MODEL_OVERRIDE_ENV.filter(
+          (key) => driverEnv[key] === undefined && env[key] === undefined,
+        ),
       ],
       timeoutMs: readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS),
     }),
@@ -177,6 +213,7 @@ export async function createProductionBackendService(
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
+        runsRoot,
       });
     try {
       await memoryMaintenance.replayPending();
@@ -198,7 +235,9 @@ export async function createProductionBackendService(
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
-      llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
+      llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient({
+        ...(env.DEEPSEEK_MODEL?.trim() ? { model: env.DEEPSEEK_MODEL.trim() } : {}),
+      }),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),

@@ -1,0 +1,27 @@
+{
+  "subset_id": "v0-repo-full",
+  "description": "Repo-complete SWE-EVO slice: all instances from conan, dask, and requests (14 total).",
+  "source_dataset_version": "hf_out-v1",
+  "source_jsonl": "../SWE-EVO/hf_out/hf_jsonl/test.jsonl",
+  "selection_rule": "Whole-repo packs only: conan-io/conan (2) + dask/dask (8) + psf/requests (4). No partial repo coverage.",
+  "environment_notes": [
+    "Requires the sibling SWE-EVO checkout and its SWE-bench harness environment.",
+    "Requires Docker access when running the real harness."
+  ],
+  "instance_ids": [
+    "conan-io__conan_2.0.14_2.0.15",
+    "conan-io__conan_2.0.2_2.0.3",
+    "dask__dask_2022.9.2_2022.10.0",
+    "dask__dask_2023.3.2_2023.4.0",
+    "dask__dask_2023.6.0_2023.6.1",
+    "dask__dask_2023.6.1_2023.7.0",
+    "dask__dask_2023.8.0_2023.8.1",
+    "dask__dask_2023.9.2_2023.9.3",
+    "dask__dask_2024.1.0_2024.1.1",
+    "dask__dask_2024.3.1_2024.4.0",
+    "psf__requests_v2.12.2_v2.12.3",
+    "psf__requests_v2.27.0_v2.27.1",
+    "psf__requests_v2.4.0_v2.4.1",
+    "psf__requests_v2.9.0_v2.9.1"
+  ]
+}

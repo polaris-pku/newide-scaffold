@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -9,6 +10,15 @@ import {
 } from '../coordinator/artifact-content';
 
 const execFileAsync = promisify(execFile);
+
+/** Shorten run_id folders under councilRoot to stay under Windows MAX_PATH. */
+export function councilRunDirName(runId: string): string {
+  return createHash('sha256').update(runId).digest('hex').slice(0, 12);
+}
+
+export function councilRunWorkspaceRoot(councilRoot: string, runId: string): string {
+  return path.join(councilRoot, councilRunDirName(runId));
+}
 
 export async function prepareCouncilWorkspace(
   sourceWorkspace: string | undefined,
@@ -26,23 +36,52 @@ export async function prepareCouncilWorkspace(
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.rm(target, { recursive: true, force: true });
   if (await isGitWorkspace(source)) {
-    await execFileAsync('git', ['-C', source, 'worktree', 'add', '--detach', target, 'HEAD'], {
-      maxBuffer: 10 * 1024 * 1024,
+    await execFileAsync(
+      'git',
+      [
+        '-C',
+        source,
+        '-c',
+        'core.longpaths=true',
+        'worktree',
+        'add',
+        '--detach',
+        target,
+        'HEAD',
+      ],
+      {
+        maxBuffer: 10 * 1024 * 1024,
+      },
+    );
+  } else {
+    await fs.cp(source, target, {
+      recursive: true,
+      force: true,
+      filter(candidate) {
+        const resolved = path.resolve(candidate);
+        if (resolved === target || resolved.startsWith(`${target}${path.sep}`)) return false;
+        const relative = path.relative(source, resolved);
+        const rootEntry = relative.split(path.sep)[0];
+        return rootEntry !== '.git' && rootEntry !== '.newide';
+      },
     });
-    return;
   }
+  // git worktree add does not copy untracked eval files such as .claude/settings.json
+  // (gitignored so they never enter the scored patch). ACP still needs them in cwd.
+  await copyEvalClaudeSettings(source, target);
+}
 
-  await fs.cp(source, target, {
-    recursive: true,
-    force: true,
-    filter(candidate) {
-      const resolved = path.resolve(candidate);
-      if (resolved === target || resolved.startsWith(`${target}${path.sep}`)) return false;
-      const relative = path.relative(source, resolved);
-      const rootEntry = relative.split(path.sep)[0];
-      return rootEntry !== '.git' && rootEntry !== '.newide';
-    },
-  });
+async function copyEvalClaudeSettings(source: string, target: string): Promise<void> {
+  const relative = path.join('.claude', 'settings.json');
+  const from = path.join(source, relative);
+  const to = path.join(target, relative);
+  try {
+    await fs.mkdir(path.dirname(to), { recursive: true });
+    await fs.copyFile(from, to);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
 }
 
 export async function stageCouncilArtifacts(

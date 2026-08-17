@@ -8,6 +8,7 @@ import type {
   AgentExecutionRequest,
 } from '../../src/protocol/agent-execution';
 import type { CouncilParticipantBinding } from '../../src/council';
+import { councilRunDirName } from '../../src/council/council-workspace';
 import { SynthesisAgentCouncilProvider } from '../../src/council/providers/synthesis-agent-provider';
 
 describe('SynthesisAgentCouncilProvider', () => {
@@ -206,10 +207,10 @@ describe('SynthesisAgentCouncilProvider', () => {
     });
     expect(signals).toEqual(Array(4).fill(controller.signal));
     expect(requests.map((request) => request.workspace_path)).toEqual([
-      path.join(councilRoot, 'run_001', 'participant_proposer_0'),
-      path.join(councilRoot, 'run_001', 'participant_proposer_1'),
-      path.join(councilRoot, 'run_001', 'participant_reviewer_0'),
-      path.join(councilRoot, 'run_001', 'participant_synthesizer_0'),
+      path.join(councilRoot, councilRunDirName('run_001'), 'participant_proposer_0'),
+      path.join(councilRoot, councilRunDirName('run_001'), 'participant_proposer_1'),
+      path.join(councilRoot, councilRunDirName('run_001'), 'participant_reviewer_0'),
+      path.join(councilRoot, councilRunDirName('run_001'), 'participant_synthesizer_0'),
     ]);
     for (const request of requests) {
       await expect(fs.stat(request.workspace_path!)).resolves.toMatchObject({});

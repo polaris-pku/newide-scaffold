@@ -10,6 +10,7 @@
 | ----------------- | --------------------------------------------------------------------------------------------- |
 | `worktree_path`   | eval `--backend-summary` 唯一强依赖；须为**绝对或可解析**路径                                 |
 | `memory_ablation` | 可选；`B0`–`B3`。写入 summary / `memory.context_pack_built` 事件，供与 eval `--ablation` 对齐 |
+| `token_usage`     | 可选；`newide.token_usage.v1`。LiteLLM proxy +（如有）Claude session 汇总；消融脚本优先读此字段 |
 
 ## Worktree 规则（能力向）
 

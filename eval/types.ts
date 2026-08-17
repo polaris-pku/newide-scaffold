@@ -42,14 +42,22 @@ export interface SweBenchPrediction {
   model_patch: string;
 }
 
+/**
+ * SWE-EVO/SWE-bench emits `{ success: [...], failure: [...] }` arrays; older
+ * fixtures use `Record<testName, status>`. Readers must handle both.
+ */
+export type SweBenchTestStatus =
+  | Record<string, string>
+  | { success?: string[]; failure?: string[] };
+
 export interface SweBenchInstanceReport {
   patch_is_None?: boolean;
   patch_exists?: boolean;
   patch_successfully_applied?: boolean;
   resolved?: boolean;
   tests_status?: {
-    FAIL_TO_PASS?: Record<string, string>;
-    PASS_TO_PASS?: Record<string, string>;
+    FAIL_TO_PASS?: SweBenchTestStatus;
+    PASS_TO_PASS?: SweBenchTestStatus;
   };
 }
 

@@ -12,6 +12,7 @@ import {
   observeSkillPromoted,
 } from './adapters/b-memory';
 import { emitTelemetryBatch } from './emit';
+import { activeLedgerTokenCostTotal } from './llm-usage-ledger';
 import type { TelemetryEmission, TelemetrySink } from './telemetry-sink';
 
 export interface MemoryCycleTelemetryContext {
@@ -19,6 +20,8 @@ export interface MemoryCycleTelemetryContext {
   role_id: string;
   run_id?: RunId;
   memory_ablation?: string;
+  /** Optional override; defaults to active LLM usage ledger total. */
+  token_cost_total?: number;
 }
 
 function buildObservedContextPack(
@@ -160,6 +163,10 @@ export function collectMemoryCycleTelemetry(input: {
       skill_count: input.skills_after.length,
       experience_count: input.experience_count,
       persona_version: input.persona.version,
+      token_cost_total:
+        typeof context.token_cost_total === 'number'
+          ? context.token_cost_total
+          : activeLedgerTokenCostTotal(),
     }),
   ];
 

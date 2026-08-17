@@ -109,6 +109,14 @@ describe('telemetry integration', () => {
       retrieved_experience_ids: expect.any(Array),
       retrieved_skill_ids: expect.any(Array),
     });
+
+    const metricsUpdated = sink.list().find((record) => record.event_type === 'metrics.updated');
+    expect(metricsUpdated?.payload).toMatchObject({
+      agent_metrics: {
+        role_id: 'role_telemetry',
+        token_cost_total: expect.any(Number),
+      },
+    });
   });
 
   it('accepts L1 harness records through FHarnessTelemetryPort', async () => {

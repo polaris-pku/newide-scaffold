@@ -230,8 +230,18 @@ export class LiteLLMClient {
         break;
       }
       case 'anthropic': {
-        const { anthropic } = await import('@ai-sdk/anthropic');
-        factory = (id) => anthropic(id);
+        const { createAnthropic } = await import('@ai-sdk/anthropic');
+        const apiKey =
+          process.env.ANTHROPIC_AUTH_TOKEN ||
+          process.env.ANTHROPIC_API_KEY ||
+          process.env.DEEPSEEK_API_KEY;
+        factory = (id) =>
+          createAnthropic({
+            ...(apiKey ? { apiKey } : {}),
+            ...(process.env.ANTHROPIC_BASE_URL
+              ? { baseURL: process.env.ANTHROPIC_BASE_URL.replace(/\/+$/, '') }
+              : {}),
+          })(id);
         break;
       }
       default:
