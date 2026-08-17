@@ -14,7 +14,7 @@ export interface IntegrationV0CliOptions {
   memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
   worktreePath?: string;
   /** Record the run trajectory to NEWIDE_TRACE_ROOT (default .newide/runs) and print the replay. */
-  trace: boolean;
+  trace?: boolean;
   traceRoot?: string;
 }
 
@@ -85,7 +85,7 @@ export function parseIntegrationV0CliArgs(args: string[]): IntegrationV0CliOptio
     ...(externalDriverTimeoutMs !== undefined ? { externalDriverTimeoutMs } : {}),
     ...(memoryAblation ? { memoryAblation } : {}),
     ...(worktreePath ? { worktreePath } : {}),
-    trace: Boolean(parsed.get('--trace')),
+    ...(parsed.get('--trace') ? { trace: true } : {}),
     ...(traceRoot ? { traceRoot } : {}),
     driverPrompt: positional[0] ?? DEFAULT_PROMPT,
   };
