@@ -326,8 +326,10 @@ export class Agent {
    */
   async executeTask(task: AgentTaskRequest): Promise<MemoryCycleResult> {
     this.state = 'running';
+    let assigned = false;
     try {
       await this.assignTask(task);
+      assigned = true;
       await this.runLoop();
 
       const result = this.lastCycleResult;
@@ -338,6 +340,12 @@ export class Agent {
       return result;
     } finally {
       this.state = 'sleeping';
+      // Failure / throw paths skip finalizeLoop; without this, currentTask
+      // stays set, hasPendingTask() remains true, and a shared backend
+      // reports B_BLOCKED for every later instance.
+      if (assigned) {
+        this.clearLoopState();
+      }
     }
   }
 
