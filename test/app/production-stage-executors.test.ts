@@ -15,7 +15,7 @@ import type { AgentExecutionRequest, AgentExecutionResult } from '../../src/prot
 import type { AgentBoardListItem, AgentBoardQuery } from '../../src/memory';
 
 describe('production stage executors', () => {
-  it('retries a missing primary Plan before executing the selected final Council Plan', async () => {
+  it('retries a missing primary Plan and resumes a B_BLOCKED final Plan execution', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-plan-first-stages-'));
     const workspace = path.join(root, 'workspace');
     await mkdir(workspace, { recursive: true });
@@ -120,7 +120,9 @@ describe('production stage executors', () => {
               ? missingPrimaryPlan
               : executionCount === 2
                 ? primaryPlan
-                : implementation;
+                : executionCount === 3
+                  ? missingPrimaryPlan
+                  : implementation;
           return {
             agent_run_id: `agent_run_${String(executionCount)}`,
             agent_id: 'role_primary',
@@ -130,10 +132,13 @@ describe('production stage executors', () => {
             artifact_refs: [artifact],
             transcript_ref: transcriptArtifact(`transcript_${String(executionCount)}`),
             session_id: 'session_primary',
-            response: executionCount === 3 ? 'implementation complete' : 'plan ready',
+            response: executionCount === 4 ? 'implementation complete' : 'plan ready',
             tool_events: [],
-            diagnostics: { driver_id: 'acp-external' },
-            status: 'completed',
+            diagnostics:
+              executionCount === 3
+                ? { driver_id: 'acp-external', driver_error_code: 'B_BLOCKED' }
+                : { driver_id: 'acp-external' },
+            status: executionCount === 3 ? 'failed' : 'completed',
             created_at: nowTimestamp(),
             schema_version: SCHEMA_VERSION,
           };
@@ -169,7 +174,7 @@ describe('production stage executors', () => {
       },
     });
 
-    expect(requests).toHaveLength(3);
+    expect(requests).toHaveLength(4);
     expect(requests[0]).toMatchObject({
       role_id: 'role_primary',
       context_policy: 'council_primary_plan',
@@ -192,6 +197,14 @@ describe('production stage executors', () => {
       workspace_path: requests[0]?.workspace_path,
     });
     expect(requests[2]?.driver_instruction).toContain('Implement the approved final Council Plan');
+    expect(requests[3]).toMatchObject({
+      role_id: 'role_primary',
+      session_id: 'session_primary',
+      context_policy: 'council_plan_execution',
+      input_artifact_refs: [finalPlan.artifact_id],
+      workspace_path: requests[2]?.workspace_path,
+    });
+    expect(requests[3]?.driver_instruction).toContain('RETRY: Resume this same Plan execution');
     expect(council.artifact_refs).toEqual([implementation.artifact_id]);
     const state = JSON.parse(
       await readFile(path.join(root, 'runs', 'run_plan', 'production-stage-state.json'), 'utf8'),

@@ -62,7 +62,7 @@ export class AutonomousCouncilHandler {
     );
     const warnings: string[] = [];
     if (fallback.length > 0) {
-      warnings.push('Council synthesis was unavailable; selected a reviewed proposal.');
+      warnings.push('Council synthesis was unavailable; selected the best available proposal.');
     }
     if (identityConflict) {
       warnings.push('Council reused a persisted Agent across seats; identity reuse was audited.');
