@@ -436,10 +436,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
                 include_recent_experience: ablationPolicy.include_recent_experience,
               },
             },
-          },
-        ),
-        options?.signal,
-      );
+          ),
+          options?.signal,
+        );
       throwIfAborted(options?.signal);
       const invocation: InvocationContext = {
         task_id: input.task_id,
@@ -503,77 +502,6 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         invocation.agent_system_prompt_sha256,
         invocation.mailbox_outcomes,
       );
-      if (inboundMailbox && result.status === 'completed') {
-        this.finishInboundMailbox(
-          inboundMailbox,
-          result,
-          invocation.mailbox_outcomes,
-          input.session_id,
-        );
-        );
-        throwIfAborted(options?.signal);
-        const invocation: InvocationContext = {
-          task_id: input.task_id,
-          run_id: input.run_id,
-          role_id: runtimeRoleId,
-          instruction: input.instruction,
-          driver_instruction: input.driver_instruction ?? input.instruction,
-          driver_instruction_locked: input.driver_instruction !== undefined,
-          ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
-          ...(input.session_id ? { session_id: input.session_id } : {}),
-          retrieval,
-          ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
-          notice_mailboxes: noticeMailboxes,
-          mailbox_outcomes: [],
-          mailbox_sequence: 0,
-          driver_attempts: 0,
-          abortObserved: false,
-          ...(options?.signal ? { signal: options.signal } : {}),
-          ...(options?.onDriverEvent
-            ? {
-                onDriverEvent: (event: DriverStreamEvent) =>
-                  options.onDriverEvent?.({ ...event, role_id: input.role_id }),
-              }
-            : {}),
-          ...(executionSpan
-            ? {
-                trace: {
-                  executionSpanId: executionSpan.span_id,
-                  executionStartedAt: executionSpan.started_at,
-                  turnStack: [],
-                  toolStack: [],
-                },
-              }
-            : {}),
-        };
-        const workspaceBefore = input.workspace_path
-          ? await snapshotWorkspaceFiles(input.workspace_path)
-          : undefined;
-        const rawDispatch = await this.invocationContext.run(invocation, () =>
-          manager.dispatchTask(runtimeRoleId, task),
-        );
-        const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
-        const workspaceArtifacts = await collectWorkspaceArtifacts(
-          input,
-          workspaceBefore,
-          invocation.execution,
-        );
-
-        if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
-          await this.recoverRole(runtimeRoleId);
-          throwIfAborted(invocation.signal);
-        }
-        const result = await this.buildResult(
-          input,
-          dispatched,
-          runtimeRoleId,
-          invocation.execution,
-          workspaceArtifacts,
-          invocation.driver_attempts,
-          invocation.driver_invocation_context,
-          invocation.agent_system_prompt_sha256,
-          invocation.mailbox_outcomes,
-        );
         this.closeAgentExecutionSpan(
           executionSpan,
           input,
