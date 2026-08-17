@@ -434,11 +434,19 @@ export class TaskProcessor {
     if (aggregate.events.some((candidate) => candidate.event_id === event.event_id)) {
       throw new Error(`Stage event ${event.event_id} already exists`);
     }
-    const terminalEvent = completing
-      ? this.createEvent('run.completed', input.run_id, aggregate.task.task_id, input.run_id, {
-          status: 'completed',
-          final_artifact_ref: input.final_output?.artifact_ref,
-        })
+    const terminalEvents = completing
+      ? [
+          this.createEvent('run.completed', input.run_id, aggregate.task.task_id, input.run_id, {
+            status: 'completed',
+            final_artifact_ref: input.final_output?.artifact_ref,
+          }),
+          // 闭合 task.run 轨迹 span：与 run.completed 并列发 task.completed，
+          // 使回放的阶段条/瀑布在任务级有正确的 end 状态（否则 task.run 悬空 open）。
+          this.createEvent('task.completed', aggregate.task.task_id, aggregate.task.task_id, input.run_id, {
+            status: 'completed',
+            final_artifact_ref: input.final_output?.artifact_ref,
+          }),
+        ]
       : undefined;
     if (completing) assertTaskStatusTransition(aggregate.task.status, 'completed');
 
@@ -500,7 +508,7 @@ export class TaskProcessor {
         task,
         run: nextRun,
         runtime_state: runtimeState,
-        events: [event, ...(terminalEvent ? [terminalEvent] : [])],
+        events: [event, ...(terminalEvents ?? [])],
       });
     } catch (error) {
       throw new TaskProcessorStageCommitError('handler.completed', error);
@@ -538,13 +546,23 @@ export class TaskProcessor {
         message: input.error.message,
       });
     assertStageEvent(event, 'handler.failed', aggregate.task.task_id, input.run_id);
-    const terminalEvent = this.createEvent(
-      'run.failed',
-      input.run_id,
-      aggregate.task.task_id,
-      input.run_id,
-      { status: 'failed', code: input.error.code, message: input.error.message },
-    );
+    const terminalEvents = [
+      this.createEvent(
+        'run.failed',
+        input.run_id,
+        aggregate.task.task_id,
+        input.run_id,
+        { status: 'failed', code: input.error.code, message: input.error.message },
+      ),
+      // 与 run.failed 并列发 task.failed，闭合 task.run 轨迹 span（失败路径）。
+      this.createEvent(
+        'task.failed',
+        aggregate.task.task_id,
+        aggregate.task.task_id,
+        input.run_id,
+        { status: 'failed', code: input.error.code, message: input.error.message },
+      ),
+    ];
     const { active_stage: _activeStage, ...diagnosticsWithoutActiveStage } =
       aggregate.runtime_state.diagnostics;
     const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
@@ -585,7 +603,7 @@ export class TaskProcessor {
         },
         updated_at: timestamp,
       },
-      events: [event, terminalEvent],
+      events: [event, ...terminalEvents],
     });
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),

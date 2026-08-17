@@ -442,17 +442,22 @@ function createProductionToolCallingClient(
   runtime: ProductionLlmRuntime | undefined,
   env: NodeJS.ProcessEnv,
 ): LiteLLMToolCallingClient {
+  const rawContextWindow = Number(env.NEWIDE_LLM_CONTEXT_WINDOW);
+  const contextWindow =
+    Number.isFinite(rawContextWindow) && rawContextWindow > 0 ? rawContextWindow : undefined;
   if (runtime) {
     return new LiteLLMToolCallingClient({
       model: runtime.model,
       apiKey: runtime.apiKey,
       baseUrl: runtime.baseUrl,
+      ...(contextWindow ? { contextWindow } : {}),
     });
   }
   return new LiteLLMToolCallingClient({
     ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
       ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
       : {}),
+    ...(contextWindow ? { contextWindow } : {}),
   });
 }
 

@@ -593,6 +593,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         );
         if (inboundMailbox && result.status === 'completed') {
           this.finishInboundMailbox(
+            input,
             inboundMailbox,
             result,
             invocation.mailbox_outcomes,
@@ -785,6 +786,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         requires_ack: false,
         idempotency_key: idempotencyKey,
       });
+      // service.reply 会把 source delivery 自动标记为 acknowledged：
+      // 在这里投影 ack 点，让消息链与 mailbox 状态机一致。
+      this.emitMailboxAckRecord({
+        run_id: invocation.run_id,
+        task_id: invocation.task_id,
+        role_id: invocation.role_id,
+        envelope: inbound,
+      });
       const replyDelivery = reply.reply.deliveries[0];
       if (!replyDelivery) throw new Error('Mailbox reply did not create a Delivery');
       const outcome: MailboxToolOutcome = {
@@ -799,6 +808,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         source_delivery_id: source.delivery_id,
       };
       invocation.mailbox_outcomes.push(outcome);
+      this.emitMailboxSent(invocation, outcome);
       return outcome;
     }
     if (invocation.inbound_mailbox && !invocation.execution) {
@@ -835,10 +845,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       wait_for_reply: waitForReply,
     };
     invocation.mailbox_outcomes.push(outcome);
+    this.emitMailboxSent(invocation, outcome);
     return outcome;
   }
 
   private finishInboundMailbox(
+    input: AgentExecutionRequest,
     inbound: PersistedMailboxEnvelope,
     result: AgentExecutionResult,
     outcomes: readonly MailboxToolOutcome[],
@@ -864,6 +876,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       (!envelopeExpectsReply(inbound) || replied)
     ) {
       mailbox.service.ack(injected.delivery_id, injected.recipient_role_id);
+      this.emitMailboxAckRecord({
+        run_id: input.run_id,
+        task_id: input.task_id,
+        role_id: input.role_id,
+        envelope: inbound,
+      });
     }
   }
 
@@ -954,6 +972,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           : current;
       if (injected.status === 'injected') {
         mailbox.service.ack(injected.delivery_id, injected.recipient_role_id);
+        this.emitMailboxAckRecord({
+          run_id: input.run_id,
+          task_id: input.task_id,
+          role_id: input.role_id,
+          envelope: notice,
+        });
       }
     }
   }
@@ -1024,6 +1048,63 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
 
   private emitTrace(input: DirectTraceRecordInput): void {
     void this.options.trace?.projectDirect(input);
+  }
+
+  /**
+   * Mailbox 发送点投影（send / reply 分支）：落 agent.message point，
+   * 供回放的消息链重建（sent ↔ acked 按 message_id 配对）与 message.unacked
+   * 路由卡死检测。invocation 上下文内调用，run_id/task_id 直接可取。
+   */
+  private emitMailboxSent(invocation: InvocationContext, outcome: MailboxToolOutcome): void {
+    if (!this.options.trace) return;
+    this.emitTrace({
+      span_id: createId('span'),
+      run_id: invocation.run_id,
+      task_id: invocation.task_id,
+      kind: 'agent.message',
+      phase: 'point',
+      agent_id: invocation.role_id,
+      summary: outcome.kind,
+      payload: {
+        message_id: outcome.message_id,
+        message_type: outcome.kind,
+        from_agent_id: invocation.role_id,
+        to_agent_id: outcome.to_role_id,
+        requires_ack: outcome.wait_for_reply,
+      },
+    });
+  }
+
+  /**
+   * Mailbox ack 点投影：ack 实际发生的位置有三处 —— service.reply 自动
+   * acknowledged source delivery（reply 分支）、finishInboundMailbox 对
+   * injected delivery 的 ack、finishNoticeMailbox 对 notice delivery 的 ack。
+   * acked_by 是接收方角色，与发送点的 to_agent_id 配对（消息链重建）。
+   * run_id/task_id/role_id 由调用方传入：reply 分支在 AsyncLocalStorage
+   * invocation 上下文内，finish* 分支在上下文之外只能取 AgentExecutionRequest。
+   */
+  private emitMailboxAckRecord(options: {
+    run_id: string;
+    task_id: string;
+    role_id: string;
+    envelope: PersistedMailboxEnvelope;
+  }): void {
+    if (!this.options.trace) return;
+    const messageType = envelopeMessageKind(options.envelope);
+    this.emitTrace({
+      span_id: createId('span'),
+      run_id: options.run_id,
+      task_id: options.task_id,
+      kind: 'agent.message',
+      phase: 'point',
+      agent_id: options.role_id,
+      summary: `${messageType} acked`,
+      payload: {
+        message_id: options.envelope.message.message_id,
+        message_type: messageType,
+        acked_by: options.role_id,
+      },
+    });
   }
 
   private openAgentExecutionSpan(input: AgentExecutionRequest): AgentTraceSpan | undefined {
@@ -1670,6 +1751,15 @@ function legacyMailboxKind(
 ): 'request' | 'notice' | undefined {
   if (!type) return undefined;
   return expectsMailboxReply(type) ? 'request' : 'notice';
+}
+
+/** 消息链 message_type 词汇：优先 kind，回退 legacy type 推断，最后 notice。 */
+function envelopeMessageKind(envelope: PersistedMailboxEnvelope): string {
+  return (
+    envelope.message.kind ??
+    legacyMailboxKind(envelope.message.type) ??
+    'notice'
+  );
 }
 
 function legacyMailboxContent(payload: Record<string, unknown> | undefined): string | undefined {

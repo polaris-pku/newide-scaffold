@@ -5,6 +5,9 @@
  * 且失败 / LLM 异常时的状态映射正确，重放能重建嵌套瀑布。
  */
 import { describe, expect, it } from 'vitest';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { DriverRuntimeAgentExecutionFacade } from '../../src/app/driver-runtime-agent-execution-facade';
 import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
 import { MockDriver } from '../../src/driver/mock-driver';
@@ -16,6 +19,13 @@ import type {
 } from '../../src/driver';
 import { InMemoryBufferRepository, InMemoryRepository } from '../../src/memory';
 import type { ToolCallResult, ToolCallingClient } from '../../src/memory';
+import {
+  MailboxDeliveryWorker,
+  PersistentMailboxService,
+  type MailboxToolOutcome,
+} from '../../src/mailbox';
+import { SqliteCoordinationStore } from '../../src/persistence';
+import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 import { InMemoryTraceStore, TraceProjector, replayTrajectory } from '../../src/trace';
 
 const RUN_ID = 'run_trace_facade_001';
@@ -46,6 +56,64 @@ function toolCall(name: string, id: string, args: Record<string, unknown>): Tool
         function: { name, arguments: JSON.stringify(args) },
       },
     ],
+  };
+}
+
+/**
+ * 两角色 mailbox 对话脚本：sender 先发 request 等待；reviewer 收到 inbound
+ * 后先 invoke_driver 再回 notice；其余轮次直接 [done]。
+ */
+function mailboxConversationLlm(): ToolCallingClient {
+  return {
+    async completeWithTools(input) {
+      const userPrompt =
+        input.messages.find((message) => message.role === 'user')?.content ?? '';
+      const lastMessage = input.messages.at(-1);
+      const inboundRequest = userPrompt.includes('- kind: request');
+      const inboundResponse =
+        userPrompt.includes('Mailbox reply') || userPrompt.includes('- kind: notice');
+      if (!userPrompt.includes('Inbound mailbox envelope:') && lastMessage?.role !== 'tool') {
+        return toolCall('mailbox_send', 'mailbox_request', {
+          to_role_id: 'role_reviewer',
+          kind: 'request',
+          content: 'Please assess this plan.',
+        });
+      }
+      if ((inboundRequest || inboundResponse) && lastMessage?.role !== 'tool') {
+        return driverToolCalls('mailbox_driver_1');
+      }
+      if (
+        inboundRequest &&
+        lastMessage?.role === 'tool' &&
+        input.messages.some((message) =>
+          message.tool_calls?.some((call) => call.function.name === 'invoke_driver'),
+        ) &&
+        !input.messages.some((message) =>
+          message.tool_calls?.some((call) => call.function.name === 'mailbox_send'),
+        )
+      ) {
+        return toolCall('mailbox_send', 'mailbox_reply', {
+          to_role_id: 'role_sender',
+          kind: 'notice',
+          content: 'The plan is sound.',
+        });
+      }
+      return { content: 'Task completed. [done]', tool_calls: undefined };
+    },
+  };
+}
+
+function driverToolCalls(...ids: string[]): ToolCallResult {
+  return {
+    content: null,
+    tool_calls: ids.map((id) => ({
+      id,
+      type: 'function' as const,
+      function: {
+        name: 'invoke_driver',
+        arguments: JSON.stringify({ instruction: `Execute ${id}.` }),
+      },
+    })),
   };
 }
 
@@ -366,5 +434,90 @@ describe('DriverRuntimeAgentExecutionFacade trace', () => {
       (record) => record.kind === 'agent.execution' && record.phase === 'end',
     )!;
     expect(executionEnd.status).toBe('error');
+  });
+
+  it('projects mailbox sent and acked records for message-chain replay', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-trace-mailbox-'));
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: 'role_sender', name: 'Sender' });
+    await repository.initializeAgent({ role_id: 'role_reviewer', name: 'Reviewer' });
+    const coordinationStore = new SqliteCoordinationStore(':memory:');
+    const mailbox = new PersistentMailboxService(coordinationStore);
+    const sessions = new InMemoryParticipantSessionRegistry();
+    sessions.register({
+      task_id: TASK_ID,
+      workspace_path: workspace,
+      role_id: 'role_reviewer',
+      session_id: 'session_reviewer',
+    });
+    const traceStore = new InMemoryTraceStore();
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: new MockDriver(),
+      repository,
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: mailboxConversationLlm(),
+      mailbox: {
+        service: mailbox,
+        allowedRoleIds: ['role_sender', 'role_reviewer'],
+        sessionRegistry: sessions,
+      },
+      trace: new TraceProjector(traceStore),
+    });
+    await facade.ready();
+
+    try {
+      const sender = await facade.runAgent({
+        ...request(),
+        role_id: 'role_sender',
+        session_id: 'session_sender',
+        workspace_path: workspace,
+        instruction: 'Ask the reviewer to assess the plan, then implement the task.',
+      });
+      const sent = (sender.diagnostics.mailbox_outcomes as MailboxToolOutcome[])[0];
+      expect(sent).toBeDefined();
+
+      const sentRecords = await traceStore.load(RUN_ID);
+      const sentMessage = sentRecords.find(
+        (record) => record.kind === 'agent.message' && record.payload?.message_type === 'request',
+      );
+      expect(sentMessage?.payload).toMatchObject({
+        message_id: sent!.message_id,
+        message_type: 'request',
+        from_agent_id: 'role_sender',
+        to_agent_id: 'role_reviewer',
+        requires_ack: true,
+      });
+
+      const worker = new MailboxDeliveryWorker(mailbox, facade, sessions);
+      const reviewerRunId = 'run_trace_reviewer';
+      const handled = await worker.process({
+        delivery_id: sent!.delivery_id,
+        run_id: reviewerRunId,
+      });
+      expect(handled.status).toBe('replied');
+
+      const ackRecords = await traceStore.load(reviewerRunId);
+      const ackMessage = ackRecords.find(
+        (record) =>
+          record.kind === 'agent.message' && record.payload?.acked_by === 'role_reviewer',
+      );
+      expect(ackMessage?.payload).toMatchObject({
+        message_id: sent!.message_id,
+        message_type: 'request',
+        acked_by: 'role_reviewer',
+      });
+      // 接收方回复本身也是一条 mailbox sent 记录（message_type: reply）。
+      const replyMessage = ackRecords.find(
+        (record) => record.kind === 'agent.message' && record.payload?.message_type === 'reply',
+      );
+      expect(replyMessage?.payload).toMatchObject({
+        from_agent_id: 'role_reviewer',
+        to_agent_id: 'role_sender',
+        requires_ack: false,
+      });
+    } finally {
+      coordinationStore.close();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
   });
 });

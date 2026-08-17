@@ -183,15 +183,58 @@ export interface LiteLLMToolCallingClientOptions {
    * LiteLLM 通过 @ai-sdk/openai 调用，SDK 会读 OPENAI_BASE_URL env。
    */
   baseUrl?: string;
+  /**
+   * 上下文窗口上限 token 数（如 deepseek-chat 的 64K / 128K）。
+   * 设置了才在 usage 里推算 context_pct（tokens_in / contextWindow），
+   * 供轨迹诊断的上下文用量曲线与 >70% 报警使用；不设则只报 tokens_in/out。
+   */
+  contextWindow?: number;
+}
+
+/**
+ * 从 AI SDK generateText 的 result.usage 提取轨迹用量（v5+ inputTokens/
+ * outputTokens，v4 promptTokens/completionTokens 兼容读取）。配置了
+ * contextWindow 时按 tokens_in / contextWindow 推算 context_pct，供轨迹
+ * 诊断的上下文曲线与 >70% 报警使用；没有 usage 数据时返回 undefined。
+ */
+export function buildToolCallUsage(
+  result: {
+    usage?:
+      | {
+          inputTokens?: number | undefined;
+          outputTokens?: number | undefined;
+          promptTokens?: number | undefined;
+          completionTokens?: number | undefined;
+        }
+      | undefined;
+  },
+  contextWindow?: number,
+): ToolCallResult['usage'] | undefined {
+  const rawUsage = result.usage;
+  const tokensIn = rawUsage?.inputTokens ?? rawUsage?.promptTokens;
+  const tokensOut = rawUsage?.outputTokens ?? rawUsage?.completionTokens;
+  if (tokensIn === undefined && tokensOut === undefined) return undefined;
+  return {
+    ...(tokensIn !== undefined ? { tokens_in: tokensIn } : {}),
+    ...(tokensOut !== undefined ? { tokens_out: tokensOut } : {}),
+    ...(contextWindow && contextWindow > 0 && tokensIn !== undefined
+      ? {
+          context_limit: contextWindow,
+          context_pct: (tokensIn / contextWindow) * 100,
+        }
+      : {}),
+  };
 }
 
 export class LiteLLMToolCallingClient implements ToolCallingClient {
   private readonly client: LiteLLMClient;
   private readonly taskName: string;
   private readonly modelOverride: string | undefined;
+  private readonly contextWindow: number | undefined;
 
   constructor(options: LiteLLMToolCallingClientOptions = {}) {
     this.taskName = options.taskName ?? 'memory-query';
+    this.contextWindow = options.contextWindow;
 
     // 构造参数覆盖环境变量
     if (options.apiKey) {
@@ -347,12 +390,15 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       temperature,
       source: 'proxy',
     });
+    // usage 是轨迹诊断的上下文用量曲线数据源（facade 在 onLlmTurnEnd 投影 agent.llm 点）。
+    const usage = buildToolCallUsage(result, this.contextWindow);
     return {
       content: result.text ?? null,
       tool_calls:
         result.toolCalls && result.toolCalls.length > 0
           ? toToolCalls(result.toolCalls as unknown[])
           : undefined,
+      ...(usage ? { usage } : {}),
     };
   }
 }

@@ -915,6 +915,109 @@ describe('TaskProcessor', () => {
     store.close();
   });
 
+  it('emits task.completed alongside run.completed when the final stage completes', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({
+      task_id: 'task_complete_event',
+      run_id: 'run_complete_event',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      cursor_input: selectInput,
+    });
+    advanceProcessorToGate(
+      processor,
+      'run_complete_event',
+      'artifact_complete',
+      '1'.repeat(64),
+    );
+    processor.startStage({
+      run_id: 'run_complete_event',
+      expected_cursor: 'gate',
+      invocation_id: 'invocation_gate_complete',
+    });
+    processor.advanceStage({
+      run_id: 'run_complete_event',
+      expected_cursor: 'gate',
+      invocation_id: 'invocation_gate_complete',
+      evidence_ref: evidenceRef('gate_complete'),
+      next_input: {
+        cursor: 'deliver',
+        changeset_ref: 'artifact_complete',
+        expected_sha256: '1'.repeat(64),
+      },
+    });
+    processor.startStage({
+      run_id: 'run_complete_event',
+      expected_cursor: 'deliver',
+      invocation_id: 'invocation_deliver_complete',
+    });
+    const advanced = processor.advanceStage({
+      run_id: 'run_complete_event',
+      expected_cursor: 'deliver',
+      invocation_id: 'invocation_deliver_complete',
+      evidence_ref: evidenceRef('deliver_complete'),
+      next_input: { cursor: 'done' },
+      final_output: {
+        artifact_ref: 'artifact_complete',
+        sha256: '1'.repeat(64),
+        workspace_path: '/workspace/result.ts',
+      },
+    });
+    expect(advanced.committed_events.map((event) => event.event_type)).toEqual([
+      'handler.completed',
+      'run.completed',
+      'task.completed',
+    ]);
+    expect(
+      advanced.committed_events.find((event) => event.event_type === 'task.completed'),
+    ).toMatchObject({
+      subject_id: 'task_complete_event',
+      task_id: 'task_complete_event',
+      run_id: 'run_complete_event',
+      payload: { status: 'completed', final_artifact_ref: 'artifact_complete' },
+    });
+    store.close();
+  });
+
+  it('emits task.failed alongside run.failed when a stage fails terminally', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({
+      task_id: 'task_fail_event',
+      run_id: 'run_fail_event',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      cursor_input: selectInput,
+    });
+    processor.startStage({
+      run_id: 'run_fail_event',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_fail_select',
+    });
+    const failed = processor.failStage({
+      run_id: 'run_fail_event',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_fail_select',
+      evidence_ref: evidenceRef('fail_select'),
+      error: { code: 'SELECT_FAILED', message: 'No agent available' },
+    });
+    expect(failed.committed_events.map((event) => event.event_type)).toEqual([
+      'handler.failed',
+      'run.failed',
+      'task.failed',
+    ]);
+    expect(
+      failed.committed_events.find((event) => event.event_type === 'task.failed'),
+    ).toMatchObject({
+      subject_id: 'task_fail_event',
+      task_id: 'task_fail_event',
+      run_id: 'run_fail_event',
+      payload: { status: 'failed', code: 'SELECT_FAILED', message: 'No agent available' },
+    });
+    store.close();
+  });
+
   it('blocks interrupted active runs once and saves a resumable full checkpoint', () => {
     const { processor, store } = createProcessor();
     processor.beginRun({

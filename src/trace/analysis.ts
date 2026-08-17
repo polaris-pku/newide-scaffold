@@ -512,6 +512,61 @@ function runEndStatus(spans: MergedTrajectorySpan[]): TrajectorySpanRecord['stat
 }
 
 // ────────────────────────────────────────────
+// 评审时序检测
+// ────────────────────────────────────────────
+
+/**
+ * 检测“参与者在 run 结束之后才收尾”的时序异常：run 已落 run.completed
+ * （或 task.completed）end 记录，却有 agent.execution span 的 ended_at 更晚。
+ * 对应 SWE-EVO council 实验里评审/执行晚于 run 收尾的旁证 —— 这类结论通常
+ * 未纳入最终交付，是“报告说完了但参与者还在跑”的信号。
+ */
+function findingsForReviewTiming(spans: MergedTrajectorySpan[]): TrajectoryFinding[] {
+  const runEnds = spans
+    .filter(
+      (span) =>
+        span.phase === 'span' &&
+        (span.kind === 'run' || span.kind === 'task.run') &&
+        span.ended_at !== undefined,
+    )
+    .sort((a, b) => a.sequence - b.sequence);
+  const runEnd = runEnds.at(-1);
+  const runEndMs = runEnd?.ended_at !== undefined ? Date.parse(runEnd.ended_at) : NaN;
+  if (!Number.isFinite(runEndMs)) return [];
+  const lateParticipants = spans
+    .filter((span) => {
+      if (
+        span.phase !== 'span' ||
+        span.kind !== 'agent.execution' ||
+        span.ended_at === undefined
+      ) {
+        return false;
+      }
+      const endedMs = Date.parse(span.ended_at);
+      return Number.isFinite(endedMs) && endedMs > runEndMs;
+    })
+    .sort((a, b) => (a.ended_at ?? '').localeCompare(b.ended_at ?? ''));
+  if (lateParticipants.length === 0) return [];
+  const latest = lateParticipants.at(-1)!;
+  return [
+    {
+      severity: 'warning',
+      code: 'late.participant',
+      span_id: latest.span_id,
+      summary:
+        `participant ${latest.agent_id ?? 'agent'} finished at ${latest.ended_at} ` +
+        `after the run ended at ${runEnd!.ended_at} — 评审/执行晚于 run 收尾，其结论可能未被纳入最终交付`,
+      detail: lateParticipants
+        .map(
+          (span) =>
+            `- ${span.agent_id ?? span.span_id}: ended ${span.ended_at} (run ended ${runEnd!.ended_at})`,
+        )
+        .join('\n'),
+    },
+  ];
+}
+
+// ────────────────────────────────────────────
 // 入口
 // ────────────────────────────────────────────
 
@@ -528,6 +583,7 @@ export function analyzeTrajectory(records: TrajectorySpanRecord[]): TrajectoryDi
   const findings: TrajectoryFinding[] = [
     ...findingsForMessages(messages),
     ...findingsForUsage(usagePoints),
+    ...findingsForReviewTiming(spans),
   ];
 
   if (finalReport.found && finalReport.violations.length > 0) {

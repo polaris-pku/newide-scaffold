@@ -247,7 +247,10 @@ export { ToolRegistry } from './runtime/tool';
 export { QueryMemoryTool as AgentQueryMemoryTool } from './runtime/tools/query-memory-tool';
 export { InvokeDriverTool } from './runtime/tools/invoke-driver-tool';
 export type { DriverTask, DriverHandler } from './runtime/tools/invoke-driver-tool';
-export { LiteLLMToolCallingClient } from './adapters/litellm-tool-calling-client';
+export {
+  LiteLLMToolCallingClient,
+  buildToolCallUsage,
+} from './adapters/litellm-tool-calling-client';
 export type { LiteLLMToolCallingClientOptions } from './adapters/litellm-tool-calling-client';
 
 // ════════════════════════════════════════════════════════

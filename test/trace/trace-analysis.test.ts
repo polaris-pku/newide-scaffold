@@ -279,6 +279,65 @@ describe('analyzeTrajectory — context usage', () => {
     expect(diag.usagePoints[0]!.context_pct).toBeCloseTo(75);
     expect(diag.findings.some((f) => f.code === 'context.high_usage')).toBe(true);
   });
+
+  it('keeps token-only usage points without alarming when no context window is known', () => {
+    // 生产 litellm client 只报 tokens_in/out、未配置 contextWindow 时：
+    // 曲线保留 token 数据，但不触发 context.high_usage（0% 无意义，不应误报）。
+    const records = healthyFixture().concat([
+      record('llm_1', 'point', 'agent.llm', 11, T1, {
+        agent_id: 'agent_a',
+        payload: { round: 1, tokens_in: 12_000, tokens_out: 400 },
+      }),
+      record('llm_2', 'point', 'agent.llm', 12, T2, {
+        agent_id: 'agent_a',
+        payload: { round: 2, tokens_in: 48_000, tokens_out: 900 },
+      }),
+    ]);
+    const diag = analyzeTrajectory(records);
+    expect(diag.usagePoints).toHaveLength(2);
+    expect(diag.usagePoints[0]!.tokens_in).toBe(12_000);
+    expect(diag.usagePoints.every((point) => point.context_pct === 0)).toBe(true);
+    expect(diag.findings.some((f) => f.code === 'context.high_usage')).toBe(false);
+  });
+});
+
+describe('analyzeTrajectory — review timing', () => {
+  it('warns when a participant finished after the run ended (late.participant)', () => {
+    const records = [
+      record('task', 'start', 'task.run', 1, T0),
+      record('seat', 'start', 'agent.execution', 2, T1, { agent_id: 'role_reviewer' }),
+      record('seat', 'end', 'agent.execution', 3, T2, {
+        agent_id: 'role_reviewer',
+        status: 'ok',
+        ended_at: T2,
+      }),
+      record('task', 'end', 'task.run', 4, T2, { status: 'ok', ended_at: T2 }),
+      record('late', 'start', 'agent.execution', 5, T1, { agent_id: 'role_synthesizer' }),
+      record('late', 'end', 'agent.execution', 6, T3, {
+        agent_id: 'role_synthesizer',
+        status: 'ok',
+        ended_at: T3,
+      }),
+    ];
+    const diag = analyzeTrajectory(records);
+    const finding = diag.findings.find((f) => f.code === 'late.participant');
+    expect(finding?.severity).toBe('warning');
+    expect(finding?.summary).toContain('role_synthesizer');
+    expect(finding?.detail).toContain('role_synthesizer');
+  });
+
+  it('does not warn when participants finished before the run ended', () => {
+    const fixture = healthyFixture().concat([
+      record('seat', 'start', 'agent.execution', 11, T1, { agent_id: 'role_reviewer' }),
+      record('seat', 'end', 'agent.execution', 12, T2, {
+        agent_id: 'role_reviewer',
+        status: 'ok',
+        ended_at: T2,
+      }),
+    ]);
+    const diag = analyzeTrajectory(fixture);
+    expect(diag.findings.some((f) => f.code === 'late.participant')).toBe(false);
+  });
 });
 
 describe('analyzeTrajectory — stages', () => {

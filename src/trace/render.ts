@@ -119,27 +119,52 @@ export function renderContextUsage(points: ContextUsagePoint[]): string {
     lines.push('(no usage points — LLM client did not report usage)');
     return lines.join('\n');
   }
-  const maxPct = Math.max(...points.map((point) => point.context_pct));
-  const maxRound = points.reduce((best, point) =>
-    point.context_pct > best.context_pct ? point : best,
-  ).round;
   const rounds = points.map((point) => String(point.round).padStart(3)).join(' ');
-  const usage = points
-    .map((point) => {
-      const pct = Math.round(point.context_pct);
-      const alarm = point.context_pct > CONTEXT_USAGE_ALARM_PCT ? ' ⚠' : '';
-      return `${String(pct).padStart(3)}${alarm}`;
-    })
-    .join(' ');
   lines.push(`  round: ${rounds}`);
-  lines.push(`  usage: ${usage}`);
+  const hasPct = points.some((point) => point.context_pct > 0);
+  if (hasPct) {
+    const maxPct = Math.max(...points.map((point) => point.context_pct));
+    const maxRound = points.reduce((best, point) =>
+      point.context_pct > best.context_pct ? point : best,
+    ).round;
+    const usage = points
+      .map((point) => {
+        const pct = Math.round(point.context_pct);
+        const alarm = point.context_pct > CONTEXT_USAGE_ALARM_PCT ? ' ⚠' : '';
+        return `${String(pct).padStart(3)}${alarm}`;
+      })
+      .join(' ');
+    lines.push(`  usage: ${usage}`);
+    lines.push(
+      `  max ${Math.round(maxPct)}% at round ${String(maxRound)}` +
+        (maxPct > CONTEXT_USAGE_ALARM_PCT
+          ? ` ⚠ exceeds ${String(CONTEXT_USAGE_ALARM_PCT)}% alarm`
+          : ''),
+    );
+    lines.push(`  bars: ${points.map((point) => renderPercentBar(point.context_pct)).join(' ')}`);
+    return lines.join('\n');
+  }
+  // Token-only 曲线：LLM client 报了 tokens_in 但没有上下文窗口信息
+  // （未配置 contextWindow）时，按 tokens_in 归一化画条形趋势。
+  const maxTokens = Math.max(...points.map((point) => point.tokens_in ?? 0));
+  const maxTokenRound = points.reduce((best, point) =>
+    (point.tokens_in ?? 0) > (best.tokens_in ?? 0) ? point : best,
+  ).round;
+  const tokens = points
+    .map((point) => String(point.tokens_in ?? 0).padStart(6))
+    .join(' ');
+  lines.push(`  tokens_in: ${tokens}`);
   lines.push(
-    `  max ${Math.round(maxPct)}% at round ${String(maxRound)}` +
-      (maxPct > CONTEXT_USAGE_ALARM_PCT
-        ? ` ⚠ exceeds ${String(CONTEXT_USAGE_ALARM_PCT)}% alarm`
-        : ''),
+    `  max ${String(maxTokens)} tokens in at round ${String(maxTokenRound)}` +
+      ' (no context window configured)',
   );
-  lines.push(`  bars: ${points.map((point) => renderPercentBar(point.context_pct)).join(' ')}`);
+  lines.push(
+    `  bars: ${points
+      .map((point) =>
+        renderPercentBar(maxTokens > 0 ? ((point.tokens_in ?? 0) / maxTokens) * 100 : 0),
+      )
+      .join(' ')}`,
+  );
   return lines.join('\n');
 }
 
