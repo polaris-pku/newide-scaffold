@@ -19,7 +19,7 @@
 
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
-import { DriverReturnSchema, type DriverReturn } from '../memory/schemas';
+import { DriverReturnSchema, type DriverReturn, type Effectiveness } from '../memory/schemas';
 import type { LlmClient } from '../memory/ports/llm-client';
 import type { DriverRunResult } from './contract';
 import type { ArtifactRef } from '../core';
@@ -120,7 +120,14 @@ function tryReadReportFile(taskId: string, workspace: string): DriverReturn | nu
   }
 
   try {
-    const report = DriverReturnSchema.parse(parsed) as DriverReturn;
+    const report = normalizeDriverReturn(parsed);
+
+    if (!report) {
+      console.error(
+        `[DriverReturnConverter] report file JSON could not be normalized to the six-field schema (${filePath})`,
+      );
+      return null;
+    }
 
     // 解析成功后，默认清理 report 文件（可通过 ACP_KEEP_REPORT_FILE=1 保留）
     const keepFile =
@@ -150,6 +157,244 @@ function tryReadReportFile(taskId: string, workspace: string): DriverReturn | nu
 }
 
 // ──────────────────────────────────────────────
+// 容错修复（normalize）：把 LLM 输出的"近似六字段"修复为完全合规的 DriverReturn
+// ──────────────────────────────────────────────
+
+/**
+ * 常见 effectiveness 同义词 → 枚举值映射。
+ * LLM 常输出 "fully effective"、"partial"、"n/a" 等非枚举写法，
+ * 这里统一映射到 DriverReturnSchema 允许的四个枚举值。
+ */
+const EFFECTIVENESS_ALIASES: Record<string, Effectiveness> = {
+  fully_effective: 'fully_effective',
+  'fully effective': 'fully_effective',
+  'fully-effective': 'fully_effective',
+  fully: 'fully_effective',
+  full: 'fully_effective',
+  complete: 'fully_effective',
+  completely: 'fully_effective',
+  partially_effective: 'partially_effective',
+  'partially effective': 'partially_effective',
+  'partially-effective': 'partially_effective',
+  partial: 'partially_effective',
+  partly: 'partially_effective',
+  somewhat: 'partially_effective',
+  some: 'partially_effective',
+  ineffective: 'ineffective',
+  no: 'ineffective',
+  none: 'ineffective',
+  failed: 'ineffective',
+  not_applicable: 'not_applicable',
+  'not applicable': 'not_applicable',
+  'not-applicable': 'not_applicable',
+  'n/a': 'not_applicable',
+  na: 'not_applicable',
+  unused: 'not_applicable',
+};
+
+/** 将任意值规范化为 string[]（字符串包成单元素数组，非数组返回空数组） */
+function toStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string');
+  }
+  if (typeof value === 'string' && value.trim()) {
+    return [value];
+  }
+  return [];
+}
+
+/** 将任意值规范化为 string（非字符串回退到 fallback） */
+function toStringValue(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+/** 将任意值规范化为 boolean（"true"/"yes"/"1" → true，其他 → false） */
+function toBooleanValue(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return ['true', 'yes', '1', 'y', 'done', 'completed'].includes(normalized);
+  }
+  return false;
+}
+
+/** 将任意值规范化为 Effectiveness 枚举（无法识别时返回 undefined） */
+function toEffectiveness(value: unknown): Effectiveness | undefined {
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim().toLowerCase();
+  return EFFECTIVENESS_ALIASES[key] ?? undefined;
+}
+
+/**
+ * 规范化 artifacts 数组：
+ * - 对象元素规整字段为 string（type 缺省 'file'）
+ * - 字符串元素（真实 LLM 常把 artifacts 输出为路径列表）转成 {type:'file', path, summary:''}
+ */
+function normalizeArtifacts(value: unknown): DriverReturn['artifacts'] {
+  if (!Array.isArray(value)) return [];
+  const artifacts: DriverReturn['artifacts'] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      artifacts.push({ type: 'file', path: item, summary: '' });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    artifacts.push({
+      type: toStringValue(record.type, 'file'),
+      path: toStringValue(record.path),
+      summary: toStringValue(record.summary),
+    });
+  }
+  return artifacts;
+}
+
+/**
+ * 规范化 decisions 数组：
+ * - 对象元素规整字段类型
+ * - 字符串元素（真实 LLM 常输出纯文本决策列表）转成 {point: text, options: [], chosen: '', reason: ''}
+ */
+function normalizeDecisions(value: unknown): DriverReturn['decisions'] {
+  if (!Array.isArray(value)) return [];
+  const decisions: DriverReturn['decisions'] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      decisions.push({ point: item, options: [], chosen: '', reason: '' });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    decisions.push({
+      point: toStringValue(record.point, 'Decision'),
+      options: toStringArray(record.options),
+      chosen: toStringValue(record.chosen),
+      reason: toStringValue(record.reason),
+    });
+  }
+  return decisions;
+}
+
+/**
+ * 规范化 blockers 数组：
+ * - 对象元素规整 attempts/resolved
+ * - 字符串元素（真实 LLM 常输出纯文本阻塞列表）转成 {blocker: text, attempts: [], resolution: '', resolved: false}
+ */
+function normalizeBlockers(value: unknown): DriverReturn['blockers'] {
+  if (!Array.isArray(value)) return [];
+  const blockers: DriverReturn['blockers'] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      blockers.push({ blocker: item, attempts: [], resolution: '', resolved: false });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    blockers.push({
+      blocker: toStringValue(record.blocker),
+      attempts: toStringArray(record.attempts),
+      resolution: toStringValue(record.resolution),
+      resolved: toBooleanValue(record.resolved),
+    });
+  }
+  return blockers;
+}
+
+/**
+ * 规范化 referenced_experiences 数组：
+ * - 对象元素规整 applied/effectiveness
+ * - 字符串元素（真实 LLM 常输出 experience id 列表）转成 {experience_id: text, applied: true, effectiveness: 'not_applicable', note: ''}
+ */
+function normalizeReferencedExperiences(value: unknown): DriverReturn['referenced_experiences'] {
+  if (!Array.isArray(value)) return [];
+  const experiences: DriverReturn['referenced_experiences'] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      experiences.push({
+        experience_id: item,
+        applied: true,
+        effectiveness: 'not_applicable',
+        note: '',
+      });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    experiences.push({
+      experience_id: toStringValue(record.experience_id),
+      applied: toBooleanValue(record.applied),
+      effectiveness: toEffectiveness(record.effectiveness) ?? 'not_applicable',
+      note: toStringValue(record.note),
+    });
+  }
+  return experiences;
+}
+
+/**
+ * 规范化 assumptions 数组：
+ * - 对象元素规整字段为 string
+ * - 字符串元素（真实 LLM 常输出纯文本假设列表）转成 {assumption: text, risk_if_wrong: ''}
+ */
+function normalizeAssumptions(value: unknown): DriverReturn['assumptions'] {
+  if (!Array.isArray(value)) return [];
+  const assumptions: DriverReturn['assumptions'] = [];
+  for (const item of value) {
+    if (typeof item === 'string') {
+      assumptions.push({ assumption: item, risk_if_wrong: '' });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    assumptions.push({
+      assumption: toStringValue(record.assumption),
+      risk_if_wrong: toStringValue(record.risk_if_wrong),
+    });
+  }
+  return assumptions;
+}
+
+/**
+ * 容错修复：将 LLM 输出的"近似六字段"对象修复为完全符合 DriverReturnSchema 的 DriverReturn。
+ *
+ * 修复规则（保留真实内容，绝不降级丢弃）：
+ * - 缺失的数组字段补空数组（artifacts/decisions/blockers/referenced_experiences/assumptions）
+ * - summary 缺失时补占位说明
+ * - 字段类型规整：字符串数组、布尔、枚举别名映射
+ * - 顶层 effectiveness 为可选字段，识别失败时省略
+ *
+ * 修复后仍无法通过 schema 校验（如整体不是对象）时返回 null。
+ *
+ * @returns 修复后的 DriverReturn；无法修复返回 null
+ */
+export function normalizeDriverReturn(raw: unknown): DriverReturn | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const input = raw as Record<string, unknown>;
+
+  const summary = toStringValue(input.summary);
+  const candidate: DriverReturn = {
+    artifacts: normalizeArtifacts(input.artifacts),
+    summary:
+      summary.trim().length > 0
+        ? summary
+        : 'Driver executed the task (no summary provided).',
+    decisions: normalizeDecisions(input.decisions),
+    blockers: normalizeBlockers(input.blockers),
+    referenced_experiences: normalizeReferencedExperiences(input.referenced_experiences),
+    assumptions: normalizeAssumptions(input.assumptions),
+  };
+
+  const effectiveness = toEffectiveness(input.effectiveness);
+  if (effectiveness) {
+    candidate.effectiveness = effectiveness;
+  }
+
+  const parsed = DriverReturnSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
+}
+
+// ──────────────────────────────────────────────
 // 策略1：从 transcript 解析结构化报告
 // ──────────────────────────────────────────────
 
@@ -169,7 +414,10 @@ export function parseDriverReturnFromTranscript(transcriptText: string): DriverR
   );
   if (taggedMatch?.[1]) {
     try {
-      return JSON.parse(taggedMatch[1]) as DriverReturn;
+      const normalized = normalizeDriverReturn(JSON.parse(taggedMatch[1]));
+      if (normalized) {
+        return normalized;
+      }
     } catch {
       // 继续尝试其他策略
     }
@@ -181,7 +429,10 @@ export function parseDriverReturnFromTranscript(transcriptText: string): DriverR
   );
   if (jsonBlockMatch?.[1]) {
     try {
-      return JSON.parse(jsonBlockMatch[1]) as DriverReturn;
+      const normalized = normalizeDriverReturn(JSON.parse(jsonBlockMatch[1]));
+      if (normalized) {
+        return normalized;
+      }
     } catch {
       // 继续尝试其他策略
     }
@@ -197,7 +448,10 @@ export function parseDriverReturnFromTranscript(transcriptText: string): DriverR
     const jsonText = extractJsonObject(transcriptText, startIndex);
     if (jsonText) {
       try {
-        return JSON.parse(jsonText) as DriverReturn;
+        const normalized = normalizeDriverReturn(JSON.parse(jsonText));
+        if (normalized) {
+          return normalized;
+        }
       } catch {
         // 解析失败
       }
@@ -368,7 +622,11 @@ function buildLlmPrompt(result: DriverRunResult, options?: DriverReturnConverter
 
 function parseLlmDriverReturn(raw: string): DriverReturn {
   const parsed = JSON.parse(raw) as unknown;
-  return DriverReturnSchema.parse(parsed);
+  const normalized = normalizeDriverReturn(parsed);
+  if (!normalized) {
+    throw new Error('LLM output could not be normalized to the six-field DriverReturn schema');
+  }
+  return normalized;
 }
 
 /**
