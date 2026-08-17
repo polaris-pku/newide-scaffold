@@ -114,7 +114,6 @@ export async function createProductionBackendService(
     ? path.resolve(repoRoot, env.ACP_DRIVER_ENV_FILE)
     : path.join(runnerDir, '.env');
   const driverEnv = loadEnvFile(driverEnvFile);
-  const driverEnv = loadEnvFile(env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env'));
   const productionLlm = resolveProductionLlmRuntime(env, driverEnv);
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
