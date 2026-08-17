@@ -61,7 +61,43 @@ describe('AutonomousCouncilHandler', () => {
     expect(output.council_result).toMatchObject({
       quality: 'best_effort',
       final_artifact_ref: 'artifact_b',
-      warnings: expect.arrayContaining(['Council synthesis was unavailable; selected a reviewed proposal.']),
+      warnings: expect.arrayContaining(['Council synthesis was unavailable; selected the best available proposal.']),
+    });
+  });
+
+  it('retains the persisted primary proposal when every Council seat fails', async () => {
+    const primaryPlan = artifact('artifact_primary_plan', 'council-plan.md', '# Primary plan\n');
+    const primaryProposal = {
+      proposal_id: 'proposal_primary',
+      run_id: 'run_001',
+      task_id: 'task_001',
+      agent_id: 'role_primary',
+      artifact_refs: [primaryPlan.artifact_id],
+      summary: 'primary plan',
+      affected_paths: ['council-plan.md'],
+      assumptions: [],
+      known_risks: [],
+      completion_evidence: [],
+      created_at: '2026-07-18T00:00:00.000Z',
+      schema_version: SCHEMA_VERSION,
+    };
+    const value = runResult({ finalArtifact: undefined, proposalArtifacts: [] });
+    value.proposals = [primaryProposal];
+    const handler = new AutonomousCouncilHandler({ councilProvider: provider(value) });
+
+    const output = await handler.execute({
+      ...request(),
+      proposals: [primaryProposal],
+      candidate_artifacts: [primaryPlan],
+    });
+
+    expect(output.final_artifact.artifact_id).toBe(primaryPlan.artifact_id);
+    expect(output.council_result).toMatchObject({
+      quality: 'best_effort',
+      final_artifact_ref: primaryPlan.artifact_id,
+      warnings: expect.arrayContaining([
+        'Council synthesis was unavailable; selected the best available proposal.',
+      ]),
     });
   });
 

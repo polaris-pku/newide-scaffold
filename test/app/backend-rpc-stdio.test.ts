@@ -737,7 +737,7 @@ describe('backend RPC stdio entrypoint', () => {
         errors: [],
       });
       expect(failedNotifications.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
       );
       expect(failedSnapshot.events.map((event) => event.type)).toContain('council.completed');
       expect(failedSnapshot.events.map((event) => event.type)).toContain('worktree.materialized');
@@ -749,7 +749,7 @@ describe('backend RPC stdio entrypoint', () => {
         .split('\n')
         .map((line) => JSON.parse(line) as AppRunEvent);
       expect(failedAudit.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
       );
     } finally {
       await service?.close();
