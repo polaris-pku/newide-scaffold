@@ -11,7 +11,9 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createProductionBackendService,
   parseDriverEnv,
+  ProductionAgentToolCallingClient,
   readAuctionEnabled,
+  resolveProductionLlmRuntime,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
 import type { NewideBackendService } from '../../src/app/newide-backend-service';
@@ -48,6 +50,160 @@ describe('readAuctionEnabled', () => {
 
   it('rejects invalid values', () => {
     expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
+
+describe('resolveProductionLlmRuntime', () => {
+  it('reuses ACP MiniMax settings through the OpenAI-compatible endpoint', () => {
+    expect(
+      resolveProductionLlmRuntime(
+        {},
+        {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'acp-token',
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        },
+      ),
+    ).toEqual({
+      baseUrl: 'https://api.minimax.io',
+      apiKey: 'acp-token',
+      model: 'MiniMax-M3',
+    });
+  });
+
+  it('keeps an explicit local OpenAI-compatible configuration authoritative', () => {
+    expect(
+      resolveProductionLlmRuntime(
+        {
+          OPENAI_BASE_URL: 'https://local.example/v1',
+          OPENAI_API_KEY: 'local-token',
+          NEWIDE_AGENT_LLM_MODEL: 'local-model',
+        },
+        {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'acp-token',
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        },
+      ),
+    ).toEqual({
+      baseUrl: 'https://local.example',
+      apiKey: 'local-token',
+      model: 'local-model',
+    });
+  });
+
+  it('does not let an inherited Anthropic environment override ACP configuration', () => {
+    expect(
+      resolveProductionLlmRuntime(
+        {
+          ANTHROPIC_BASE_URL: 'https://stale.example/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'stale-token',
+          ANTHROPIC_MODEL: 'stale-model',
+        },
+        {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'acp-token',
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        },
+      ),
+    ).toEqual({
+      baseUrl: 'https://api.minimax.io',
+      apiKey: 'acp-token',
+      model: 'MiniMax-M3',
+    });
+  });
+});
+
+describe('ProductionAgentToolCallingClient', () => {
+  it('retries one malformed MiniMax function-arguments response', async () => {
+    const completeWithTools = vi
+      .fn<
+        ToolCallingClient['completeWithTools']
+      >()
+      .mockRejectedValueOnce(
+        new Error('invalid params, invalid function arguments json string (2013)'),
+      )
+      .mockResolvedValueOnce({
+        content: null,
+        tool_calls: [
+          {
+            id: 'call_driver',
+            type: 'function',
+            function: { name: 'invoke_driver', arguments: '{}' },
+          },
+        ],
+      });
+    const client = new ProductionAgentToolCallingClient({ completeWithTools });
+
+    await expect(
+      client.completeWithTools({
+        messages: [{ role: 'user', content: 'delegate' }],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'invoke_driver', description: 'run', parameters: { type: 'object' } },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ tool_calls: [{ function: { name: 'invoke_driver' } }] });
+    expect(completeWithTools).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to the real Driver after repeated malformed MiniMax tool arguments', async () => {
+    const completeWithTools = vi
+      .fn<ToolCallingClient['completeWithTools']>()
+      .mockRejectedValue(new Error('invalid params, invalid function arguments json string (2013)'));
+    const client = new ProductionAgentToolCallingClient({ completeWithTools });
+
+    await expect(
+      client.completeWithTools({
+        messages: [{ role: 'user', content: 'Task: Review the submitted plan.' }],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'invoke_driver', description: 'Run the real Driver', parameters: {} },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({
+      tool_calls: [
+        {
+          function: {
+            name: 'invoke_driver',
+            arguments: JSON.stringify({ instruction: 'Review the submitted plan.' }),
+          },
+        },
+      ],
+    });
+    expect(completeWithTools).toHaveBeenCalledTimes(2);
+  });
+
+  it('forces one real Driver tool call after two text-only responses', async () => {
+    const completeWithTools = vi
+      .fn<ToolCallingClient['completeWithTools']>()
+      .mockResolvedValueOnce({ content: 'I will handle it.', tool_calls: undefined })
+      .mockResolvedValueOnce({ content: 'Still text only.', tool_calls: undefined });
+    const client = new ProductionAgentToolCallingClient({ completeWithTools });
+
+    const result = await client.completeWithTools({
+      messages: [{ role: 'user', content: 'Task: Implement the requested file.' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'invoke_driver', description: 'run', parameters: { type: 'object' } },
+        },
+      ],
+    });
+
+    expect(result.tool_calls).toMatchObject([
+      {
+        function: {
+          name: 'invoke_driver',
+          arguments: JSON.stringify({ instruction: 'Implement the requested file.' }),
+        },
+      },
+    ]);
+    expect(completeWithTools).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -581,7 +737,7 @@ describe('backend RPC stdio entrypoint', () => {
         errors: [],
       });
       expect(failedNotifications.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
       );
       expect(failedSnapshot.events.map((event) => event.type)).toContain('council.completed');
       expect(failedSnapshot.events.map((event) => event.type)).toContain('worktree.materialized');
@@ -593,7 +749,7 @@ describe('backend RPC stdio entrypoint', () => {
         .split('\n')
         .map((line) => JSON.parse(line) as AppRunEvent);
       expect(failedAudit.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
       );
     } finally {
       await service?.close();

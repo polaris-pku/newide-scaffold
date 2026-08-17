@@ -10,7 +10,10 @@ PROMPT=''
 PROMPT_FILE_INPUT=''
 STATE_ROOT_INPUT=''
 DRIVER_RUNNER_INPUT="${ACP_DRIVER_RUNNER_DIR:-$REPO_ROOT/../acp-client-prototype}"
-RUN_TIMEOUT_MS='900000'
+# A four-role plan-first Council has five real ACP turns (two Plans, review,
+# synthesis, and implementation). Fifteen minutes can terminate a healthy M3
+# run during the final implementation turn.
+RUN_TIMEOUT_MS='1800000'
 DRIVER_TIMEOUT_MS="${ACP_DRIVER_TIMEOUT_MS:-300000}"
 USE_LOCAL_POSTGRES=0
 SKIP_BUILD=0
@@ -31,7 +34,7 @@ Required:
 Options:
   --state-root PATH         Runtime state and evidence directory
   --driver-runner PATH      ACP client checkout (default: sibling directory)
-  --timeout-ms NUMBER       Whole-task timeout (default: 900000)
+  --timeout-ms NUMBER       Whole-task timeout (default: 1800000)
   --driver-timeout-ms NUM   Timeout for each ACP driver call (default: 300000)
   --local-postgres          Start/reuse the repository's local PostgreSQL container
   --skip-build              Use existing backend and ACP client build output
@@ -164,9 +167,9 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   [[ -d "$REPO_ROOT/node_modules" ]] || fail "backend dependencies are missing; run: pnpm --dir $REPO_ROOT install"
   [[ -d "$DRIVER_RUNNER/node_modules" ]] || fail "ACP client dependencies are missing; run: pnpm --dir $DRIVER_RUNNER install"
   printf '[newide] Building ACP client...\n' >&2
-  pnpm --dir "$DRIVER_RUNNER" build >&2
+  (cd "$DRIVER_RUNNER" && corepack pnpm build) >&2
   printf '[newide] Building backend CLI...\n' >&2
-  pnpm --dir "$REPO_ROOT" build >&2
+  (cd "$REPO_ROOT" && corepack pnpm build) >&2
 else
   [[ -f "$DRIVER_RUNNER/dist/src/driver/contract-runner.js" ]] || fail 'ACP client build output is missing; remove --skip-build'
   [[ -f "$REPO_ROOT/dist/newide.mjs" ]] || fail 'backend CLI build output is missing; remove --skip-build'

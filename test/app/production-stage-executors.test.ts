@@ -24,11 +24,18 @@ import type {
 import type { AgentBoardListItem, AgentBoardQuery } from '../../src/memory';
 
 describe('production stage executors', () => {
-  it('executes the selected final Council Plan through the original primary Session', async () => {
+  it('retries a missing primary Plan and resumes a B_BLOCKED final Plan execution', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-plan-first-stages-'));
     const workspace = path.join(root, 'workspace');
     await mkdir(workspace, { recursive: true });
     const primaryPlan = fileArtifact('artifact_primary_plan', 'council-plan.md', '# Primary plan');
+    const missingPrimaryPlan: ArtifactRef = {
+      artifact_id: 'artifact_missing_primary_plan',
+      type: 'patch',
+      producer_id: 'role_primary',
+      created_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    };
     const finalPlan = fileArtifact('artifact_final_plan', 'final-plan.md', '# Final plan');
     const implementation = fileArtifact('artifact_implementation', 'src/result.ts', 'export {};');
     const requests: Array<{ role_id: string; session_id?: string; workspace_path?: string; context_policy: string; input_artifact_refs: string[] }> = [];
@@ -117,7 +124,14 @@ describe('production stage executors', () => {
         async runAgent(input) {
           requests.push(input);
           executionCount += 1;
-          const artifact = executionCount === 1 ? primaryPlan : implementation;
+          const artifact =
+            executionCount === 1
+              ? missingPrimaryPlan
+              : executionCount === 2
+                ? primaryPlan
+                : executionCount === 3
+                  ? missingPrimaryPlan
+                  : implementation;
           return {
             agent_run_id: `agent_run_${String(executionCount)}`,
             agent_id: 'role_primary',
@@ -127,10 +141,13 @@ describe('production stage executors', () => {
             artifact_refs: [artifact],
             transcript_ref: transcriptArtifact(`transcript_${String(executionCount)}`),
             session_id: 'session_primary',
-            response: executionCount === 1 ? 'plan ready' : 'implementation complete',
+            response: executionCount === 4 ? 'implementation complete' : 'plan ready',
             tool_events: [],
-            diagnostics: { driver_id: 'acp-external' },
-            status: 'completed',
+            diagnostics:
+              executionCount === 3
+                ? { driver_id: 'acp-external', driver_error_code: 'B_BLOCKED' }
+                : { driver_id: 'acp-external' },
+            status: executionCount === 3 ? 'failed' : 'completed',
             created_at: nowTimestamp(),
             schema_version: SCHEMA_VERSION,
           };
@@ -166,14 +183,21 @@ describe('production stage executors', () => {
       },
     });
 
-    expect(requests).toHaveLength(2);
+    expect(requests).toHaveLength(4);
     expect(requests[0]).toMatchObject({
       role_id: 'role_primary',
       context_policy: 'council_primary_plan',
       memory_ablation: 'B0',
     });
     expect(requests[0]?.instruction).toContain('council-plan.md');
+    expect(requests[0]?.driver_instruction).toContain('council-plan.md');
     expect(requests[1]).toMatchObject({
+      role_id: 'role_primary',
+      context_policy: 'council_primary_plan',
+    });
+    expect(requests[1]?.instruction).toContain('RETRY:');
+    expect(requests[1]?.driver_instruction).toContain('RETRY:');
+    expect(requests[2]).toMatchObject({
       role_id: 'role_primary',
       session_id: 'session_primary',
       context_policy: 'council_plan_execution',
@@ -181,6 +205,15 @@ describe('production stage executors', () => {
       input_artifact_refs: [finalPlan.artifact_id],
       workspace_path: requests[0]?.workspace_path,
     });
+    expect(requests[2]?.driver_instruction).toContain('Implement the approved final Council Plan');
+    expect(requests[3]).toMatchObject({
+      role_id: 'role_primary',
+      session_id: 'session_primary',
+      context_policy: 'council_plan_execution',
+      input_artifact_refs: [finalPlan.artifact_id],
+      workspace_path: requests[2]?.workspace_path,
+    });
+    expect(requests[3]?.driver_instruction).toContain('RETRY: Resume this same Plan execution');
     expect(council.artifact_refs).toEqual([implementation.artifact_id]);
     const state = JSON.parse(
       await readFile(path.join(root, 'runs', 'run_plan', 'production-stage-state.json'), 'utf8'),
@@ -361,6 +394,7 @@ describe('production stage executors', () => {
       session_id: 'session_primary',
       input_artifact_refs: councilResult.synthesis?.artifact_refs,
     });
+    expect(implementation?.driver_instruction).toContain('Implement the approved final Council Plan');
     expect(council.artifact_refs).toEqual(['artifact_role_primary_council_plan_execution']);
     expect(councilResult.plan_execution).toMatchObject({
       executor_role_id: 'role_primary',

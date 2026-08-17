@@ -99,6 +99,7 @@ interface InvocationContext {
   task_id: string;
   run_id: string;
   role_id: string;
+  context_policy: string;
   instruction: string;
   driver_instruction: string;
   driver_instruction_locked: boolean;
@@ -125,6 +126,8 @@ const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
 const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
 const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
 const DEFAULT_MAILBOX_DEADLINE_SECONDS = 300;
+const PRODUCTION_EXECUTION_CONTRACT =
+  'Production execution contract: call invoke_driver for task work; a text-only answer is not task completion.';
 
 export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly manager: Promise<AgentManager>;
@@ -299,8 +302,21 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       queueKeys,
       async () => {
         throwIfAborted(options?.signal);
-        const manager = await this.ensureRole(runtimeRoleId);
-        const result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+        let manager = await this.ensureRole(runtimeRoleId);
+        if (manager.getAgent(runtimeRoleId)?.hasPendingTask()) {
+          await this.recoverRole(runtimeRoleId);
+          manager = await this.ensureRole(runtimeRoleId);
+        }
+        let result: AgentExecutionResult;
+        try {
+          result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+        } catch (error) {
+          await this.recoverRole(runtimeRoleId);
+          throw error;
+        }
+        if (result.status !== 'completed') {
+          await this.recoverRole(runtimeRoleId);
+        }
         const effectiveSessionId = scopedInput.session_id ?? result.session_id;
         if (
           effectiveSessionId &&
@@ -375,6 +391,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         task_id: input.task_id,
         run_id: input.run_id,
         role_id: runtimeRoleId,
+        context_policy: input.context_policy,
         instruction: input.instruction,
         driver_instruction: input.driver_instruction ?? input.instruction,
         driver_instruction_locked: input.driver_instruction !== undefined,
@@ -409,7 +426,6 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       );
 
       if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
-        await this.recoverRole(runtimeRoleId);
         throwIfAborted(invocation.signal);
       }
       const result = await this.buildResult(
@@ -493,6 +509,18 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           tool_calls: undefined,
         };
       }
+      if (
+        invocation.context_policy?.startsWith('council_') &&
+        invocation.execution?.status === 'succeeded'
+      ) {
+        // Council phases persist their substantive result through the Driver.
+        // A second top-level model turn only restates completion and can fail
+        // independently after the artifact was already written.
+        return {
+          content: 'The Council Driver phase completed successfully. [done]',
+          tool_calls: undefined,
+        };
+      }
       invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
       return await withAbort(
         this.options.llm.completeWithTools(
@@ -546,8 +574,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (!mailbox.allowedRoleIds.includes(input.to_role_id)) {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
-    invocation.mailbox_sequence += 1;
     const waitForReply = expectsMailboxReply(kind);
+    if (waitForReply && invocation.context_policy === 'council_primary_plan') {
+      throw new Error(
+        'Council primary planning is independent: write council-plan.md instead of waiting for a Mailbox reply',
+      );
+    }
+    invocation.mailbox_sequence += 1;
     if (
       waitForReply &&
       invocation.mailbox_outcomes.some(
@@ -1264,7 +1297,10 @@ function withTopLevelExecutionContext(
     messages: input.messages.map((message) => {
       if (injected || message.role !== 'user' || message.content === null) return message;
       injected = true;
-      return { ...message, content: `${message.content}\n\n${context}` };
+      return {
+        ...message,
+        content: `${PRODUCTION_EXECUTION_CONTRACT}\n\n${message.content}\n\n${context}`,
+      };
     }),
   };
 }

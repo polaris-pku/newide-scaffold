@@ -167,7 +167,7 @@ async function parseCouncilRunOptions(args: string[]): Promise<CouncilRunOptions
   const timeoutRaw = readOptionalFlag(args, '--timeout-ms');
   const timeoutMs = timeoutRaw
     ? parsePositiveInteger(timeoutRaw, '--timeout-ms')
-    : (request?.timeout_ms ?? 900_000);
+    : (request?.timeout_ms ?? 1_800_000);
   const allowDegraded = args.includes('--allow-degraded') || request?.allow_degraded === true;
 
   if (!prompt?.trim()) throw new Error('Council prompt is required');

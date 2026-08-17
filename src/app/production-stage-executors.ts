@@ -202,28 +202,44 @@ export function createProductionStageExecutors(
           ? { ablation: context.memory_ablation }
           : {}),
       });
-      const result = await dependencies.agentExecutionFacade.runAgent(
-        {
-          task_id: context.task_id,
-          run_id: context.run_id,
-          role_id: context.cursor_input.winner_agent_id,
-          instruction: agentExecutionInstruction(context, planFirst),
-          workspace_path: executionWorkspace,
-          input_artifact_refs: [],
-          context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
-          schema_version: SCHEMA_VERSION,
-          ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
-          ...(context.session_id ? { session_id: context.session_id } : {}),
-          ...(context.cursor_input.mailbox_delivery_id
-            ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
-            : {}),
-        },
-        {
-          ...(context.signal ? { signal: context.signal } : {}),
-          ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
-        },
-      );
-      const mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
+      const primaryInstruction = agentExecutionInstruction(context, planFirst);
+      const executePrimary = (instruction: string) =>
+        dependencies.agentExecutionFacade.runAgent(
+          {
+            task_id: context.task_id,
+            run_id: context.run_id,
+            role_id: context.cursor_input.winner_agent_id,
+            instruction,
+            driver_instruction: instruction,
+            workspace_path: executionWorkspace,
+            input_artifact_refs: [],
+            context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
+            schema_version: SCHEMA_VERSION,
+            ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
+            ...(context.session_id ? { session_id: context.session_id } : {}),
+            ...(context.cursor_input.mailbox_delivery_id
+              ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
+              : {}),
+          },
+          {
+            ...(context.signal ? { signal: context.signal } : {}),
+            ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
+          },
+        );
+      let result = await executePrimary(primaryInstruction);
+      let mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
+      if (planFirst && result.status === 'completed' && !mailboxWait) {
+        try {
+          assertCouncilPlanArtifacts(result.artifact_refs, 'primary proposal');
+        } catch {
+          result = await executePrimary([
+            primaryInstruction,
+            'RETRY: the previous turn did not create the required council-plan.md artifact.',
+            'Call invoke_driver and write that file now. Do not send Mailbox requests or finish with text only.',
+          ].join('\n'));
+          mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
+        }
+      }
       if (mailboxWait) {
         await stateStore.update(
           context.run_id,
@@ -357,7 +373,7 @@ export function createProductionStageExecutors(
           ],
         };
       }
-      if (planFirst) {
+      if (planFirst && !mailboxWait) {
         assertCouncilPlanArtifacts(result.artifact_refs, 'primary proposal');
       }
       const selection = await selectionState({
@@ -807,46 +823,63 @@ async function executeFinalCouncilPlan(input: {
     'primary',
   );
   await stageCouncilArtifacts(workspace, input.finalPlans);
-  emit(input.context, 'agent.execution_requested', input.context.run_id, {
-    phase: 'council_plan_execution',
-    role_id: input.primary.role_id,
-    session_id: input.primary.session_id,
-    workspace_path: workspace,
-    final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
-  });
-  const result = await input.dependencies.agentExecutionFacade.runAgent(
-    {
-      task_id: input.context.task_id,
-      run_id: input.context.run_id,
+  const implementationInstruction = [
+    'Implement the approved final Council Plan staged under inputs/.',
+    'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
+    'Use paths relative to the current workspace for every product file; never construct an absolute path.',
+    'Do not stop after rewriting or summarizing the Plan; produce the concrete implementation artifacts.',
+    `Original Task: ${input.context.task_request.spec}`,
+  ].join('\n');
+  const runImplementation = async (attempt: 1 | 2) => {
+    const retryInstruction =
+      attempt === 1
+        ? implementationInstruction
+        : [
+            implementationInstruction,
+            'RETRY: Resume this same Plan execution after a recoverable runtime interruption. Inspect the existing workspace, preserve completed work, and finish the remaining implementation.',
+          ].join('\n\n');
+    emit(input.context, 'agent.execution_requested', input.context.run_id, {
+      phase: 'council_plan_execution',
+      attempt,
       role_id: input.primary.role_id,
-      instruction: [
-        'Implement the approved final Council Plan staged under inputs/.',
-        'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
-        'Do not stop after rewriting or summarizing the Plan; produce the concrete implementation artifacts.',
-        `Original Task: ${input.context.task_request.spec}`,
-      ].join('\n'),
-      workspace_path: workspace,
       session_id: input.primary.session_id,
-      input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
-      context_policy: 'council_plan_execution',
-      schema_version: SCHEMA_VERSION,
-      ...(input.context.memory_ablation
-        ? { memory_ablation: input.context.memory_ablation }
-        : {}),
-    },
-    {
-      ...(input.context.signal ? { signal: input.context.signal } : {}),
-      ...(input.context.on_driver_event
-        ? { onDriverEvent: input.context.on_driver_event }
-        : {}),
-    },
-  );
+      workspace_path: workspace,
+      final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
+      ...(attempt === 2 ? { recovery: 'single_agent_continuation' } : {}),
+    });
+    return input.dependencies.agentExecutionFacade.runAgent(
+      {
+        task_id: input.context.task_id,
+        run_id: input.context.run_id,
+        role_id: input.primary.role_id,
+        instruction: retryInstruction,
+        driver_instruction: retryInstruction,
+        workspace_path: workspace,
+        session_id: input.primary.session_id,
+        input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
+        context_policy: 'council_plan_execution',
+        schema_version: SCHEMA_VERSION,
+        ...(input.context.memory_ablation
+          ? { memory_ablation: input.context.memory_ablation }
+          : {}),
+      },
+      {
+        ...(input.context.signal ? { signal: input.context.signal } : {}),
+        ...(input.context.on_driver_event
+          ? { onDriverEvent: input.context.on_driver_event }
+          : {}),
+      },
+    );
+  };
+  let result = await runImplementation(1);
+  let implementationArtifacts = implementationArtifactsFrom(result);
+  if (shouldResumeFinalCouncilPlan(result, implementationArtifacts)) {
+    result = await runImplementation(2);
+    implementationArtifacts = implementationArtifactsFrom(result);
+  }
   if (result.status !== 'completed') {
     throw new Error(`Primary Agent Plan execution ended with status ${result.status}`);
   }
-  const implementationArtifacts = result.artifact_refs.filter(
-    (artifact) => isMaterializableFileArtifact(artifact) && !isCouncilPlanArtifact(artifact),
-  );
   if (implementationArtifacts.length === 0) {
     throw new Error('Primary Agent completed the final Council Plan without implementation artifacts');
   }
@@ -865,6 +898,23 @@ async function executeFinalCouncilPlan(input: {
     diagnostics: result.diagnostics,
   });
   return { result, artifact_refs: implementationArtifacts };
+}
+
+function implementationArtifactsFrom(result: AgentExecutionResult): ArtifactRef[] {
+  return result.artifact_refs.filter(
+    (artifact) => isMaterializableFileArtifact(artifact) && !isCouncilPlanArtifact(artifact),
+  );
+}
+
+function shouldResumeFinalCouncilPlan(
+  result: AgentExecutionResult,
+  implementationArtifacts: readonly ArtifactRef[],
+): boolean {
+  return (
+    result.status === 'interrupted' ||
+    (result.status === 'failed' && result.diagnostics.driver_error_code === 'B_BLOCKED') ||
+    (result.status === 'completed' && implementationArtifacts.length === 0)
+  );
 }
 
 async function attachPlanExecution(
@@ -936,7 +986,8 @@ function agentExecutionInstruction(
     return [
       'Produce an independent implementation Plan for the original Task.',
       'Use your Persona, Skills, and Memory, but do not modify product files or implement the solution yet.',
-      'Write the complete Plan to council-plan.md, including affected files, ordered steps, risks, and verification.',
+      'Write the complete Plan to the relative path council-plan.md in the current workspace; never construct an absolute path.',
+      'Include affected files, ordered steps, risks, and verification.',
       `Original Task: ${context.task_request.spec}`,
     ].join('\n');
   }

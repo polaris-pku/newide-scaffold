@@ -422,7 +422,7 @@ function completedReusedProposalEvent(
 }
 
 function failedEvent(error: CouncilRoleExecutionError): CouncilLifecycleEvent {
-  return { type: 'council.failed', payload: { code: error.code, ...error.details } };
+  return { type: 'council.role.failed', payload: { code: error.code, ...error.details } };
 }
 
 async function emitLifecycle(
@@ -752,7 +752,8 @@ function buildProposalInstruction(
     `Produce independent implementation Plan ${label} for: ${question}.`,
     'Use your role Persona, Skills, and Memory to reason about the best approach.',
     'Do not modify product files or implement the solution.',
-    'Write the complete Plan to council-plan.md, including affected files, ordered steps, risks, and verification.',
+    'Write the complete Plan to the relative path council-plan.md in the current role workspace; never construct an absolute path.',
+    'Include affected files, ordered steps, risks, and verification.',
   ].join(' ');
 }
 
@@ -765,6 +766,7 @@ function buildReviewerInstruction(
     return [
       `Review the staged Council Plan inputs for: ${question}.`,
       `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
+      'Read only the staged inputs/**/council-plan.md files; do not inspect unrelated source files or run tests.',
       'Compare scope, implementation feasibility, unnecessary changes, risks, and verification coverage.',
       'Do not modify product files.',
       'Return JSON only: {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}.',
@@ -786,8 +788,9 @@ function buildSynthesisInstruction(
   if (artifactMode === 'plan') {
     return [
       `Synthesis round ${String(round)} for: ${question}.`,
-      'Read the staged Council Plans and reviews.json in this isolated workspace.',
+      'Read only inputs/**/council-plan.md and reviews.json; do not inspect unrelated source files or run tests.',
       'Resolve material review concerns and write one executable final Plan to final-plan.md.',
+      'Use the relative path final-plan.md in the current role workspace; never construct an absolute path.',
       'Do not implement the Plan or modify product files.',
       'The final Plan must identify affected files, ordered steps, risks, and verification.',
     ].join(' ');

@@ -325,7 +325,7 @@ describe('SynthesisAgentCouncilProvider', () => {
       );
       expect(lifecycleEvents).toContainEqual(
         expect.objectContaining({
-          type: 'council.failed',
+          type: 'council.role.failed',
           payload: expect.objectContaining({
             code: expectedCode,
             participant_id: failedParticipant,
@@ -337,7 +337,7 @@ describe('SynthesisAgentCouncilProvider', () => {
     },
   );
 
-  it('preserves cancellation without publishing council.failed', async () => {
+  it('preserves cancellation without publishing a Council failure event', async () => {
     const controller = new AbortController();
     const lifecycleEvents: string[] = [];
     const agentExecutionFacade: AgentExecutionFacade = {
@@ -383,6 +383,7 @@ describe('SynthesisAgentCouncilProvider', () => {
       ),
     ).rejects.toThrow('cancelled by user');
     expect(lifecycleEvents).not.toContain('council.failed');
+    expect(lifecycleEvents).not.toContain('council.role.failed');
   });
 
   it('surfaces a lifecycle publication failure instead of silently losing audit events', async () => {
