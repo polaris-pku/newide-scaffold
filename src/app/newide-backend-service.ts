@@ -1432,7 +1432,12 @@ export class NewideBackendService {
       event.type === 'run.failed' ||
       event.type === 'run.cancelled'
     ) {
-      void this.traceProjector.closeOpenSpans(event.run_id);
+      // 延迟到同步批次结束：同一 commit 里 task.completed / task.failed 与
+      // run.completed 一起投影（on_committed_events 同步遍历），必须先让
+      // task.run 正常闭合；这里只兜底真正未闭合的 span（如进程中断遗留）。
+      queueMicrotask(() => {
+        void this.traceProjector.closeOpenSpans(event.run_id);
+      });
     }
   }
 

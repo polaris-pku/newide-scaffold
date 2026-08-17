@@ -145,7 +145,13 @@ export class RuntimeOrchestrator {
       input.event_type === 'run.failed' ||
       input.event_type === 'run.cancelled'
     ) {
-      void this.traceProjector.closeOpenSpans(resolvedRunId);
+      // 与生产 projectRunTrace 一致：run 终态事件之后通常紧跟同批的
+      // task.completed / task.failed，先让 task.run 正常闭合，再兜底
+      // 关闭真正未闭合的 span。queueMicrotask 保证同同步批次的后续
+      // 事件（task.completed）先投影。
+      queueMicrotask(() => {
+        void this.traceProjector.closeOpenSpans(resolvedRunId);
+      });
     }
     return event;
   }
