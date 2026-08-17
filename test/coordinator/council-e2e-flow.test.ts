@@ -7,6 +7,7 @@ import { SCHEMA_VERSION, type ArtifactRef } from '../../src/core';
 import { runIntegrationV0Flow } from '../../src/coordinator/integration-v0-flow';
 import {
   SynthesisAgentCouncilProvider,
+  councilRunWorkspaceRoot,
   type CouncilParticipantResolver,
 } from '../../src/council';
 import type {
@@ -57,7 +58,7 @@ describe('Council end-to-end coordinator slice', () => {
       'role_release_synthesizer',
     ]);
     expect(requests[0]?.workspace_path).toBe(
-      path.join(councilRoot, result.run_id, 'primary'),
+      path.join(councilRunWorkspaceRoot(councilRoot, result.run_id), 'primary'),
     );
     expect(await fs.readdir(workspace)).toEqual(['final.ts']);
     const delivered = await fs.readFile(path.join(workspace, 'final.ts'));

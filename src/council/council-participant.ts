@@ -19,6 +19,16 @@ export interface CouncilParticipantBinding {
   conflict_flags?: string[];
 }
 
+const SEAT_CODE: Readonly<Record<CouncilSeat, string>> = {
+  proposer: 'p',
+  reviewer: 'r',
+  synthesizer: 's',
+};
+
+/**
+ * Short stable participant folder id.
+ * Long names under deep experiment roots blow Windows MAX_PATH on git worktree add.
+ */
 export function createCouncilParticipantId(
   runId: string,
   seat: CouncilSeat,
@@ -28,6 +38,6 @@ export function createCouncilParticipantId(
   const digest = createHash('sha256')
     .update(`${runId}\0${seat}\0${String(seatIndex)}\0${agentId}`)
     .digest('hex')
-    .slice(0, 16);
-  return `council_participant_${seat}_${String(seatIndex)}_${digest}`;
+    .slice(0, 8);
+  return `cp_${SEAT_CODE[seat]}${String(seatIndex)}_${digest}`;
 }

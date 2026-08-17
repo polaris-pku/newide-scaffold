@@ -16,6 +16,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { councilRunWorkspaceRoot } from '../src/council/council-workspace';
 
 interface JsonRpcMessage {
   jsonrpc: '2.0';
@@ -562,7 +563,10 @@ async function runCouncilScenario(): Promise<ScenarioReport> {
           typeof value === 'string' && value.length > 0 && path.basename(value) === value,
       );
     details.council_role_directories = ['primary', ...participantIds].map((participantId) =>
-      path.join(stateRoot, 'council', runId, participantId),
+      path.join(
+        councilRunWorkspaceRoot(path.join(stateRoot, 'council'), runId),
+        participantId,
+      ),
     );
     details.run_dir = runDir;
     details.errors_from_run = snapshot.errors ?? [];

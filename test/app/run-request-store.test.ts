@@ -172,6 +172,7 @@ describe('NewideBackendService run restart', () => {
       mode: string;
       session_id?: string;
       task_request?: TaskCreateRequest;
+      memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
     }[] = [];
     let nextRun = 1;
     const service = new NewideBackendService(
@@ -182,6 +183,9 @@ describe('NewideBackendService run restart', () => {
             mode: request.mode,
             ...(request.session_id ? { session_id: request.session_id } : {}),
             ...(request.task_request ? { task_request: request.task_request } : {}),
+            ...(request.memoryAblation
+              ? { memoryAblation: request.memoryAblation }
+              : {}),
           });
           const sequence = nextRun;
           nextRun += 1;
@@ -213,6 +217,7 @@ describe('NewideBackendService run restart', () => {
           affected_paths: ['src/app/**'],
           completion_criteria: ['Original acceptance criterion remains unchanged'],
         },
+        memory_ablation: 'B2',
       });
       await requestPersisted(runsRoot, 'run_1');
       // 模拟上个进程留下的终态快照：restart 必须复用其中的 session_id。
@@ -236,6 +241,7 @@ describe('NewideBackendService run restart', () => {
         prompt: 'Original task',
         mode: 'single_agent',
         session_id: 'session_from_terminal',
+        memoryAblation: 'B2',
         task_request: {
           spec: 'Original durable task definition',
           role_id: 'role_backend_engineer',
@@ -249,6 +255,7 @@ describe('NewideBackendService run restart', () => {
       await expect(requestStore.load('run_2')).resolves.toMatchObject({
         restarted_from_run_id: 'run_1',
         session_id: 'session_from_terminal',
+        memory_ablation: 'B2',
       });
       await expect(requestStore.load('run_1')).resolves.not.toHaveProperty('restarted_from_run_id');
       await expect(service.restartRun('run_missing')).rejects.toBeInstanceOf(

@@ -679,6 +679,9 @@ export class NewideBackendService {
         ...(params.project_id ? { project_id: params.project_id } : {}),
         ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
         ...(params.title ? { title: params.title } : {}),
+        ...(params.memory_ablation
+          ? { memory_ablation: params.memory_ablation }
+          : {}),
         ...(lineage?.restarted_from_run_id
           ? { restarted_from_run_id: lineage.restarted_from_run_id }
           : {}),
@@ -707,6 +710,9 @@ export class NewideBackendService {
       loop,
       controller,
       ...(params.session_id ? { session_id: params.session_id } : {}),
+      ...(params.memory_ablation
+        ? { memory_ablation: params.memory_ablation }
+        : {}),
     });
     this.terminalRuns.set(identity.run_id, terminalRun);
     void terminalRun.finally(() => {
@@ -720,12 +726,16 @@ export class NewideBackendService {
     identity: { run_id: string; task_id: string };
     loop: TaskExecutionLoop;
     controller: AbortController;
+    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
     session_id?: string;
   }): Promise<void> {
     const processor = this.taskProcessor!;
     try {
       const taskSnapshot = await input.loop.run({
         ...input.identity,
+        ...(input.memory_ablation
+          ? { memory_ablation: input.memory_ablation }
+          : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         signal: input.controller.signal,
         on_driver_event: (event) => this.appendDriverStreamEvent(input.identity, event),
@@ -1108,6 +1118,9 @@ export class NewideBackendService {
                 ...(params.project_id ? { project_id: params.project_id } : {}),
                 ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
                 ...(params.title ? { title: params.title } : {}),
+                ...(params.memory_ablation
+                  ? { memory_ablation: params.memory_ablation }
+                  : {}),
                 ...(lineage?.restarted_from_run_id
                   ? { restarted_from_run_id: lineage.restarted_from_run_id }
                   : {}),

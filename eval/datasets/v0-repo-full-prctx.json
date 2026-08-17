@@ -1,0 +1,28 @@
+{
+  "subset_id": "v0-repo-full-prctx",
+  "description": "v0-repo-full with offline release-note + PR/Issue body context (SWE-EVO paper Appendix N.1 style).",
+  "source_dataset_version": "hf_out-v1-prctx",
+  "source_jsonl": "eval/data/sweevo-v0-repo-full-prctx.jsonl",
+  "selection_rule": "Same 14 instance ids as v0-repo-full; problem_statement augmented from eval/data/pr-issue-cache (GitHub bodies only; never patch_without_test).",
+  "environment_notes": [
+    "Build cache first: pnpm eval:build-pr-context -- --subset v0-repo-full",
+    "Requires GITHUB_TOKEN or GH_TOKEN for practical fetch rates; anonymous is ~60 req/hour.",
+    "Use with NEWIDE_SWE_EVO_BLOCK_INTERNET=1 so agents cannot fetch live PRs at runtime."
+  ],
+  "instance_ids": [
+    "conan-io__conan_2.0.14_2.0.15",
+    "conan-io__conan_2.0.2_2.0.3",
+    "dask__dask_2022.9.2_2022.10.0",
+    "dask__dask_2023.3.2_2023.4.0",
+    "dask__dask_2023.6.0_2023.6.1",
+    "dask__dask_2023.6.1_2023.7.0",
+    "dask__dask_2023.8.0_2023.8.1",
+    "dask__dask_2023.9.2_2023.9.3",
+    "dask__dask_2024.1.0_2024.1.1",
+    "dask__dask_2024.3.1_2024.4.0",
+    "psf__requests_v2.12.2_v2.12.3",
+    "psf__requests_v2.27.0_v2.27.1",
+    "psf__requests_v2.4.0_v2.4.1",
+    "psf__requests_v2.9.0_v2.9.1"
+  ]
+}

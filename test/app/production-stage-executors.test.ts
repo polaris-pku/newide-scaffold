@@ -3,7 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
+import {
+  SCHEMA_VERSION,
+  nowTimestamp,
+  type ArtifactRef,
+  type Event,
+} from '../../src/core';
 import { completionCriterionId } from '../../src/coordinator/completion-criteria-evaluator';
 import { createProductionStageExecutors } from '../../src/app/production-stage-executors';
 import {
@@ -11,7 +16,11 @@ import {
   createCouncilStrategyProvider,
   SynthesisAgentCouncilProvider,
 } from '../../src/council';
-import type { AgentExecutionRequest, AgentExecutionResult } from '../../src/protocol/agent-execution';
+import type {
+  AgentExecutionFacade,
+  AgentExecutionRequest,
+  AgentExecutionResult,
+} from '../../src/protocol/agent-execution';
 import type { AgentBoardListItem, AgentBoardQuery } from '../../src/memory';
 
 describe('production stage executors', () => {
@@ -399,6 +408,8 @@ describe('production stage executors', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
     const workspace = path.join(root, 'workspace');
     const criterion = 'output.txt is delivered';
+    let receivedAgentRequest: AgentExecutionRequest | undefined;
+    const emittedEvents: Event[] = [];
     const artifact: ArtifactRef = {
       artifact_id: 'artifact_output',
       type: 'file',
@@ -451,7 +462,9 @@ describe('production stage executors', () => {
         }),
       },
       agentExecutionFacade: {
-        runAgent: async () => ({
+        runAgent: async (request) => {
+          receivedAgentRequest = request;
+          return {
           agent_run_id: 'agent_run_1',
           agent_id: 'role_ts_engineer',
           role_id: 'role_ts_engineer',
@@ -472,7 +485,8 @@ describe('production stage executors', () => {
           status: 'completed',
           created_at: nowTimestamp(),
           schema_version: SCHEMA_VERSION,
-        }),
+          };
+        },
       },
       councilProvider: {
         runCouncilRound: async () => {
@@ -517,6 +531,8 @@ describe('production stage executors', () => {
       mode: 'single_agent' as const,
       task_request: taskRequest,
       workspace_path: workspace,
+      memory_ablation: 'B0' as const,
+      on_event: (event: Event) => emittedEvents.push(event),
     };
 
     const selected = await executors.select_agent.execute({
@@ -527,6 +543,10 @@ describe('production stage executors', () => {
       ...common,
       cursor_input: { cursor: 'execute_agent', winner_agent_id: selected.winner_agent_id },
     });
+    expect(receivedAgentRequest).toMatchObject({ memory_ablation: 'B0' });
+    expect(
+      emittedEvents.find((event) => event.event_type === 'memory.context_pack_built')?.payload,
+    ).toMatchObject({ ablation: 'B0' });
     const gated = await executors.gate.execute({
       ...common,
       cursor_input: {
@@ -567,6 +587,87 @@ describe('production stage executors', () => {
     expect(delivered.evidence).toMatchObject({
       idempotency_key: expect.stringMatching(/^deliver:/),
       run_outcome: { status: 'verified' },
+    });
+  });
+
+  it('emits memory.context_pack_built with ablation when council primary fails', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
+    const workspace = path.join(root, 'workspace');
+    await mkdir(workspace, { recursive: true });
+    const emittedEvents: Event[] = [];
+    const executors = createProductionStageExecutors({
+      selectAgentHandler: {
+        execute: async () => {
+          throw new Error('select_agent not used');
+        },
+      },
+      agentExecutionFacade: {
+        runAgent: async () => ({
+          agent_run_id: 'agent_run_failed',
+          agent_id: 'role_ts_engineer',
+          role_id: 'role_ts_engineer',
+          context_pack_ref: 'context_pack_failed',
+          memory_buffer_ref: 'memory_buffer_failed',
+          driver_run_result_id: 'driver_result_failed',
+          artifact_refs: [],
+          transcript_ref: {
+            artifact_id: 'transcript_failed',
+            type: 'transcript',
+            producer_id: 'role_ts_engineer',
+            created_at: nowTimestamp(),
+            schema_version: SCHEMA_VERSION,
+          },
+          session_id: 'session_failed',
+          response: 'partial attempt',
+          tool_events: [],
+          diagnostics: { driver_id: 'acp-external' },
+          status: 'failed',
+          created_at: nowTimestamp(),
+          schema_version: SCHEMA_VERSION,
+        }),
+      },
+      councilProvider: {
+        runCouncilRound: async () => {
+          throw new Error('Council is not expected in this unit test');
+        },
+      },
+      gateExecutor: {
+        execute: async () => ({
+          hook_point: 'task.completed',
+          matched: false,
+          gate_results: [],
+        }),
+      },
+      bootstrapAgentIds: ['role_ts_engineer'],
+      runsRoot: path.join(root, 'runs'),
+      councilRoot: path.join(root, 'council'),
+      worktreesRoot: path.join(root, 'worktrees'),
+    });
+
+    const result = await executors.execute_agent.execute({
+      task_id: 'task_failed_primary',
+      run_id: 'run_failed_primary',
+      mode: 'council',
+      task_request: {
+        spec: 'attempt a fix',
+        completion_criteria: ['done'],
+      },
+      workspace_path: workspace,
+      memory_ablation: 'B1',
+      on_event: (event: Event) => emittedEvents.push(event),
+      cursor_input: { cursor: 'execute_agent', winner_agent_id: 'role_ts_engineer' },
+    });
+
+    expect(result.escalation_request).toMatchObject({
+      type: 'request_council',
+      reason: 'primary_agent_failed',
+    });
+    expect(
+      emittedEvents.find((event) => event.event_type === 'memory.context_pack_built')?.payload,
+    ).toMatchObject({
+      ablation: 'B1',
+      primary_status: 'failed',
+      context_pack_ref: 'context_pack_failed',
     });
   });
 

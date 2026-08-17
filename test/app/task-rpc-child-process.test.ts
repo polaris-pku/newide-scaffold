@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { AppRunEvent } from '../../src/app/run-registry';
+import { councilRunDirName } from '../../src/council/council-workspace';
 import type { TaskSnapshot } from '../../src/protocol/task-snapshot';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
 
@@ -149,6 +150,10 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       rmSync(workspace, { recursive: true, force: true });
       for (const runId of createdRunIds) {
         rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+        rmSync(path.join('.newide', 'council', councilRunDirName(runId)), {
+          recursive: true,
+          force: true,
+        });
         rmSync(path.join('.newide', 'council', runId), { recursive: true, force: true });
       }
       for (const directory of marketDirectories) {

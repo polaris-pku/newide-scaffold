@@ -26,6 +26,7 @@ import {
   removeEphemeralWorktree,
 } from './prepare-worktree';
 import { collectWorktreePatch, readBackendWorktreePath } from './worktree-patch';
+import { assertSafeCandidatePatch } from './patch-policy';
 
 export interface RunInstanceOptions {
   instanceId: string;
@@ -248,6 +249,7 @@ async function resolvePatchInput(
       const seedPatch =
         options.patchFile !== undefined ? readFileSync(options.patchFile, 'utf-8') : undefined;
       if (seedPatch !== undefined) {
+        assertSafeCandidatePatch(seedPatch);
         await applyPatchToWorktree(prepared.worktreePath, seedPatch);
       } else {
         throw new Error(
@@ -278,9 +280,11 @@ async function resolvePatchInput(
   }
 
   if (options.patchFile) {
+    const realPatch = readFileSync(options.patchFile, 'utf-8');
+    assertSafeCandidatePatch(realPatch);
     return {
       patchSource: 'patch_file',
-      realPatch: readFileSync(options.patchFile, 'utf-8'),
+      realPatch,
     };
   }
 

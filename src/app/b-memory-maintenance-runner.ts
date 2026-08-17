@@ -16,6 +16,12 @@ import {
   type MemoryRepository,
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
+import {
+  collectClaudeSessionUsage,
+  mergeTokenUsageSummaries,
+  runWithLlmUsageLedger,
+  snapshotRunLedgerUsage,
+} from '../telemetry';
 
 export interface BMemoryMaintenanceRequest {
   task_id: string;
@@ -72,6 +78,8 @@ export interface BMemoryMaintenanceRunnerOptions {
   bufferRepository: BufferRepository;
   llm: LlmClient;
   evidenceStore: BMemoryMaintenanceEvidenceStore;
+  /** When set, completed maintenance rewrites summary.json token_usage for the run. */
+  runsRoot?: string;
 }
 
 export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
@@ -177,72 +185,84 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     }
 
     try {
-      const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
-      const result = await processPendingBuffer(memory, input.buffer_seq, {
-        task: {
+      const evidence = await runWithLlmUsageLedger(
+        {
+          case_id: input.task_id,
+          run_id: input.run_id,
           task_id: input.task_id,
-          call_id: `maintenance:${input.run_id}:${String(input.buffer_seq)}`,
-          source_driver: pending.snapshot.source_driver,
-          spec: pending.snapshot.task_description,
+          scaffold_variant: 'full_system',
         },
-        extractor: this.extractor,
-        promote: async () => ({
-          check: {
-            eligible: false,
-            auto_approved: false,
-            reasons: ['Skill promotion is exposed as a separate application operation.'],
-            blocking_rules: [],
-          },
-        }),
-      });
+        async () => {
+          const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
+          const result = await processPendingBuffer(memory, input.buffer_seq, {
+            task: {
+              task_id: input.task_id,
+              call_id: `maintenance:${input.run_id}:${String(input.buffer_seq)}`,
+              source_driver: pending.snapshot.source_driver,
+              spec: pending.snapshot.task_description,
+            },
+            extractor: this.extractor,
+            promote: async () => ({
+              check: {
+                eligible: false,
+                auto_approved: false,
+                reasons: ['Skill promotion is exposed as a separate application operation.'],
+                blocking_rules: [],
+              },
+            }),
+          });
 
-      let skills: SkillRecord[] = [];
-      const warnings: string[] = [];
-      if (ablationPolicy.promote_skills) {
-        const outcomes = await promoteExperiencesForAgent(
-          input.role_id,
-          (role_id) =>
-            createAgentMemoryScope(
-              this.options.repository,
-              this.options.bufferRepository,
-              role_id,
-            ),
-          this.promoter,
-        );
-        skills = [];
-        for (const outcome of outcomes) {
-          if (!outcome.skill) continue;
-          const approved: SkillRecord = {
-            ...outcome.skill,
-            review_status: 'approved',
-          };
-          await memory.updateSkill(approved);
-          skills.push(approved);
-        }
-        if (skills.length === 0) {
-          warnings.push('Ablation B2/B3 promote ran but no eligible Experience was promoted.');
-        } else {
-          warnings.push(
-            'Ablation B2/B3 auto-approved promoted Skills so they are retrievable in subsequent tasks.',
-          );
-        }
-      }
+          let skills: SkillRecord[] = [];
+          const warnings: string[] = [];
+          if (ablationPolicy.promote_skills) {
+            const outcomes = await promoteExperiencesForAgent(
+              input.role_id,
+              (role_id) =>
+                createAgentMemoryScope(
+                  this.options.repository,
+                  this.options.bufferRepository,
+                  role_id,
+                ),
+              this.promoter,
+            );
+            skills = [];
+            for (const outcome of outcomes) {
+              if (!outcome.skill) continue;
+              const approved: SkillRecord = {
+                ...outcome.skill,
+                review_status: 'approved',
+              };
+              await memory.updateSkill(approved);
+              skills.push(approved);
+            }
+            if (skills.length === 0) {
+              warnings.push('Ablation B2/B3 promote ran but no eligible Experience was promoted.');
+            } else {
+              warnings.push(
+                'Ablation B2/B3 auto-approved promoted Skills so they are retrievable in subsequent tasks.',
+              );
+            }
+          }
 
-      return this.persist({
-        maintenance_ref: maintenanceRef,
-        kind: 'experience_extraction',
-        status: 'completed',
-        task_id: input.task_id,
-        run_id: input.run_id,
-        role_id: input.role_id,
-        buffer_seq: input.buffer_seq,
-        experiences: result.extraction.experiences,
-        skills,
-        warnings,
-        created_at: startedAt,
-        completed_at: nowTimestamp(),
-        schema_version: SCHEMA_VERSION,
-      });
+          return this.persist({
+            maintenance_ref: maintenanceRef,
+            kind: 'experience_extraction',
+            status: 'completed',
+            task_id: input.task_id,
+            run_id: input.run_id,
+            role_id: input.role_id,
+            buffer_seq: input.buffer_seq,
+            experiences: result.extraction.experiences,
+            skills,
+            warnings,
+            created_at: startedAt,
+            completed_at: nowTimestamp(),
+            schema_version: SCHEMA_VERSION,
+          });
+        },
+      );
+      await this.refreshRunTokenUsage(input.run_id);
+      return evidence;
     } catch (error) {
       return this.persist({
         maintenance_ref: maintenanceRef,
@@ -393,6 +413,37 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
   ): Promise<BMemoryMaintenanceEvidence> {
     const saved = await this.options.evidenceStore.save(evidence);
     return { ...evidence, evidence_uri: saved.uri };
+  }
+
+  private async refreshRunTokenUsage(runId: string): Promise<void> {
+    const runsRoot = this.options.runsRoot;
+    if (!runsRoot) return;
+    const summaryPath = path.join(runsRoot, runId, 'summary.json');
+    try {
+      const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+      const proxy = snapshotRunLedgerUsage(runId);
+      const worktreePath =
+        typeof raw.worktree_path === 'string' && raw.worktree_path.length > 0
+          ? raw.worktree_path
+          : undefined;
+      const sessionId =
+        typeof raw.session_id === 'string' && raw.session_id.length > 0
+          ? raw.session_id
+          : undefined;
+      const claude = worktreePath
+        ? await collectClaudeSessionUsage({
+            worktreePath,
+            ...(sessionId ? { sessionId } : {}),
+          })
+        : undefined;
+      raw.token_usage = claude
+        ? mergeTokenUsageSummaries([proxy, claude])
+        : proxy;
+      await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      // Non-fatal: maintenance evidence already persisted.
+    }
   }
 }
 
