@@ -381,7 +381,7 @@ describe('TaskProcessor', () => {
       task_id: 'task_mailbox_continue',
       run_id: 'run_mailbox_continuation',
       task_request: taskRequest,
-      workspace_path: '/workspace',
+      workspace_path: '/workspace/.newide/council/primary',
       mode: 'single_agent',
       memory_ablation: 'B0',
       session_id: 'session_sender',
@@ -400,11 +400,19 @@ describe('TaskProcessor', () => {
     expect(processor.getRunExecutionState('run_mailbox_continuation')).toMatchObject({
       task_id: 'task_mailbox_continue',
       memory_ablation: 'B0',
+      workspace_path: '/workspace/.newide/council/primary',
       resume_cursor: 'execute_agent',
       cursor_input: {
         winner_agent_id: 'agent_a',
         mailbox_delivery_id: replyDeliveryId,
       },
+    });
+    const persisted = store.getTaskAggregate('task_mailbox_continue');
+    expect(persisted?.task.workspace_path).toBe('/workspace');
+    expect(
+      persisted?.runs.find((run) => run.run_id === 'run_mailbox_continuation'),
+    ).toMatchObject({
+      workspace_path: '/workspace/.newide/council/primary',
     });
     expect(() =>
       processor.beginRun({
