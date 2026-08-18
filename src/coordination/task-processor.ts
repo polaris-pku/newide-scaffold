@@ -214,10 +214,16 @@ export class TaskProcessor {
     if (activeRun) {
       throw new Error(`Task ${input.task_id} already has active run ${activeRun.run_id}`);
     }
-    if (existing) {
-      assertImmutableTaskDefinition(existing.task, input.task_request, input.workspace_path);
-    }
     const runIntent = input.run_intent ?? { type: 'create' as const };
+    if (existing) {
+      // A Council participant may resume in its isolated Run workspace while
+      // the parent Task keeps its user workspace immutable.
+      const taskWorkspacePath =
+        runIntent.type === 'mailbox_continuation'
+          ? existing.task.workspace_path
+          : input.workspace_path;
+      assertImmutableTaskDefinition(existing.task, input.task_request, taskWorkspacePath);
+    }
     const cursorInput = input.cursor_input ?? defaultCursorInput(input.run_id);
     assertBeginRunIntent(
       existing,
@@ -613,7 +619,7 @@ export class TaskProcessor {
         completion_criteria: [...aggregate.task.completion_criteria],
         ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
       },
-      workspace_path: aggregate.task.workspace_path,
+      workspace_path: run.workspace_path,
       resume_cursor: aggregate.runtime_state.resume_cursor,
       ...(aggregate.runtime_state.cursor_input
         ? { cursor_input: aggregate.runtime_state.cursor_input }
@@ -1575,6 +1581,7 @@ function assertBeginRunIntent(
     if (
       source.message.task_id !== input.task_id ||
       reply.message.task_id !== input.task_id ||
+      input.workspace_path !== source.message.workspace_path ||
       reply.message.workspace_path !== source.message.workspace_path ||
       source.message.from_role_id !== existing.task.owner_agent_id ||
       reply.message.from_role_id !== source.delivery.recipient_role_id ||
