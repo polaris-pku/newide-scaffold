@@ -1,6 +1,26 @@
 #!/usr/bin/env node
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { hasFlag, readFlag } from './cli-args';
+import { getScaffoldRoot } from './paths';
 import { runSweEvoHarnessAdapter } from './sweevo-harness-adapter';
+
+function applyDotenvFiles(repoRoot: string): void {
+  for (const name of ['.env', '.env.local']) {
+    const filePath = join(repoRoot, name);
+    if (!existsSync(filePath)) continue;
+    for (const raw of readFileSync(filePath, 'utf-8').split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      const separator = line.indexOf('=');
+      if (separator <= 0) continue;
+      const key = line.slice(0, separator).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      const value = line.slice(separator + 1).trim().replace(/^(["'])(.*)\1$/, '$2');
+      process.env[key] ??= value;
+    }
+  }
+}
 
 function readMaxWorkers(): number {
   const raw = readFlag('--max-workers');
@@ -15,6 +35,7 @@ function readMaxWorkers(): number {
 }
 
 async function main(): Promise<void> {
+  applyDotenvFiles(getScaffoldRoot());
   const predictionsPath = readFlag('--predictions');
   const runId = readFlag('--run-id');
   if (!predictionsPath || !runId) {

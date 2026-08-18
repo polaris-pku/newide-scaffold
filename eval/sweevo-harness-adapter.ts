@@ -80,8 +80,25 @@ export function toWslPath(pathLike: string): string {
   return rest ? `/mnt/${drive}/${rest}` : `/mnt/${drive}`;
 }
 
-function resolveSweEvoPython(): string {
+export function resolveSweEvoPython(): string {
   return process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python';
+}
+
+export function assertSweEvoPythonCanImportSwebench(python: string, viaWsl: boolean): void {
+  if (viaWsl) return;
+  const probe = spawnSync(python, ['-c', 'import swebench'], {
+    encoding: 'utf-8',
+  });
+  if (probe.status === 0) return;
+  const detail = `${probe.stderr ?? ''}${probe.stdout ?? ''}`.trim().slice(0, 400);
+  throw new Error(
+    [
+      `SWE-EVO harness interpreter "${python}" cannot import swebench.`,
+      'Set NEWIDE_SWE_EVO_PYTHON to the SWE-bench venv python',
+      '(example: /data/shiyangziran/SWE-EVO/SWE-bench/.venv-swebench/bin/python).',
+      detail ? `Probe output: ${detail}` : `Probe exited ${probe.status ?? 'unknown'}.`,
+    ].join(' '),
+  );
 }
 
 function resolveSweEvoWslDistro(): string {
@@ -276,6 +293,7 @@ export async function runSweEvoHarnessAdapter(
 
   if (!options.dryRun) {
     const viaWsl = command.command === 'wsl';
+    assertSweEvoPythonCanImportSwebench(resolveSweEvoPython(), viaWsl);
     const completed = spawnSync(command.command, command.args, {
       // WSL uses `--cd`; Node cwd is only for native python.
       ...(viaWsl ? {} : { cwd: command.cwd }),
