@@ -104,6 +104,10 @@ const fileEnv = {
   ...loadEnvFile(path.join(repoRoot, '.env')),
   ...loadEnvFile(path.join(repoRoot, '.env.local')),
 };
+// Harness adapter and path helpers read process.env, not baseEnv.
+for (const [key, value] of Object.entries(fileEnv)) {
+  if (value !== undefined) process.env[key] ??= value;
+}
 // Agent budget: 45 minutes (paper-aligned). ACCEPTANCE_RUN_TIMEOUT_MS overrides.
 // Set ACCEPTANCE_RUN_TIMEOUT_MS=0 for no wall-clock cancel (wait until terminal).
 const runTimeoutRaw = process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? fileEnv.ACCEPTANCE_RUN_TIMEOUT_MS;
@@ -244,6 +248,7 @@ log(
 );
 log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
 log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
+log(`NEWIDE_SWE_EVO_PYTHON: ${process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python (default)'}`);
 log(`NEWIDE_EVAL_FS_JAIL: ${baseEnv.NEWIDE_EVAL_FS_JAIL}`);
 const permissionBuildPath = path.join(
   String(baseEnv.ACP_DRIVER_RUNNER_DIR),
@@ -583,6 +588,7 @@ async function runOneInstance(input: {
         keepWorktree: true,
         runSweEvoHarness: runHarness || harnessDryRun,
         harnessDryRun,
+        ...(baseEnv.NEWIDE_SWE_EVO_ROOT ? { sweEvoRoot: baseEnv.NEWIDE_SWE_EVO_ROOT } : {}),
       });
       row.eval_run_dir = evalResult.runDir;
       row.eval_predictions_path = evalResult.summary.predictions_path;
