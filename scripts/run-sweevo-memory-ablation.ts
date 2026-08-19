@@ -24,7 +24,13 @@ import {
 import { runEvalInstance } from '../eval/run-instance-core';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
 import {
+  isDriverStreamUsage,
+  projectTaskDriverUsage,
+  type TaskDriverUsage,
+} from '../src/app/driver-usage-projector';
+import {
   collectClaudeSessionUsage,
+  isPopulatedRunTokenUsage,
   type RunTokenUsageSummary,
 } from '../src/telemetry';
 import {
@@ -85,6 +91,7 @@ interface InstanceRow {
   maintenance_ref?: string;
   maintenance_status?: string;
   token_usage?: TokenUsage;
+  driver_usage?: TaskDriverUsage;
   eval_run_dir?: string;
   eval_predictions_path?: string;
   eval_error?: string;
@@ -415,6 +422,7 @@ await fs.writeFile(
 );
 const timingTotals = summarizeTiming(metricsRows);
 const tokenTotals = summarizeTokens(metricsRows);
+const driverUsageTotals = summarizeDriverUsage(metricsRows);
 const summary = {
   schema_version: 'sweevo-memory-ablation.v0',
   started_at: startedAt.toISOString(),
@@ -433,6 +441,7 @@ const summary = {
   metrics_path: metricsPath,
   timing_totals: timingTotals,
   token_totals: tokenTotals,
+  driver_usage_totals: driverUsageTotals,
   arms: mergedArms,
 };
 const summaryPath = path.join(experimentRoot, 'summary.json');
@@ -441,7 +450,7 @@ log('');
 log(`summary: ${summaryPath}`);
 log(`metrics: ${metricsPath}`);
 log(
-  `totals wall_ms=${String(timingTotals.wall_ms)} driver_ms=${String(timingTotals.driver_duration_ms)} tokens=${String(tokenTotals.total_tokens)} (in=${String(tokenTotals.total_input_tokens)} out=${String(tokenTotals.output_tokens)})`,
+  `totals wall_ms=${String(timingTotals.wall_ms)} driver_ms=${String(timingTotals.driver_duration_ms)} tokens=${String(tokenTotals.total_tokens)} (in=${String(tokenTotals.total_input_tokens)} out=${String(tokenTotals.output_tokens)}) driver_context=${String(driverUsageTotals.context_tokens_used)} (${String(driverUsageTotals.instances_with_driver_usage)}/${String(driverUsageTotals.instances)})`,
 );
 
 const failed = mergedArms.some((arm) => arm.instances.some((row) => row.status === 'failed'));
@@ -561,6 +570,11 @@ async function runOneInstance(input: {
       }
     }
 
+    row.driver_usage = await resolveInstanceDriverUsage({
+      summary,
+      stateRoot,
+      taskId: row.backend_task_id,
+    });
     row.token_usage = await resolveInstanceTokenUsage({
       summary,
       sessionId: row.session_id,
@@ -621,7 +635,7 @@ async function runOneInstance(input: {
     row.wall_finished_at = new Date(wallFinishedAt).toISOString();
     row.wall_ms = Math.max(0, wallFinishedAt - wallStartedAt);
     log(
-      `  metrics wall_ms=${String(row.wall_ms)} driver_ms=${String(row.driver_duration_ms ?? '-')} tokens=${String(row.token_usage?.total_tokens ?? '-')} source=${row.token_usage?.source ?? 'unavailable'}`,
+      `  metrics wall_ms=${String(row.wall_ms)} driver_ms=${String(row.driver_duration_ms ?? '-')} tokens=${String(row.token_usage?.total_tokens ?? '-')} source=${row.token_usage?.source ?? 'unavailable'} driver_context=${String(row.driver_usage?.context_tokens_used ?? '-')} driver_sessions=${String(row.driver_usage?.sessions.length ?? 0)}`,
     );
     if (prepared && !keepWorktree) {
       try {
@@ -728,32 +742,35 @@ function toAblationTokenUsage(summary: RunTokenUsageSummary): TokenUsage {
 function readSummaryTokenUsage(summary: unknown): TokenUsage | undefined {
   if (!summary || typeof summary !== 'object') return undefined;
   const tokenUsage = (summary as { token_usage?: unknown }).token_usage;
-  if (!tokenUsage || typeof tokenUsage !== 'object') return undefined;
-  const obj = tokenUsage as Partial<RunTokenUsageSummary>;
-  const totalTokens = Number(obj.total_tokens ?? 0);
-  const callCount = Number(obj.call_count ?? 0);
-  if (!Number.isFinite(totalTokens) || !Number.isFinite(callCount)) return undefined;
-  if (totalTokens <= 0 && callCount <= 0) return undefined;
-  return toAblationTokenUsage({
-    schema_version: 'newide.token_usage.v1',
-    source: (obj.source as RunTokenUsageSummary['source']) ?? 'mixed',
-    input_tokens: Number(obj.input_tokens ?? 0),
-    output_tokens: Number(obj.output_tokens ?? 0),
-    cache_creation_input_tokens: Number(obj.cache_creation_input_tokens ?? 0),
-    cache_read_input_tokens: Number(obj.cache_read_input_tokens ?? 0),
-    total_input_tokens: Number(obj.total_input_tokens ?? 0),
-    total_tokens: totalTokens,
-    call_count: callCount,
-    sources: Array.isArray(obj.sources)
-      ? (obj.sources as RunTokenUsageSummary['sources'])
-      : [],
-    by_source:
-      obj.by_source && typeof obj.by_source === 'object'
-        ? (obj.by_source as RunTokenUsageSummary['by_source'])
-        : {},
-    ...(typeof obj.session_id === 'string' ? { session_id: obj.session_id } : {}),
-    ...(typeof obj.session_path === 'string' ? { session_path: obj.session_path } : {}),
-  });
+  if (!isPopulatedRunTokenUsage(tokenUsage)) return undefined;
+  return toAblationTokenUsage(tokenUsage);
+}
+
+function readSummaryDriverUsage(summary: unknown): TaskDriverUsage | undefined {
+  if (!summary || typeof summary !== 'object') return undefined;
+  const obj = summary as { driver_usage?: unknown; token_usage?: unknown };
+  if (isDriverStreamUsage(obj.driver_usage)) {
+    return obj.driver_usage;
+  }
+  if (isDriverStreamUsage(obj.token_usage)) {
+    return obj.token_usage;
+  }
+  return undefined;
+}
+
+async function resolveInstanceDriverUsage(input: {
+  summary: unknown;
+  stateRoot: string;
+  taskId?: string;
+}): Promise<TaskDriverUsage | undefined> {
+  const fromSummary = readSummaryDriverUsage(input.summary);
+  if (fromSummary) return fromSummary;
+  if (!input.taskId) return undefined;
+  const projected = await projectTaskDriverUsage(
+    path.join(input.stateRoot, 'runs'),
+    input.taskId,
+  );
+  return projected.available ? projected : undefined;
 }
 
 async function resolveInstanceTokenUsage(input: {
@@ -817,6 +834,29 @@ function summarizeTokens(rows: InstanceRow[]): {
     ),
     total_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.total_tokens ?? 0), 0),
     instances_with_tokens: withTokens.length,
+    instances: rows.length,
+  };
+}
+
+function summarizeDriverUsage(rows: InstanceRow[]): {
+  context_tokens_used: number;
+  reported_cost_usd: number;
+  sessions: number;
+  instances_with_driver_usage: number;
+  instances: number;
+} {
+  const withDriver = rows.filter((row) => row.driver_usage?.available === true);
+  return {
+    context_tokens_used: withDriver.reduce(
+      (sum, row) => sum + (row.driver_usage?.context_tokens_used ?? 0),
+      0,
+    ),
+    reported_cost_usd: withDriver.reduce((sum, row) => {
+      const usd = row.driver_usage?.reported_costs.find((cost) => cost.currency === 'USD');
+      return sum + (usd?.amount ?? 0);
+    }, 0),
+    sessions: withDriver.reduce((sum, row) => sum + (row.driver_usage?.sessions.length ?? 0), 0),
+    instances_with_driver_usage: withDriver.length,
     instances: rows.length,
   };
 }
