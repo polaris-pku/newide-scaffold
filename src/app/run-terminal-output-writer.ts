@@ -5,7 +5,12 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AppRunSnapshot } from './run-registry';
 import { projectRunSnapshot } from './run-snapshot-projector';
-import { projectTaskDriverUsage, type TaskDriverUsage } from './driver-usage-projector';
+import {
+  isDriverStreamUsage,
+  preferDriverUsage,
+  projectTaskDriverUsage,
+  type TaskDriverUsage,
+} from './driver-usage-projector';
 
 export interface RunTerminalOutputWriter {
   finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | void>;
@@ -60,6 +65,7 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
       ...fallbackWrites,
       fs.writeFile(frontendSnapshotPath, serializedSnapshot, 'utf-8'),
     ]);
+    await mergeDriverUsageIntoSummary(summaryPath, tokenUsage);
     return {
       artifact_ref: pathToFileURL(path.resolve(frontendSnapshotPath)).href,
       sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),
@@ -105,7 +111,8 @@ function buildBackendSummary(
     changed_files: [...changedFiles],
     artifact_refs: [...artifactRefs],
     artifacts_materialized: projected.artifacts.length,
-    token_usage: proxyTokenUsage ?? tokenUsage,
+    ...(proxyTokenUsage ? { token_usage: proxyTokenUsage } : {}),
+    ...(tokenUsage.available ? { driver_usage: tokenUsage } : {}),
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     result_path: paths.result_path,
     summary_path: paths.summary_path,
@@ -193,6 +200,33 @@ function resolveTokenUsageFromTimeline(
     sources: ['proxy'],
     by_source: { proxy },
   };
+}
+
+async function mergeDriverUsageIntoSummary(
+  summaryPath: string,
+  driverUsage: TaskDriverUsage,
+): Promise<void> {
+  try {
+    const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+    const preferred = preferDriverUsage(
+      isDriverStreamUsage(raw.driver_usage) ? raw.driver_usage : raw.token_usage,
+      driverUsage,
+    );
+    let changed = false;
+    if (preferred && raw.driver_usage !== preferred) {
+      raw.driver_usage = preferred;
+      changed = true;
+    }
+    if (isDriverStreamUsage(raw.token_usage)) {
+      delete raw.token_usage;
+      changed = true;
+    }
+    if (!changed) return;
+    await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
 }
 
 async function writeJsonIfMissing(filePath: string, value: unknown): Promise<void> {
