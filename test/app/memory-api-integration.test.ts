@@ -7,7 +7,8 @@
  *   createAgent → updateAgent → createSkill → publishSkillToMarket →
  *   updateSkill → marketImport → rateTask → updateExperience →
  *   updatePersona → regeneratePersona → getBufferState → retryExtraction →
- *   getPendingBuffer → 列表过滤 → searchMemory → retireAgent → deleteAgent
+ *   getPendingBuffer → 列表过滤 → searchMemory → deleteAgent 安全边界
+ *   （未退休无 force 拒绝 / force 二次确认允许）→ retireAgent → deleteAgent
  */
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
@@ -30,6 +31,7 @@ import { MemoryRpcMethods } from '../../src/rpc/memory-methods';
 const ROLE = 'role_integration';
 const BUYER = 'role_buyer';
 const TASK = 'task_integration';
+const FORCE_ROLE = 'role_force_delete';
 
 interface RpcResponse {
   id: number;
@@ -75,7 +77,7 @@ describe('memory.* full API integration (M7)', () => {
           await repository.updateAgentMeta(roleId, patch);
           return repository.getAgent(roleId);
         },
-        deleteAgent: (roleId) => manager.deleteAgent(roleId),
+        deleteAgent: (roleId, options) => manager.deleteAgent(roleId, options),
       },
       embedding,
     );
@@ -225,9 +227,26 @@ describe('memory.* full API integration (M7)', () => {
     expect(search.result!.skills).toHaveLength(1);
     expect(search.result!.experiences).toHaveLength(1);
 
-    // 11. 退休 → 硬删除（闭环删除）
-    await call(19, 'memory.retireAgent', { role_id: ROLE, reason: 'manual' });
-    const deleted = await call(20, 'memory.deleteAgent', {
+    // 11. 未退休 Agent 删除安全边界：无 force 拒绝，force 二次确认后允许
+    const rejected = await call(19, 'memory.deleteAgent', {
+      role_id: ROLE,
+      confirm: true,
+    });
+    expect(rejected.error).toBeDefined();
+    expect(rejected.error!.message).toMatch(/retired before deletion/);
+
+    await call(20, 'memory.createAgent', { role_id: FORCE_ROLE, name: 'Force Delete' });
+    const forced = await call(21, 'memory.deleteAgent', {
+      role_id: FORCE_ROLE,
+      confirm: true,
+      force: true,
+    });
+    expect(forced.result!.deleted).toBe(true);
+    expect(await repository.listAgentIds()).not.toContain(FORCE_ROLE);
+
+    // 12. 退休 → 硬删除（闭环删除）
+    await call(22, 'memory.retireAgent', { role_id: ROLE, reason: 'manual' });
+    const deleted = await call(23, 'memory.deleteAgent', {
       role_id: ROLE,
       confirm: true,
     });

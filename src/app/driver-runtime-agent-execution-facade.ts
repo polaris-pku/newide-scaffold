@@ -274,11 +274,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
 
   /**
    * 硬删除 Agent（memory.deleteAgent）：委托基座 AgentManager.deleteAgent。
-   * 安全前置（retired）与确认参数由 AgentManager / RPC 层保证。
+   * 安全前置（retired）与确认参数由 AgentManager / RPC 层保证；
+   * `options.force` 允许删除未退休 Agent（级联丢弃其全部资产）。
    */
-  async deleteAgent(roleId: string): Promise<void> {
+  async deleteAgent(roleId: string, options?: { force?: boolean }): Promise<void> {
     const manager = await this.manager;
-    await manager.deleteAgent(roleId);
+    await manager.deleteAgent(roleId, options);
   }
 
   /**

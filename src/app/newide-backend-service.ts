@@ -376,8 +376,8 @@ export class NewideBackendService {
     return this.requireBMemoryService().updateAgent(roleId, patch);
   }
 
-  deleteMemoryAgent(roleId: string): Promise<void> {
-    return this.requireBMemoryService().deleteAgent(roleId);
+  deleteMemoryAgent(roleId: string, options?: { force?: boolean }): Promise<void> {
+    return this.requireBMemoryService().deleteAgent(roleId, options);
   }
 
   approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {

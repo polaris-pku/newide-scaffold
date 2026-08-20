@@ -70,8 +70,10 @@ prior artifacts (task execution → extraction → promotion → market), so the
    asset-level writes go through `BMemoryBackendService` composing repo/services.
 3. Agent catalog becomes DB-driven + env seed; allowlist consumers query dynamically.
 4. capabilities ↔ RPC 1:1; UI renders by declaration.
-5. Hard delete only allowed for `retired` agents (skills already migrated to market;
-   remaining retained experiences are cascade-deleted). Active agents must `retireAgent` first.
+5. Hard delete default-requires `retired` (skills already migrated to market;
+   remaining retained experiences are cascade-deleted). Active agents must either
+   `retireAgent` first, or pass `force: true` as an explicit second confirmation
+   (permanently discards all owned assets — irreversible).
 6. Idempotency: skills dedupe on `(agent_id, content-hash)`; market import keeps
    `imported_from`; retry extraction keyed by `(role_id, buffer_seq, task_id)`.
 
@@ -82,7 +84,7 @@ prior artifacts (task execution → extraction → promotion → market), so the
 |---|---|---|---|
 | `memory.createAgent` | `{role_id, name, tags?, persona_seed?, constraints?}` | `AgentBoardAgentView` | validate uniqueness + reserved ids; facade → `AgentManager.createAgent` |
 | `memory.updateAgent` | `{role_id, name?, tags?}` | `AgentBoardAgentView` | PATCH; new repo `updateAgentMeta` |
-| `memory.deleteAgent` | `{role_id, confirm: true}` | `{deleted: true, removed_experiences}` | retired-only; cascade experiences + buffer dir; new repo `deleteAgent`, buffer `deleteAgent`; remove from manager map |
+| `memory.deleteAgent` | `{role_id, confirm: true, force?}` | `{deleted: true, removed_experiences}` | retired-only by default; **未退休需 `force: true` 二次确认**（级联丢弃名下全部资产且不可恢复）；cascade experiences + buffer dir; new repo `deleteAgent`, buffer `deleteAgent`; remove from manager map |
 | `memory.reactivateAgent` | `{role_id}` | `AgentBoardAgentView` | `retired → active`; low priority |
 
 ### B. Skill management (known-2, L2)

@@ -96,6 +96,29 @@ describe('AgentManager.deleteAgent', () => {
     const { manager } = await setup();
     await expect(manager.deleteAgent(MARKET_POOL_ROLE_ID)).rejects.toThrow(/market pool/);
   });
+
+  it('rejects deletion of an active agent without force, and hints at force', async () => {
+    const { manager } = await setup();
+    await manager.createAgent({ role_id: 'role_active_2', name: 'Active 2' });
+
+    const err = await manager.deleteAgent('role_active_2').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/must be retired before deletion/);
+    expect((err as Error).message).toMatch(/force: true/);
+  });
+
+  it('force-deletes an active agent end-to-end (repo + buffer + memory map)', async () => {
+    const { manager, repository, bufferRepository } = await setup();
+    await manager.createAgent({ role_id: 'role_active_3', name: 'Active 3' });
+
+    await manager.deleteAgent('role_active_3', { force: true });
+
+    expect(await manager.listAgentHandles()).toHaveLength(0);
+    await expect(repository.getAgent('role_active_3')).rejects.toThrow(/Agent not found/);
+    const result = await manager.dispatchTask('role_active_3', task());
+    expect(result.status).toBe('blocked');
+    await expect(bufferRepository.listPendingBufferSeqs('role_active_3')).rejects.toThrow();
+  });
 });
 
 describe('createAgentCatalogProvider', () => {

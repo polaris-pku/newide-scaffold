@@ -112,8 +112,8 @@ export interface BMemoryLifecycle {
   createAgent(spec: CreateAgentSpec): Promise<AgentHandle>;
   /** 更新 Agent 元数据（名称 / 标签）。 */
   updateAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle>;
-  /** 硬删除 Agent（安全前置：retired，由 AgentManager 强制）。 */
-  deleteAgent(roleId: string): Promise<void>;
+  /** 硬删除 Agent（安全前置：retired；未退休须 options.force 二次确认）。 */
+  deleteAgent(roleId: string, options?: { force?: boolean }): Promise<void>;
 }
 export interface BMemoryBackendServiceOptions {
   autoApprovePromotedSkills?: boolean;
@@ -370,12 +370,15 @@ export class BMemoryBackendService {
     return this.lifecycle.updateAgent(roleId, patch);
   }
 
-  /** 硬删除 Agent（memory.deleteAgent），委托给注入的 lifecycle。 */
-  deleteAgent(roleId: string): Promise<void> {
+  /**
+   * 硬删除 Agent（memory.deleteAgent），委托给注入的 lifecycle。
+   * 未退休 Agent 需要 `options.force`（级联丢弃名下全部资产）。
+   */
+  deleteAgent(roleId: string, options?: { force?: boolean }): Promise<void> {
     if (!this.lifecycle) {
       throw new Error('Agent deletion is not available in this B runtime');
     }
-    return this.lifecycle.deleteAgent(roleId);
+    return this.lifecycle.deleteAgent(roleId, options);
   }
 
   /** 手动创建 Skill（memory.createSkill），返回对外 SkillView。 */

@@ -52,8 +52,8 @@ export interface MemoryMethodsService {
   createMemoryAgent(spec: CreateAgentSpec): Promise<AgentHandle>;
   /** 更新 Agent 元数据（名称 / 标签） */
   updateMemoryAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle>;
-  /** 硬删除 Agent（需 confirm: true，且 Agent 已 retired） */
-  deleteMemoryAgent(roleId: string): Promise<void>;
+  /** 硬删除 Agent（需 confirm: true；未退休 Agent 还需 force: true 二次确认） */
+  deleteMemoryAgent(roleId: string, options?: { force?: boolean }): Promise<void>;
   /** 手动创建 Skill（memory.createSkill） */
   createMemorySkill(input: CreateSkillInput): Promise<SkillView>;
   /** PATCH 更新 Skill（memory.updateSkill） */
@@ -211,6 +211,9 @@ const deleteAgentParamsSchema = z
   .object({
     role_id: z.string().trim().min(1),
     confirm: z.literal(true),
+    // 删除未退休 Agent 的二次确认：级联丢弃其名下全部资产且不可恢复。
+    // 已退休 Agent 删除无需该字段。
+    force: z.literal(true).optional(),
   })
   .strict();
 const createSkillParamsSchema = z
@@ -442,7 +445,19 @@ export class MemoryRpcMethods {
     });
     dispatcher.register('memory.deleteAgent', async (params) => {
       const parsed = parseParams(deleteAgentParamsSchema, params);
-      await this.service.deleteMemoryAgent(parsed.role_id);
+      try {
+        await this.service.deleteMemoryAgent(
+          parsed.role_id,
+          parsed.force === true ? { force: true } : undefined,
+        );
+      } catch (error) {
+        // 业务错误（未退休需 force 二次确认、市场池禁止删除等）透传为
+        // 可读消息，供前端识别并引导二次确认；不吞成 "Internal error"。
+        throw new JsonRpcMethodError(
+          JSON_RPC_ERROR_CODES.APPLICATION_ERROR,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
       return { deleted: true };
     });
     dispatcher.register('memory.createSkill', async (params) => {

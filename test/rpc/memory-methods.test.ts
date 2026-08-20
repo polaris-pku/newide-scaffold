@@ -51,6 +51,7 @@ describe('MemoryRpcMethods', () => {
       reviewed_by: 'reviewer',
     }) as never);
     
+    const deleteMemoryAgent = vi.fn(async () => undefined);
     const service = fakeService({
       promoteMemorySkills,
       marketSearchMemorySkills,
@@ -59,6 +60,7 @@ describe('MemoryRpcMethods', () => {
       runRetirementScan,
       approveMemorySkill,
       rejectMemorySkill,
+      deleteMemoryAgent,
     });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
@@ -206,6 +208,12 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":47,"method":"memory.searchMemory","params":{"role_id":"role_ts_engineer","query":""}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":48,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":true,"force":true}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":49,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":true,"force":false}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -295,6 +303,8 @@ describe('MemoryRpcMethods', () => {
       { id: 45, result: { experiences: [{ id: 'experience_1' }] } },
       { id: 46, result: { skills: [{ id: 'skill_1' }], experiences: [{ id: 'experience_1' }] } },
       { id: 47, error: { code: -32602, message: 'Invalid params' } },
+      { id: 48, result: { deleted: true } },
+      { id: 49, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -319,6 +329,8 @@ describe('MemoryRpcMethods', () => {
     });
     expect(runRetirementScan).toHaveBeenCalledTimes(2);
     expect(runRetirementScan).toHaveBeenLastCalledWith('role_ts_engineer');
+    expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', undefined);
+    expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', { force: true });
   });
 });
 

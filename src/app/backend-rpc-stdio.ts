@@ -307,7 +307,7 @@ export async function createProductionBackendService(
         runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
         createAgent: (spec) => agentExecutionFacade.createAgent(spec),
         updateAgent: (roleId, patch) => agentExecutionFacade.updateAgent(roleId, patch),
-        deleteAgent: (roleId) => agentExecutionFacade.deleteAgent(roleId),
+        deleteAgent: (roleId, options) => agentExecutionFacade.deleteAgent(roleId, options),
       },
       bRuntime.embedding,
       memoryLlm,
