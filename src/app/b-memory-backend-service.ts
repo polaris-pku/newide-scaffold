@@ -36,7 +36,13 @@ import {
   updateSkill,
   type PersonaInducer,
 } from '../memory';
-import type { PersonaDef, SkillRecord } from '../memory/schemas';
+import type {
+  AgentContextSnapshot,
+  BufferMeta,
+  BufferSnapshot,
+  PersonaDef,
+  SkillRecord,
+} from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BPublicCapabilities, ReviewedSkill } from './b-public-capabilities';
 import { filterLegacyCouncilPseudoAgents } from './council-legacy-agent-filter';
@@ -65,6 +71,9 @@ export interface BMemoryCapabilities {
     update_persona: BMemoryOperationCapability;
     regenerate_persona: BMemoryOperationCapability;
     rate_task: BMemoryOperationCapability;
+    get_buffer_state: BMemoryOperationCapability;
+    get_pending_buffer: BMemoryOperationCapability;
+    retry_extraction: BMemoryOperationCapability;
     market_search: BMemoryOperationCapability;
     market_import: BMemoryOperationCapability;
     retire_agent: BMemoryOperationCapability;
@@ -231,6 +240,24 @@ export class BMemoryBackendService {
             : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
         rate_task: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        get_buffer_state: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        get_pending_buffer: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        retry_extraction: {
           status: this.repository ? 'available' : 'unavailable',
           ...(this.repository
             ? {}
@@ -409,6 +436,52 @@ export class BMemoryBackendService {
       task_id: taskId,
       rating,
       ...(note !== undefined ? { note } : {}),
+    });
+  }
+
+  /** Buffer 状态总览（memory.getBufferState）：meta + pending + dead-letter seq 列表。 */
+  async getBufferState(roleId: string): Promise<{
+    meta: BufferMeta;
+    pending_seqs: number[];
+    dead_letter_seqs: number[];
+  }> {
+    const repository = this.requireRepository('Buffer state');
+    const [meta, pending_seqs, dead_letter_seqs] = await Promise.all([
+      this.capabilities.bufferRepository.getBufferMeta(roleId),
+      this.capabilities.bufferRepository.listPendingBufferSeqs(roleId),
+      this.capabilities.bufferRepository.listDeadLetterSeqs(roleId),
+    ]);
+    // roleId 必须存在（避免对不存在 Agent 的探针）
+    await repository.getAgent(roleId);
+    return { meta, pending_seqs, dead_letter_seqs };
+  }
+
+  /** 查看一条 pending 缓冲区快照（memory.getPendingBuffer）。 */
+  async getPendingBuffer(roleId: string, seq: number): Promise<{
+    snapshot: BufferSnapshot;
+    agent_context?: AgentContextSnapshot;
+  } | undefined> {
+    this.requireRepository('Pending buffer');
+    return this.capabilities.bufferRepository.getPendingBuffer(roleId, seq);
+  }
+
+  /**
+   * 重试提取（memory.retryExtraction）：死信缓冲区恢复到 pending 后重新入队
+   * 维护链路（BMemoryMaintenanceRunner.scheduleBuffer），返回调度证据。
+   */
+  async retryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
+    const repository = this.requireRepository('Extraction retry');
+    await repository.getAgent(roleId);
+    await this.capabilities.bufferRepository.restoreDeadLetter(roleId, seq);
+    const pending = await this.capabilities.bufferRepository.getPendingBuffer(roleId, seq);
+    if (!pending) {
+      throw new Error(`Pending buffer not found after restore: seq=${seq}`);
+    }
+    return this.capabilities.maintenance.scheduleBuffer({
+      task_id: pending.snapshot.source_task_id,
+      run_id: `retry:${roleId}:${String(seq)}`,
+      role_id: roleId,
+      buffer_seq: seq,
     });
   }
 

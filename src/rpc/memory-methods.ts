@@ -24,6 +24,7 @@ import type {
   UserRatingResult,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
+import type { AgentContextSnapshot, BufferMeta, BufferSnapshot } from '../memory/schemas';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 
@@ -82,6 +83,19 @@ export interface MemoryMethodsService {
     rating: UserRating,
     note?: string,
   ): Promise<UserRatingResult>;
+  /** Buffer 状态总览（memory.getBufferState） */
+  getMemoryBufferState(roleId: string): Promise<{
+    meta: BufferMeta;
+    pending_seqs: number[];
+    dead_letter_seqs: number[];
+  }>;
+  /** 查看 pending 缓冲区（memory.getPendingBuffer） */
+  getMemoryPendingBuffer(
+    roleId: string,
+    seq: number,
+  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined>;
+  /** 重试提取（memory.retryExtraction） */
+  retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -233,6 +247,12 @@ const rateTaskParamsSchema = z
     task_id: z.string().trim().min(1),
     rating: z.enum(['resolved', 'partially_resolved', 'unresolved', 'not_rated']),
     note: z.string().trim().min(1).optional(),
+  })
+  .strict();
+const bufferSeqParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    seq: z.number().int().positive(),
   })
   .strict();
 
@@ -432,6 +452,21 @@ export class MemoryRpcMethods {
         parsed.note,
       );
       return { rating: result };
+    });
+    dispatcher.register('memory.getBufferState', async (params) => {
+      const parsed = parseParams(roleParamsSchema, params);
+      const state = await this.service.getMemoryBufferState(parsed.role_id);
+      return { state };
+    });
+    dispatcher.register('memory.getPendingBuffer', async (params) => {
+      const parsed = parseParams(bufferSeqParamsSchema, params);
+      const buffer = await this.service.getMemoryPendingBuffer(parsed.role_id, parsed.seq);
+      return { buffer };
+    });
+    dispatcher.register('memory.retryExtraction', async (params) => {
+      const parsed = parseParams(bufferSeqParamsSchema, params);
+      const maintenance = await this.service.retryMemoryExtraction(parsed.role_id, parsed.seq);
+      return { maintenance };
     });
   }
 }

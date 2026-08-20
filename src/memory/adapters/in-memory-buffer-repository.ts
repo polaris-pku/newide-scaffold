@@ -20,6 +20,8 @@ interface PendingEntry {
 interface BufferStore {
   bufferMeta: BufferMeta;
   pending: Map<number, PendingEntry>;
+  /** 死信条目（markBufferDeadLetter 移入，可被 restoreDeadLetter 恢复） */
+  deadLetters: Map<number, PendingEntry>;
 }
 
 function createEmptyBufferMeta(role_id: string): BufferMeta {
@@ -103,9 +105,27 @@ export class InMemoryBufferRepository implements BufferRepository {
       throw new Error(`Pending buffer not found: seq=${seq}`);
     }
     store.pending.delete(seq);
+    store.deadLetters.set(seq, entry);
     store.bufferMeta.pending_count = Math.max(0, store.bufferMeta.pending_count - 1);
     store.bufferMeta.total_dead_letters += 1;
     entry.snapshot.extraction_status = 'dead_letter';
+  }
+
+  async listDeadLetterSeqs(role_id: string): Promise<number[]> {
+    return [...this.requireStore(role_id).deadLetters.keys()].sort((a, b) => a - b);
+  }
+
+  async restoreDeadLetter(role_id: string, seq: number): Promise<void> {
+    const store = this.requireStore(role_id);
+    const entry = store.deadLetters.get(seq);
+    if (!entry) {
+      throw new Error(`Dead-letter buffer not found: seq=${seq}`);
+    }
+    store.deadLetters.delete(seq);
+    store.pending.set(seq, entry);
+    store.bufferMeta.pending_count += 1;
+    store.bufferMeta.total_dead_letters = Math.max(0, store.bufferMeta.total_dead_letters - 1);
+    entry.snapshot.extraction_status = 'pending';
   }
 
   async updateBufferRating(role_id: string, seq: number, rating: UserRating): Promise<void> {
@@ -141,6 +161,7 @@ export class InMemoryBufferRepository implements BufferRepository {
       store = {
         bufferMeta: createEmptyBufferMeta(role_id),
         pending: new Map(),
+        deadLetters: new Map(),
       };
       this.stores.set(role_id, store);
     }

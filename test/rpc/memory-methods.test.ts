@@ -176,6 +176,18 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":37,"method":"memory.rateTask","params":{"role_id":"role_ts_engineer","task_id":"task_001","rating":"bogus"}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":38,"method":"memory.getBufferState","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":39,"method":"memory.getPendingBuffer","params":{"role_id":"role_ts_engineer","seq":1}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":40,"method":"memory.getPendingBuffer","params":{"role_id":"role_ts_engineer","seq":0}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":41,"method":"memory.retryExtraction","params":{"role_id":"role_ts_engineer","seq":2}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -193,6 +205,9 @@ describe('MemoryRpcMethods', () => {
               },
               regenerate_persona: { status: 'available' },
               rate_task: { status: 'available' },
+              get_buffer_state: { status: 'available' },
+              get_pending_buffer: { status: 'available' },
+              retry_extraction: { status: 'available' },
               create_agent: { status: 'available' },
               update_agent: { status: 'available' },
               delete_agent: { status: 'available' },
@@ -246,6 +261,15 @@ describe('MemoryRpcMethods', () => {
       { id: 35, error: { code: -32602, message: 'Invalid params' } },
       { id: 36, result: { rating: { updated_experiences: 1, buffer_updated: false } } },
       { id: 37, error: { code: -32602, message: 'Invalid params' } },
+      {
+        id: 38,
+        result: {
+          state: { meta: { pending_count: 0 }, pending_seqs: [], dead_letter_seqs: [2] },
+        },
+      },
+      { id: 39, result: { buffer: { snapshot: { task_id: 'task_001' } } } },
+      { id: 40, error: { code: -32602, message: 'Invalid params' } },
+      { id: 41, result: { maintenance: { maintenance_ref: 'b_maintenance_1' } } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -296,6 +320,9 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         update_persona: { status: 'available' },
         regenerate_persona: { status: 'available' },
         rate_task: { status: 'available' },
+        get_buffer_state: { status: 'available' },
+        get_pending_buffer: { status: 'available' },
+        retry_extraction: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
         retire_agent: { status: 'available' },
@@ -410,6 +437,13 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
       generated_at: '2026-07-21T00:00:00.000Z',
     }),
     rateMemoryTask: async () => ({ updated_experiences: 1, buffer_updated: false }),
+    getMemoryBufferState: async () => ({
+      meta: { pending_count: 0 },
+      pending_seqs: [],
+      dead_letter_seqs: [2],
+    } as never),
+    getMemoryPendingBuffer: async () => ({ snapshot: { task_id: 'task_001' } } as never),
+    retryMemoryExtraction: async () => maintenance(),
     ...overrides,
   };
 }

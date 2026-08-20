@@ -171,6 +171,55 @@ export class FileBufferRepository implements BufferRepository {
     return seqs.sort((a, b) => a - b);
   }
 
+  async listDeadLetterSeqs(role_id: string): Promise<number[]> {
+    const deadLetterDir = join(this.requireBufferRoot(role_id), DEAD_LETTER_DIR);
+    const entries = await readdirSafe(deadLetterDir);
+    const seqs: number[] = [];
+
+    for (const entry of entries) {
+      const match = REPORT_FILE_PATTERN.exec(entry);
+      if (match) {
+        seqs.push(Number(match[1]));
+      }
+    }
+
+    return seqs.sort((a, b) => a - b);
+  }
+
+  async restoreDeadLetter(role_id: string, seq: number): Promise<void> {
+    const bufferRoot = this.requireBufferRoot(role_id);
+    const deadLetterReportPath = join(bufferRoot, DEAD_LETTER_DIR, reportFileName(seq));
+
+    let rawReport: string;
+    try {
+      rawReport = await readFile(deadLetterReportPath, 'utf8');
+    } catch {
+      throw new Error(`Dead-letter buffer not found: seq=${seq}`);
+    }
+
+    const snapshot = BufferSnapshotSchema.parse(JSON.parse(rawReport));
+    snapshot.extraction_status = 'pending';
+    // dead_letter → pending（写回时一并更新提取状态）
+    await moveFile(
+      deadLetterReportPath,
+      join(bufferRoot, PENDING_DIR, reportFileName(seq)),
+      snapshot,
+    );
+    try {
+      await moveFile(
+        join(bufferRoot, DEAD_LETTER_DIR, contextFileName(seq)),
+        join(bufferRoot, PENDING_DIR, contextFileName(seq)),
+      );
+    } catch {
+      // context 文件可选，缺失时不阻塞恢复
+    }
+
+    const meta = await this.readBufferMeta(role_id);
+    meta.pending_count += 1;
+    meta.total_dead_letters = Math.max(0, meta.total_dead_letters - 1);
+    await writeJsonAtomic(join(bufferRoot, META_FILE), meta);
+  }
+
   async getPendingBuffer(
     role_id: string,
     seq: number,

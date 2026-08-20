@@ -87,7 +87,7 @@ import type {
   UserRating,
   UserRatingResult,
 } from '../memory';
-import type { SkillRecord } from '../memory/schemas';
+import type { SkillRecord, BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { AgentMetaPatch, BMemoryBackendService } from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
@@ -426,6 +426,25 @@ export class NewideBackendService {
     note?: string,
   ): Promise<UserRatingResult> {
     return this.requireBMemoryService().rateTask(roleId, taskId, rating, note);
+  }
+
+  getMemoryBufferState(roleId: string): Promise<{
+    meta: BufferMeta;
+    pending_seqs: number[];
+    dead_letter_seqs: number[];
+  }> {
+    return this.requireBMemoryService().getBufferState(roleId);
+  }
+
+  getMemoryPendingBuffer(
+    roleId: string,
+    seq: number,
+  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined> {
+    return this.requireBMemoryService().getPendingBuffer(roleId, seq);
+  }
+
+  retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
+    return this.requireBMemoryService().retryExtraction(roleId, seq);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

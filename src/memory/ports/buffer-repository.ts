@@ -55,6 +55,17 @@ export interface BufferRepository {
   /** 列出所有待处理缓冲区的 seq 列表 */
   listPendingBufferSeqs(role_id: string): Promise<number[]>;
 
+  /** 列出所有死信缓冲区的 seq 列表（提取失败，可经 restoreDeadLetter 恢复） */
+  listDeadLetterSeqs(role_id: string): Promise<number[]>;
+
+  /**
+   * 将一条死信缓冲区恢复到 pending（memory.retryExtraction）。
+   *
+   * 副作用：文件移回 pending/ 目录并写回 extraction_status='pending'，
+   * meta 的 pending_count +1、total_dead_letters −1。seq 不在死信时抛错。
+   */
+  restoreDeadLetter(role_id: string, seq: number): Promise<void>;
+
   /** 获取指定 seq 的待处理缓冲区快照（含 agentContext） */
   getPendingBuffer(
     role_id: string,
