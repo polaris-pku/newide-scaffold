@@ -4,7 +4,7 @@
  * 定义 Agent 任务后 buffer 队列的读写契约：pending 写入、游标、
  * processed / dead_letter 迁移等。生产实现为文件存储（pending/ 等目录）。
  */
-import type { BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../schemas';
+import type { BufferMeta, BufferSnapshot, AgentContextSnapshot, UserRating } from '../schemas';
 
 /** saveBufferSnapshot 的返回值 */
 export interface SaveBufferResult {
@@ -43,6 +43,14 @@ export interface BufferRepository {
 
   /** 标记缓冲区为死信（提取失败） */
   markBufferDeadLetter(role_id: string, seq: number): Promise<void>;
+
+  /**
+   * 为仍处于 pending 的缓冲区快照写入用户评分（memory.rateTask）。
+   *
+   * 仅 pending 有效：seq 不在 pending 中（已处理/死信/不存在）时抛错，
+   * 由调用方先经 listPendingBufferSeqs + getPendingBuffer 定位任务对应 seq。
+   */
+  updateBufferRating(role_id: string, seq: number, rating: UserRating): Promise<void>;
 
   /** 列出所有待处理缓冲区的 seq 列表 */
   listPendingBufferSeqs(role_id: string): Promise<number[]>;

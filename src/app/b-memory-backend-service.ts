@@ -2,6 +2,7 @@ import {
   type AgentBoardAgentView,
   type AgentBoardListItem,
   type AgentHandle,
+  applyUserRating,
   type CreateAgentSpec,
   createSkill,
   deleteExperience,
@@ -29,6 +30,8 @@ import {
   toExperienceView,
   toSkillView,
   type CreateSkillInput,
+  type UserRating,
+  type UserRatingResult,
   updateExperience,
   updateSkill,
   type PersonaInducer,
@@ -61,6 +64,7 @@ export interface BMemoryCapabilities {
     reject_skill: BMemoryOperationCapability;
     update_persona: BMemoryOperationCapability;
     regenerate_persona: BMemoryOperationCapability;
+    rate_task: BMemoryOperationCapability;
     market_search: BMemoryOperationCapability;
     market_import: BMemoryOperationCapability;
     retire_agent: BMemoryOperationCapability;
@@ -221,6 +225,12 @@ export class BMemoryBackendService {
             : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
         regenerate_persona: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        rate_task: {
           status: this.repository ? 'available' : 'unavailable',
           ...(this.repository
             ? {}
@@ -389,6 +399,17 @@ export class BMemoryBackendService {
       roleId,
       this.personaInducer(),
     );
+  }
+
+  /** 用户评分（memory.rateTask）：调整派生经验置信度并写入 pending buffer。 */
+  rateTask(roleId: string, taskId: string, rating: UserRating, note?: string): Promise<UserRatingResult> {
+    const repository = this.requireRepository('Task rating');
+    return applyUserRating(repository, this.capabilities.bufferRepository, {
+      role_id: roleId,
+      task_id: taskId,
+      rating,
+      ...(note !== undefined ? { note } : {}),
+    });
   }
 
   /** 构造 Persona 归纳器：有 LLM 注入则 LLM 归纳（自动降级规则版），否则纯规则版 */

@@ -84,6 +84,8 @@ import type {
   RetirementScanResult,
   SkillView,
   SkillWritePatch,
+  UserRating,
+  UserRatingResult,
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
@@ -415,6 +417,15 @@ export class NewideBackendService {
 
   regenerateMemoryPersona(roleId: string): Promise<PersonaDef> {
     return this.requireBMemoryService().regeneratePersona(roleId);
+  }
+
+  rateMemoryTask(
+    roleId: string,
+    taskId: string,
+    rating: UserRating,
+    note?: string,
+  ): Promise<UserRatingResult> {
+    return this.requireBMemoryService().rateTask(roleId, taskId, rating, note);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

@@ -4,7 +4,12 @@
  * 所有 Agent 共享一个实例，buffer 数据按 role_id 隔离存储于内存 Map。
  * 无物理文件路径；生产向持久化见 FileBufferRepository。
  */
-import type { BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../schemas';
+import type {
+  AgentContextSnapshot,
+  BufferMeta,
+  BufferSnapshot,
+  UserRating,
+} from '../schemas';
 import type { BufferRepository, SaveBufferResult } from '../ports/buffer-repository';
 
 interface PendingEntry {
@@ -101,6 +106,15 @@ export class InMemoryBufferRepository implements BufferRepository {
     store.bufferMeta.pending_count = Math.max(0, store.bufferMeta.pending_count - 1);
     store.bufferMeta.total_dead_letters += 1;
     entry.snapshot.extraction_status = 'dead_letter';
+  }
+
+  async updateBufferRating(role_id: string, seq: number, rating: UserRating): Promise<void> {
+    const store = this.requireStore(role_id);
+    const entry = store.pending.get(seq);
+    if (!entry) {
+      throw new Error(`Pending buffer not found: seq=${seq}`);
+    }
+    entry.snapshot = { ...entry.snapshot, user_rating: rating };
   }
 
   async listPendingBufferSeqs(role_id: string): Promise<number[]> {

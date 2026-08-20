@@ -14,6 +14,7 @@ import {
   type AgentContextSnapshot,
   type BufferMeta,
   type BufferSnapshot,
+  type UserRating,
 } from '../schemas';
 import type { BufferRepository, SaveBufferResult } from '../ports/buffer-repository';
 
@@ -139,6 +140,20 @@ export class FileBufferRepository implements BufferRepository {
 
   async markBufferDeadLetter(role_id: string, seq: number): Promise<void> {
     await this.markBuffer(role_id, seq, 'dead_letter', 'total_dead_letters');
+  }
+
+  async updateBufferRating(role_id: string, seq: number, rating: UserRating): Promise<void> {
+    const bufferRoot = this.requireBufferRoot(role_id);
+    const reportPath = join(bufferRoot, PENDING_DIR, reportFileName(seq));
+    let rawReport: string;
+    try {
+      rawReport = await readFile(reportPath, 'utf8');
+    } catch {
+      throw new Error(`Pending buffer not found: seq=${seq}`);
+    }
+    const snapshot = BufferSnapshotSchema.parse(JSON.parse(rawReport));
+    snapshot.user_rating = rating;
+    await writeJsonAtomic(reportPath, snapshot);
   }
 
   async listPendingBufferSeqs(role_id: string): Promise<number[]> {

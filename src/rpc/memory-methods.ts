@@ -20,6 +20,8 @@ import type {
   RetirementScanResult,
   SkillView,
   SkillWritePatch,
+  UserRating,
+  UserRatingResult,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
@@ -73,6 +75,13 @@ export interface MemoryMethodsService {
   updateMemoryPersona(roleId: string, patch: PersonaPatch): Promise<PersonaDef>;
   /** 按需重新生成 Persona（memory.regeneratePersona） */
   regenerateMemoryPersona(roleId: string): Promise<PersonaDef>;
+  /** 用户评分（memory.rateTask） */
+  rateMemoryTask(
+    roleId: string,
+    taskId: string,
+    rating: UserRating,
+    note?: string,
+  ): Promise<UserRatingResult>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -218,6 +227,14 @@ const updatePersonaParamsSchema = z
       value.notes !== undefined,
     { message: 'At least one persona field is required' },
   );
+const rateTaskParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    task_id: z.string().trim().min(1),
+    rating: z.enum(['resolved', 'partially_resolved', 'unresolved', 'not_rated']),
+    note: z.string().trim().min(1).optional(),
+  })
+  .strict();
 
 export class MemoryRpcMethods {
   constructor(private readonly service: MemoryMethodsService) {}
@@ -405,6 +422,16 @@ export class MemoryRpcMethods {
       const parsed = parseParams(roleParamsSchema, params);
       const persona = await this.service.regenerateMemoryPersona(parsed.role_id);
       return { persona };
+    });
+    dispatcher.register('memory.rateTask', async (params) => {
+      const parsed = parseParams(rateTaskParamsSchema, params);
+      const result = await this.service.rateMemoryTask(
+        parsed.role_id,
+        parsed.task_id,
+        parsed.rating,
+        parsed.note,
+      );
+      return { rating: result };
     });
   }
 }

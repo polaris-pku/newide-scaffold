@@ -170,6 +170,12 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":35,"method":"memory.regeneratePersona","params":{"role_id":""}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":36,"method":"memory.rateTask","params":{"role_id":"role_ts_engineer","task_id":"task_001","rating":"resolved","note":"great"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":37,"method":"memory.rateTask","params":{"role_id":"role_ts_engineer","task_id":"task_001","rating":"bogus"}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -186,6 +192,7 @@ describe('MemoryRpcMethods', () => {
                 status: 'available',
               },
               regenerate_persona: { status: 'available' },
+              rate_task: { status: 'available' },
               create_agent: { status: 'available' },
               update_agent: { status: 'available' },
               delete_agent: { status: 'available' },
@@ -237,6 +244,8 @@ describe('MemoryRpcMethods', () => {
       { id: 33, error: { code: -32602, message: 'Invalid params' } },
       { id: 34, result: { persona: { version: 2 } } },
       { id: 35, error: { code: -32602, message: 'Invalid params' } },
+      { id: 36, result: { rating: { updated_experiences: 1, buffer_updated: false } } },
+      { id: 37, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -286,6 +295,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         reject_skill: { status: 'available' },
         update_persona: { status: 'available' },
         regenerate_persona: { status: 'available' },
+        rate_task: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
         retire_agent: { status: 'available' },
@@ -399,6 +409,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
       notes: '',
       generated_at: '2026-07-21T00:00:00.000Z',
     }),
+    rateMemoryTask: async () => ({ updated_experiences: 1, buffer_updated: false }),
     ...overrides,
   };
 }
