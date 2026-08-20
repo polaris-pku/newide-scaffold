@@ -37,6 +37,8 @@ import {
   updateExperience,
   updateSkill,
   type PersonaInducer,
+  computeMemoryOverview,
+  type MemoryOverview,
 } from '../memory';
 import type {
   AgentContextSnapshot,
@@ -91,6 +93,9 @@ export interface BMemoryCapabilities {
     publish_skill: BMemoryOperationCapability;
     update_experience: BMemoryOperationCapability;
     delete_experience: BMemoryOperationCapability;
+    get_overview: BMemoryOperationCapability;
+    list_pending_reviews: BMemoryOperationCapability;
+    list_experiences_by_source_task: BMemoryOperationCapability;
   };
 }
 
@@ -275,6 +280,24 @@ export class BMemoryBackendService {
                 reason:
                   'B runtime has no MemoryRepository or semantic embedding provider configured.',
               }),
+        },
+        get_overview: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        list_pending_reviews: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        list_experiences_by_source_task: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
       },
     };
@@ -535,6 +558,43 @@ export class BMemoryBackendService {
         : repository.searchExperiences(roleId, searchOptions),
     ]);
     return { skills: skills.map(toSkillView), experiences: experiences.map(toExperienceView) };
+  }
+
+  /** 全局记忆总览（memory.getOverview）：跨 Agent 聚合规模与健康信号。 */
+  getOverview(): Promise<MemoryOverview> {
+    const repository = this.requireRepository('Memory overview');
+    return computeMemoryOverview(repository, this.capabilities.bufferRepository);
+  }
+
+  /**
+   * 跨 Agent 待审核技能队列（memory.listPendingReviews）。
+   * 汇总所有 Agent 名下 review_status='pending' 的技能，按提交时间升序。
+   */
+  async listPendingReviews(): Promise<SkillView[]> {
+    this.requireRepository('Pending reviews');
+    const agentIds = await this.capabilities.boardQuery.listAgents();
+    const batches = await Promise.all(
+      agentIds.map((agent) =>
+        this.capabilities.boardQuery.listSkills(agent.role_id, { review_status: 'pending' }),
+      ),
+    );
+    return batches.flat().sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
+  /**
+   * 按任务溯源经验（memory.listExperiencesBySourceTask）。
+   * 跨所有 Agent 查找 source_task_id === taskId 的经验，返回对外视图。
+   */
+  async listExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]> {
+    const repository = this.requireRepository('Experience source lookup');
+    const agentIds = await repository.listAgentIds();
+    const batches = await Promise.all(
+      agentIds.map(async (roleId) => {
+        const experiences = await repository.listExperiences(roleId);
+        return experiences.filter((item) => item.source_task_id === taskId);
+      }),
+    );
+    return batches.flat().map(toExperienceView);
   }
 
   /** 构造 Persona 归纳器：有 LLM 注入则 LLM 归纳（自动降级规则版），否则纯规则版 */

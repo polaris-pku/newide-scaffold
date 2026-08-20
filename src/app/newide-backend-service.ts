@@ -88,6 +88,7 @@ import type {
   SkillWritePatch,
   UserRating,
   UserRatingResult,
+  MemoryOverview,
 } from '../memory';
 import type { SkillRecord, BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
@@ -463,6 +464,18 @@ export class NewideBackendService {
     } = {},
   ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }> {
     return this.requireBMemoryService().searchMemory(roleId, query, options);
+  }
+
+  getMemoryOverview(): Promise<MemoryOverview> {
+    return this.requireBMemoryService().getOverview();
+  }
+
+  listMemoryPendingReviews(): Promise<SkillView[]> {
+    return this.requireBMemoryService().listPendingReviews();
+  }
+
+  listMemoryExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]> {
+    return this.requireBMemoryService().listExperiencesBySourceTask(taskId);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

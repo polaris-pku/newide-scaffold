@@ -24,6 +24,7 @@ import type {
   SkillWritePatch,
   UserRating,
   UserRatingResult,
+  MemoryOverview,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
 import type { AgentContextSnapshot, BufferMeta, BufferSnapshot } from '../memory/schemas';
@@ -109,6 +110,12 @@ export interface MemoryMethodsService {
       include_experiences?: boolean;
     },
   ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }>;
+  /** 全局记忆总览（memory.getOverview） */
+  getMemoryOverview(): Promise<MemoryOverview>;
+  /** 跨 Agent 待审核技能队列（memory.listPendingReviews） */
+  listMemoryPendingReviews(): Promise<SkillView[]>;
+  /** 按任务溯源经验（memory.listExperiencesBySourceTask） */
+  listMemoryExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -306,6 +313,11 @@ const bufferSeqParamsSchema = z
     seq: z.number().int().positive(),
   })
   .strict();
+const taskIdParamsSchema = z
+  .object({
+    task_id: z.string().trim().min(1),
+  })
+  .strict();
 
 export class MemoryRpcMethods {
   constructor(private readonly service: MemoryMethodsService) {}
@@ -361,6 +373,21 @@ export class MemoryRpcMethods {
           : {}),
       });
       return { skills: result.skills, experiences: result.experiences };
+    });
+    dispatcher.register('memory.getOverview', async (params) => {
+      parseParams(emptyParamsSchema, params ?? {});
+      const overview = await this.service.getMemoryOverview();
+      return { overview };
+    });
+    dispatcher.register('memory.listPendingReviews', async (params) => {
+      parseParams(emptyParamsSchema, params ?? {});
+      const skills = await this.service.listMemoryPendingReviews();
+      return { skills };
+    });
+    dispatcher.register('memory.listExperiencesBySourceTask', async (params) => {
+      const parsed = parseParams(taskIdParamsSchema, params);
+      const experiences = await this.service.listMemoryExperiencesBySourceTask(parsed.task_id);
+      return { experiences };
     });
     dispatcher.register('memory.listMaintenance', (params) => {
       const parsed = parseParams(optionalRoleParamsSchema, params ?? {});

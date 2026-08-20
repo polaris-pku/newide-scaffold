@@ -109,6 +109,9 @@ describe('memory.* full API integration (M7)', () => {
         rate_task: { status: 'available' },
         get_buffer_state: { status: 'available' },
         search_memory: { status: 'available' },
+        get_overview: { status: 'available' },
+        list_pending_reviews: { status: 'available' },
+        list_experiences_by_source_task: { status: 'available' },
       },
     });
 
@@ -141,6 +144,11 @@ describe('memory.* full API integration (M7)', () => {
     const skillId = (skill.result!.skill as { id: string }).id;
     expect(skill.result!.skill).toMatchObject({ review_status: 'pending' });
 
+    // 4a. 待审核队列：createSkill 后应包含该 pending 技能
+    const pendingReviews = await call(100, 'memory.listPendingReviews', {});
+    expect(pendingReviews.result!.skills).toHaveLength(1);
+    expect(pendingReviews.result!.skills[0]).toMatchObject({ id: skillId });
+
     const published = await call(6, 'memory.publishSkillToMarket', {
       role_id: ROLE,
       skill_id: skillId,
@@ -159,6 +167,10 @@ describe('memory.* full API integration (M7)', () => {
       skill_id: skillId,
       reviewed_by: 'integration',
     });
+    // 4b. 审核后待审核队列应清空
+    const noPending = await call(101, 'memory.listPendingReviews', {});
+    expect(noPending.result!.skills).toHaveLength(0);
+
     const imported = await call(9, 'memory.marketImport', {
       role_id: BUYER,
       source_skill_id: skillId,
@@ -226,6 +238,24 @@ describe('memory.* full API integration (M7)', () => {
     });
     expect(search.result!.skills).toHaveLength(1);
     expect(search.result!.experiences).toHaveLength(1);
+
+    // 10b. 按任务溯源：该任务产出的经验应能被反查
+    const byTask = await call(102, 'memory.listExperiencesBySourceTask', { task_id: TASK });
+    expect(byTask.result!.experiences).toHaveLength(1);
+    expect(byTask.result!.experiences[0]).toMatchObject({ source_task_id: TASK });
+
+    // 10c. 全局总览：聚合 Agent / 技能 / 经验 / buffer / 置信度
+    const overview = await call(103, 'memory.getOverview', {});
+    expect(overview.result!.overview).toMatchObject({
+      agents: { total: 2 },
+      // ROLE 上架 1 个 available 技能 + BUYER 引入副本（继承 available）
+      skills: { total: 2, pending_review: 0, in_market: 2 },
+      experiences: { total: 1 },
+      buffer: { dead_letters: 0 },
+    });
+    expect(
+      (overview.result!.overview as { quality: { avg_confidence: number } }).quality.avg_confidence,
+    ).toBe(0.9);
 
     // 11. 未退休 Agent 删除安全边界：无 force 拒绝，force 二次确认后允许
     const rejected = await call(19, 'memory.deleteAgent', {

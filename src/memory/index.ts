@@ -123,6 +123,10 @@ export {
   type RateTaskInput,
   type UserRatingResult,
 } from './services/feedback';
+export {
+  computeMemoryOverview,
+  type MemoryOverview,
+} from './services/memory-overview';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,

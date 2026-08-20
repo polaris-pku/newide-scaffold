@@ -18,14 +18,16 @@ All milestones implemented, tested, and committed on `feat/memory-api-surface-im
 | M4 | `caabd2c` | Task rating feedback loop |
 | M5 | `589a9b1` | Buffer observability + extraction retry |
 | M6 | `b272bcc` | List filters / pagination / in-agent search |
-| M7 | (this commit) | capabilities v2 + integration verification + docs |
+| M7 | `bb3b68c` | capabilities v2 + integration verification + docs |
+| M8 | (this commit) | Observability read APIs: `getOverview` / `listPendingReviews` / `listExperiencesBySourceTask` |
 
-**Final `memory.*` surface (29 methods):** existing 13 + `createAgent` / `updateAgent` /
+**Final `memory.*` surface (32 methods):** existing 13 + `createAgent` / `updateAgent` /
 `deleteAgent` / `createSkill` / `updateSkill` / `deleteSkill` / `publishSkillToMarket` /
 `updateExperience` / `deleteExperience` / `updatePersona` / `regeneratePersona` /
-`rateTask` / `getBufferState` / `getPendingBuffer` / `retryExtraction` / `searchMemory`,
+`rateTask` / `getBufferState` / `getPendingBuffer` / `retryExtraction` / `searchMemory` /
+`getOverview` / `listPendingReviews` / `listExperiencesBySourceTask`,
 plus filter/pagination params on `listAgents` / `listSkills` / `listExperiences`.
-Capabilities schema bumped to `newide.b-memory-capabilities.v2` with 28 operation flags.
+Capabilities schema bumped to `newide.b-memory-capabilities.v2` with 31 operation flags.
 
 ## 1. Problem
 
@@ -125,6 +127,13 @@ prior artifacts (task execution → extraction → promotion → market), so the
 | `memory.listSkills` / `listExperiences` (extended) | optional `{type?, review_status?, tag?, confidence_min?, confidence_max?, keyword?, offset?, limit?, sort?}` | array | extend `AgentBoardQuery` filters/pagination; `keyword` = text contains; `listAgents` gains `status?` |
 | `memory.searchMemory` | `{role_id, query, top_k?, include_skills?, include_experiences?}` | `{skills, experiences}` | text → embedding → repo `searchSkills/searchExperiences` |
 
+### H. Observability read APIs (M8)
+| RPC | Params | Returns | Notes |
+|---|---|---|---|
+| `memory.getOverview` | `{}` | `MemoryOverview` | cross-agent aggregation: agents (total/by_status), skills (total/pending_review/in_market), experiences total, buffer (pending/dead_letters), quality avg_confidence; new `services/memory-overview.ts` |
+| `memory.listPendingReviews` | `{}` | `SkillView[]` | cross-agent `review_status='pending'` queue, sorted by `created_at`; review workbench |
+| `memory.listExperiencesBySourceTask` | `{task_id}` | `ExperienceView[]` | reverse lookup: all experiences whose `source_task_id` matches |
+
 ## 4. Port / Service Extensions
 
 **`ports/memory-repository.ts`** (+ in-memory + pg implementations):
@@ -170,6 +179,7 @@ consumers become dynamic queries.
 | M5 | Buffer observability/retry | `ports/buffer-repository.ts` + both impls, `b-memory-maintenance-runner.ts` (retry reuse), app 3 layers, `memory-methods.ts` |
 | M6 | List filters/pagination/search | `ports/agent-board-query.ts`, `adapters/agent-board-query.ts`, app 3 layers, `memory-methods.ts` |
 | M7 | capabilities v2 + docs + integration verification | `b-memory-backend-service.ts`, README updates, stdio RPC smoke script |
+| M8 | Observability read APIs (getOverview / listPendingReviews / listExperiencesBySourceTask) | new `services/memory-overview.ts`, `b-memory-backend-service.ts`, app 3 layers, `memory-methods.ts` |
 
 Dependencies: M1 is the base for M2–M7; M4 needs `findExperiencesBySourceTask` (from M2
 or earlier); M3 needs M1's injection channel.

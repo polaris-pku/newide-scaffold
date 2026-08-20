@@ -214,6 +214,18 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":49,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":true,"force":false}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":50,"method":"memory.getOverview","params":{}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":51,"method":"memory.listPendingReviews","params":{}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":52,"method":"memory.listExperiencesBySourceTask","params":{"task_id":"task_001"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":53,"method":"memory.listExperiencesBySourceTask","params":{"task_id":""}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -305,6 +317,21 @@ describe('MemoryRpcMethods', () => {
       { id: 47, error: { code: -32602, message: 'Invalid params' } },
       { id: 48, result: { deleted: true } },
       { id: 49, error: { code: -32602, message: 'Invalid params' } },
+      {
+        id: 50,
+        result: {
+          overview: {
+            agents: { total: 1, by_status: { active: 1 } },
+            skills: { total: 1, pending_review: 0, in_market: 1 },
+            experiences: { total: 1 },
+            buffer: { pending: 0, dead_letters: 0 },
+            quality: { avg_confidence: 0.8 },
+          },
+        },
+      },
+      { id: 51, result: { skills: [{ id: 'skill_pending' }] } },
+      { id: 52, result: { experiences: [{ id: 'experience_1' }] } },
+      { id: 53, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -374,6 +401,9 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         publish_skill: { status: 'available' },
         update_experience: { status: 'available' },
         delete_experience: { status: 'available' },
+        get_overview: { status: 'available' },
+        list_pending_reviews: { status: 'available' },
+        list_experiences_by_source_task: { status: 'available' },
       },
     }),
     listMemoryAgents: async () => [
@@ -486,6 +516,15 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
       skills: [{ id: 'skill_1' } as never],
       experiences: [{ id: 'experience_1' } as never],
     }),
+    getMemoryOverview: async () => ({
+      agents: { total: 1, by_status: { active: 1 } },
+      skills: { total: 1, pending_review: 0, in_market: 1 },
+      experiences: { total: 1 },
+      buffer: { pending: 0, dead_letters: 0 },
+      quality: { avg_confidence: 0.8 },
+    }),
+    listMemoryPendingReviews: async () => [{ id: 'skill_pending' } as never],
+    listMemoryExperiencesBySourceTask: async () => [{ id: 'experience_1' } as never],
     ...overrides,
   };
 }
