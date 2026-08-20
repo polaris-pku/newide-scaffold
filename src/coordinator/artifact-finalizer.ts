@@ -160,6 +160,7 @@ export class ArtifactSelector {
         question: input.question ?? 'Select the best driver output artifact for v0 integration.',
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
+        ...(input.proposal_agent_id ? { primary_agent_id: input.proposal_agent_id } : {}),
         candidate_artifacts: [...input.driver_result.artifacts],
         proposals: [proposal],
         evidence_pack: input.evidence_pack,

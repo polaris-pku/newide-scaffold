@@ -36,6 +36,12 @@ NEWIDE_B_EMBEDDING_DIMENSIONS=32
 并用 `NEWIDE_COUNCIL_SEATS` 固定 4 个席位；关闭竞标用
 `NEWIDE_AUCTION_ENABLED=0` + `NEWIDE_PRIMARY_AGENT_ID`。详见 `.env.example`。
 
+如需让 Council 成员由真实 Agent Market 竞标选择，可设置
+`NEWIDE_COUNCIL_AUCTION_ENABLED=1`。首次 `select_agent` 的赢家固定为 proposer 0，
+其余 proposer、reviewer 和 synthesizer 席位各进行一次独立竞标；可用
+`NEWIDE_COUNCIL_PROPOSERS` 调整 proposer 数量（默认 2）。未开启时保持原固定席位逻辑；
+显式设置 `NEWIDE_COUNCIL_SEATS` 时固定映射优先。
+
 在 ACP Client 仓库的 `.env` 中配置对应 agent 的凭据。例如 `ACP_AGENT_ID=claude` 时：
 
 ```dotenv

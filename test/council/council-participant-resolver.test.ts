@@ -65,6 +65,64 @@ describe('AgentBoardCouncilParticipantResolver', () => {
     ).rejects.toThrow('No eligible persisted Agent');
   });
 
+  it('selects the primary and remaining seats through independent auctions when enabled', async () => {
+    const calls: Array<{
+      seat: string;
+      seat_index: number;
+      candidate_agent_ids: string[];
+      excluded_agent_ids: string[];
+    }> = [];
+    const winners = ['role_ts_engineer', 'role_reviewer', 'role_synthesizer'];
+    const resolver = new AgentBoardCouncilParticipantResolver({
+      boardQuery: boardQuery([
+        agent('role_primary', ['market_eligible']),
+        agent('role_ts_engineer', ['market_eligible']),
+        agent('role_reviewer', ['market_eligible']),
+        agent('role_synthesizer', ['market_eligible']),
+      ]),
+      allowedAgentIds: [
+        'role_primary',
+        'role_ts_engineer',
+        'role_reviewer',
+        'role_synthesizer',
+      ],
+      auctionEnabled: true,
+      auctionSelector: async (input) => {
+        calls.push({
+          seat: input.seat,
+          seat_index: input.seat_index,
+          candidate_agent_ids: input.candidate_agent_ids,
+          excluded_agent_ids: input.excluded_agent_ids,
+        });
+        return {
+          agent_id: winners[calls.length - 1]!,
+          selection_refs: [`audit_${calls.length}`],
+        };
+      },
+    });
+
+    const participants = await resolver.resolve({
+      run_id: 'run_auction',
+      task_id: 'task_auction',
+      question: 'Choose an implementation.',
+      primary_agent_id: 'role_primary',
+    });
+
+    expect(
+      participants.map(({ seat, seat_index, agent_id }) => ({ seat, seat_index, agent_id })),
+    ).toEqual([
+      { seat: 'proposer', seat_index: 0, agent_id: 'role_primary' },
+      { seat: 'proposer', seat_index: 1, agent_id: 'role_ts_engineer' },
+      { seat: 'reviewer', seat_index: 0, agent_id: 'role_reviewer' },
+      { seat: 'synthesizer', seat_index: 0, agent_id: 'role_synthesizer' },
+    ]);
+    expect(calls).toHaveLength(3);
+    expect(calls.map((call) => call.seat)).toEqual(['proposer', 'reviewer', 'synthesizer']);
+    expect(calls[0]?.excluded_agent_ids).toEqual(['role_primary']);
+    expect(calls[1]?.excluded_agent_ids).toEqual(['role_primary', 'role_ts_engineer']);
+    expect(participants[1]?.selection_refs).toEqual(['audit_1']);
+  });
+
   it('binds Council seats to fixed role_ids when seatAssignments is configured', async () => {
     const resolver = new AgentBoardCouncilParticipantResolver({
       boardQuery: boardQuery([
