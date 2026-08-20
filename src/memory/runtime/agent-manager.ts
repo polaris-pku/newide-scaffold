@@ -169,6 +169,29 @@ export class AgentManager {
   }
 
   /**
+   * 删除 Agent（硬删除，级联清理全部持久化记忆与 buffer 存储）。
+   *
+   * 安全前置条件：Agent 必须已 retired（skills 已在退休时迁移市场池），
+   * 名下保留的 experiences 随删除级联清理。活跃 / draining Agent 须先
+   * retireAgent。市场池 Agent 禁止删除。
+   */
+  async deleteAgent(role_id: string): Promise<void> {
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot delete market pool agent: ${role_id}`);
+    }
+    const handle = await this.repository.getAgent(role_id).catch(() => null);
+    if (!handle) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+    if (handle.status !== 'retired') {
+      throw new Error(`Agent must be retired before deletion: ${role_id}`);
+    }
+    await this.repository.deleteAgent(role_id);
+    await this.bufferRepository.deleteAgent(role_id);
+    this.agents.delete(role_id);
+  }
+
+  /**
    * 为指定 role_id 装配运行时 Agent 实例：
    * 确保 buffer 目录存在、创建 AgentMemoryScope、自动注入 QueryMemoryTool。
    */

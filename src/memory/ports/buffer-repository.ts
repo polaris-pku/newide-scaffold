@@ -20,6 +20,14 @@ export interface BufferRepository {
   /** 确保 Agent 的 buffer 存储已初始化（不存在则创建空状态） */
   ensureAgent(role_id: string): Promise<void>;
 
+  /**
+   * 删除 Agent 的 buffer 存储（pending / processed / dead_letter 与 meta）。
+   *
+   * 与 MemoryRepository.deleteAgent 配对使用；Agent 不存在时静默成功
+   * （未初始化过 buffer 的 Agent 删除不报错）。
+   */
+  deleteAgent(role_id: string): Promise<void>;
+
   /** 保存缓冲区快照（配对可选 AgentContextSnapshot） */
   saveBufferSnapshot(
     role_id: string,

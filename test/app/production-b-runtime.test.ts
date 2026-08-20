@@ -29,11 +29,12 @@ describe('createProductionBRuntime', () => {
     });
 
     expect(runtime.app_state_root).toBe(appStateRoot);
+    // market_agent_ids 现在是 DB 快照（按 role_id 排序），而非硬编码种子声明顺序
     expect(runtime.market_agent_ids).toEqual([
-      'role_fullstack_engineer',
-      'role_ts_engineer',
       'role_code_reviewer',
+      'role_fullstack_engineer',
       'role_synthesis_engineer',
+      'role_ts_engineer',
     ]);
     expect(new Set(await runtime.repository.listAgentIds())).toEqual(
       new Set([
@@ -66,10 +67,10 @@ describe('createProductionBRuntime', () => {
     );
 
     expect(runtime.market_agent_ids).toEqual([
-      'role_fullstack_engineer',
-      'role_ts_engineer',
       'role_code_reviewer',
+      'role_fullstack_engineer',
       'role_synthesis_engineer',
+      'role_ts_engineer',
     ]);
     expect(new Set(await runtime.repository.listAgentIds())).toEqual(
       new Set([

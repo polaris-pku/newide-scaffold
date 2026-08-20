@@ -1,6 +1,8 @@
 import {
   type AgentBoardAgentView,
   type AgentBoardListItem,
+  type AgentHandle,
+  type CreateAgentSpec,
   type EmbeddingProvider,
   type ExperienceView,
   type MarketImportResult,
@@ -44,17 +46,32 @@ export interface BMemoryCapabilities {
     market_import: BMemoryOperationCapability;
     retire_agent: BMemoryOperationCapability;
     retirement_scan: BMemoryOperationCapability;
+    create_agent: BMemoryOperationCapability;
+    update_agent: BMemoryOperationCapability;
+    delete_agent: BMemoryOperationCapability;
   };
 }
 
+/** Agent 元数据更新补丁（与 MemoryRepository.updateAgentMeta 对齐） */
+export interface AgentMetaPatch {
+  name?: string;
+  tags?: string[];
+}
+
 /**
- * Agent 退休生命周期端口。生产实现由 DriverRuntimeAgentExecutionFacade
- * 提供（→ AgentManager.retireAgent）；测试可注入真 AgentManager。
+ * Agent 生命周期端口。生产实现由 DriverRuntimeAgentExecutionFacade 提供
+ * （→ AgentManager）；测试可注入真 AgentManager。
  */
 export interface BMemoryLifecycle {
   retireAgent(roleId: string, options: RetireOptions): Promise<RetireResult>;
   /** 三重门控退休检测（week3 RFC §8.2）：只产出建议，不自动退休。 */
   runRetirementScan(roleId?: string): Promise<RetirementScanResult[]>;
+  /** 显式创建 Agent（memory.createAgent）。 */
+  createAgent(spec: CreateAgentSpec): Promise<AgentHandle>;
+  /** 更新 Agent 元数据（名称 / 标签）。 */
+  updateAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle>;
+  /** 硬删除 Agent（安全前置：retired，由 AgentManager 强制）。 */
+  deleteAgent(roleId: string): Promise<void>;
 }
 export interface BMemoryBackendServiceOptions {
   autoApprovePromotedSkills?: boolean;
@@ -124,6 +141,20 @@ export class BMemoryBackendService {
           ...(this.lifecycle
             ? {}
             : { reason: 'B runtime does not expose retirement scanning.' }),
+        },
+        create_agent: {
+          status: this.lifecycle ? 'available' : 'unavailable',
+          ...(this.lifecycle ? {} : { reason: 'B runtime does not expose Agent creation.' }),
+        },
+        update_agent: {
+          status: this.lifecycle ? 'available' : 'unavailable',
+          ...(this.lifecycle
+            ? {}
+            : { reason: 'B runtime does not expose Agent metadata updates.' }),
+        },
+        delete_agent: {
+          status: this.lifecycle ? 'available' : 'unavailable',
+          ...(this.lifecycle ? {} : { reason: 'B runtime does not expose Agent deletion.' }),
         },
       },
     };
@@ -201,6 +232,30 @@ export class BMemoryBackendService {
       throw new Error('Retirement scanning is not available in this B runtime');
     }
     return this.lifecycle.runRetirementScan(roleId);
+  }
+
+  /** 显式创建 Agent（memory.createAgent），委托给注入的 lifecycle。 */
+  createAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
+    if (!this.lifecycle) {
+      throw new Error('Agent creation is not available in this B runtime');
+    }
+    return this.lifecycle.createAgent(spec);
+  }
+
+  /** 更新 Agent 元数据（名称 / 标签），委托给注入的 lifecycle。 */
+  updateAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle> {
+    if (!this.lifecycle) {
+      throw new Error('Agent metadata updates are not available in this B runtime');
+    }
+    return this.lifecycle.updateAgent(roleId, patch);
+  }
+
+  /** 硬删除 Agent（memory.deleteAgent），委托给注入的 lifecycle。 */
+  deleteAgent(roleId: string): Promise<void> {
+    if (!this.lifecycle) {
+      throw new Error('Agent deletion is not available in this B runtime');
+    }
+    return this.lifecycle.deleteAgent(roleId);
   }
   approveSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
     return this.capabilities.reviewSkill({

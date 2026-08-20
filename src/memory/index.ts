@@ -322,6 +322,7 @@ export type {
 
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
 export type { AgentToolConfig } from './runtime/agent';
+export type { AgentHandle, CreateAgentSpec } from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  22. Tool-calling 类型

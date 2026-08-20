@@ -70,6 +70,8 @@ import type { DriverStreamEvent } from '../driver/contract';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
+  AgentHandle,
+  CreateAgentSpec,
   ExperienceView,
   MarketImportResult,
   MarketSearchQuery,
@@ -80,7 +82,7 @@ import type {
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
-import type { BMemoryBackendService } from './b-memory-backend-service';
+import type { AgentMetaPatch, BMemoryBackendService } from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
 import {
   NoopDriverStreamAuditWriter,
@@ -352,6 +354,18 @@ export class NewideBackendService {
 
   runRetirementScan(roleId?: string): Promise<RetirementScanResult[]> {
     return this.requireBMemoryService().runRetirementScan(roleId);
+  }
+
+  createMemoryAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
+    return this.requireBMemoryService().createAgent(spec);
+  }
+
+  updateMemoryAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle> {
+    return this.requireBMemoryService().updateAgent(roleId, patch);
+  }
+
+  deleteMemoryAgent(roleId: string): Promise<void> {
+    return this.requireBMemoryService().deleteAgent(roleId);
   }
 
   approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {

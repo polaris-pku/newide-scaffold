@@ -5,7 +5,7 @@
  * `{agentStateRoot}/{role_id}/buffer/` 下的 pending / processed / dead_letter。
  * 仅负责存储与状态迁移，不做经验提取；处理由 processPendingBuffer 等上层服务完成。
  */
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   AgentContextSnapshotSchema,
@@ -75,6 +75,12 @@ export class FileBufferRepository implements BufferRepository {
     } catch {
       await writeJsonAtomic(metaPath, createEmptyBufferMeta(role_id));
     }
+  }
+
+  async deleteAgent(role_id: string): Promise<void> {
+    assertSafeRoleId(role_id);
+    // 整个 Agent 状态目录（含 buffer 子目录）一并移除；不存在时静默成功
+    await rm(join(this.agentStateRoot, role_id), { recursive: true, force: true });
   }
 
   async saveBufferSnapshot(

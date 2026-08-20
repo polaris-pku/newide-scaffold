@@ -56,7 +56,8 @@ export interface ProductionStageExecutorDependencies {
   agentExecutionFacade: AgentExecutionFacade;
   councilProvider: CouncilProvider;
   gateExecutor: IntegrationV0GateExecutor;
-  bootstrapAgentIds: readonly string[];
+  /** 默认候选 Agent：静态数组或动态提供者（每次选择时查询，支持运行时新增 Agent） */
+  bootstrapAgentIds: readonly string[] | (() => Promise<readonly string[]>);
   runsRoot: string;
   councilRoot: string;
   worktreesRoot: string;
@@ -137,13 +138,17 @@ export function createProductionStageExecutors(
         );
       }
       // 关闭竞标时把候选固定为 primary（单候选短路，MarketAuctionEngine 直接返回它）。
+      const bootstrapAgentIds =
+        typeof dependencies.bootstrapAgentIds === 'function'
+          ? await dependencies.bootstrapAgentIds()
+          : dependencies.bootstrapAgentIds;
       const candidateIds = auctionDisabled
         ? [dependencies.primaryAgentId!]
         : context.cursor_input.candidate_ids.length > 0
           ? context.cursor_input.candidate_ids
           : context.task_request.role_id
             ? [context.task_request.role_id]
-            : [...dependencies.bootstrapAgentIds];
+            : [...bootstrapAgentIds];
       const result = await dependencies.selectAgentHandler.execute({
         task_id: context.task_id,
         task_description: context.task_request.spec,

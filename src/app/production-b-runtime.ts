@@ -101,7 +101,9 @@ export async function createProductionBRuntime(
       bufferRepository,
       ...(storage.embedding ? { embedding: storage.embedding } : {}),
       app_state_root: appStateRoot,
-      market_agent_ids: MARKET_AGENT_CATALOG.map((agent) => agent.role_id),
+      // 目录以 DB 当前注册的 Agent 为准（含历史运行创建的 Agent），而非硬编码种子；
+      // 排序保证确定性（InMemory 仓库不排序，Pg 仓库按 role_id 排序）
+      market_agent_ids: [...(await storage.repository.listAgentIds())].sort(compareCodeUnits),
       embedding_info: storage.embedding_info ?? {
         provider: 'host-managed repository',
         readiness: 'host_managed',

@@ -115,6 +115,44 @@ export class PgMemoryRepository implements MemoryRepository {
     return result.rows.map((row) => row.role_id);
   }
 
+  async updateAgentMeta(
+    role_id: string,
+    patch: { name?: string; tags?: string[] },
+  ): Promise<void> {
+    await this.ensureSchema();
+    const handle = await this.getAgent(role_id);
+    const nextHandle: AgentHandle = {
+      ...handle,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+    };
+    AgentHandleSchema.parse(nextHandle);
+
+    const result = await this.pool.query(
+      `UPDATE memory_agents
+       SET handle = $2::jsonb
+       WHERE role_id = $1`,
+      [role_id, JSON.stringify(nextHandle)],
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
+  async deleteAgent(role_id: string): Promise<void> {
+    await this.ensureSchema();
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot delete market pool agent: ${role_id}`);
+    }
+    // memory_skills / memory_experiences 的 FK 均带 ON DELETE CASCADE，级联清理
+    const result = await this.pool.query('DELETE FROM memory_agents WHERE role_id = $1', [
+      role_id,
+    ]);
+    if (result.rowCount === 0) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
   async getAgent(role_id: string): Promise<AgentHandle> {
     await this.ensureSchema();
     const row = await this.requireAgentRow(role_id);

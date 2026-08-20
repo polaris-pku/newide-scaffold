@@ -25,9 +25,11 @@ import {
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
   type AgentTaskRequest,
+  type AgentHandle,
   type BufferRepository,
   type CollectCompetitionClaimsOptions,
   type CompetitionClaimBatch,
+  type CreateAgentSpec,
   type DispatchTaskResult,
   type DriverContext,
   type DriverTask,
@@ -89,7 +91,8 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   memoryMaintenance?: BMemoryMaintenancePort;
   mailbox?: {
     service: PersistentMailboxService;
-    allowedRoleIds: readonly string[];
+    /** 协作名册：静态数组或动态提供者（每次使用时查询，支持运行时新增 Agent） */
+    allowedRoleIds: readonly string[] | (() => Promise<readonly string[]>);
     defaultDeadlineSeconds?: number;
     sessionRegistry?: ParticipantSessionRegistry;
   };
@@ -246,6 +249,36 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   async retireAgent(roleId: string, options: RetireOptions = {}): Promise<RetireResult> {
     const manager = await (this.roleReady.get(roleId) ?? this.manager);
     return manager.retireAgent(roleId, options);
+  }
+
+  /**
+   * 显式创建 Agent（memory.createAgent）：走基座 AgentManager.createAgent，
+   * 保证内存 map、buffer 初始化与 QueryMemoryTool 注入与 DB 一致。
+   */
+  async createAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
+    const manager = await this.manager;
+    return manager.createAgent(spec);
+  }
+
+  /**
+   * 更新 Agent 元数据（名称 / 标签）：委托 repository.updateAgentMeta。
+   * Agent 运行时实例通过 scope 读 repository，无需重建。
+   */
+  async updateAgent(
+    roleId: string,
+    patch: { name?: string; tags?: string[] },
+  ): Promise<AgentHandle> {
+    await this.options.repository.updateAgentMeta(roleId, patch);
+    return this.options.repository.getAgent(roleId);
+  }
+
+  /**
+   * 硬删除 Agent（memory.deleteAgent）：委托基座 AgentManager.deleteAgent。
+   * 安全前置（retired）与确认参数由 AgentManager / RPC 层保证。
+   */
+  async deleteAgent(roleId: string): Promise<void> {
+    const manager = await this.manager;
+    await manager.deleteAgent(roleId);
   }
 
   /**
@@ -557,6 +590,18 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     return envelope;
   }
 
+  /** 解析 mailbox 协作名册：支持静态数组与动态提供者（每次使用时查询） */
+  private async resolveAllowedRoleIds(): Promise<readonly string[]> {
+    const allowed = this.options.mailbox?.allowedRoleIds;
+    if (!allowed) return [];
+    return typeof allowed === 'function' ? allowed() : allowed;
+  }
+
+  private async isAllowedMailboxRecipient(roleId: string): Promise<boolean> {
+    const allowed = await this.resolveAllowedRoleIds();
+    return allowed.includes(roleId);
+  }
+
   private async sendMailbox(input: MailboxSendToolInput): Promise<MailboxToolOutcome> {
     const mailbox = this.options.mailbox;
     const invocation = this.invocationContext.getStore();
@@ -571,7 +616,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (!invocation.workspace_path) {
       throw new Error('mailbox.send requires a workspace-bound Agent invocation');
     }
-    if (!mailbox.allowedRoleIds.includes(input.to_role_id)) {
+    if (!await this.isAllowedMailboxRecipient(input.to_role_id)) {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
     const waitForReply = expectsMailboxReply(kind);
@@ -708,7 +753,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private async buildCollaborationBrief(invocation: InvocationContext): Promise<string> {
     const mailbox = this.options.mailbox;
     if (!mailbox) return '';
-    const allowed = new Set(mailbox.allowedRoleIds);
+    const allowed = new Set(await this.resolveAllowedRoleIds());
     const roleIds = (await this.options.repository.listAgentIds()).filter((roleId) =>
       allowed.has(roleId),
     );

@@ -34,6 +34,11 @@ export class InMemoryBufferRepository implements BufferRepository {
     this.getOrCreateStore(role_id);
   }
 
+  async deleteAgent(role_id: string): Promise<void> {
+    // 未初始化过 buffer 的 Agent 静默成功
+    this.stores.delete(role_id);
+  }
+
   async saveBufferSnapshot(
     role_id: string,
     snapshot: BufferSnapshot,

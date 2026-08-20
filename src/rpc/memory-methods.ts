@@ -1,11 +1,13 @@
 /** memory.* JSON-RPC methods backed by B's public board and application maintenance services. */
 import { z } from 'zod';
 import type { BMemoryMaintenanceEvidence } from '../app/b-memory-maintenance-runner';
-import type { BMemoryCapabilities } from '../app/b-memory-backend-service';
+import type { AgentMetaPatch, BMemoryCapabilities } from '../app/b-memory-backend-service';
 import type { ReviewedSkill } from '../app/b-public-capabilities';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
+  AgentHandle,
+  CreateAgentSpec,
   ExperienceView,
   MarketImportResult,
   MarketSearchQuery,
@@ -36,6 +38,12 @@ export interface MemoryMethodsService {
   runRetirementScan(roleId?: string): Promise<RetirementScanResult[]>;
   approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill>;
   rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill>;
+  /** 显式创建 Agent（memory.createAgent） */
+  createMemoryAgent(spec: CreateAgentSpec): Promise<AgentHandle>;
+  /** 更新 Agent 元数据（名称 / 标签） */
+  updateMemoryAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle>;
+  /** 硬删除 Agent（需 confirm: true，且 Agent 已 retired） */
+  deleteMemoryAgent(roleId: string): Promise<void>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -78,6 +86,31 @@ const reviewParamsSchema = z
     role_id: z.string().trim().min(1),
     skill_id: z.string().trim().min(1),
     reviewed_by: z.string().trim().min(1).default('user'),
+  })
+  .strict();
+const createAgentParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    tags: z.array(z.string().trim().min(1)).optional(),
+    persona_seed: z.string().trim().min(1).optional(),
+    constraints: z.array(z.string().trim().min(1)).optional(),
+  })
+  .strict();
+const updateAgentParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    name: z.string().trim().min(1).optional(),
+    tags: z.array(z.string().trim().min(1)).optional(),
+  })
+  .strict()
+  .refine((value) => value.name !== undefined || value.tags !== undefined, {
+    message: 'At least one of name or tags is required',
+  });
+const deleteAgentParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    confirm: z.literal(true),
   })
   .strict();
 
@@ -166,6 +199,32 @@ export class MemoryRpcMethods {
       return this.service
         .rejectMemorySkill(parsed.role_id, parsed.skill_id, parsed.reviewed_by)
         .then((skill) => ({ skill }));
+    });
+    dispatcher.register('memory.createAgent', async (params) => {
+      const parsed = parseParams(createAgentParamsSchema, params);
+      await this.service.createMemoryAgent({
+        role_id: parsed.role_id,
+        name: parsed.name,
+        ...(parsed.tags !== undefined ? { tags: parsed.tags } : {}),
+        ...(parsed.persona_seed !== undefined ? { persona_seed: parsed.persona_seed } : {}),
+        ...(parsed.constraints !== undefined ? { constraints: parsed.constraints } : {}),
+      });
+      const agent = await this.service.getMemoryAgent(parsed.role_id);
+      return { agent };
+    });
+    dispatcher.register('memory.updateAgent', async (params) => {
+      const parsed = parseParams(updateAgentParamsSchema, params);
+      await this.service.updateMemoryAgent(parsed.role_id, {
+        ...(parsed.name !== undefined ? { name: parsed.name } : {}),
+        ...(parsed.tags !== undefined ? { tags: parsed.tags } : {}),
+      });
+      const agent = await this.service.getMemoryAgent(parsed.role_id);
+      return { agent };
+    });
+    dispatcher.register('memory.deleteAgent', async (params) => {
+      const parsed = parseParams(deleteAgentParamsSchema, params);
+      await this.service.deleteMemoryAgent(parsed.role_id);
+      return { deleted: true };
     });
   }
 }

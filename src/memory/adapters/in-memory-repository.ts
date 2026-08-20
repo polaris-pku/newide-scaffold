@@ -90,6 +90,27 @@ export class InMemoryRepository implements MemoryRepository {
     return [...this.agents.keys()].filter((id) => id !== MARKET_POOL_ROLE_ID);
   }
 
+  async updateAgentMeta(
+    role_id: string,
+    patch: { name?: string; tags?: string[] },
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    store.handle = {
+      ...store.handle,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+    };
+  }
+
+  async deleteAgent(role_id: string): Promise<void> {
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot delete market pool agent: ${role_id}`);
+    }
+    if (!this.agents.delete(role_id)) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
   async getAgent(role_id: string): Promise<AgentHandle> {
     return this.requireStore(role_id).handle;
   }
