@@ -9,15 +9,21 @@ import {
   type EmbeddingProvider,
   type ExperienceView,
   type ExperienceWritePatch,
+  type LlmClient,
+  LlmPersonaInduction,
   type MarketImportResult,
   marketImport,
   type MarketSearchQuery,
   marketSearch,
   type MemoryRepository,
+  mergePersonaPatch,
+  type PersonaPatch,
   publishSkillToMarket,
+  regeneratePersona,
   type RetireOptions,
   type RetireResult,
   type RetirementScanResult,
+  ruleBasedPersonaInduction,
   type SkillView,
   type SkillWritePatch,
   toExperienceView,
@@ -25,8 +31,9 @@ import {
   type CreateSkillInput,
   updateExperience,
   updateSkill,
+  type PersonaInducer,
 } from '../memory';
-import type { SkillRecord } from '../memory/schemas';
+import type { PersonaDef, SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BPublicCapabilities, ReviewedSkill } from './b-public-capabilities';
 import { filterLegacyCouncilPseudoAgents } from './council-legacy-agent-filter';
@@ -53,6 +60,7 @@ export interface BMemoryCapabilities {
     approve_skill: BMemoryOperationCapability;
     reject_skill: BMemoryOperationCapability;
     update_persona: BMemoryOperationCapability;
+    regenerate_persona: BMemoryOperationCapability;
     market_search: BMemoryOperationCapability;
     market_import: BMemoryOperationCapability;
     retire_agent: BMemoryOperationCapability;
@@ -98,15 +106,16 @@ export class BMemoryBackendService {
   constructor(
     private readonly capabilities: Pick<
       BPublicCapabilities,
-      'boardQuery' | 'maintenance' | 'reviewSkill'
+      'boardQuery' | 'maintenance' | 'reviewSkill' | 'bufferRepository'
     >,
     private readonly embeddingInfo: BEmbeddingRuntimeInfo,
     private readonly options: BMemoryBackendServiceOptions = {},
-    // 以下三个为可选注入：不注入时对应能力在 getCapabilities() 里报告 unavailable，
+    // 以下为可选注入：不注入时对应能力在 getCapabilities() 里报告 unavailable，
     // 调用对应方法时抛出明确错误。保持与旧的两参构造签名向后兼容。
     private readonly repository?: MemoryRepository,
     private readonly lifecycle?: BMemoryLifecycle,
     private readonly embedding?: EmbeddingProvider,
+    private readonly llm?: LlmClient,
   ) {}
 
   getCapabilities(): BMemoryCapabilities {
@@ -130,10 +139,6 @@ export class BMemoryBackendService {
         },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
-        update_persona: {
-          status: 'unavailable',
-          reason: 'B does not expose a public Persona update transition.',
-        },
         market_search: {
           status: this.repository && this.embedding ? 'available' : 'unavailable',
           ...(this.repository && this.embedding
@@ -204,6 +209,18 @@ export class BMemoryBackendService {
             : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
         delete_experience: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        update_persona: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        regenerate_persona: {
           status: this.repository ? 'available' : 'unavailable',
           ...(this.repository
             ? {}
@@ -352,6 +369,35 @@ export class BMemoryBackendService {
   async deleteExperience(roleId: string, experienceId: string): Promise<void> {
     const repository = this.requireRepository('Experience deletion');
     await deleteExperience(repository, roleId, experienceId);
+  }
+
+  /** PATCH 更新 Persona（memory.updatePersona）：合并自由文本字段并 version+1。 */
+  async updatePersona(roleId: string, patch: PersonaPatch): Promise<PersonaDef> {
+    const repository = this.requireRepository('Persona updates');
+    return mergePersonaPatch(repository, roleId, patch);
+  }
+
+  /**
+   * 按需重新生成 Persona（memory.regeneratePersona）：基于当前 skills/experiences
+   * 归纳；注入 LLM 时走 LlmPersonaInduction（失败降级规则版），否则直接规则版。
+   */
+  async regeneratePersona(roleId: string): Promise<PersonaDef> {
+    const repository = this.requireRepository('Persona regeneration');
+    return regeneratePersona(
+      repository,
+      this.capabilities.bufferRepository,
+      roleId,
+      this.personaInducer(),
+    );
+  }
+
+  /** 构造 Persona 归纳器：有 LLM 注入则 LLM 归纳（自动降级规则版），否则纯规则版 */
+  private personaInducer(): PersonaInducer {
+    if (this.llm) {
+      const induction = new LlmPersonaInduction(this.llm);
+      return (memory, input) => induction.induce(memory, input);
+    }
+    return (memory, input) => ruleBasedPersonaInduction(memory, input);
   }
 
   approveSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {

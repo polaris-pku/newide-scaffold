@@ -205,14 +205,16 @@ export async function createProductionBackendService(
       dependencies.bRuntime ??
       (await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot }));
     assertValidMarketAgentIds(bRuntime.market_agent_ids);
+    // B 侧文本 LLM：memoryMaintenance 与 BMemoryBackendService（persona 重生成）共享
+    const memoryLlm =
+      dependencies.memoryLlm ??
+      new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env));
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
         repository: bRuntime.repository,
         bufferRepository: bRuntime.bufferRepository,
-        llm:
-          dependencies.memoryLlm ??
-          new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env)),
+        llm: memoryLlm,
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
@@ -308,6 +310,7 @@ export async function createProductionBackendService(
         deleteAgent: (roleId) => agentExecutionFacade.deleteAgent(roleId),
       },
       bRuntime.embedding,
+      memoryLlm,
     );
 
     try {

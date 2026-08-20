@@ -13,6 +13,8 @@ import type {
   ExperienceWritePatch,
   MarketImportResult,
   MarketSearchQuery,
+  PersonaDef,
+  PersonaPatch,
   RetireOptions,
   RetireResult,
   RetirementScanResult,
@@ -67,6 +69,10 @@ export interface MemoryMethodsService {
   ): Promise<ExperienceView>;
   /** 删除 Experience（memory.deleteExperience） */
   deleteMemoryExperience(roleId: string, experienceId: string): Promise<void>;
+  /** PATCH 更新 Persona（memory.updatePersona） */
+  updateMemoryPersona(roleId: string, patch: PersonaPatch): Promise<PersonaDef>;
+  /** 按需重新生成 Persona（memory.regeneratePersona） */
+  regenerateMemoryPersona(roleId: string): Promise<PersonaDef>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -192,6 +198,25 @@ const updateExperienceParamsSchema = z
       value.tags !== undefined ||
       value.confidence !== undefined,
     { message: 'At least one updatable field is required' },
+  );
+const updatePersonaParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    summary: z.string().optional(),
+    skills_overview: z.string().optional(),
+    experience_coverage: z.string().optional(),
+    recent_performance: z.string().optional(),
+    notes: z.string().optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.summary !== undefined ||
+      value.skills_overview !== undefined ||
+      value.experience_coverage !== undefined ||
+      value.recent_performance !== undefined ||
+      value.notes !== undefined,
+    { message: 'At least one persona field is required' },
   );
 
 export class MemoryRpcMethods {
@@ -358,6 +383,28 @@ export class MemoryRpcMethods {
       const parsed = parseParams(experienceRefParamsSchema, params);
       await this.service.deleteMemoryExperience(parsed.role_id, parsed.experience_id);
       return { deleted: true };
+    });
+    dispatcher.register('memory.updatePersona', async (params) => {
+      const parsed = parseParams(updatePersonaParamsSchema, params);
+      const persona = await this.service.updateMemoryPersona(parsed.role_id, {
+        ...(parsed.summary !== undefined ? { summary: parsed.summary } : {}),
+        ...(parsed.skills_overview !== undefined
+          ? { skills_overview: parsed.skills_overview }
+          : {}),
+        ...(parsed.experience_coverage !== undefined
+          ? { experience_coverage: parsed.experience_coverage }
+          : {}),
+        ...(parsed.recent_performance !== undefined
+          ? { recent_performance: parsed.recent_performance }
+          : {}),
+        ...(parsed.notes !== undefined ? { notes: parsed.notes } : {}),
+      });
+      return { persona };
+    });
+    dispatcher.register('memory.regeneratePersona', async (params) => {
+      const parsed = parseParams(roleParamsSchema, params);
+      const persona = await this.service.regenerateMemoryPersona(parsed.role_id);
+      return { persona };
     });
   }
 }

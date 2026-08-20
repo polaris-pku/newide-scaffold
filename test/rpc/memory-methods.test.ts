@@ -158,6 +158,18 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":31,"method":"memory.deleteExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1"}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":32,"method":"memory.updatePersona","params":{"role_id":"role_ts_engineer","summary":"New persona summary"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":33,"method":"memory.updatePersona","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":34,"method":"memory.regeneratePersona","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":35,"method":"memory.regeneratePersona","params":{"role_id":""}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -171,9 +183,9 @@ describe('MemoryRpcMethods', () => {
                 status: 'available',
               },
               update_persona: {
-                status: 'unavailable',
-                reason: expect.any(String),
+                status: 'available',
               },
+              regenerate_persona: { status: 'available' },
               create_agent: { status: 'available' },
               update_agent: { status: 'available' },
               delete_agent: { status: 'available' },
@@ -221,6 +233,10 @@ describe('MemoryRpcMethods', () => {
       { id: 29, result: { experience: { id: 'experience_1' } } },
       { id: 30, error: { code: -32602, message: 'Invalid params' } },
       { id: 31, result: { deleted: true } },
+      { id: 32, result: { persona: { version: 2 } } },
+      { id: 33, error: { code: -32602, message: 'Invalid params' } },
+      { id: 34, result: { persona: { version: 2 } } },
+      { id: 35, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -268,7 +284,8 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         promote_skills: { status: 'available' },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
-        update_persona: { status: 'unavailable', reason: 'not exposed' },
+        update_persona: { status: 'available' },
+        regenerate_persona: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
         retire_agent: { status: 'available' },
@@ -362,6 +379,26 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     publishMemorySkillToMarket: async () => ({ id: 'skill_1' } as never),
     updateMemoryExperience: async () => ({ id: 'experience_1' } as never),
     deleteMemoryExperience: async () => undefined,
+    updateMemoryPersona: async () => ({
+      role_id: 'role_ts_engineer',
+      version: 2,
+      summary: 'New persona summary',
+      skills_overview: '',
+      experience_coverage: '',
+      recent_performance: '',
+      notes: '',
+      generated_at: '2026-07-21T00:00:00.000Z',
+    }),
+    regenerateMemoryPersona: async () => ({
+      role_id: 'role_ts_engineer',
+      version: 2,
+      summary: 'Regenerated',
+      skills_overview: '',
+      experience_coverage: '',
+      recent_performance: '',
+      notes: '',
+      generated_at: '2026-07-21T00:00:00.000Z',
+    }),
     ...overrides,
   };
 }

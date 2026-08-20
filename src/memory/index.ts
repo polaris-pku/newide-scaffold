@@ -112,6 +112,12 @@ export {
   type SkillWritePatch,
   type ExperienceWritePatch,
 } from './services/memory-writer';
+export {
+  mergePersonaPatch,
+  regeneratePersona,
+  type PersonaPatch,
+  type PersonaInducer,
+} from './services/persona-update';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,
@@ -335,7 +341,7 @@ export type {
 
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
 export type { AgentToolConfig } from './runtime/agent';
-export type { AgentHandle, CreateAgentSpec } from './schemas';
+export type { AgentHandle, CreateAgentSpec, PersonaDef } from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  22. Tool-calling 类型

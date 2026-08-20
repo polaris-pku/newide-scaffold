@@ -77,6 +77,8 @@ import type {
   ExperienceWritePatch,
   MarketImportResult,
   MarketSearchQuery,
+  PersonaDef,
+  PersonaPatch,
   RetireOptions,
   RetireResult,
   RetirementScanResult,
@@ -405,6 +407,14 @@ export class NewideBackendService {
 
   deleteMemoryExperience(roleId: string, experienceId: string): Promise<void> {
     return this.requireBMemoryService().deleteExperience(roleId, experienceId);
+  }
+
+  updateMemoryPersona(roleId: string, patch: PersonaPatch): Promise<PersonaDef> {
+    return this.requireBMemoryService().updatePersona(roleId, patch);
+  }
+
+  regenerateMemoryPersona(roleId: string): Promise<PersonaDef> {
+    return this.requireBMemoryService().regeneratePersona(roleId);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {
