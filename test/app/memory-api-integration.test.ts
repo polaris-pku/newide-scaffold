@@ -209,10 +209,13 @@ describe('memory.* full API integration (M7)', () => {
       (personaPatch.result!.persona as { version: number }).version,
     );
 
-    // 9. Buffer：置死信 → 状态总览 → 重试提取 → 查看恢复后的 pending
-    await bufferRepository.markBufferDeadLetter(ROLE, 1);
+    // 9. Buffer：置死信（带失败原因）→ 状态总览（含死信详情）→ 重试提取 → 查看恢复后的 pending
+    await bufferRepository.markBufferDeadLetter(ROLE, 1, 'LLM extraction timeout');
     const state = await call(14, 'memory.getBufferState', { role_id: ROLE });
     expect(state.result!.state).toMatchObject({ dead_letter_seqs: [1] });
+    expect(state.result!.state).toMatchObject({
+      dead_letters: [{ seq: 1, task_id: TASK, reason: 'LLM extraction timeout' }],
+    });
 
     const retried = await call(15, 'memory.retryExtraction', { role_id: ROLE, seq: 1 });
     expect(retried.result!.maintenance).toMatchObject({ status: 'scheduled' });
@@ -238,6 +241,13 @@ describe('memory.* full API integration (M7)', () => {
     });
     expect(search.result!.skills).toHaveLength(1);
     expect(search.result!.experiences).toHaveLength(1);
+    // 召回项应携带相似度分数（解释"为什么召回这条"）
+    expect(
+      (search.result!.skills as Array<{ similarity: number }>)[0]!.similarity,
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      (search.result!.experiences as Array<{ similarity: number }>)[0]!.similarity,
+    ).toBeGreaterThanOrEqual(0);
 
     // 10b. 按任务溯源：该任务产出的经验应能被反查
     const byTask = await call(102, 'memory.listExperiencesBySourceTask', { task_id: TASK });

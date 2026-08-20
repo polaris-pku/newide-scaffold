@@ -303,7 +303,12 @@ describe('MemoryRpcMethods', () => {
       {
         id: 38,
         result: {
-          state: { meta: { pending_count: 0 }, pending_seqs: [], dead_letter_seqs: [2] },
+          state: {
+            meta: { pending_count: 0 },
+            pending_seqs: [],
+            dead_letter_seqs: [2],
+            dead_letters: [{ seq: 2, task_id: 'task_001', reason: 'LLM extraction timeout' }],
+          },
         },
       },
       { id: 39, result: { buffer: { snapshot: { task_id: 'task_001' } } } },
@@ -313,7 +318,13 @@ describe('MemoryRpcMethods', () => {
       { id: 43, error: { code: -32602, message: 'Invalid params' } },
       { id: 44, result: { skills: [{ id: 'skill_1' }] } },
       { id: 45, result: { experiences: [{ id: 'experience_1' }] } },
-      { id: 46, result: { skills: [{ id: 'skill_1' }], experiences: [{ id: 'experience_1' }] } },
+      {
+        id: 46,
+        result: {
+          skills: [{ id: 'skill_1', similarity: 0.82 }],
+          experiences: [{ id: 'experience_1', similarity: 0.71 }],
+        },
+      },
       { id: 47, error: { code: -32602, message: 'Invalid params' } },
       { id: 48, result: { deleted: true } },
       { id: 49, error: { code: -32602, message: 'Invalid params' } },
@@ -509,12 +520,13 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
       meta: { pending_count: 0 },
       pending_seqs: [],
       dead_letter_seqs: [2],
+      dead_letters: [{ seq: 2, task_id: 'task_001', reason: 'LLM extraction timeout' }],
     } as never),
     getMemoryPendingBuffer: async () => ({ snapshot: { task_id: 'task_001' } } as never),
     retryMemoryExtraction: async () => maintenance(),
     searchAgentMemory: async () => ({
-      skills: [{ id: 'skill_1' } as never],
-      experiences: [{ id: 'experience_1' } as never],
+      skills: [{ id: 'skill_1', similarity: 0.82 } as never],
+      experiences: [{ id: 'experience_1', similarity: 0.71 } as never],
     }),
     getMemoryOverview: async () => ({
       agents: { total: 1, by_status: { active: 1 } },

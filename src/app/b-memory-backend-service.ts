@@ -39,12 +39,15 @@ import {
   type PersonaInducer,
   computeMemoryOverview,
   type MemoryOverview,
+  cosineSimilarity,
+  type DeadLetterEntry,
 } from '../memory';
 import type {
   AgentContextSnapshot,
   AgentStatus,
   BufferMeta,
   BufferSnapshot,
+  ExperienceRecord,
   PersonaDef,
   SkillRecord,
 } from '../memory/schemas';
@@ -478,21 +481,26 @@ export class BMemoryBackendService {
     });
   }
 
-  /** Buffer 状态总览（memory.getBufferState）：meta + pending + dead-letter seq 列表。 */
+  /**
+   * Buffer 状态总览（memory.getBufferState）：
+   * meta + pending + dead-letter seq 列表 + 死信详情（含失败原因）。
+   */
   async getBufferState(roleId: string): Promise<{
     meta: BufferMeta;
     pending_seqs: number[];
     dead_letter_seqs: number[];
+    dead_letters: DeadLetterEntry[];
   }> {
     const repository = this.requireRepository('Buffer state');
-    const [meta, pending_seqs, dead_letter_seqs] = await Promise.all([
+    const [meta, pending_seqs, dead_letter_seqs, dead_letters] = await Promise.all([
       this.capabilities.bufferRepository.getBufferMeta(roleId),
       this.capabilities.bufferRepository.listPendingBufferSeqs(roleId),
       this.capabilities.bufferRepository.listDeadLetterSeqs(roleId),
+      this.capabilities.bufferRepository.listDeadLetterEntries(roleId),
     ]);
     // roleId 必须存在（避免对不存在 Agent 的探针）
     await repository.getAgent(roleId);
-    return { meta, pending_seqs, dead_letter_seqs };
+    return { meta, pending_seqs, dead_letter_seqs, dead_letters };
   }
 
   /** 查看一条 pending 缓冲区快照（memory.getPendingBuffer）。 */
@@ -526,7 +534,8 @@ export class BMemoryBackendService {
 
   /**
    * 单 Agent 内文本检索（memory.searchMemory）：query → embedding →
-   * repo.searchSkills / searchExperiences（向量 top-K），返回对外视图。
+   * repo.searchSkills / searchExperiences（向量 top-K），返回对外视图，
+   * 并附每条召回的相似度分数（供前端解释"为什么召回这条"）。
    */
   async searchMemory(
     roleId: string,
@@ -537,7 +546,10 @@ export class BMemoryBackendService {
       include_skills?: boolean;
       include_experiences?: boolean;
     } = {},
-  ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }> {
+  ): Promise<{
+    skills: Array<SkillView & { similarity: number }>;
+    experiences: Array<ExperienceView & { similarity: number }>;
+  }> {
     const repository = this.requireRepository('Memory search');
     if (!this.embedding) {
       throw new Error('Memory search requires a semantic embedding provider');
@@ -557,7 +569,37 @@ export class BMemoryBackendService {
         ? []
         : repository.searchExperiences(roleId, searchOptions),
     ]);
-    return { skills: skills.map(toSkillView), experiences: experiences.map(toExperienceView) };
+    const [scoredSkills, scoredExperiences] = await Promise.all([
+      Promise.all(
+        skills.map(async (skill) => ({
+          ...toSkillView(skill),
+          similarity: await this.computeSimilarity(query_embedding, skill),
+        })),
+      ),
+      Promise.all(
+        experiences.map(async (experience) => ({
+          ...toExperienceView(experience),
+          similarity: await this.computeSimilarity(query_embedding, experience),
+        })),
+      ),
+    ]);
+    return { skills: scoredSkills, experiences: scoredExperiences };
+  }
+
+  /** 计算召回记录与查询向量的余弦相似度（空 embedding 时按描述补算）。 */
+  private async computeSimilarity(
+    queryEmbedding: number[],
+    record: SkillRecord | ExperienceRecord,
+  ): Promise<number> {
+    const embedding = this.embedding;
+    if (!embedding) {
+      throw new Error('Memory search requires a semantic embedding provider');
+    }
+    const recordEmbedding =
+      record.description_embedding.length === embedding.dimensions
+        ? record.description_embedding
+        : await embedding.embed(record.description);
+    return cosineSimilarity(queryEmbedding, recordEmbedding);
   }
 
   /** 全局记忆总览（memory.getOverview）：跨 Agent 聚合规模与健康信号。 */

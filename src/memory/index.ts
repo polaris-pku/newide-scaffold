@@ -48,6 +48,7 @@ export * as schemas from './schemas';
 
 export { InMemoryRepository } from './adapters/in-memory-repository';
 export { InMemoryBufferRepository } from './adapters/in-memory-buffer-repository';
+export { cosineSimilarity } from './utils/vector';
 export {
   PgMemoryRepository,
   type PgMemoryRepositoryOptions,
@@ -325,7 +326,11 @@ export { createMockCompetitionClaimEvaluator } from './adapters/mock-competition
 //  20. Port 接口类型（供外部实现者使用）
 // ════════════════════════════════════════════════════════
 
-export type { BufferRepository, SaveBufferResult } from './ports/buffer-repository';
+export type {
+  BufferRepository,
+  DeadLetterEntry,
+  SaveBufferResult,
+} from './ports/buffer-repository';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';

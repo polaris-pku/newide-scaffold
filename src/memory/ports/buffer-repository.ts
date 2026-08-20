@@ -16,6 +16,17 @@ export interface SaveBufferResult {
   agent_context_snapshot?: AgentContextSnapshot;
 }
 
+/** 死信条目详情（memory.getBufferState 的 dead_letters 数组元素） */
+export interface DeadLetterEntry {
+  seq: number;
+  /** 失败缓冲区的任务 ID */
+  task_id: string;
+  /** 提取失败原因（markBufferDeadLetter 时记录，可为空） */
+  reason?: string;
+  /** 进入死信的时间 */
+  failed_at: string;
+}
+
 export interface BufferRepository {
   /** 确保 Agent 的 buffer 存储已初始化（不存在则创建空状态） */
   ensureAgent(role_id: string): Promise<void>;
@@ -41,8 +52,13 @@ export interface BufferRepository {
   /** 标记缓冲区为已处理（移动到 processed/） */
   markBufferProcessed(role_id: string, seq: number): Promise<void>;
 
-  /** 标记缓冲区为死信（提取失败） */
-  markBufferDeadLetter(role_id: string, seq: number): Promise<void>;
+  /**
+   * 标记缓冲区为死信（提取失败）。
+   *
+   * `reason` 记录提取失败的原因（如错误消息），随死信条目持久化，
+   * 经 listDeadLetterEntries / memory.getBufferState 对外可见。
+   */
+  markBufferDeadLetter(role_id: string, seq: number, reason?: string): Promise<void>;
 
   /**
    * 为仍处于 pending 的缓冲区快照写入用户评分（memory.rateTask）。
@@ -57,6 +73,9 @@ export interface BufferRepository {
 
   /** 列出所有死信缓冲区的 seq 列表（提取失败，可经 restoreDeadLetter 恢复） */
   listDeadLetterSeqs(role_id: string): Promise<number[]>;
+
+  /** 列出死信详情（seq + task_id + 失败原因 + 进入死信时间） */
+  listDeadLetterEntries(role_id: string): Promise<DeadLetterEntry[]>;
 
   /**
    * 将一条死信缓冲区恢复到 pending（memory.retryExtraction）。

@@ -79,6 +79,32 @@ describe.each([
     await expect(repository.restoreDeadLetter(ROLE, 99)).rejects.toThrow(/Dead-letter/);
   });
 
+  it('records and exposes the dead-letter reason via listDeadLetterEntries', async () => {
+    const repository = factory();
+    await repository.ensureAgent(ROLE);
+    await repository.saveBufferSnapshot(ROLE, snapshot(1));
+
+    await repository.markBufferDeadLetter(ROLE, 1, 'LLM extraction timeout');
+    const entries = await repository.listDeadLetterEntries(ROLE);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      seq: 1,
+      task_id: 'task_1',
+      reason: 'LLM extraction timeout',
+    });
+    expect(typeof entries[0]!.failed_at).toBe('string');
+
+    // 未提供 reason 时 reason 字段缺省，但仍能拿到 task_id 与时间
+    await repository.saveBufferSnapshot(ROLE, snapshot(2));
+    await repository.markBufferDeadLetter(ROLE, 2);
+    const entries2 = await repository.listDeadLetterEntries(ROLE);
+    expect(entries2.find((entry) => entry.seq === 2)).not.toHaveProperty('reason');
+    expect(entries2.find((entry) => entry.seq === 2)).toMatchObject({
+      seq: 2,
+      task_id: 'task_2',
+    });
+  });
+
   it('updateBufferRating writes into a pending snapshot and rejects non-pending', async () => {
     const repository = factory();
     await repository.ensureAgent(ROLE);

@@ -19,7 +19,8 @@ All milestones implemented, tested, and committed on `feat/memory-api-surface-im
 | M5 | `589a9b1` | Buffer observability + extraction retry |
 | M6 | `b272bcc` | List filters / pagination / in-agent search |
 | M7 | `bb3b68c` | capabilities v2 + integration verification + docs |
-| M8 | (this commit) | Observability read APIs: `getOverview` / `listPendingReviews` / `listExperiencesBySourceTask` |
+| M8 | `52d0632` | Observability read APIs: `getOverview` / `listPendingReviews` / `listExperiencesBySourceTask` |
+| M9 | (this commit) | Recall transparency + dead-letter observability |
 
 **Final `memory.*` surface (32 methods):** existing 13 + `createAgent` / `updateAgent` /
 `deleteAgent` / `createSkill` / `updateSkill` / `deleteSkill` / `publishSkillToMarket` /
@@ -117,7 +118,7 @@ prior artifacts (task execution → extraction → promotion → market), so the
 ### F. Buffer observability / retry (L3, docs "阶段 6")
 | RPC | Params | Returns | Notes |
 |---|---|---|---|
-| `memory.getBufferState` | `{role_id}` | `{meta, pending_seqs, dead_letter_seqs}` | new buffer `listDeadLetterSeqs` (file: read `dead_letter/` dir; in-memory: set) |
+| `memory.getBufferState` | `{role_id}` | `{meta, pending_seqs, dead_letter_seqs, dead_letters}` | new buffer `listDeadLetterSeqs` (file: read `dead_letter/` dir; in-memory: set); `dead_letters` = `[{seq, task_id, reason?, failed_at}]` via new `listDeadLetterEntries`; reason recorded at `markBufferDeadLetter` |
 | `memory.getPendingBuffer` | `{role_id, seq}` | `{snapshot, agent_context?}` | passthrough `AgentMemoryScope.getPendingBuffer` |
 | `memory.retryExtraction` | `{role_id, seq}` | `BMemoryMaintenanceEvidence` | new buffer `restoreDeadLetter` (dead_letter → pending) + reuse `BMemoryMaintenanceRunner.scheduleBuffer`; idempotent key |
 
@@ -125,7 +126,7 @@ prior artifacts (task execution → extraction → promotion → market), so the
 | RPC | Params | Returns | Notes |
 |---|---|---|---|
 | `memory.listSkills` / `listExperiences` (extended) | optional `{type?, review_status?, tag?, confidence_min?, confidence_max?, keyword?, offset?, limit?, sort?}` | array | extend `AgentBoardQuery` filters/pagination; `keyword` = text contains; `listAgents` gains `status?` |
-| `memory.searchMemory` | `{role_id, query, top_k?, include_skills?, include_experiences?}` | `{skills, experiences}` | text → embedding → repo `searchSkills/searchExperiences` |
+| `memory.searchMemory` | `{role_id, query, top_k?, include_skills?, include_experiences?}` | `{skills, experiences}` | text → embedding → repo `searchSkills/searchExperiences`; 每项附 `similarity` 分数（服务层按 query 向量与 description_embedding 重算，解释"为什么召回这条"） |
 
 ### H. Observability read APIs (M8)
 | RPC | Params | Returns | Notes |
@@ -180,6 +181,7 @@ consumers become dynamic queries.
 | M6 | List filters/pagination/search | `ports/agent-board-query.ts`, `adapters/agent-board-query.ts`, app 3 layers, `memory-methods.ts` |
 | M7 | capabilities v2 + docs + integration verification | `b-memory-backend-service.ts`, README updates, stdio RPC smoke script |
 | M8 | Observability read APIs (getOverview / listPendingReviews / listExperiencesBySourceTask) | new `services/memory-overview.ts`, `b-memory-backend-service.ts`, app 3 layers, `memory-methods.ts` |
+| M9 | Recall transparency + dead-letter observability (searchMemory similarity score; getBufferState `dead_letters` with failure reason) | `ports/buffer-repository.ts` + both impls, `b-memory-backend-service.ts`, app 3 layers, `memory-methods.ts` |
 
 Dependencies: M1 is the base for M2–M7; M4 needs `findExperiencesBySourceTask` (from M2
 or earlier); M3 needs M1's injection channel.

@@ -89,6 +89,7 @@ import type {
   UserRating,
   UserRatingResult,
   MemoryOverview,
+  DeadLetterEntry,
 } from '../memory';
 import type { SkillRecord, BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
@@ -438,6 +439,7 @@ export class NewideBackendService {
     meta: BufferMeta;
     pending_seqs: number[];
     dead_letter_seqs: number[];
+    dead_letters: DeadLetterEntry[];
   }> {
     return this.requireBMemoryService().getBufferState(roleId);
   }
@@ -462,7 +464,10 @@ export class NewideBackendService {
       include_skills?: boolean;
       include_experiences?: boolean;
     } = {},
-  ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }> {
+  ): Promise<{
+    skills: Array<SkillView & { similarity: number }>;
+    experiences: Array<ExperienceView & { similarity: number }>;
+  }> {
     return this.requireBMemoryService().searchMemory(roleId, query, options);
   }
 

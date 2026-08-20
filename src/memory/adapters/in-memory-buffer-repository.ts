@@ -10,11 +10,20 @@ import type {
   BufferSnapshot,
   UserRating,
 } from '../schemas';
-import type { BufferRepository, SaveBufferResult } from '../ports/buffer-repository';
+import type {
+  BufferRepository,
+  DeadLetterEntry,
+  SaveBufferResult,
+} from '../ports/buffer-repository';
+import { nowTimestamp } from '../../core';
 
 interface PendingEntry {
   snapshot: BufferSnapshot;
   agentContext?: AgentContextSnapshot;
+  /** 进入死信的原因（markBufferDeadLetter 时记录） */
+  dead_letter_reason?: string;
+  /** 进入死信的时间 */
+  dead_letter_at?: string;
 }
 
 interface BufferStore {
@@ -98,7 +107,7 @@ export class InMemoryBufferRepository implements BufferRepository {
     entry.snapshot.extraction_status = 'processed';
   }
 
-  async markBufferDeadLetter(role_id: string, seq: number): Promise<void> {
+  async markBufferDeadLetter(role_id: string, seq: number, reason?: string): Promise<void> {
     const store = this.requireStore(role_id);
     const entry = store.pending.get(seq);
     if (!entry) {
@@ -109,10 +118,28 @@ export class InMemoryBufferRepository implements BufferRepository {
     store.bufferMeta.pending_count = Math.max(0, store.bufferMeta.pending_count - 1);
     store.bufferMeta.total_dead_letters += 1;
     entry.snapshot.extraction_status = 'dead_letter';
+    if (reason !== undefined) {
+      entry.dead_letter_reason = reason;
+      entry.dead_letter_at = nowTimestamp();
+    }
   }
 
   async listDeadLetterSeqs(role_id: string): Promise<number[]> {
     return [...this.requireStore(role_id).deadLetters.keys()].sort((a, b) => a - b);
+  }
+
+  async listDeadLetterEntries(role_id: string): Promise<DeadLetterEntry[]> {
+    const store = this.requireStore(role_id);
+    return [...store.deadLetters.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([seq, entry]) => ({
+        seq,
+        task_id: entry.snapshot.task_id,
+        ...(entry.dead_letter_reason !== undefined
+          ? { reason: entry.dead_letter_reason }
+          : {}),
+        failed_at: entry.dead_letter_at ?? nowTimestamp(),
+      }));
   }
 
   async restoreDeadLetter(role_id: string, seq: number): Promise<void> {

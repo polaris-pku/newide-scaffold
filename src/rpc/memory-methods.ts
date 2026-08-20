@@ -25,6 +25,7 @@ import type {
   UserRating,
   UserRatingResult,
   MemoryOverview,
+  DeadLetterEntry,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
 import type { AgentContextSnapshot, BufferMeta, BufferSnapshot } from '../memory/schemas';
@@ -86,11 +87,12 @@ export interface MemoryMethodsService {
     rating: UserRating,
     note?: string,
   ): Promise<UserRatingResult>;
-  /** Buffer 状态总览（memory.getBufferState） */
+  /** Buffer 状态总览（memory.getBufferState）；含死信详情（失败原因） */
   getMemoryBufferState(roleId: string): Promise<{
     meta: BufferMeta;
     pending_seqs: number[];
     dead_letter_seqs: number[];
+    dead_letters: DeadLetterEntry[];
   }>;
   /** 查看 pending 缓冲区（memory.getPendingBuffer） */
   getMemoryPendingBuffer(
@@ -99,7 +101,7 @@ export interface MemoryMethodsService {
   ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined>;
   /** 重试提取（memory.retryExtraction） */
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence>;
-  /** 单 Agent 内文本检索（memory.searchMemory） */
+  /** 单 Agent 内文本检索（memory.searchMemory）；召回项附相似度分数 */
   searchAgentMemory(
     roleId: string,
     query: string,
@@ -109,7 +111,10 @@ export interface MemoryMethodsService {
       include_skills?: boolean;
       include_experiences?: boolean;
     },
-  ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }>;
+  ): Promise<{
+    skills: Array<SkillView & { similarity: number }>;
+    experiences: Array<ExperienceView & { similarity: number }>;
+  }>;
   /** 全局记忆总览（memory.getOverview） */
   getMemoryOverview(): Promise<MemoryOverview>;
   /** 跨 Agent 待审核技能队列（memory.listPendingReviews） */

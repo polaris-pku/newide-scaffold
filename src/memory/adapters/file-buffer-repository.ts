@@ -16,7 +16,12 @@ import {
   type BufferSnapshot,
   type UserRating,
 } from '../schemas';
-import type { BufferRepository, SaveBufferResult } from '../ports/buffer-repository';
+import type {
+  BufferRepository,
+  DeadLetterEntry,
+  SaveBufferResult,
+} from '../ports/buffer-repository';
+import { nowTimestamp } from '../../core';
 
 /** FileBufferRepository 构造选项 */
 export interface FileBufferRepositoryOptions {
@@ -138,8 +143,8 @@ export class FileBufferRepository implements BufferRepository {
     await this.markBuffer(role_id, seq, 'processed', 'total_processed');
   }
 
-  async markBufferDeadLetter(role_id: string, seq: number): Promise<void> {
-    await this.markBuffer(role_id, seq, 'dead_letter', 'total_dead_letters');
+  async markBufferDeadLetter(role_id: string, seq: number, reason?: string): Promise<void> {
+    await this.markBuffer(role_id, seq, 'dead_letter', 'total_dead_letters', reason);
   }
 
   async updateBufferRating(role_id: string, seq: number, rating: UserRating): Promise<void> {
@@ -184,6 +189,42 @@ export class FileBufferRepository implements BufferRepository {
     }
 
     return seqs.sort((a, b) => a - b);
+  }
+
+  async listDeadLetterEntries(role_id: string): Promise<DeadLetterEntry[]> {
+    const deadLetterDir = join(this.requireBufferRoot(role_id), DEAD_LETTER_DIR);
+    const entries = await readdirSafe(deadLetterDir);
+    const result: DeadLetterEntry[] = [];
+
+    for (const entry of entries) {
+      const match = REPORT_FILE_PATTERN.exec(entry);
+      if (!match) {
+        continue;
+      }
+      const seq = Number(match[1]);
+      let rawReport: string;
+      try {
+        rawReport = await readFile(join(deadLetterDir, entry), 'utf8');
+      } catch {
+        continue;
+      }
+      // 直接读原始 JSON（不经 schema parse）：task_id 必在快照内，
+      // reason / failed_at 是 markBufferDeadLetter 附加的死信字段。
+      const parsed = JSON.parse(rawReport) as BufferSnapshot & {
+        dead_letter_reason?: string;
+        dead_letter_at?: string;
+      };
+      result.push({
+        seq,
+        task_id: parsed.task_id,
+        ...(parsed.dead_letter_reason !== undefined
+          ? { reason: parsed.dead_letter_reason }
+          : {}),
+        failed_at: parsed.dead_letter_at ?? nowTimestamp(),
+      });
+    }
+
+    return result.sort((a, b) => a.seq - b.seq);
   }
 
   async restoreDeadLetter(role_id: string, seq: number): Promise<void> {
@@ -271,6 +312,7 @@ export class FileBufferRepository implements BufferRepository {
     seq: number,
     targetStatus: 'processed' | 'dead_letter',
     totalField: 'total_processed' | 'total_dead_letters',
+    reason?: string,
   ): Promise<void> {
     const bufferRoot = this.requireBufferRoot(role_id);
     const pendingReportPath = join(bufferRoot, PENDING_DIR, reportFileName(seq));
@@ -287,7 +329,15 @@ export class FileBufferRepository implements BufferRepository {
     snapshot.extraction_status = targetStatus;
 
     const targetDir = targetStatus === 'processed' ? PROCESSED_DIR : DEAD_LETTER_DIR;
-    await moveFile(pendingReportPath, join(bufferRoot, targetDir, reportFileName(seq)), snapshot);
+    // 死信额外字段直接附加到快照对象（写盘时一并持久化；读取用原始 JSON）
+    const rewritten = targetStatus === 'dead_letter' && reason !== undefined
+      ? {
+          ...snapshot,
+          dead_letter_reason: reason,
+          dead_letter_at: nowTimestamp(),
+        }
+      : snapshot;
+    await moveFile(pendingReportPath, join(bufferRoot, targetDir, reportFileName(seq)), rewritten);
 
     try {
       await moveFile(pendingContextPath, join(bufferRoot, targetDir, contextFileName(seq)));
