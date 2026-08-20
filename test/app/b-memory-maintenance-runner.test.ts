@@ -12,6 +12,7 @@ import {
   InMemoryBufferRepository,
   InMemoryRepository,
   createAgentMemoryScope,
+  type ExperienceExtractor,
   type LlmClient,
 } from '../../src/memory';
 import type { BufferSnapshot } from '../../src/memory/schemas';
@@ -276,11 +277,73 @@ describe('BMemoryMaintenanceRunner', () => {
     await idle;
     expect(idleResolved).toBe(true);
   });
+
+  it('automatically dead-letters the buffer with the failure reason when extraction fails', async () => {
+    const { runner, repository, bufferRepository, evidenceStore } = await fixture(
+      maintenanceLlm(),
+      undefined,
+      failingExtractor(),
+    );
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_fail');
+
+    const result = await runner.processBuffer({
+      task_id: 'task_fail',
+      run_id: 'run_fail',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'experience_extraction',
+      status: 'failed',
+      error: 'LLM provider unavailable',
+      buffer_seq: seq,
+    });
+    // 自动死信闭环：buffer 移入死信并记录失败原因
+    expect(await bufferRepository.listDeadLetterSeqs('role_ts_engineer')).toEqual([seq]);
+    expect(await bufferRepository.listPendingBufferSeqs('role_ts_engineer')).toEqual([]);
+    const entries = await bufferRepository.listDeadLetterEntries('role_ts_engineer');
+    expect(entries[0]).toMatchObject({
+      seq,
+      task_id: 'task_fail',
+      reason: 'LLM provider unavailable',
+    });
+    // evidence 仍持久化为 failed
+    await expect(evidenceStore.get(result.maintenance_ref)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'LLM provider unavailable',
+    });
+  });
+
+  it('returns failed evidence even when auto dead-lettering itself fails', async () => {
+    const { runner, repository, bufferRepository } = await fixture(
+      maintenanceLlm(),
+      undefined,
+      failingExtractor(),
+    );
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_lock');
+    const markSpy = vi
+      .spyOn(bufferRepository, 'markBufferDeadLetter')
+      .mockRejectedValue(new Error('store locked'));
+
+    const result = await runner.processBuffer({
+      task_id: 'task_lock',
+      run_id: 'run_lock',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    expect(result).toMatchObject({ status: 'failed', error: 'LLM provider unavailable' });
+    expect(markSpy).toHaveBeenCalledWith('role_ts_engineer', seq, 'LLM provider unavailable');
+    // 置死信失败不应影响 failed evidence 返回
+    expect(await bufferRepository.listDeadLetterSeqs('role_ts_engineer')).toEqual([]);
+  });
 });
 
 async function fixture(
   llm: LlmClient = maintenanceLlm(),
   providedEvidenceStore?: BMemoryMaintenanceEvidenceStore,
+  extractor?: ExperienceExtractor,
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-maintenance-'));
   roots.push(root);
@@ -295,8 +358,18 @@ async function fixture(
     bufferRepository,
     llm,
     evidenceStore,
+    ...(extractor ? { extractor } : {}),
   });
   return { runner, repository, bufferRepository, evidenceStore };
+}
+
+/** 提取总是失败的提取器（模拟 LLM 与规则版降级均失败） */
+function failingExtractor(): ExperienceExtractor {
+  return {
+    async extract() {
+      throw new Error('LLM provider unavailable');
+    },
+  };
 }
 
 async function writePending(

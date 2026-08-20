@@ -11,6 +11,7 @@ import {
   promoteExperiencesForAgent,
   resolveMemoryAblationPolicy,
   type BufferRepository,
+  type ExperienceExtractor,
   type LlmClient,
   type MemoryAblation,
   type MemoryRepository,
@@ -80,17 +81,19 @@ export interface BMemoryMaintenanceRunnerOptions {
   evidenceStore: BMemoryMaintenanceEvidenceStore;
   /** When set, completed maintenance rewrites summary.json token_usage for the run. */
   runsRoot?: string;
+  /** 可选提取器注入（默认 LlmExperienceExtractor + 规则版降级）；测试注入失败提取器用。 */
+  extractor?: ExperienceExtractor;
 }
 
 export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
-  private readonly extractor: LlmExperienceExtractor;
+  private readonly extractor: ExperienceExtractor;
   private readonly promoter: LlmSkillPromotion;
   private readonly roleQueues = new Map<string, Promise<void>>();
   private readonly scheduleFlights = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
   private readonly jobs = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
 
   constructor(private readonly options: BMemoryMaintenanceRunnerOptions) {
-    this.extractor = new LlmExperienceExtractor(options.llm);
+    this.extractor = options.extractor ?? new LlmExperienceExtractor(options.llm);
     this.promoter = new LlmSkillPromotion(options.llm);
   }
 
@@ -264,6 +267,11 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
       await this.refreshRunTokenUsage(input.run_id);
       return evidence;
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      // 自动死信闭环：提取失败 → buffer 从 pending 移入死信并记录原因，
+      // 可经 memory.getBufferState 查看、memory.retryExtraction 恢复重试。
+      // 置死信失败（如 buffer 已被处理/删除）不阻塞返回 failed evidence。
+      await this.tryMarkDeadLetter(input.role_id, input.buffer_seq, errorMessage);
       return this.persist({
         maintenance_ref: maintenanceRef,
         kind: 'experience_extraction',
@@ -275,11 +283,20 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
         experiences: [],
         skills: [],
         warnings: [],
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
         created_at: startedAt,
         completed_at: nowTimestamp(),
         schema_version: SCHEMA_VERSION,
       });
+    }
+  }
+
+  /** 提取失败自动置死信（best-effort：失败不阻塞返回 failed evidence）。 */
+  private async tryMarkDeadLetter(roleId: string, seq: number, reason: string): Promise<void> {
+    try {
+      await this.options.bufferRepository.markBufferDeadLetter(roleId, seq, reason);
+    } catch {
+      // buffer 可能已被处理或删除（如并发清理），置死信失败可忽略
     }
   }
 

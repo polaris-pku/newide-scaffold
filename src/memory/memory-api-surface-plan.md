@@ -20,7 +20,7 @@ All milestones implemented, tested, and committed on `feat/memory-api-surface-im
 | M6 | `b272bcc` | List filters / pagination / in-agent search |
 | M7 | `bb3b68c` | capabilities v2 + integration verification + docs |
 | M8 | `52d0632` | Observability read APIs: `getOverview` / `listPendingReviews` / `listExperiencesBySourceTask` |
-| M9 | (this commit) | Recall transparency + dead-letter observability |
+| M9 | (this commit) | Recall transparency + dead-letter observability + auto dead-letter on extraction failure |
 
 **Final `memory.*` surface (32 methods):** existing 13 + `createAgent` / `updateAgent` /
 `deleteAgent` / `createSkill` / `updateSkill` / `deleteSkill` / `publishSkillToMarket` /
@@ -118,7 +118,7 @@ prior artifacts (task execution → extraction → promotion → market), so the
 ### F. Buffer observability / retry (L3, docs "阶段 6")
 | RPC | Params | Returns | Notes |
 |---|---|---|---|
-| `memory.getBufferState` | `{role_id}` | `{meta, pending_seqs, dead_letter_seqs, dead_letters}` | new buffer `listDeadLetterSeqs` (file: read `dead_letter/` dir; in-memory: set); `dead_letters` = `[{seq, task_id, reason?, failed_at}]` via new `listDeadLetterEntries`; reason recorded at `markBufferDeadLetter` |
+| `memory.getBufferState` | `{role_id}` | `{meta, pending_seqs, dead_letter_seqs, dead_letters}` | new buffer `listDeadLetterSeqs` (file: read `dead_letter/` dir; in-memory: set); `dead_letters` = `[{seq, task_id, reason?, failed_at}]` via new `listDeadLetterEntries`; reason recorded at `markBufferDeadLetter`; **提取失败自动置死信**（`BMemoryMaintenanceRunner` 失败路径调 `markBufferDeadLetter(role_id, seq, error)`，闭环：失败→死信→`retryExtraction` 恢复重试） |
 | `memory.getPendingBuffer` | `{role_id, seq}` | `{snapshot, agent_context?}` | passthrough `AgentMemoryScope.getPendingBuffer` |
 | `memory.retryExtraction` | `{role_id, seq}` | `BMemoryMaintenanceEvidence` | new buffer `restoreDeadLetter` (dead_letter → pending) + reuse `BMemoryMaintenanceRunner.scheduleBuffer`; idempotent key |
 
