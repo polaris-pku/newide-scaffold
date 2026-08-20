@@ -57,7 +57,7 @@ export interface BMemoryOperationCapability {
 }
 
 export interface BMemoryCapabilities {
-  schema_version: 'newide.b-memory-capabilities.v1';
+  schema_version: 'newide.b-memory-capabilities.v2';
   embedding: BEmbeddingRuntimeInfo;
   skill_review: {
     mode: 'manual' | 'auto_approve';
@@ -137,7 +137,7 @@ export class BMemoryBackendService {
 
   getCapabilities(): BMemoryCapabilities {
     return {
-      schema_version: 'newide.b-memory-capabilities.v1',
+      schema_version: 'newide.b-memory-capabilities.v2',
       embedding: { ...this.embeddingInfo },
       skill_review: {
         mode: this.options.autoApprovePromotedSkills ? 'auto_approve' : 'manual',
@@ -505,7 +505,12 @@ export class BMemoryBackendService {
   async searchMemory(
     roleId: string,
     query: string,
-    options: { top_k?: number; include_skills?: boolean; include_experiences?: boolean } = {},
+    options: {
+      top_k?: number;
+      min_similarity?: number;
+      include_skills?: boolean;
+      include_experiences?: boolean;
+    } = {},
   ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }> {
     const repository = this.requireRepository('Memory search');
     if (!this.embedding) {
@@ -513,13 +518,18 @@ export class BMemoryBackendService {
     }
     const query_embedding = await this.embedding.embed(query);
     const top_k = options.top_k ?? 5;
+    const searchOptions = {
+      query_embedding,
+      top_k,
+      ...(options.min_similarity !== undefined
+        ? { min_similarity: options.min_similarity }
+        : {}),
+    };
     const [skills, experiences] = await Promise.all([
-      options.include_skills === false
-        ? []
-        : repository.searchSkills(roleId, { query_embedding, top_k }),
+      options.include_skills === false ? [] : repository.searchSkills(roleId, searchOptions),
       options.include_experiences === false
         ? []
-        : repository.searchExperiences(roleId, { query_embedding, top_k }),
+        : repository.searchExperiences(roleId, searchOptions),
     ]);
     return { skills: skills.map(toSkillView), experiences: experiences.map(toExperienceView) };
   }

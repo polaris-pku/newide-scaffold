@@ -102,7 +102,12 @@ export interface MemoryMethodsService {
   searchAgentMemory(
     roleId: string,
     query: string,
-    options: { top_k?: number; include_skills?: boolean; include_experiences?: boolean },
+    options: {
+      top_k?: number;
+      min_similarity?: number;
+      include_skills?: boolean;
+      include_experiences?: boolean;
+    },
   ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }>;
 }
 
@@ -138,6 +143,7 @@ const searchMemoryParamsSchema = z
     role_id: z.string().trim().min(1),
     query: z.string().trim().min(1),
     top_k: z.number().int().positive().optional(),
+    min_similarity: z.number().min(0).max(1).optional(),
     include_skills: z.boolean().optional(),
     include_experiences: z.boolean().optional(),
   })
@@ -343,6 +349,9 @@ export class MemoryRpcMethods {
       const parsed = parseParams(searchMemoryParamsSchema, params);
       const result = await this.service.searchAgentMemory(parsed.role_id, parsed.query, {
         ...(parsed.top_k !== undefined ? { top_k: parsed.top_k } : {}),
+        ...(parsed.min_similarity !== undefined
+          ? { min_similarity: parsed.min_similarity }
+          : {}),
         ...(parsed.include_skills !== undefined ? { include_skills: parsed.include_skills } : {}),
         ...(parsed.include_experiences !== undefined
           ? { include_experiences: parsed.include_experiences }

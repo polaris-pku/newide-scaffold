@@ -47,7 +47,7 @@ function experience(overrides: Partial<ExperienceRecord> = {}): ExperienceRecord
   };
 }
 
-function pendingBuffer(seq: number): BufferSnapshot {
+function pendingBuffer(_seq: number): BufferSnapshot {
   const now = nowTimestamp();
   return {
     task_id: TASK,

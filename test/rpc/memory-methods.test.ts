@@ -325,7 +325,7 @@ describe('MemoryRpcMethods', () => {
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
     getMemoryCapabilities: () => ({
-      schema_version: 'newide.b-memory-capabilities.v1',
+      schema_version: 'newide.b-memory-capabilities.v2',
       skill_review: { mode: 'manual' },
       embedding: {
         provider: 'test',

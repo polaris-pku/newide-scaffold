@@ -1,10 +1,31 @@
-# Memory Module API Surface Plan (feat/memory-api-surface)
+# Memory Module API Surface Plan (feat/memory-api-surface-impl)
 
-> Branch: `feat/memory-api-surface`
+> Branch: `feat/memory-api-surface-impl`
 > Local deep-dive references (git-ignored by repo convention, see `.gitignore` lines 53-54):
 > `src/memory/docs/对外接口局限分析.md` (limitation analysis with evidence)
 > `src/memory/docs/对外接口完善计划.md` (full executable design, Chinese)
 > This file is the tracked, self-contained plan used for implementation rounds.
+
+## Completion Status (M1–M7)
+
+All milestones implemented, tested, and committed on `feat/memory-api-surface-impl`:
+
+| Milestone | Commit | Scope |
+|---|---|---|
+| M1 | `f417e32` | Agent lifecycle RPCs + dynamic catalog |
+| M2 | `650838b` | Skill / Experience management writes |
+| M3 | `7aa8f4e` | Persona update + on-demand regeneration |
+| M4 | `caabd2c` | Task rating feedback loop |
+| M5 | `589a9b1` | Buffer observability + extraction retry |
+| M6 | `b272bcc` | List filters / pagination / in-agent search |
+| M7 | (this commit) | capabilities v2 + integration verification + docs |
+
+**Final `memory.*` surface (29 methods):** existing 13 + `createAgent` / `updateAgent` /
+`deleteAgent` / `createSkill` / `updateSkill` / `deleteSkill` / `publishSkillToMarket` /
+`updateExperience` / `deleteExperience` / `updatePersona` / `regeneratePersona` /
+`rateTask` / `getBufferState` / `getPendingBuffer` / `retryExtraction` / `searchMemory`,
+plus filter/pagination params on `listAgents` / `listSkills` / `listExperiences`.
+Capabilities schema bumped to `newide.b-memory-capabilities.v2` with 28 operation flags.
 
 ## 1. Problem
 

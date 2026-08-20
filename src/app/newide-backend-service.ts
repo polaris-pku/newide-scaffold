@@ -455,7 +455,12 @@ export class NewideBackendService {
   searchAgentMemory(
     roleId: string,
     query: string,
-    options: { top_k?: number; include_skills?: boolean; include_experiences?: boolean } = {},
+    options: {
+      top_k?: number;
+      min_similarity?: number;
+      include_skills?: boolean;
+      include_experiences?: boolean;
+    } = {},
   ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }> {
     return this.requireBMemoryService().searchMemory(roleId, query, options);
   }
