@@ -3,17 +3,28 @@ import {
   type AgentBoardListItem,
   type AgentHandle,
   type CreateAgentSpec,
+  createSkill,
+  deleteExperience,
+  deleteSkill,
   type EmbeddingProvider,
   type ExperienceView,
+  type ExperienceWritePatch,
   type MarketImportResult,
   marketImport,
   type MarketSearchQuery,
   marketSearch,
   type MemoryRepository,
+  publishSkillToMarket,
   type RetireOptions,
   type RetireResult,
   type RetirementScanResult,
   type SkillView,
+  type SkillWritePatch,
+  toExperienceView,
+  toSkillView,
+  type CreateSkillInput,
+  updateExperience,
+  updateSkill,
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
@@ -49,6 +60,12 @@ export interface BMemoryCapabilities {
     create_agent: BMemoryOperationCapability;
     update_agent: BMemoryOperationCapability;
     delete_agent: BMemoryOperationCapability;
+    create_skill: BMemoryOperationCapability;
+    update_skill: BMemoryOperationCapability;
+    delete_skill: BMemoryOperationCapability;
+    publish_skill: BMemoryOperationCapability;
+    update_experience: BMemoryOperationCapability;
+    delete_experience: BMemoryOperationCapability;
   };
 }
 
@@ -156,6 +173,42 @@ export class BMemoryBackendService {
           status: this.lifecycle ? 'available' : 'unavailable',
           ...(this.lifecycle ? {} : { reason: 'B runtime does not expose Agent deletion.' }),
         },
+        create_skill: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        update_skill: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        delete_skill: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        publish_skill: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        update_experience: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
+        delete_experience: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
+        },
       },
     };
   }
@@ -257,6 +310,50 @@ export class BMemoryBackendService {
     }
     return this.lifecycle.deleteAgent(roleId);
   }
+
+  /** 手动创建 Skill（memory.createSkill），返回对外 SkillView。 */
+  async createSkill(input: CreateSkillInput): Promise<SkillView> {
+    const repository = this.requireRepository('Skill creation');
+    const skill = await createSkill(repository, input, {
+      autoApprove: this.options.autoApprovePromotedSkills === true,
+    });
+    return toSkillView(skill);
+  }
+
+  /** PATCH 更新 Skill（memory.updateSkill），返回对外 SkillView。 */
+  async updateSkill(roleId: string, skillId: string, patch: SkillWritePatch): Promise<SkillView> {
+    const repository = this.requireRepository('Skill updates');
+    return toSkillView(await updateSkill(repository, roleId, skillId, patch));
+  }
+
+  /** 删除 Skill（memory.deleteSkill）。 */
+  async deleteSkill(roleId: string, skillId: string): Promise<void> {
+    const repository = this.requireRepository('Skill deletion');
+    await deleteSkill(repository, roleId, skillId);
+  }
+
+  /** 技能上架市场（memory.publishSkillToMarket）：置 market_status='available'，保留归属。 */
+  async publishSkillToMarket(roleId: string, skillId: string): Promise<SkillView> {
+    const repository = this.requireRepository('Skill market publishing');
+    return toSkillView(await publishSkillToMarket(repository, roleId, skillId));
+  }
+
+  /** PATCH 更新 Experience（memory.updateExperience），返回对外 ExperienceView。 */
+  async updateExperience(
+    roleId: string,
+    experienceId: string,
+    patch: ExperienceWritePatch,
+  ): Promise<ExperienceView> {
+    const repository = this.requireRepository('Experience updates');
+    return toExperienceView(await updateExperience(repository, roleId, experienceId, patch));
+  }
+
+  /** 删除 Experience（memory.deleteExperience）。 */
+  async deleteExperience(roleId: string, experienceId: string): Promise<void> {
+    const repository = this.requireRepository('Experience deletion');
+    await deleteExperience(repository, roleId, experienceId);
+  }
+
   approveSkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
     return this.capabilities.reviewSkill({
       role_id: roleId,
@@ -273,6 +370,14 @@ export class BMemoryBackendService {
       decision: 'rejected',
       reviewer: reviewedBy,
     });
+  }
+
+  /** 未注入 repository 时抛明确错误（与 capabilities 报告的 unavailable 对应） */
+  private requireRepository(operation: string): MemoryRepository {
+    if (!this.repository) {
+      throw new Error(`${operation} requires a MemoryRepository`);
+    }
+    return this.repository;
   }
 }
 

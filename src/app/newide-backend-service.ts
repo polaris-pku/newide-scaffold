@@ -72,13 +72,16 @@ import type {
   AgentBoardListItem,
   AgentHandle,
   CreateAgentSpec,
+  CreateSkillInput,
   ExperienceView,
+  ExperienceWritePatch,
   MarketImportResult,
   MarketSearchQuery,
   RetireOptions,
   RetireResult,
   RetirementScanResult,
   SkillView,
+  SkillWritePatch,
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
@@ -374,6 +377,34 @@ export class NewideBackendService {
 
   rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
     return this.requireBMemoryService().rejectSkill(roleId, skillId, reviewedBy);
+  }
+
+  createMemorySkill(input: CreateSkillInput): Promise<SkillView> {
+    return this.requireBMemoryService().createSkill(input);
+  }
+
+  updateMemorySkill(roleId: string, skillId: string, patch: SkillWritePatch): Promise<SkillView> {
+    return this.requireBMemoryService().updateSkill(roleId, skillId, patch);
+  }
+
+  deleteMemorySkill(roleId: string, skillId: string): Promise<void> {
+    return this.requireBMemoryService().deleteSkill(roleId, skillId);
+  }
+
+  publishMemorySkillToMarket(roleId: string, skillId: string): Promise<SkillView> {
+    return this.requireBMemoryService().publishSkillToMarket(roleId, skillId);
+  }
+
+  updateMemoryExperience(
+    roleId: string,
+    experienceId: string,
+    patch: ExperienceWritePatch,
+  ): Promise<ExperienceView> {
+    return this.requireBMemoryService().updateExperience(roleId, experienceId, patch);
+  }
+
+  deleteMemoryExperience(roleId: string, experienceId: string): Promise<void> {
+    return this.requireBMemoryService().deleteExperience(roleId, experienceId);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

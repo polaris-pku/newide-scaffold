@@ -131,6 +131,33 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":22,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":false}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":23,"method":"memory.createSkill","params":{"role_id":"role_ts_engineer","description":"TS patterns","content":"Define contracts.","tags":["typescript"]}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":24,"method":"memory.createSkill","params":{"role_id":"role_ts_engineer","description":"TS patterns"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":25,"method":"memory.updateSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1","tags":["typescript","reviewer"]}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":26,"method":"memory.updateSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1","market_status":"bogus"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":27,"method":"memory.publishSkillToMarket","params":{"role_id":"role_ts_engineer","skill_id":"skill_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":28,"method":"memory.deleteSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":29,"method":"memory.updateExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1","confidence":0.9}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":30,"method":"memory.updateExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":31,"method":"memory.deleteExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1"}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -185,6 +212,15 @@ describe('MemoryRpcMethods', () => {
       { id: 20, error: { code: -32602, message: 'Invalid params' } },
       { id: 21, result: { deleted: true } },
       { id: 22, error: { code: -32602, message: 'Invalid params' } },
+      { id: 23, result: { skill: { id: 'skill_1' } } },
+      { id: 24, error: { code: -32602, message: 'Invalid params' } },
+      { id: 25, result: { skill: { id: 'skill_1' } } },
+      { id: 26, error: { code: -32602, message: 'Invalid params' } },
+      { id: 27, result: { skill: { id: 'skill_1' } } },
+      { id: 28, result: { deleted: true } },
+      { id: 29, result: { experience: { id: 'experience_1' } } },
+      { id: 30, error: { code: -32602, message: 'Invalid params' } },
+      { id: 31, result: { deleted: true } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -240,6 +276,12 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         create_agent: { status: 'available' },
         update_agent: { status: 'available' },
         delete_agent: { status: 'available' },
+        create_skill: { status: 'available' },
+        update_skill: { status: 'available' },
+        delete_skill: { status: 'available' },
+        publish_skill: { status: 'available' },
+        update_experience: { status: 'available' },
+        delete_experience: { status: 'available' },
       },
     }),
     listMemoryAgents: async () => [
@@ -314,6 +356,12 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
       owned_exps: [],
     }),
     deleteMemoryAgent: async () => undefined,
+    createMemorySkill: async () => ({ id: 'skill_1' } as never),
+    updateMemorySkill: async () => ({ id: 'skill_1' } as never),
+    deleteMemorySkill: async () => undefined,
+    publishMemorySkillToMarket: async () => ({ id: 'skill_1' } as never),
+    updateMemoryExperience: async () => ({ id: 'experience_1' } as never),
+    deleteMemoryExperience: async () => undefined,
     ...overrides,
   };
 }

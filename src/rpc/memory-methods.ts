@@ -8,13 +8,16 @@ import type {
   AgentBoardListItem,
   AgentHandle,
   CreateAgentSpec,
+  CreateSkillInput,
   ExperienceView,
+  ExperienceWritePatch,
   MarketImportResult,
   MarketSearchQuery,
   RetireOptions,
   RetireResult,
   RetirementScanResult,
   SkillView,
+  SkillWritePatch,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
@@ -44,6 +47,26 @@ export interface MemoryMethodsService {
   updateMemoryAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle>;
   /** 硬删除 Agent（需 confirm: true，且 Agent 已 retired） */
   deleteMemoryAgent(roleId: string): Promise<void>;
+  /** 手动创建 Skill（memory.createSkill） */
+  createMemorySkill(input: CreateSkillInput): Promise<SkillView>;
+  /** PATCH 更新 Skill（memory.updateSkill） */
+  updateMemorySkill(
+    roleId: string,
+    skillId: string,
+    patch: SkillWritePatch,
+  ): Promise<SkillView>;
+  /** 删除 Skill（memory.deleteSkill） */
+  deleteMemorySkill(roleId: string, skillId: string): Promise<void>;
+  /** 技能上架市场（memory.publishSkillToMarket） */
+  publishMemorySkillToMarket(roleId: string, skillId: string): Promise<SkillView>;
+  /** PATCH 更新 Experience（memory.updateExperience） */
+  updateMemoryExperience(
+    roleId: string,
+    experienceId: string,
+    patch: ExperienceWritePatch,
+  ): Promise<ExperienceView>;
+  /** 删除 Experience（memory.deleteExperience） */
+  deleteMemoryExperience(roleId: string, experienceId: string): Promise<void>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -113,6 +136,63 @@ const deleteAgentParamsSchema = z
     confirm: z.literal(true),
   })
   .strict();
+const createSkillParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    description: z.string().trim().min(1),
+    content: z.string().trim().min(1),
+    tags: z.array(z.string().trim().min(1)).optional(),
+    version: z.string().trim().min(1).optional(),
+  })
+  .strict();
+const skillRefParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    skill_id: z.string().trim().min(1),
+  })
+  .strict();
+const updateSkillParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    skill_id: z.string().trim().min(1),
+    description: z.string().trim().min(1).optional(),
+    content: z.string().trim().min(1).optional(),
+    tags: z.array(z.string().trim().min(1)).optional(),
+    market_status: z.enum(['available', 'superseded']).optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.description !== undefined ||
+      value.content !== undefined ||
+      value.tags !== undefined ||
+      value.market_status !== undefined,
+    { message: 'At least one updatable field is required' },
+  );
+const experienceRefParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    experience_id: z.string().trim().min(1),
+  })
+  .strict();
+const updateExperienceParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    experience_id: z.string().trim().min(1),
+    description: z.string().trim().min(1).optional(),
+    content: z.string().trim().min(1).optional(),
+    tags: z.array(z.string().trim().min(1)).optional(),
+    confidence: z.number().min(0).max(1).optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.description !== undefined ||
+      value.content !== undefined ||
+      value.tags !== undefined ||
+      value.confidence !== undefined,
+    { message: 'At least one updatable field is required' },
+  );
 
 export class MemoryRpcMethods {
   constructor(private readonly service: MemoryMethodsService) {}
@@ -224,6 +304,59 @@ export class MemoryRpcMethods {
     dispatcher.register('memory.deleteAgent', async (params) => {
       const parsed = parseParams(deleteAgentParamsSchema, params);
       await this.service.deleteMemoryAgent(parsed.role_id);
+      return { deleted: true };
+    });
+    dispatcher.register('memory.createSkill', async (params) => {
+      const parsed = parseParams(createSkillParamsSchema, params);
+      const skill = await this.service.createMemorySkill({
+        role_id: parsed.role_id,
+        description: parsed.description,
+        content: parsed.content,
+        ...(parsed.tags !== undefined ? { tags: parsed.tags } : {}),
+        ...(parsed.version !== undefined ? { version: parsed.version } : {}),
+      });
+      return { skill };
+    });
+    dispatcher.register('memory.updateSkill', async (params) => {
+      const parsed = parseParams(updateSkillParamsSchema, params);
+      const skill = await this.service.updateMemorySkill(parsed.role_id, parsed.skill_id, {
+        ...(parsed.description !== undefined ? { description: parsed.description } : {}),
+        ...(parsed.content !== undefined ? { content: parsed.content } : {}),
+        ...(parsed.tags !== undefined ? { tags: parsed.tags } : {}),
+        ...(parsed.market_status !== undefined ? { market_status: parsed.market_status } : {}),
+      });
+      return { skill };
+    });
+    dispatcher.register('memory.deleteSkill', async (params) => {
+      const parsed = parseParams(skillRefParamsSchema, params);
+      await this.service.deleteMemorySkill(parsed.role_id, parsed.skill_id);
+      return { deleted: true };
+    });
+    dispatcher.register('memory.publishSkillToMarket', async (params) => {
+      const parsed = parseParams(skillRefParamsSchema, params);
+      const skill = await this.service.publishMemorySkillToMarket(
+        parsed.role_id,
+        parsed.skill_id,
+      );
+      return { skill };
+    });
+    dispatcher.register('memory.updateExperience', async (params) => {
+      const parsed = parseParams(updateExperienceParamsSchema, params);
+      const experience = await this.service.updateMemoryExperience(
+        parsed.role_id,
+        parsed.experience_id,
+        {
+          ...(parsed.description !== undefined ? { description: parsed.description } : {}),
+          ...(parsed.content !== undefined ? { content: parsed.content } : {}),
+          ...(parsed.tags !== undefined ? { tags: parsed.tags } : {}),
+          ...(parsed.confidence !== undefined ? { confidence: parsed.confidence } : {}),
+        },
+      );
+      return { experience };
+    });
+    dispatcher.register('memory.deleteExperience', async (params) => {
+      const parsed = parseParams(experienceRefParamsSchema, params);
+      await this.service.deleteMemoryExperience(parsed.role_id, parsed.experience_id);
       return { deleted: true };
     });
   }

@@ -16,7 +16,7 @@ import type {
   SkillView,
 } from '../ports/agent-board-query';
 
-function toSkillView(s: SkillRecord): SkillView {
+export function toSkillView(s: SkillRecord): SkillView {
   return {
     id: s.id,
     description: s.description,
@@ -39,7 +39,7 @@ function toSkillView(s: SkillRecord): SkillView {
   };
 }
 
-function toExperienceView(e: ExperienceRecord): ExperienceView {
+export function toExperienceView(e: ExperienceRecord): ExperienceView {
   return {
     id: e.id,
     description: e.description,

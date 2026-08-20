@@ -100,6 +100,18 @@ export {
   type ReviewSkillInput,
   type SkillReviewDecision,
 } from './services/skill-review';
+export {
+  createSkill,
+  updateSkill,
+  deleteSkill,
+  publishSkillToMarket,
+  updateExperience,
+  deleteExperience,
+  type CreateSkillInput,
+  type CreateSkillOptions,
+  type SkillWritePatch,
+  type ExperienceWritePatch,
+} from './services/memory-writer';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,
@@ -217,6 +229,7 @@ export { RepositoryMemoryProvider } from './adapters/repository-memory-provider'
 // ════════════════════════════════════════════════════════
 
 export { RepositoryAgentBoardQuery } from './adapters/agent-board-query';
+export { toSkillView, toExperienceView } from './adapters/agent-board-query';
 
 // ════════════════════════════════════════════════════════
 //  11. Agent 运行时
