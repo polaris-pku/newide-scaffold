@@ -82,6 +82,8 @@ import type {
   RetireOptions,
   RetireResult,
   RetirementScanResult,
+  ExperienceListFilter,
+  SkillListFilter,
   SkillView,
   SkillWritePatch,
   UserRating,
@@ -319,8 +321,8 @@ export class NewideBackendService {
     return this.requireMailboxService().reply(input);
   }
 
-  listMemoryAgents(): Promise<AgentBoardListItem[]> {
-    return this.requireBMemoryService().listAgents();
+  listMemoryAgents(status?: string): Promise<AgentBoardListItem[]> {
+    return this.requireBMemoryService().listAgents(status);
   }
 
   getMemoryCapabilities() {
@@ -331,12 +333,15 @@ export class NewideBackendService {
     return this.requireBMemoryService().getAgent(roleId);
   }
 
-  listMemorySkills(roleId: string): Promise<SkillView[]> {
-    return this.requireBMemoryService().listSkills(roleId);
+  listMemorySkills(roleId: string, filter?: SkillListFilter): Promise<SkillView[]> {
+    return this.requireBMemoryService().listSkills(roleId, filter);
   }
 
-  listMemoryExperiences(roleId: string): Promise<ExperienceView[]> {
-    return this.requireBMemoryService().listExperiences(roleId);
+  listMemoryExperiences(
+    roleId: string,
+    filter?: ExperienceListFilter,
+  ): Promise<ExperienceView[]> {
+    return this.requireBMemoryService().listExperiences(roleId, filter);
   }
 
   listMemoryMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]> {
@@ -445,6 +450,14 @@ export class NewideBackendService {
 
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().retryExtraction(roleId, seq);
+  }
+
+  searchAgentMemory(
+    roleId: string,
+    query: string,
+    options: { top_k?: number; include_skills?: boolean; include_experiences?: boolean } = {},
+  ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }> {
+    return this.requireBMemoryService().searchMemory(roleId, query, options);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

@@ -188,6 +188,24 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":41,"method":"memory.retryExtraction","params":{"role_id":"role_ts_engineer","seq":2}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":42,"method":"memory.listAgents","params":{"status":"active"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":43,"method":"memory.listAgents","params":{"status":""}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":44,"method":"memory.listSkills","params":{"role_id":"role_ts_engineer","review_status":"approved","keyword":"ts","limit":10}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":45,"method":"memory.listExperiences","params":{"role_id":"role_ts_engineer","type":"positive","confidence_min":0.5}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":46,"method":"memory.searchMemory","params":{"role_id":"role_ts_engineer","query":"typescript","top_k":5}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":47,"method":"memory.searchMemory","params":{"role_id":"role_ts_engineer","query":""}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -208,6 +226,7 @@ describe('MemoryRpcMethods', () => {
               get_buffer_state: { status: 'available' },
               get_pending_buffer: { status: 'available' },
               retry_extraction: { status: 'available' },
+              search_memory: { status: 'available' },
               create_agent: { status: 'available' },
               update_agent: { status: 'available' },
               delete_agent: { status: 'available' },
@@ -270,6 +289,12 @@ describe('MemoryRpcMethods', () => {
       { id: 39, result: { buffer: { snapshot: { task_id: 'task_001' } } } },
       { id: 40, error: { code: -32602, message: 'Invalid params' } },
       { id: 41, result: { maintenance: { maintenance_ref: 'b_maintenance_1' } } },
+      { id: 42, result: { agents: [{ role_id: 'role_ts_engineer' }] } },
+      { id: 43, error: { code: -32602, message: 'Invalid params' } },
+      { id: 44, result: { skills: [{ id: 'skill_1' }] } },
+      { id: 45, result: { experiences: [{ id: 'experience_1' }] } },
+      { id: 46, result: { skills: [{ id: 'skill_1' }], experiences: [{ id: 'experience_1' }] } },
+      { id: 47, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -323,6 +348,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         get_buffer_state: { status: 'available' },
         get_pending_buffer: { status: 'available' },
         retry_extraction: { status: 'available' },
+        search_memory: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
         retire_agent: { status: 'available' },
@@ -444,6 +470,10 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     } as never),
     getMemoryPendingBuffer: async () => ({ snapshot: { task_id: 'task_001' } } as never),
     retryMemoryExtraction: async () => maintenance(),
+    searchAgentMemory: async () => ({
+      skills: [{ id: 'skill_1' } as never],
+      experiences: [{ id: 'experience_1' } as never],
+    }),
     ...overrides,
   };
 }

@@ -9,6 +9,7 @@ import type {
   AgentHandle,
   CreateAgentSpec,
   CreateSkillInput,
+  ExperienceListFilter,
   ExperienceView,
   ExperienceWritePatch,
   MarketImportResult,
@@ -18,6 +19,7 @@ import type {
   RetireOptions,
   RetireResult,
   RetirementScanResult,
+  SkillListFilter,
   SkillView,
   SkillWritePatch,
   UserRating,
@@ -30,10 +32,10 @@ import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 
 export interface MemoryMethodsService {
   getMemoryCapabilities(): BMemoryCapabilities;
-  listMemoryAgents(): Promise<AgentBoardListItem[]>;
+  listMemoryAgents(status?: string): Promise<AgentBoardListItem[]>;
   getMemoryAgent(roleId: string): Promise<AgentBoardAgentView>;
-  listMemorySkills(roleId: string): Promise<SkillView[]>;
-  listMemoryExperiences(roleId: string): Promise<ExperienceView[]>;
+  listMemorySkills(roleId: string, filter?: SkillListFilter): Promise<SkillView[]>;
+  listMemoryExperiences(roleId: string, filter?: ExperienceListFilter): Promise<ExperienceView[]>;
   listMemoryMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]>;
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence>;
   /** 技能市场检索（Spec §6.2 skill.market_search） */
@@ -96,10 +98,50 @@ export interface MemoryMethodsService {
   ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined>;
   /** 重试提取（memory.retryExtraction） */
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence>;
+  /** 单 Agent 内文本检索（memory.searchMemory） */
+  searchAgentMemory(
+    roleId: string,
+    query: string,
+    options: { top_k?: number; include_skills?: boolean; include_experiences?: boolean },
+  ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
 const roleParamsSchema = z.object({ role_id: z.string().trim().min(1) }).strict();
+const listAgentsParamsSchema = z
+  .object({ status: z.string().trim().min(1).optional() })
+  .strict();
+const listSkillsParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    review_status: z.string().trim().min(1).optional(),
+    tag: z.string().trim().min(1).optional(),
+    keyword: z.string().trim().min(1).optional(),
+    offset: z.number().int().min(0).optional(),
+    limit: z.number().int().positive().optional(),
+  })
+  .strict();
+const listExperiencesParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    type: z.string().trim().min(1).optional(),
+    confidence_min: z.number().min(0).max(1).optional(),
+    confidence_max: z.number().min(0).max(1).optional(),
+    tag: z.string().trim().min(1).optional(),
+    keyword: z.string().trim().min(1).optional(),
+    offset: z.number().int().min(0).optional(),
+    limit: z.number().int().positive().optional(),
+  })
+  .strict();
+const searchMemoryParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    query: z.string().trim().min(1),
+    top_k: z.number().int().positive().optional(),
+    include_skills: z.boolean().optional(),
+    include_experiences: z.boolean().optional(),
+  })
+  .strict();
 const optionalRoleParamsSchema = z
   .object({ role_id: z.string().trim().min(1).optional() })
   .strict();
@@ -264,23 +306,49 @@ export class MemoryRpcMethods {
       parseParams(emptyParamsSchema, params ?? {});
       return { capabilities: this.service.getMemoryCapabilities() };
     });
-    dispatcher.register('memory.listAgents', (params) => {
-      parseParams(emptyParamsSchema, params ?? {});
-      return this.service.listMemoryAgents().then((agents) => ({ agents }));
+    dispatcher.register('memory.listAgents', async (params) => {
+      const parsed = parseParams(listAgentsParamsSchema, params ?? {});
+      const agents = await this.service.listMemoryAgents(parsed.status);
+      return { agents };
     });
     dispatcher.register('memory.getAgent', (params) => {
       const parsed = parseParams(roleParamsSchema, params);
       return this.service.getMemoryAgent(parsed.role_id).then((agent) => ({ agent }));
     });
-    dispatcher.register('memory.listSkills', (params) => {
-      const parsed = parseParams(roleParamsSchema, params);
-      return this.service.listMemorySkills(parsed.role_id).then((skills) => ({ skills }));
+    dispatcher.register('memory.listSkills', async (params) => {
+      const parsed = parseParams(listSkillsParamsSchema, params);
+      const skills = await this.service.listMemorySkills(parsed.role_id, {
+        ...(parsed.review_status !== undefined ? { review_status: parsed.review_status } : {}),
+        ...(parsed.tag !== undefined ? { tag: parsed.tag } : {}),
+        ...(parsed.keyword !== undefined ? { keyword: parsed.keyword } : {}),
+        ...(parsed.offset !== undefined ? { offset: parsed.offset } : {}),
+        ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
+      });
+      return { skills };
     });
-    dispatcher.register('memory.listExperiences', (params) => {
-      const parsed = parseParams(roleParamsSchema, params);
-      return this.service
-        .listMemoryExperiences(parsed.role_id)
-        .then((experiences) => ({ experiences }));
+    dispatcher.register('memory.listExperiences', async (params) => {
+      const parsed = parseParams(listExperiencesParamsSchema, params);
+      const experiences = await this.service.listMemoryExperiences(parsed.role_id, {
+        ...(parsed.type !== undefined ? { type: parsed.type } : {}),
+        ...(parsed.confidence_min !== undefined ? { confidence_min: parsed.confidence_min } : {}),
+        ...(parsed.confidence_max !== undefined ? { confidence_max: parsed.confidence_max } : {}),
+        ...(parsed.tag !== undefined ? { tag: parsed.tag } : {}),
+        ...(parsed.keyword !== undefined ? { keyword: parsed.keyword } : {}),
+        ...(parsed.offset !== undefined ? { offset: parsed.offset } : {}),
+        ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
+      });
+      return { experiences };
+    });
+    dispatcher.register('memory.searchMemory', async (params) => {
+      const parsed = parseParams(searchMemoryParamsSchema, params);
+      const result = await this.service.searchAgentMemory(parsed.role_id, parsed.query, {
+        ...(parsed.top_k !== undefined ? { top_k: parsed.top_k } : {}),
+        ...(parsed.include_skills !== undefined ? { include_skills: parsed.include_skills } : {}),
+        ...(parsed.include_experiences !== undefined
+          ? { include_experiences: parsed.include_experiences }
+          : {}),
+      });
+      return { skills: result.skills, experiences: result.experiences };
     });
     dispatcher.register('memory.listMaintenance', (params) => {
       const parsed = parseParams(optionalRoleParamsSchema, params ?? {});

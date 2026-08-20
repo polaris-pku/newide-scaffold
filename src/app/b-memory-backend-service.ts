@@ -8,6 +8,7 @@ import {
   deleteExperience,
   deleteSkill,
   type EmbeddingProvider,
+  type ExperienceListFilter,
   type ExperienceView,
   type ExperienceWritePatch,
   type LlmClient,
@@ -25,6 +26,7 @@ import {
   type RetireResult,
   type RetirementScanResult,
   ruleBasedPersonaInduction,
+  type SkillListFilter,
   type SkillView,
   type SkillWritePatch,
   toExperienceView,
@@ -38,6 +40,7 @@ import {
 } from '../memory';
 import type {
   AgentContextSnapshot,
+  AgentStatus,
   BufferMeta,
   BufferSnapshot,
   PersonaDef,
@@ -74,6 +77,7 @@ export interface BMemoryCapabilities {
     get_buffer_state: BMemoryOperationCapability;
     get_pending_buffer: BMemoryOperationCapability;
     retry_extraction: BMemoryOperationCapability;
+    search_memory: BMemoryOperationCapability;
     market_search: BMemoryOperationCapability;
     market_import: BMemoryOperationCapability;
     retire_agent: BMemoryOperationCapability;
@@ -263,13 +267,22 @@ export class BMemoryBackendService {
             ? {}
             : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
+        search_memory: {
+          status: this.repository && this.embedding ? 'available' : 'unavailable',
+          ...(this.repository && this.embedding
+            ? {}
+            : {
+                reason:
+                  'B runtime has no MemoryRepository or semantic embedding provider configured.',
+              }),
+        },
       },
     };
   }
 
-  async listAgents(): Promise<AgentBoardListItem[]> {
+  async listAgents(status?: string): Promise<AgentBoardListItem[]> {
     return filterLegacyCouncilPseudoAgents(
-      await this.capabilities.boardQuery.listAgents(),
+      await this.capabilities.boardQuery.listAgents(status as AgentStatus),
     );
   }
 
@@ -277,12 +290,12 @@ export class BMemoryBackendService {
     return this.capabilities.boardQuery.getAgent(roleId);
   }
 
-  listSkills(roleId: string): Promise<SkillView[]> {
-    return this.capabilities.boardQuery.listSkills(roleId);
+  listSkills(roleId: string, filter?: SkillListFilter): Promise<SkillView[]> {
+    return this.capabilities.boardQuery.listSkills(roleId, filter);
   }
 
-  listExperiences(roleId: string): Promise<ExperienceView[]> {
-    return this.capabilities.boardQuery.listExperiences(roleId);
+  listExperiences(roleId: string, filter?: ExperienceListFilter): Promise<ExperienceView[]> {
+    return this.capabilities.boardQuery.listExperiences(roleId, filter);
   }
 
   listMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]> {
@@ -483,6 +496,32 @@ export class BMemoryBackendService {
       role_id: roleId,
       buffer_seq: seq,
     });
+  }
+
+  /**
+   * 单 Agent 内文本检索（memory.searchMemory）：query → embedding →
+   * repo.searchSkills / searchExperiences（向量 top-K），返回对外视图。
+   */
+  async searchMemory(
+    roleId: string,
+    query: string,
+    options: { top_k?: number; include_skills?: boolean; include_experiences?: boolean } = {},
+  ): Promise<{ skills: SkillView[]; experiences: ExperienceView[] }> {
+    const repository = this.requireRepository('Memory search');
+    if (!this.embedding) {
+      throw new Error('Memory search requires a semantic embedding provider');
+    }
+    const query_embedding = await this.embedding.embed(query);
+    const top_k = options.top_k ?? 5;
+    const [skills, experiences] = await Promise.all([
+      options.include_skills === false
+        ? []
+        : repository.searchSkills(roleId, { query_embedding, top_k }),
+      options.include_experiences === false
+        ? []
+        : repository.searchExperiences(roleId, { query_embedding, top_k }),
+    ]);
+    return { skills: skills.map(toSkillView), experiences: experiences.map(toExperienceView) };
   }
 
   /** 构造 Persona 归纳器：有 LLM 注入则 LLM 归纳（自动降级规则版），否则纯规则版 */

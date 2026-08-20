@@ -338,6 +338,8 @@ export type {
   AgentBoardAgentView,
   SkillView,
   ExperienceView,
+  SkillListFilter,
+  ExperienceListFilter,
 } from './ports/agent-board-query';
 
 // ════════════════════════════════════════════════════════
