@@ -26,6 +26,9 @@ my-session.json
 
 # memory 本地设计文档（Spec + 代码导读 + 模块导读），不入仓
 src/memory/docs/
+# memory API 面计划/评审提案（本地设计文档），不入仓
+src/memory/api-surface-review-proposal.md
+src/memory/memory-api-surface-plan.md
 
 # 本地架构、设计与执行计划文档，不入仓
 docs/
@@ -48,6 +51,9 @@ docs/
 # AI 驱动测试生成残留 — 脚手架 / 报告 / 子项目
 DL_RESULT.md
 jwt-auth-system/
+
+# 本地复现/调试脚本，不入仓
+scripts/repro-*.ts
 
 
 *[^ -~]*
