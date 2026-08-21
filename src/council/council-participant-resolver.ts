@@ -105,7 +105,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       return this.resolveFixedSeats(input, agents, allowed);
     }
     if (this.auctionEnabled) {
-      return this.resolveAuctionSeats(input, agents);
+      return this.resolveAuctionSeats(input, agents, allowed);
     }
     const candidates = orderCandidates(
       agents.filter(
@@ -170,6 +170,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
   private async resolveAuctionSeats(
     input: CouncilParticipantResolutionInput,
     agents: readonly AgentBoardListItem[],
+    allowed: ReadonlySet<string>,
   ): Promise<CouncilParticipantBinding[]> {
     if (!this.auctionSelector) {
       throw new Error('Council auction mode requires an auction selector');
@@ -177,7 +178,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     const candidates = orderCandidates(
       agents.filter(
         (agent) =>
-          this.allowedAgentIds.has(agent.role_id) &&
+          allowed.has(agent.role_id) &&
           ['created', 'active', 'idle'].includes(agent.status) &&
           !agent.tags?.includes('council_only'),
       ),
@@ -190,7 +191,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     }
     const candidateAgentIds = candidates.map((candidate) => candidate.role_id);
     const primary = input.primary_agent_id ?? candidates[0]!.role_id;
-    if (!this.allowedAgentIds.has(primary) || !candidateAgentIds.includes(primary)) {
+    if (!allowed.has(primary) || !candidateAgentIds.includes(primary)) {
       throw new Error(`Council primary Agent ${primary} is not eligible for auction participation`);
     }
     const assignments: CouncilParticipantBinding[] = [];
