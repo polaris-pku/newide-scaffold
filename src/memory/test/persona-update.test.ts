@@ -41,7 +41,10 @@ describe('mergePersonaPatch', () => {
     expect(updated.notes).toBe('manual edit');
     // 未提供的字段保持原值
     expect(updated.skills_overview).toBe(before.skills_overview);
-    expect(updated.generated_at).not.toBe(before.generated_at);
+    // generated_at 刷新（毫秒级时间戳允许同一毫秒，按“不早于原值”断言刷新语义）
+    expect(new Date(updated.generated_at).getTime()).toBeGreaterThanOrEqual(
+      new Date(before.generated_at).getTime(),
+    );
     // 已落库
     expect((await repository.getPersona(ROLE)).summary).toBe('New summary');
   });

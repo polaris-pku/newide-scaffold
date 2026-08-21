@@ -228,7 +228,10 @@ export async function createProductionBackendService(
     const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
     // 动态 Agent 目录：选人 / 议会 / 邮箱协作每次使用时查询当前注册 Agent，
     // 使 memory.createAgent 新增的 Agent 无需重启即可进入协作流程。
-    const agentCatalogProvider = createAgentCatalogProvider(bCapabilities.boardQuery);
+    const agentCatalogProvider = createAgentCatalogProvider(
+      bCapabilities.boardQuery,
+      bRuntime.market_agent_ids,
+    );
     const configuredDatabasePath =
       env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
     const databasePath =
