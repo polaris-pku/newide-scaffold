@@ -24,6 +24,9 @@ my-session.json
 *.tar.gz
 *.log
 
+# 本地评测/复现产物，不入仓
+evalResult/
+
 # memory 本地设计文档（Spec + 代码导读 + 模块导读），不入仓
 src/memory/docs/
 # memory API 面计划/评审提案（本地设计文档），不入仓
