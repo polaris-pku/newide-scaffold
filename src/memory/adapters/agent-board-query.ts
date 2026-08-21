@@ -5,18 +5,20 @@
  * linked_negative_exp），并在 getAgent 内计算派生指标。
  * 实现 Port 见 ports/agent-board-query.ts。
  */
-import type { ExperienceRecord, SkillRecord } from '../schemas';
+import type { AgentStatus, ExperienceRecord, SkillRecord } from '../schemas';
 import { calculateDerivedMetrics } from '../schemas';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
   AgentBoardQuery,
+  ExperienceListFilter,
   ExperienceView,
+  SkillListFilter,
   SkillView,
 } from '../ports/agent-board-query';
 
-function toSkillView(s: SkillRecord): SkillView {
+export function toSkillView(s: SkillRecord): SkillView {
   return {
     id: s.id,
     description: s.description,
@@ -39,7 +41,7 @@ function toSkillView(s: SkillRecord): SkillView {
   };
 }
 
-function toExperienceView(e: ExperienceRecord): ExperienceView {
+export function toExperienceView(e: ExperienceRecord): ExperienceView {
   return {
     id: e.id,
     description: e.description,
@@ -64,18 +66,20 @@ function toExperienceView(e: ExperienceRecord): ExperienceView {
 export class RepositoryAgentBoardQuery implements AgentBoardQuery {
   constructor(private readonly repository: MemoryRepository) {}
 
-  async listAgents(): Promise<AgentBoardListItem[]> {
+  async listAgents(status?: AgentStatus): Promise<AgentBoardListItem[]> {
     const ids = await this.repository.listAgentIds();
     const handles = await Promise.all(ids.map((id) => this.repository.getAgent(id)));
-    return handles.map((h) => ({
-      role_id: h.role_id,
-      name: h.name,
-      status: h.status,
-      tags: h.tags,
-      skill_count: h.skill_count,
-      experience_count: h.experience_count,
-      persona_summary: h.persona.summary,
-    }));
+    return handles
+      .filter((h) => status === undefined || h.status === status)
+      .map((h) => ({
+        role_id: h.role_id,
+        name: h.name,
+        status: h.status,
+        tags: h.tags,
+        skill_count: h.skill_count,
+        experience_count: h.experience_count,
+        persona_summary: h.persona.summary,
+      }));
   }
 
   async getAgent(role_id: string): Promise<AgentBoardAgentView> {
@@ -97,13 +101,75 @@ export class RepositoryAgentBoardQuery implements AgentBoardQuery {
     };
   }
 
-  async listSkills(role_id: string): Promise<SkillView[]> {
+  async listSkills(role_id: string, filter?: SkillListFilter): Promise<SkillView[]> {
     const skills = await this.repository.listSkills(role_id);
-    return skills.map(toSkillView);
+    return applyPagination(
+      skills.filter((skill) => matchesSkillFilter(skill, filter)).map(toSkillView),
+      filter,
+    );
   }
 
-  async listExperiences(role_id: string): Promise<ExperienceView[]> {
+  async listExperiences(
+    role_id: string,
+    filter?: ExperienceListFilter,
+  ): Promise<ExperienceView[]> {
     const experiences = await this.repository.listExperiences(role_id);
-    return experiences.map(toExperienceView);
+    return applyPagination(
+      experiences.filter((experience) => matchesExperienceFilter(experience, filter)).map(toExperienceView),
+      filter,
+    );
   }
+}
+
+/** Skill 过滤：审核状态 / 标签 / 关键词（description + content 不区分大小写包含） */
+function matchesSkillFilter(skill: SkillRecord, filter: SkillListFilter | undefined): boolean {
+  if (!filter) return true;
+  if (filter.review_status !== undefined && skill.review_status !== filter.review_status) {
+    return false;
+  }
+  if (filter.tag !== undefined && !skill.tags.includes(filter.tag)) {
+    return false;
+  }
+  if (filter.keyword !== undefined) {
+    const needle = filter.keyword.toLowerCase();
+    const haystack = `${skill.description}\n${skill.content}`.toLowerCase();
+    if (!haystack.includes(needle)) return false;
+  }
+  return true;
+}
+
+/** Experience 过滤：类型 / 置信度区间 / 标签 / 关键词 */
+function matchesExperienceFilter(
+  experience: ExperienceRecord,
+  filter: ExperienceListFilter | undefined,
+): boolean {
+  if (!filter) return true;
+  if (filter.type !== undefined && experience.type !== filter.type) {
+    return false;
+  }
+  if (filter.confidence_min !== undefined && experience.confidence < filter.confidence_min) {
+    return false;
+  }
+  if (filter.confidence_max !== undefined && experience.confidence > filter.confidence_max) {
+    return false;
+  }
+  if (filter.tag !== undefined && !experience.tags.includes(filter.tag)) {
+    return false;
+  }
+  if (filter.keyword !== undefined) {
+    const needle = filter.keyword.toLowerCase();
+    const haystack = `${experience.description}\n${experience.content}`.toLowerCase();
+    if (!haystack.includes(needle)) return false;
+  }
+  return true;
+}
+
+/** 分页：offset 默认 0，limit 默认不限 */
+function applyPagination<T>(items: T[], filter: { offset?: number; limit?: number } | undefined): T[] {
+  if (!filter || (filter.offset === undefined && filter.limit === undefined)) {
+    return items;
+  }
+  const offset = filter.offset ?? 0;
+  const end = filter.limit !== undefined ? offset + filter.limit : undefined;
+  return items.slice(offset, end);
 }

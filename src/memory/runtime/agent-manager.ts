@@ -47,13 +47,24 @@ export interface AgentManagerOptions {
 }
 
 /**
+ * deleteAgent 的选项。
+ *
+ * - `force`: 删除未退休 Agent 时必传。未退休 Agent 的 skills 尚未迁移
+ *   市场池、experiences 尚未分级处置，强制删除会级联丢弃其名下全部
+ *   资产且不可恢复——仅应在用户明确二次确认后置 true。已退休 Agent
+ *   删除无需该标志。
+ */
+export interface DeleteAgentOptions {
+  force?: boolean;
+}
+
+/**
  * dispatchTask 的返回结果。
  *
  * - 不包含 winner_role_id 和 scores（Memory 不负责选赢家）
  * - role_id 即 dispatchTask 指定的目标 Agent
  * - status 反映任务执行结果
- */
-export interface DispatchTaskResult {
+ */export interface DispatchTaskResult {
   role_id: string;
   status:
     | 'completed'
@@ -166,6 +177,36 @@ export class AgentManager {
     const agent = await this.instantiateAgent(spec.role_id);
     this.agents.set(spec.role_id, agent);
     return agent.getHandle();
+  }
+
+  /**
+   * 删除 Agent（硬删除，级联清理全部持久化记忆与 buffer 存储）。
+   *
+   * 默认安全前置条件：Agent 必须已 retired（skills 已在退休时迁移市场池），
+   * 名下保留的 experiences 随删除级联清理。活跃 / draining Agent 若确认要
+   * 彻底移除（级联丢弃名下全部资产且不可恢复），可传 `{ force: true }`
+   * 显式二次确认后删除；资产想保留应先 retireAgent（skills 进市场池）。
+   * 市场池 Agent 禁止删除。
+   */
+  async deleteAgent(role_id: string, options: DeleteAgentOptions = {}): Promise<void> {
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot delete market pool agent: ${role_id}`);
+    }
+    const handle = await this.repository.getAgent(role_id).catch(() => null);
+    if (!handle) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+    if (handle.status !== 'retired' && !options.force) {
+      throw new Error(
+        `Agent must be retired before deletion: ${role_id} ` +
+          `(current status: ${handle.status}); ` +
+          `pass force: true to delete it anyway — this permanently discards ` +
+          `all of its skills, experiences and persona`,
+      );
+    }
+    await this.repository.deleteAgent(role_id);
+    await this.bufferRepository.deleteAgent(role_id);
+    this.agents.delete(role_id);
   }
 
   /**

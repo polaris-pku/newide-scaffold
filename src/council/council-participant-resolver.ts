@@ -49,7 +49,10 @@ export interface CouncilSeatAssignments {
 
 export interface AgentBoardCouncilParticipantResolverOptions {
   boardQuery: AgentBoardQuery;
-  allowedAgentIds: readonly string[];
+  /** 静态允许名册（与 resolveAllowedAgentIds 二选一；两者都提供时优先动态提供者） */
+  allowedAgentIds?: readonly string[];
+  /** 动态名册提供者：每次 resolve 时查询，支持运行时新增 Agent（memory.createAgent） */
+  resolveAllowedAgentIds?: () => Promise<readonly string[]>;
   ensureAgent?: (agentId: string) => Promise<void>;
   seatAssignments?: CouncilSeatAssignments;
   auctionSelector?: CouncilParticipantAuctionSelector;
@@ -66,7 +69,8 @@ export interface AgentBoardCouncilParticipantResolverOptions {
  */
 export class AgentBoardCouncilParticipantResolver implements CouncilParticipantResolver {
   private readonly boardQuery: AgentBoardQuery;
-  private readonly allowedAgentIds: ReadonlySet<string>;
+  private readonly allowedAgentIds: ReadonlySet<string> | undefined;
+  private readonly resolveAllowedAgentIds: (() => Promise<readonly string[]>) | undefined;
   private readonly ensureAgent: ((agentId: string) => Promise<void>) | undefined;
   private readonly seatAssignments: CouncilSeatAssignments | undefined;
   private readonly auctionSelector: CouncilParticipantAuctionSelector | undefined;
@@ -75,7 +79,8 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
 
   constructor(options: AgentBoardCouncilParticipantResolverOptions) {
     this.boardQuery = options.boardQuery;
-    this.allowedAgentIds = new Set(options.allowedAgentIds);
+    this.allowedAgentIds = options.allowedAgentIds ? new Set(options.allowedAgentIds) : undefined;
+    this.resolveAllowedAgentIds = options.resolveAllowedAgentIds;
     this.ensureAgent = options.ensureAgent;
     this.seatAssignments = options.seatAssignments;
     this.auctionSelector = options.auctionSelector;
@@ -89,22 +94,23 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
   async resolve(
     input: CouncilParticipantResolutionInput,
   ): Promise<CouncilParticipantBinding[]> {
+    const allowed = await this.resolveAllowedSet();
     if (this.ensureAgent) {
-      for (const agentId of [...this.allowedAgentIds].sort(compareCodeUnits)) {
+      for (const agentId of [...allowed].sort(compareCodeUnits)) {
         await this.ensureAgent(agentId);
       }
     }
     const agents = await this.boardQuery.listAgents();
     if (this.seatAssignments) {
-      return this.resolveFixedSeats(input, agents);
+      return this.resolveFixedSeats(input, agents, allowed);
     }
     if (this.auctionEnabled) {
-      return this.resolveAuctionSeats(input, agents);
+      return this.resolveAuctionSeats(input, agents, allowed);
     }
     const candidates = orderCandidates(
       agents.filter(
         (agent) =>
-          this.allowedAgentIds.has(agent.role_id) &&
+          allowed.has(agent.role_id) &&
           ['created', 'active', 'idle'].includes(agent.status) &&
           !agent.tags?.includes('council_only'),
       ),
@@ -164,6 +170,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
   private async resolveAuctionSeats(
     input: CouncilParticipantResolutionInput,
     agents: readonly AgentBoardListItem[],
+    allowed: ReadonlySet<string>,
   ): Promise<CouncilParticipantBinding[]> {
     if (!this.auctionSelector) {
       throw new Error('Council auction mode requires an auction selector');
@@ -171,7 +178,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     const candidates = orderCandidates(
       agents.filter(
         (agent) =>
-          this.allowedAgentIds.has(agent.role_id) &&
+          allowed.has(agent.role_id) &&
           ['created', 'active', 'idle'].includes(agent.status) &&
           !agent.tags?.includes('council_only'),
       ),
@@ -184,7 +191,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     }
     const candidateAgentIds = candidates.map((candidate) => candidate.role_id);
     const primary = input.primary_agent_id ?? candidates[0]!.role_id;
-    if (!this.allowedAgentIds.has(primary) || !candidateAgentIds.includes(primary)) {
+    if (!allowed.has(primary) || !candidateAgentIds.includes(primary)) {
       throw new Error(`Council primary Agent ${primary} is not eligible for auction participation`);
     }
     const assignments: CouncilParticipantBinding[] = [];
@@ -265,6 +272,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
   private async resolveFixedSeats(
     input: CouncilParticipantResolutionInput,
     agents: readonly AgentBoardListItem[],
+    allowed: ReadonlySet<string>,
   ): Promise<CouncilParticipantBinding[]> {
     const assignments = this.seatAssignments!;
     const agentByRole = new Map(agents.map((agent) => [agent.role_id, agent] as const));
@@ -281,7 +289,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       );
     }
     for (const entry of entries) {
-      if (!this.allowedAgentIds.has(entry.roleId)) {
+      if (!allowed.has(entry.roleId)) {
         throw new Error(`Council seat role_id ${entry.roleId} is not in the allowed roster`);
       }
       const agent = agentByRole.get(entry.roleId);
@@ -303,6 +311,16 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       agent_id: entry.roleId,
       role_profile_ref: entry.roleId,
     }));
+  }
+  /**
+   * 解析本次 resolve 的允许名册：优先动态提供者（支持运行时新增 Agent），
+   * 否则回退静态 allowlist（两者都未提供时为空集合）。
+   */
+  private async resolveAllowedSet(): Promise<ReadonlySet<string>> {
+    if (this.resolveAllowedAgentIds) {
+      return new Set(await this.resolveAllowedAgentIds());
+    }
+    return this.allowedAgentIds ?? new Set();
   }
 }
 

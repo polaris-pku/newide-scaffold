@@ -70,17 +70,30 @@ import type { DriverStreamEvent } from '../driver/contract';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
+  AgentHandle,
+  CreateAgentSpec,
+  CreateSkillInput,
   ExperienceView,
+  ExperienceWritePatch,
   MarketImportResult,
   MarketSearchQuery,
+  PersonaDef,
+  PersonaPatch,
   RetireOptions,
   RetireResult,
   RetirementScanResult,
+  ExperienceListFilter,
+  SkillListFilter,
   SkillView,
+  SkillWritePatch,
+  UserRating,
+  UserRatingResult,
+  MemoryOverview,
+  DeadLetterEntry,
 } from '../memory';
-import type { SkillRecord } from '../memory/schemas';
+import type { SkillRecord, BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
-import type { BMemoryBackendService } from './b-memory-backend-service';
+import type { AgentMetaPatch, BMemoryBackendService } from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
 import {
   NoopDriverStreamAuditWriter,
@@ -310,8 +323,8 @@ export class NewideBackendService {
     return this.requireMailboxService().reply(input);
   }
 
-  listMemoryAgents(): Promise<AgentBoardListItem[]> {
-    return this.requireBMemoryService().listAgents();
+  listMemoryAgents(status?: string): Promise<AgentBoardListItem[]> {
+    return this.requireBMemoryService().listAgents(status);
   }
 
   getMemoryCapabilities() {
@@ -322,12 +335,15 @@ export class NewideBackendService {
     return this.requireBMemoryService().getAgent(roleId);
   }
 
-  listMemorySkills(roleId: string): Promise<SkillView[]> {
-    return this.requireBMemoryService().listSkills(roleId);
+  listMemorySkills(roleId: string, filter?: SkillListFilter): Promise<SkillView[]> {
+    return this.requireBMemoryService().listSkills(roleId, filter);
   }
 
-  listMemoryExperiences(roleId: string): Promise<ExperienceView[]> {
-    return this.requireBMemoryService().listExperiences(roleId);
+  listMemoryExperiences(
+    roleId: string,
+    filter?: ExperienceListFilter,
+  ): Promise<ExperienceView[]> {
+    return this.requireBMemoryService().listExperiences(roleId, filter);
   }
 
   listMemoryMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]> {
@@ -354,12 +370,117 @@ export class NewideBackendService {
     return this.requireBMemoryService().runRetirementScan(roleId);
   }
 
+  createMemoryAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
+    return this.requireBMemoryService().createAgent(spec);
+  }
+
+  updateMemoryAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle> {
+    return this.requireBMemoryService().updateAgent(roleId, patch);
+  }
+
+  deleteMemoryAgent(roleId: string, options?: { force?: boolean }): Promise<void> {
+    return this.requireBMemoryService().deleteAgent(roleId, options);
+  }
+
   approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
     return this.requireBMemoryService().approveSkill(roleId, skillId, reviewedBy);
   }
 
   rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
     return this.requireBMemoryService().rejectSkill(roleId, skillId, reviewedBy);
+  }
+
+  createMemorySkill(input: CreateSkillInput): Promise<SkillView> {
+    return this.requireBMemoryService().createSkill(input);
+  }
+
+  updateMemorySkill(roleId: string, skillId: string, patch: SkillWritePatch): Promise<SkillView> {
+    return this.requireBMemoryService().updateSkill(roleId, skillId, patch);
+  }
+
+  deleteMemorySkill(roleId: string, skillId: string): Promise<void> {
+    return this.requireBMemoryService().deleteSkill(roleId, skillId);
+  }
+
+  publishMemorySkillToMarket(roleId: string, skillId: string): Promise<SkillView> {
+    return this.requireBMemoryService().publishSkillToMarket(roleId, skillId);
+  }
+
+  updateMemoryExperience(
+    roleId: string,
+    experienceId: string,
+    patch: ExperienceWritePatch,
+  ): Promise<ExperienceView> {
+    return this.requireBMemoryService().updateExperience(roleId, experienceId, patch);
+  }
+
+  deleteMemoryExperience(roleId: string, experienceId: string): Promise<void> {
+    return this.requireBMemoryService().deleteExperience(roleId, experienceId);
+  }
+
+  updateMemoryPersona(roleId: string, patch: PersonaPatch): Promise<PersonaDef> {
+    return this.requireBMemoryService().updatePersona(roleId, patch);
+  }
+
+  regenerateMemoryPersona(roleId: string): Promise<PersonaDef> {
+    return this.requireBMemoryService().regeneratePersona(roleId);
+  }
+
+  rateMemoryTask(
+    roleId: string,
+    taskId: string,
+    rating: UserRating,
+    note?: string,
+  ): Promise<UserRatingResult> {
+    return this.requireBMemoryService().rateTask(roleId, taskId, rating, note);
+  }
+
+  getMemoryBufferState(roleId: string): Promise<{
+    meta: BufferMeta;
+    pending_seqs: number[];
+    dead_letter_seqs: number[];
+    dead_letters: DeadLetterEntry[];
+  }> {
+    return this.requireBMemoryService().getBufferState(roleId);
+  }
+
+  getMemoryPendingBuffer(
+    roleId: string,
+    seq: number,
+  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined> {
+    return this.requireBMemoryService().getPendingBuffer(roleId, seq);
+  }
+
+  retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
+    return this.requireBMemoryService().retryExtraction(roleId, seq);
+  }
+
+  searchAgentMemory(
+    roleId: string,
+    query: string,
+    options: {
+      top_k?: number;
+      min_similarity?: number;
+      include_skills?: boolean;
+      include_experiences?: boolean;
+    } = {},
+  ): Promise<{
+    skills: Array<SkillView & { similarity: number }>;
+    experiences: Array<ExperienceView & { similarity: number }>;
+  }> {
+    return this.requireBMemoryService().searchMemory(roleId, query, options);
+  }
+
+  getMemoryOverview(): Promise<MemoryOverview> {
+    return this.requireBMemoryService().getOverview();
+  }
+
+  listMemoryPendingReviews(): Promise<SkillView[]> {
+    return this.requireBMemoryService().listPendingReviews();
+  }
+
+  listMemoryExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]> {
+    return this.requireBMemoryService().listExperiencesBySourceTask(taskId);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {

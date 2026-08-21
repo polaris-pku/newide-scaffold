@@ -167,7 +167,7 @@ describe('B memory evolution end to end', () => {
             promote_skills: { status: 'available' },
             approve_skill: { status: 'available' },
             reject_skill: { status: 'available' },
-            update_persona: { status: 'unavailable', reason: expect.any(String) },
+            update_persona: { status: 'available' },
           },
         },
       },

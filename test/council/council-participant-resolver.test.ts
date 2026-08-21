@@ -50,6 +50,39 @@ describe('AgentBoardCouncilParticipantResolver', () => {
     );
   });
 
+  it('resolves the roster from a dynamic provider so runtime-created Agents participate', async () => {
+    const board = [agent('role_ts_engineer', ['market_eligible'])];
+    const resolver = new AgentBoardCouncilParticipantResolver({
+      boardQuery: boardQuery(board),
+      resolveAllowedAgentIds: async () => board.map((entry) => entry.role_id),
+    });
+    const input = {
+      run_id: 'run_dynamic_roster',
+      task_id: 'task_dynamic_roster',
+      question: 'Choose an implementation.',
+    };
+
+    // 单 Agent 时 Council 不可用
+    await expect(resolver.resolve(input)).rejects.toThrow(
+      'Council requires at least two distinct persisted Agents',
+    );
+
+    // 运行时新增 Agent（memory.createAgent 后）无需重启即可参与
+    board.push(agent('role_fullstack_engineer', ['market_eligible']));
+    const participants = await resolver.resolve(input);
+
+    expect(participants.map(({ seat, seat_index, agent_id }) => ({
+      seat,
+      seat_index,
+      agent_id,
+    }))).toEqual([
+      { seat: 'proposer', seat_index: 0, agent_id: 'role_fullstack_engineer' },
+      { seat: 'proposer', seat_index: 1, agent_id: 'role_ts_engineer' },
+      { seat: 'reviewer', seat_index: 0, agent_id: 'role_ts_engineer' },
+      { seat: 'synthesizer', seat_index: 0, agent_id: 'role_fullstack_engineer' },
+    ]);
+  });
+
   it('rejects a Council when no eligible persisted Agent exists', async () => {
     const resolver = new AgentBoardCouncilParticipantResolver({
       boardQuery: boardQuery([agent('reviewer', ['council_only'])]),

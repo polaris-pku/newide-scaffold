@@ -68,6 +68,26 @@ export interface MemoryRepository {
   /** 按 spec 注册新 Agent（已存在则抛错） */
   initializeAgent(spec: CreateAgentSpec): Promise<void>;
 
+  /**
+   * 更新 Agent 元数据（显示名称 / 标签）。
+   *
+   * 仅允许更新非生命周期字段；Agent 状态变更走 updateAgentStatus。
+   * 实现须同步 AgentHandle 内嵌快照与聚合根一致性。
+   */
+  updateAgentMeta(
+    role_id: string,
+    patch: { name?: string; tags?: string[] },
+  ): Promise<void>;
+
+  /**
+   * 删除 Agent 及其全部持久化记忆（级联）。
+   *
+   * 调用方负责前置条件（通常仅允许 retired 状态，且 skills 已迁移市场）；
+   * 实现须级联删除名下 experiences / skills（Pg 由 ON DELETE CASCADE 保证）
+   * 与 Agent 行本身。删除不存在的 Agent 抛错。
+   */
+  deleteAgent(role_id: string): Promise<void>;
+
   /** 列出所有已注册的 Agent role_id */
   listAgentIds(): Promise<string[]>;
 

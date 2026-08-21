@@ -52,6 +52,7 @@ import {
 } from './b-memory-maintenance-runner';
 import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
+import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
 import { SystemRpcMethods } from '../rpc/system-methods';
 import { createProductionSystemStatusService } from './system-status-service';
@@ -204,14 +205,16 @@ export async function createProductionBackendService(
       dependencies.bRuntime ??
       (await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot }));
     assertValidMarketAgentIds(bRuntime.market_agent_ids);
+    // B 侧文本 LLM：memoryMaintenance 与 BMemoryBackendService（persona 重生成）共享
+    const memoryLlm =
+      dependencies.memoryLlm ??
+      new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env));
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
         repository: bRuntime.repository,
         bufferRepository: bRuntime.bufferRepository,
-        llm:
-          dependencies.memoryLlm ??
-          new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env)),
+        llm: memoryLlm,
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
@@ -223,6 +226,12 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
     const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    // 动态 Agent 目录：选人 / 议会 / 邮箱协作每次使用时查询当前注册 Agent，
+    // 使 memory.createAgent 新增的 Agent 无需重启即可进入协作流程。
+    const agentCatalogProvider = createAgentCatalogProvider(
+      bCapabilities.boardQuery,
+      bRuntime.market_agent_ids,
+    );
     const configuredDatabasePath =
       env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
     const databasePath =
@@ -248,7 +257,7 @@ export async function createProductionBackendService(
       }),
       mailbox: {
         service: mailboxService,
-        allowedRoleIds: bRuntime.market_agent_ids,
+        allowedRoleIds: agentCatalogProvider,
         sessionRegistry: participantSessions,
       },
     });
@@ -257,7 +266,6 @@ export async function createProductionBackendService(
         competitionQuery: agentExecutionFacade,
         boardQuery: bCapabilities.boardQuery,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
-        allowedAgentIds: bRuntime.market_agent_ids,
         candidateSource: 'allowed_catalog',
       }),
       evidenceStore: new FileMarketEvidenceStore({
@@ -272,7 +280,7 @@ export async function createProductionBackendService(
       councilRoot: path.join(stateRoot, 'council'),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
-        allowedAgentIds: bRuntime.market_agent_ids,
+        resolveAllowedAgentIds: agentCatalogProvider,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
         ...(councilSeatAssignments ? { seatAssignments: councilSeatAssignments } : {}),
         ...(!councilSeatAssignments && councilAuctionEnabled
@@ -320,8 +328,12 @@ export async function createProductionBackendService(
       {
         retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
         runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
+        createAgent: (spec) => agentExecutionFacade.createAgent(spec),
+        updateAgent: (roleId, patch) => agentExecutionFacade.updateAgent(roleId, patch),
+        deleteAgent: (roleId, options) => agentExecutionFacade.deleteAgent(roleId, options),
       },
       bRuntime.embedding,
+      memoryLlm,
     );
 
     try {
@@ -344,7 +356,7 @@ export async function createProductionBackendService(
         agentExecutionFacade,
         councilProvider,
         gateExecutor,
-        bootstrapAgentIds: bRuntime.market_agent_ids,
+        bootstrapAgentIds: agentCatalogProvider,
         auctionEnabled: readAuctionEnabled(env.NEWIDE_AUCTION_ENABLED),
         ...(env.NEWIDE_PRIMARY_AGENT_ID?.trim()
           ? { primaryAgentId: env.NEWIDE_PRIMARY_AGENT_ID.trim() }

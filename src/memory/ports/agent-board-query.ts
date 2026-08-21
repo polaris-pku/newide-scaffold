@@ -5,7 +5,7 @@
  * 只读、不写；不替代 AgentManager.submitTask 等写/执行路径。
  * 实现见 adapters/agent-board-query.ts。
  */
-import type { AgentMetrics, DerivedMetrics, PersonaDef } from '../schemas';
+import type { AgentMetrics, AgentStatus, DerivedMetrics, PersonaDef } from '../schemas';
 
 /** Board 列表卡片 DTO — 轻量摘要，不含 metrics / persona 全文 */
 export interface AgentBoardListItem {
@@ -83,15 +83,47 @@ export interface ExperienceView {
  * 方法签名与 DTO 映射见 Spec §6.7.4。
  */
 export interface AgentBoardQuery {
-  /** Board 卡片列表（轻量摘要） */
-  listAgents(): Promise<AgentBoardListItem[]>;
+  /** Board 卡片列表（轻量摘要）；可选按生命周期状态过滤 */
+  listAgents(status?: AgentStatus): Promise<AgentBoardListItem[]>;
 
   /** Agent 详情页：头部 + 画像 Tab + 指标 Tab 一次拿齐 */
   getAgent(role_id: string): Promise<AgentBoardAgentView>;
 
-  /** 按需加载技能列表（剔除 description_embedding） */
-  listSkills(role_id: string): Promise<SkillView[]>;
+  /** 按需加载技能列表（剔除 description_embedding）；支持过滤/分页 */
+  listSkills(role_id: string, filter?: SkillListFilter): Promise<SkillView[]>;
 
-  /** 按需加载经验列表（剔除 description_embedding 与 linked_negative_exp） */
-  listExperiences(role_id: string): Promise<ExperienceView[]>;
+  /** 按需加载经验列表（剔除 description_embedding 与 linked_negative_exp）；支持过滤/分页 */
+  listExperiences(role_id: string, filter?: ExperienceListFilter): Promise<ExperienceView[]>;
+}
+
+/** Skill 列表过滤/分页参数（M6） */
+export interface SkillListFilter {
+  /** 审核状态过滤（pending / approved / rejected） */
+  review_status?: string;
+  /** 标签过滤（tags 包含该标签） */
+  tag?: string;
+  /** 关键词：description / content 不区分大小写包含匹配（不依赖向量） */
+  keyword?: string;
+  /** 分页偏移（默认 0） */
+  offset?: number;
+  /** 分页条数上限（默认不限） */
+  limit?: number;
+}
+
+/** Experience 列表过滤/分页参数（M6） */
+export interface ExperienceListFilter {
+  /** 经验类型过滤（positive / negative） */
+  type?: string;
+  /** 置信度下限（含） */
+  confidence_min?: number;
+  /** 置信度上限（含） */
+  confidence_max?: number;
+  /** 标签过滤（tags 包含该标签） */
+  tag?: string;
+  /** 关键词：description / content 不区分大小写包含匹配 */
+  keyword?: string;
+  /** 分页偏移（默认 0） */
+  offset?: number;
+  /** 分页条数上限（默认不限） */
+  limit?: number;
 }

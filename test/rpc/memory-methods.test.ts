@@ -51,6 +51,7 @@ describe('MemoryRpcMethods', () => {
       reviewed_by: 'reviewer',
     }) as never);
     
+    const deleteMemoryAgent = vi.fn(async () => undefined);
     const service = fakeService({
       promoteMemorySkills,
       marketSearchMemorySkills,
@@ -59,6 +60,7 @@ describe('MemoryRpcMethods', () => {
       runRetirementScan,
       approveMemorySkill,
       rejectMemorySkill,
+      deleteMemoryAgent,
     });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
@@ -113,6 +115,117 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":16,"method":"memory.retirementScan","params":{"role_id":"","extra":true}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":17,"method":"memory.createAgent","params":{"role_id":"role_new","name":"New Agent","tags":["typescript"],"persona_seed":"Build TS services."}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":18,"method":"memory.createAgent","params":{"role_id":"role_new"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":19,"method":"memory.updateAgent","params":{"role_id":"role_ts_engineer","tags":["typescript","reviewer"]}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":20,"method":"memory.updateAgent","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":21,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":true}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":22,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":false}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":23,"method":"memory.createSkill","params":{"role_id":"role_ts_engineer","description":"TS patterns","content":"Define contracts.","tags":["typescript"]}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":24,"method":"memory.createSkill","params":{"role_id":"role_ts_engineer","description":"TS patterns"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":25,"method":"memory.updateSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1","tags":["typescript","reviewer"]}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":26,"method":"memory.updateSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1","market_status":"bogus"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":27,"method":"memory.publishSkillToMarket","params":{"role_id":"role_ts_engineer","skill_id":"skill_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":28,"method":"memory.deleteSkill","params":{"role_id":"role_ts_engineer","skill_id":"skill_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":29,"method":"memory.updateExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1","confidence":0.9}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":30,"method":"memory.updateExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":31,"method":"memory.deleteExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":32,"method":"memory.updatePersona","params":{"role_id":"role_ts_engineer","summary":"New persona summary"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":33,"method":"memory.updatePersona","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":34,"method":"memory.regeneratePersona","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":35,"method":"memory.regeneratePersona","params":{"role_id":""}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":36,"method":"memory.rateTask","params":{"role_id":"role_ts_engineer","task_id":"task_001","rating":"resolved","note":"great"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":37,"method":"memory.rateTask","params":{"role_id":"role_ts_engineer","task_id":"task_001","rating":"bogus"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":38,"method":"memory.getBufferState","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":39,"method":"memory.getPendingBuffer","params":{"role_id":"role_ts_engineer","seq":1}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":40,"method":"memory.getPendingBuffer","params":{"role_id":"role_ts_engineer","seq":0}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":41,"method":"memory.retryExtraction","params":{"role_id":"role_ts_engineer","seq":2}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":42,"method":"memory.listAgents","params":{"status":"active"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":43,"method":"memory.listAgents","params":{"status":""}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":44,"method":"memory.listSkills","params":{"role_id":"role_ts_engineer","review_status":"approved","keyword":"ts","limit":10}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":45,"method":"memory.listExperiences","params":{"role_id":"role_ts_engineer","type":"positive","confidence_min":0.5}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":46,"method":"memory.searchMemory","params":{"role_id":"role_ts_engineer","query":"typescript","top_k":5}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":47,"method":"memory.searchMemory","params":{"role_id":"role_ts_engineer","query":""}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":48,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":true,"force":true}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":49,"method":"memory.deleteAgent","params":{"role_id":"role_ts_engineer","confirm":true,"force":false}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":50,"method":"memory.getOverview","params":{}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":51,"method":"memory.listPendingReviews","params":{}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":52,"method":"memory.listExperiencesBySourceTask","params":{"task_id":"task_001"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":53,"method":"memory.listExperiencesBySourceTask","params":{"task_id":""}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -126,9 +239,17 @@ describe('MemoryRpcMethods', () => {
                 status: 'available',
               },
               update_persona: {
-                status: 'unavailable',
-                reason: expect.any(String),
+                status: 'available',
               },
+              regenerate_persona: { status: 'available' },
+              rate_task: { status: 'available' },
+              get_buffer_state: { status: 'available' },
+              get_pending_buffer: { status: 'available' },
+              retry_extraction: { status: 'available' },
+              search_memory: { status: 'available' },
+              create_agent: { status: 'available' },
+              update_agent: { status: 'available' },
+              delete_agent: { status: 'available' },
             },
           },
         },
@@ -158,6 +279,70 @@ describe('MemoryRpcMethods', () => {
       { id: 14, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
       { id: 15, result: { scans: [scanResult({ role_id: 'role_ts_engineer' })] } },
       { id: 16, error: { code: -32602, message: 'Invalid params' } },
+      { id: 17, result: { agent: { role_id: 'role_ts_engineer' } } },
+      { id: 18, error: { code: -32602, message: 'Invalid params' } },
+      { id: 19, result: { agent: { role_id: 'role_ts_engineer' } } },
+      { id: 20, error: { code: -32602, message: 'Invalid params' } },
+      { id: 21, result: { deleted: true } },
+      { id: 22, error: { code: -32602, message: 'Invalid params' } },
+      { id: 23, result: { skill: { id: 'skill_1' } } },
+      { id: 24, error: { code: -32602, message: 'Invalid params' } },
+      { id: 25, result: { skill: { id: 'skill_1' } } },
+      { id: 26, error: { code: -32602, message: 'Invalid params' } },
+      { id: 27, result: { skill: { id: 'skill_1' } } },
+      { id: 28, result: { deleted: true } },
+      { id: 29, result: { experience: { id: 'experience_1' } } },
+      { id: 30, error: { code: -32602, message: 'Invalid params' } },
+      { id: 31, result: { deleted: true } },
+      { id: 32, result: { persona: { version: 2 } } },
+      { id: 33, error: { code: -32602, message: 'Invalid params' } },
+      { id: 34, result: { persona: { version: 2 } } },
+      { id: 35, error: { code: -32602, message: 'Invalid params' } },
+      { id: 36, result: { rating: { updated_experiences: 1, buffer_updated: false } } },
+      { id: 37, error: { code: -32602, message: 'Invalid params' } },
+      {
+        id: 38,
+        result: {
+          state: {
+            meta: { pending_count: 0 },
+            pending_seqs: [],
+            dead_letter_seqs: [2],
+            dead_letters: [{ seq: 2, task_id: 'task_001', reason: 'LLM extraction timeout' }],
+          },
+        },
+      },
+      { id: 39, result: { buffer: { snapshot: { task_id: 'task_001' } } } },
+      { id: 40, error: { code: -32602, message: 'Invalid params' } },
+      { id: 41, result: { maintenance: { maintenance_ref: 'b_maintenance_1' } } },
+      { id: 42, result: { agents: [{ role_id: 'role_ts_engineer' }] } },
+      { id: 43, error: { code: -32602, message: 'Invalid params' } },
+      { id: 44, result: { skills: [{ id: 'skill_1' }] } },
+      { id: 45, result: { experiences: [{ id: 'experience_1' }] } },
+      {
+        id: 46,
+        result: {
+          skills: [{ id: 'skill_1', similarity: 0.82 }],
+          experiences: [{ id: 'experience_1', similarity: 0.71 }],
+        },
+      },
+      { id: 47, error: { code: -32602, message: 'Invalid params' } },
+      { id: 48, result: { deleted: true } },
+      { id: 49, error: { code: -32602, message: 'Invalid params' } },
+      {
+        id: 50,
+        result: {
+          overview: {
+            agents: { total: 1, by_status: { active: 1 } },
+            skills: { total: 1, pending_review: 0, in_market: 1 },
+            experiences: { total: 1 },
+            buffer: { pending: 0, dead_letters: 0 },
+            quality: { avg_confidence: 0.8 },
+          },
+        },
+      },
+      { id: 51, result: { skills: [{ id: 'skill_pending' }] } },
+      { id: 52, result: { experiences: [{ id: 'experience_1' }] } },
+      { id: 53, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(approveMemorySkill).toHaveBeenCalledWith(
@@ -182,13 +367,15 @@ describe('MemoryRpcMethods', () => {
     });
     expect(runRetirementScan).toHaveBeenCalledTimes(2);
     expect(runRetirementScan).toHaveBeenLastCalledWith('role_ts_engineer');
+    expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', undefined);
+    expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', { force: true });
   });
 });
 
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
     getMemoryCapabilities: () => ({
-      schema_version: 'newide.b-memory-capabilities.v1',
+      schema_version: 'newide.b-memory-capabilities.v2',
       skill_review: { mode: 'manual' },
       embedding: {
         provider: 'test',
@@ -205,11 +392,29 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         promote_skills: { status: 'available' },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
-        update_persona: { status: 'unavailable', reason: 'not exposed' },
+        update_persona: { status: 'available' },
+        regenerate_persona: { status: 'available' },
+        rate_task: { status: 'available' },
+        get_buffer_state: { status: 'available' },
+        get_pending_buffer: { status: 'available' },
+        retry_extraction: { status: 'available' },
+        search_memory: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
         retire_agent: { status: 'available' },
         retirement_scan: { status: 'available' },
+        create_agent: { status: 'available' },
+        update_agent: { status: 'available' },
+        delete_agent: { status: 'available' },
+        create_skill: { status: 'available' },
+        update_skill: { status: 'available' },
+        delete_skill: { status: 'available' },
+        publish_skill: { status: 'available' },
+        update_experience: { status: 'available' },
+        delete_experience: { status: 'available' },
+        get_overview: { status: 'available' },
+        list_pending_reviews: { status: 'available' },
+        list_experiences_by_source_task: { status: 'available' },
       },
     }),
     listMemoryAgents: async () => [
@@ -259,6 +464,79 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     runRetirementScan: async () => [scanResult()],
     approveMemorySkill: async () => ({ id: 'skill_1' } as never),
     rejectMemorySkill: async () => ({ id: 'skill_1' } as never),
+    createMemoryAgent: async (spec) => ({
+      role_id: spec.role_id,
+      name: spec.name,
+      status: 'created',
+      skill_count: 0,
+      experience_count: 0,
+      persona: {} as never,
+      metric: {} as never,
+      created_at: '2026-07-21T00:00:00.000Z',
+      owned_skills: [],
+      owned_exps: [],
+    }),
+    updateMemoryAgent: async (roleId) => ({
+      role_id: roleId,
+      name: 'TypeScript Engineer',
+      status: 'active',
+      skill_count: 1,
+      experience_count: 1,
+      persona: {} as never,
+      metric: {} as never,
+      created_at: '2026-07-21T00:00:00.000Z',
+      owned_skills: [],
+      owned_exps: [],
+    }),
+    deleteMemoryAgent: async () => undefined,
+    createMemorySkill: async () => ({ id: 'skill_1' } as never),
+    updateMemorySkill: async () => ({ id: 'skill_1' } as never),
+    deleteMemorySkill: async () => undefined,
+    publishMemorySkillToMarket: async () => ({ id: 'skill_1' } as never),
+    updateMemoryExperience: async () => ({ id: 'experience_1' } as never),
+    deleteMemoryExperience: async () => undefined,
+    updateMemoryPersona: async () => ({
+      role_id: 'role_ts_engineer',
+      version: 2,
+      summary: 'New persona summary',
+      skills_overview: '',
+      experience_coverage: '',
+      recent_performance: '',
+      notes: '',
+      generated_at: '2026-07-21T00:00:00.000Z',
+    }),
+    regenerateMemoryPersona: async () => ({
+      role_id: 'role_ts_engineer',
+      version: 2,
+      summary: 'Regenerated',
+      skills_overview: '',
+      experience_coverage: '',
+      recent_performance: '',
+      notes: '',
+      generated_at: '2026-07-21T00:00:00.000Z',
+    }),
+    rateMemoryTask: async () => ({ updated_experiences: 1, buffer_updated: false }),
+    getMemoryBufferState: async () => ({
+      meta: { pending_count: 0 },
+      pending_seqs: [],
+      dead_letter_seqs: [2],
+      dead_letters: [{ seq: 2, task_id: 'task_001', reason: 'LLM extraction timeout' }],
+    } as never),
+    getMemoryPendingBuffer: async () => ({ snapshot: { task_id: 'task_001' } } as never),
+    retryMemoryExtraction: async () => maintenance(),
+    searchAgentMemory: async () => ({
+      skills: [{ id: 'skill_1', similarity: 0.82 } as never],
+      experiences: [{ id: 'experience_1', similarity: 0.71 } as never],
+    }),
+    getMemoryOverview: async () => ({
+      agents: { total: 1, by_status: { active: 1 } },
+      skills: { total: 1, pending_review: 0, in_market: 1 },
+      experiences: { total: 1 },
+      buffer: { pending: 0, dead_letters: 0 },
+      quality: { avg_confidence: 0.8 },
+    }),
+    listMemoryPendingReviews: async () => [{ id: 'skill_pending' } as never],
+    listMemoryExperiencesBySourceTask: async () => [{ id: 'experience_1' } as never],
     ...overrides,
   };
 }
