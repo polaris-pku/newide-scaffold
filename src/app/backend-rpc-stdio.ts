@@ -270,6 +270,8 @@ export async function createProductionBackendService(
       }),
     });
     const councilSeatAssignments = readCouncilSeatAssignments(env.NEWIDE_COUNCIL_SEATS);
+    const councilAuctionEnabled = readCouncilAuctionEnabled(env.NEWIDE_COUNCIL_AUCTION_ENABLED);
+    const councilProposerCount = readCouncilProposerCount(env.NEWIDE_COUNCIL_PROPOSERS);
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
@@ -278,6 +280,24 @@ export async function createProductionBackendService(
         resolveAllowedAgentIds: agentCatalogProvider,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
         ...(councilSeatAssignments ? { seatAssignments: councilSeatAssignments } : {}),
+        ...(!councilSeatAssignments && councilAuctionEnabled
+          ? {
+              auctionEnabled: true,
+              proposerCount: councilProposerCount,
+              auctionSelector: async (input) => {
+                const result = await selectAgentHandler.execute({
+                  task_id: input.task_id,
+                  task_description: input.question,
+                  bootstrap_agent_ids: input.candidate_agent_ids,
+                  seed: `${input.run_id}:${input.seat}:${input.seat_index}`,
+                });
+                return {
+                  agent_id: result.winner_agent_id,
+                  selection_refs: [result.ledger_ref, result.audit_ref],
+                };
+              },
+            }
+          : {}),
       }),
     });
     const councilProvider = createCouncilStrategyProvider(
@@ -786,4 +806,27 @@ export function readAuctionEnabled(value: string | undefined): boolean {
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
   throw new Error(`Invalid NEWIDE_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
+}
+
+export function readCouncilAuctionEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return false;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(
+    `Invalid NEWIDE_COUNCIL_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`,
+  );
+}
+
+export function readCouncilProposerCount(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw) return 2;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Invalid NEWIDE_COUNCIL_PROPOSERS: ${value}. Expected an integer >= 2.`);
+  }
+  const count = Number(raw);
+  if (!Number.isSafeInteger(count) || count < 2) {
+    throw new Error(`Invalid NEWIDE_COUNCIL_PROPOSERS: ${value}. Expected an integer >= 2.`);
+  }
+  return count;
 }

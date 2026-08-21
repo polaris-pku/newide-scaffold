@@ -12,6 +12,7 @@ import {
   runSweEvoHarnessAdapter,
   buildSweEvoHarnessCommand,
   toWslPath,
+  assertSweEvoPythonCanImportSwebench,
 } from '../../eval/sweevo-harness-adapter';
 import type { SweEvoInstance } from '../../eval/types';
 import { parsePredictionMode } from '../../eval/validation';
@@ -84,6 +85,13 @@ describe('F eval utilities', () => {
       toWslPath(join(sweEvoRoot, 'SWE-bench', 'evaluate_instance.py')),
     );
     expect(command.args).toContain(toWslPath(trajectoryDir));
+  });
+
+  it('fails fast when the harness interpreter cannot import swebench', () => {
+    expect(() =>
+      assertSweEvoPythonCanImportSwebench('/no/such/sweevo-python', false),
+    ).toThrow(/cannot import swebench/);
+    expect(() => assertSweEvoPythonCanImportSwebench('/no/such/sweevo-python', true)).not.toThrow();
   });
 
   it('honors NEWIDE_SWE_EVO_PYTHON as a direct interpreter path', () => {

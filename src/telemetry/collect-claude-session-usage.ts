@@ -69,27 +69,63 @@ async function sumUsageFromClaudeJsonl(
   };
 }
 
+function resolveClaudeRoot(home: string): string {
+  if (path.basename(home) === '.claude') return home;
+  return path.join(home, '.claude');
+}
+
+function claudeHomeCandidates(): string[] {
+  const homes = [
+    process.env.ACP_PROCESS_SANDBOX_HOME,
+    process.env.CLAUDE_HOME,
+    process.env.USERPROFILE,
+    process.env.HOME,
+  ].filter((home): home is string => typeof home === 'string' && home.length > 0);
+  return [...new Set(homes.map((home) => path.resolve(home)))];
+}
+
+async function findSessionJsonl(claudeRoot: string, sessionId: string): Promise<string[]> {
+  const projectsRoot = path.join(claudeRoot, 'projects');
+  if (!existsSync(projectsRoot)) return [];
+  try {
+    const entries = await fs.readdir(projectsRoot, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(projectsRoot, entry.name, `${sessionId}.jsonl`))
+      .filter((filePath) => existsSync(filePath));
+  } catch {
+    return [];
+  }
+}
+
 export async function collectClaudeSessionUsage(input: {
   sessionId?: string;
   worktreePath: string;
 }): Promise<RunTokenUsageSummary> {
-  const home = process.env.USERPROFILE ?? process.env.HOME ?? '';
-  const claudeRoot = home ? path.join(home, '.claude') : '';
-  if (!claudeRoot || !existsSync(claudeRoot)) {
+  const homes = claudeHomeCandidates();
+  const claudeRoots = homes
+    .map((home) => resolveClaudeRoot(home))
+    .filter((claudeRoot, index, all) => existsSync(claudeRoot) && all.indexOf(claudeRoot) === index);
+  if (claudeRoots.length === 0) {
     return emptyTokenUsageSummary({
       ...(input.sessionId ? { session_id: input.sessionId } : {}),
     });
   }
 
-  const projectDirs = encodeClaudeProjectDirCandidates(input.worktreePath).map((encoded) =>
-    path.join(claudeRoot, 'projects', encoded),
+  const projectDirs = claudeRoots.flatMap((claudeRoot) =>
+    encodeClaudeProjectDirCandidates(input.worktreePath).map((encoded) =>
+      path.join(claudeRoot, 'projects', encoded),
+    ),
   );
   const candidates: string[] = [];
   if (input.sessionId) {
+    for (const claudeRoot of claudeRoots) {
+      candidates.push(...(await findSessionJsonl(claudeRoot, input.sessionId)));
+      candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
+    }
     for (const projectDir of projectDirs) {
       candidates.push(path.join(projectDir, `${input.sessionId}.jsonl`));
     }
-    candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
   }
 
   for (const projectDir of projectDirs) {

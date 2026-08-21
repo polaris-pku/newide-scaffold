@@ -18,7 +18,13 @@ import {
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
 import {
+  isDriverStreamUsage,
+  preferDriverUsage,
+  projectTaskDriverUsage,
+} from './driver-usage-projector';
+import {
   collectClaudeSessionUsage,
+  isPopulatedRunTokenUsage,
   mergeTokenUsageSummaries,
   runWithLlmUsageLedger,
   snapshotRunLedgerUsage,
@@ -438,6 +444,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     const summaryPath = path.join(runsRoot, runId, 'summary.json');
     try {
       const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+      const taskId = typeof raw.task_id === 'string' ? raw.task_id : undefined;
       const proxy = snapshotRunLedgerUsage(runId);
       const worktreePath =
         typeof raw.worktree_path === 'string' && raw.worktree_path.length > 0
@@ -453,9 +460,17 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
             ...(sessionId ? { sessionId } : {}),
           })
         : undefined;
-      raw.token_usage = claude
-        ? mergeTokenUsageSummaries([proxy, claude])
-        : proxy;
+      const billed = claude ? mergeTokenUsageSummaries([proxy, claude]) : proxy;
+      const driverUsage = preferDriverUsage(
+        isDriverStreamUsage(raw.driver_usage) ? raw.driver_usage : raw.token_usage,
+        taskId ? await projectTaskDriverUsage(runsRoot, taskId) : undefined,
+      );
+      if (driverUsage) raw.driver_usage = driverUsage;
+      if (isPopulatedRunTokenUsage(billed)) {
+        raw.token_usage = billed;
+      } else if (isDriverStreamUsage(raw.token_usage)) {
+        delete raw.token_usage;
+      }
       await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;

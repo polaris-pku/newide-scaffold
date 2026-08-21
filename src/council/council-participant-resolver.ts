@@ -10,11 +10,31 @@ export interface CouncilParticipantResolutionInput {
   task_id: string;
   question: string;
   participant_profile_refs?: string[];
+  primary_agent_id?: string;
 }
 
 export interface CouncilParticipantResolver {
   resolve(input: CouncilParticipantResolutionInput): Promise<CouncilParticipantBinding[]>;
 }
+
+export interface CouncilParticipantAuctionInput {
+  run_id: string;
+  task_id: string;
+  question: string;
+  seat: CouncilSeat;
+  seat_index: number;
+  candidate_agent_ids: string[];
+  excluded_agent_ids: string[];
+}
+
+export interface CouncilParticipantAuctionResult {
+  agent_id: string;
+  selection_refs?: string[];
+}
+
+export type CouncilParticipantAuctionSelector = (
+  input: CouncilParticipantAuctionInput,
+) => Promise<CouncilParticipantAuctionResult>;
 
 /**
  * 固定 Council 席位映射。配置后按 role_id 精确绑定 4 个席位，杜绝复用；
@@ -35,13 +55,16 @@ export interface AgentBoardCouncilParticipantResolverOptions {
   resolveAllowedAgentIds?: () => Promise<readonly string[]>;
   ensureAgent?: (agentId: string) => Promise<void>;
   seatAssignments?: CouncilSeatAssignments;
+  auctionSelector?: CouncilParticipantAuctionSelector;
+  auctionEnabled?: boolean;
+  proposerCount?: number;
 }
 
 /**
  * 从 B AgentBoard 的真实 Agent 中解析 Council 席位。
  *
- * 当前 MVP 固定为两个 proposer、一个 reviewer 和一个 synthesizer。
- * 两个不同的真实 Agent 即可正常启动；reviewer/synthesizer 复用会被审计。
+ * 默认绑定两个 proposer、一个 reviewer 和一个 synthesizer；动态竞标模式
+ * 可以配置更多 proposer。两个不同的真实 Agent 即可正常启动；复用会被审计。
  * 单 Agent 运行直接阻断。
  */
 export class AgentBoardCouncilParticipantResolver implements CouncilParticipantResolver {
@@ -50,6 +73,9 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
   private readonly resolveAllowedAgentIds: (() => Promise<readonly string[]>) | undefined;
   private readonly ensureAgent: ((agentId: string) => Promise<void>) | undefined;
   private readonly seatAssignments: CouncilSeatAssignments | undefined;
+  private readonly auctionSelector: CouncilParticipantAuctionSelector | undefined;
+  private readonly auctionEnabled: boolean;
+  private readonly proposerCount: number;
 
   constructor(options: AgentBoardCouncilParticipantResolverOptions) {
     this.boardQuery = options.boardQuery;
@@ -57,6 +83,12 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     this.resolveAllowedAgentIds = options.resolveAllowedAgentIds;
     this.ensureAgent = options.ensureAgent;
     this.seatAssignments = options.seatAssignments;
+    this.auctionSelector = options.auctionSelector;
+    this.auctionEnabled = options.auctionEnabled === true;
+    this.proposerCount = options.proposerCount ?? 2;
+    if (!Number.isInteger(this.proposerCount) || this.proposerCount < 2) {
+      throw new Error('Council proposerCount must be an integer greater than or equal to 2');
+    }
   }
 
   async resolve(
@@ -71,6 +103,9 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     const agents = await this.boardQuery.listAgents();
     if (this.seatAssignments) {
       return this.resolveFixedSeats(input, agents, allowed);
+    }
+    if (this.auctionEnabled) {
+      return this.resolveAuctionSeats(input, agents);
     }
     const candidates = orderCandidates(
       agents.filter(
@@ -130,6 +165,103 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
           }
         : {}),
     }));
+  }
+
+  private async resolveAuctionSeats(
+    input: CouncilParticipantResolutionInput,
+    agents: readonly AgentBoardListItem[],
+  ): Promise<CouncilParticipantBinding[]> {
+    if (!this.auctionSelector) {
+      throw new Error('Council auction mode requires an auction selector');
+    }
+    const candidates = orderCandidates(
+      agents.filter(
+        (agent) =>
+          this.allowedAgentIds.has(agent.role_id) &&
+          ['created', 'active', 'idle'].includes(agent.status) &&
+          !agent.tags?.includes('council_only'),
+      ),
+      input.participant_profile_refs,
+    );
+    if (candidates.length < 2) {
+      throw new Error(
+        `Council requires at least two distinct persisted Agents; found ${candidates.length}.`,
+      );
+    }
+    const candidateAgentIds = candidates.map((candidate) => candidate.role_id);
+    const primary = input.primary_agent_id ?? candidates[0]!.role_id;
+    if (!this.allowedAgentIds.has(primary) || !candidateAgentIds.includes(primary)) {
+      throw new Error(`Council primary Agent ${primary} is not eligible for auction participation`);
+    }
+    const assignments: CouncilParticipantBinding[] = [];
+    const used = new Set<string>();
+    assignments.push(this.binding(input, 'proposer', 0, primary));
+    used.add(primary);
+
+    for (let seatIndex = 1; seatIndex < this.proposerCount; seatIndex += 1) {
+      const selected = await this.selectAuctionSeat(input, 'proposer', seatIndex, candidates, used);
+      assignments.push(this.binding(input, 'proposer', seatIndex, selected.agent_id, selected.selection_refs));
+      used.add(selected.agent_id);
+    }
+    for (const seat of ['reviewer', 'synthesizer'] as const) {
+      const selected = await this.selectAuctionSeat(input, seat, 0, candidates, used);
+      assignments.push(this.binding(input, seat, 0, selected.agent_id, selected.selection_refs));
+      used.add(selected.agent_id);
+    }
+    const usage = countAgentUsage(assignments);
+    return assignments.map((assignment) =>
+      usage.get(assignment.agent_id)! > 1
+        ? {
+            ...assignment,
+            conflict_flags: [
+              ...(assignment.conflict_flags ?? []),
+              'agent_reused_across_council_seats',
+              'best_effort_identity',
+            ],
+          }
+        : assignment,
+    );
+  }
+
+  private async selectAuctionSeat(
+    input: CouncilParticipantResolutionInput,
+    seat: CouncilSeat,
+    seatIndex: number,
+    candidates: readonly AgentBoardListItem[],
+    used: ReadonlySet<string>,
+  ): Promise<CouncilParticipantAuctionResult> {
+    const candidateAgentIds = candidates.map((candidate) => candidate.role_id);
+    const available = candidateAgentIds.filter((agentId) => !used.has(agentId));
+    const selected = await this.auctionSelector!({
+      run_id: input.run_id,
+      task_id: input.task_id,
+      question: input.question,
+      seat,
+      seat_index: seatIndex,
+      candidate_agent_ids: available.length > 0 ? available : candidateAgentIds,
+      excluded_agent_ids: [...used],
+    });
+    if (!candidateAgentIds.includes(selected.agent_id)) {
+      throw new Error(`Council auction selected ineligible Agent ${selected.agent_id}`);
+    }
+    return selected;
+  }
+
+  private binding(
+    input: CouncilParticipantResolutionInput,
+    seat: CouncilSeat,
+    seatIndex: number,
+    agentId: string,
+    selectionRefs: readonly string[] = [],
+  ): CouncilParticipantBinding {
+    return {
+      participant_id: createCouncilParticipantId(input.run_id, seat, seatIndex, agentId),
+      seat,
+      seat_index: seatIndex,
+      agent_id: agentId,
+      role_profile_ref: agentId,
+      ...(selectionRefs.length > 0 ? { selection_refs: [...selectionRefs] } : {}),
+    };
   }
 
   /**

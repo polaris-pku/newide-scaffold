@@ -13,6 +13,8 @@ import {
   parseDriverEnv,
   ProductionAgentToolCallingClient,
   readAuctionEnabled,
+  readCouncilAuctionEnabled,
+  readCouncilProposerCount,
   resolveProductionLlmRuntime,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
@@ -50,6 +52,18 @@ describe('readAuctionEnabled', () => {
 
   it('rejects invalid values', () => {
     expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
+
+describe('Council auction configuration', () => {
+  it('keeps dynamic Council selection opt-in and parses proposer count', () => {
+    expect(readCouncilAuctionEnabled(undefined)).toBe(false);
+    expect(readCouncilAuctionEnabled('1')).toBe(true);
+    expect(readCouncilAuctionEnabled('false')).toBe(false);
+    expect(readCouncilProposerCount(undefined)).toBe(2);
+    expect(readCouncilProposerCount('3')).toBe(3);
+    expect(() => readCouncilAuctionEnabled('maybe')).toThrow('NEWIDE_COUNCIL_AUCTION_ENABLED');
+    expect(() => readCouncilProposerCount('1')).toThrow('NEWIDE_COUNCIL_PROPOSERS');
   });
 });
 
