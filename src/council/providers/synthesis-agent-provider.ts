@@ -376,6 +376,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         ...(input.participant_profile_refs
           ? { participant_profile_refs: input.participant_profile_refs }
           : {}),
+        ...(input.primary_agent_id ? { primary_agent_id: input.primary_agent_id } : {}),
       }));
     if (!participants) {
       throw new Error(
@@ -502,8 +503,8 @@ function validateParticipants(
     participantIds.add(participant.participant_id);
   }
   const proposers = participants.filter((participant) => participant.seat === 'proposer');
-  if (proposers.length !== 2 || new Set(proposers.map((item) => item.seat_index)).size !== 2) {
-    throw new Error('Council requires exactly two distinct proposer seats');
+  if (proposers.length < 2 || new Set(proposers.map((item) => item.seat_index)).size !== proposers.length) {
+    throw new Error('Council requires at least two distinct proposer seats');
   }
   for (const seat of ['reviewer', 'synthesizer'] as const) {
     if (participants.filter((participant) => participant.seat === seat).length !== 1) {
@@ -539,6 +540,7 @@ function participantAuditPayload(
     ...(participant.role_profile_ref
       ? { role_profile_ref: participant.role_profile_ref }
       : {}),
+    ...(participant.selection_refs ? { selection_refs: [...participant.selection_refs] } : {}),
     ...(participant.conflict_flags
       ? { conflict_flags: participant.conflict_flags }
       : {}),

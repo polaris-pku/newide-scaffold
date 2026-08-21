@@ -194,6 +194,8 @@ export interface CouncilRunRequest {
   candidate_artifacts?: ArtifactRef[];
   context_pack_ref?: string;
   participant_profile_refs?: string[];
+  /** Initial select_agent winner; used as proposer seat 0 in auction mode. */
+  primary_agent_id?: string;
   participants?: CouncilParticipantBinding[];
   proposals: Proposal[];
   reviews?: Review[];
