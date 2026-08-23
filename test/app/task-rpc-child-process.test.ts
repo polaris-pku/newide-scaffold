@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { AppRunEvent } from '../../src/app/run-registry';
 import { councilRunDirName } from '../../src/council/council-workspace';
+import type { RunSnapshot } from '../../src/protocol/run-snapshot';
 import type { TaskSnapshot } from '../../src/protocol/task-snapshot';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
 
@@ -73,6 +74,79 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         'COUNCIL_FINAL',
       );
 
+      const councilRunId = councilTerminal.run_history[0]?.run_id;
+      expect(councilRunId).toBeDefined();
+      const liveCouncilEvents = client.taskEvents(created.task.task_id);
+      const liveCouncilEventTypes = liveCouncilEvents.map((event) => event.type);
+      expect(liveCouncilEventTypes).toEqual(
+        expect.arrayContaining([
+          'market.auction.started',
+          'market.auction.completed',
+          'council.started',
+          'council.participants.selected',
+          'council.phase.started',
+          'council.proposal.completed',
+          'council.review.completed',
+          'council.synthesis.completed',
+          'council.decision',
+          'council.completed',
+        ]),
+      );
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'market.auction.started')?.payload,
+      ).toMatchObject({
+        selection_scope: 'primary',
+        selection_mode: 'auction',
+        candidates: expect.any(Array),
+      });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'market.auction.completed')
+          ?.payload,
+      ).toMatchObject({
+        selection_scope: 'primary',
+        winner_role_id: expect.stringMatching(/^role_/),
+        winner_probability: expect.any(Number),
+        bids: expect.any(Array),
+      });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'council.proposal.completed')
+          ?.payload,
+      ).toMatchObject({ proposal: { summary: expect.any(String) } });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'council.review.completed')
+          ?.payload,
+      ).toMatchObject({ reviews: expect.any(Array) });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'council.synthesis.completed')
+          ?.payload,
+      ).toMatchObject({ synthesis: { summary: expect.any(String) } });
+
+      const runSnapshot = await client.call<RunSnapshot>('run.getSnapshot', {
+        run_id: councilRunId,
+      });
+      expect(runSnapshot.council).toMatchObject({
+        phase: 'completed',
+        subject: 'Produce a result and then validate it with Council',
+        auctions: expect.any(Array),
+        participants: expect.any(Array),
+        proposals: expect.any(Array),
+        reviews: expect.any(Array),
+        synthesis: { summary: expect.any(String) },
+      });
+      const finalArtifactRef = councilTerminal.council?.result?.final_artifact_ref;
+      expect(finalArtifactRef).toBeDefined();
+      await expect(
+        client.call('artifact.getContent', {
+          run_id: councilRunId,
+          artifact_id: finalArtifactRef,
+        }),
+      ).resolves.toMatchObject({
+        run_id: councilRunId,
+        artifact_id: finalArtifactRef,
+        content: expect.stringContaining('COUNCIL_FINAL'),
+        truncated: false,
+      });
+
       const agents = await client.call<{ agents: Array<{ role_id: string }> }>(
         'memory.listAgents',
         {},
@@ -117,7 +191,6 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         ]),
       });
 
-      const liveCouncilEvents = client.taskEvents(created.task.task_id);
       const replayCursor = liveCouncilEvents.find((event) => event.type === 'run.created');
       expect(replayCursor).toBeDefined();
       expect(liveCouncilEvents.at(-1)).toMatchObject({ type: 'run.completed' });
