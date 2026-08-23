@@ -1,11 +1,13 @@
 import {
   MarketAuctionEngine,
+  type AgentProjection,
   type AgentProjectionSource,
   type BidLedger,
   type MarketAudit,
   type MarketEvidenceStore,
   type MarketTaskSpecification,
 } from '../../market';
+import { createId } from '../../core';
 
 export interface SelectAgentHandlerOptions {
   projectionSource: AgentProjectionSource;
@@ -23,6 +25,7 @@ export interface SelectAgentInput {
 }
 
 export interface SelectAgentResult {
+  auction_id: string;
   winner_agent_id: string;
   winner_bid_id: string;
   ledger_ref: string;
@@ -32,15 +35,32 @@ export interface SelectAgentResult {
   market_task: MarketTaskSpecification;
 }
 
+export interface SelectAgentExecutionOptions {
+  onCandidatesCollected?: (input: {
+    auction_id: string;
+    market_task: MarketTaskSpecification;
+    candidates: readonly AgentProjection[];
+  }) => void | Promise<void>;
+}
+
 export class SelectAgentHandler {
   constructor(private readonly options: SelectAgentHandlerOptions) {}
 
-  async execute(input: SelectAgentInput): Promise<SelectAgentResult> {
+  async execute(
+    input: SelectAgentInput,
+    executionOptions: SelectAgentExecutionOptions = {},
+  ): Promise<SelectAgentResult> {
+    const auctionId = createId('market_auction');
     const marketTask = buildMarketTask(input.task_id, input.task_description);
     const candidates = await this.options.projectionSource.projectCandidates(
       { task_id: input.task_id, spec: input.task_description },
       { bootstrap_agent_ids: input.bootstrap_agent_ids },
     );
+    await executionOptions.onCandidatesCollected?.({
+      auction_id: auctionId,
+      market_task: marketTask,
+      candidates,
+    });
     const auction = new MarketAuctionEngine({
       policy: {
         policy_version: this.options.policyVersion ?? 'market-v0',
@@ -54,6 +74,7 @@ export class SelectAgentHandler {
       audit: auction.audit,
     });
     return {
+      auction_id: auctionId,
       winner_agent_id: auction.winner_agent_id,
       winner_bid_id: auction.winner_bid_id,
       ...refs,

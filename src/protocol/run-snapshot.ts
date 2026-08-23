@@ -124,6 +124,23 @@ export const runSnapshotSchema = z
       .object({
         enabled: z.literal(true),
         status: z.enum(['running', 'completed', 'failed', 'cancelled']),
+        council_run_id: z.string().min(1).optional(),
+        phase: z
+          .enum([
+            'selecting',
+            'proposal',
+            'review',
+            'synthesis',
+            'implementation',
+            'decision',
+            'completed',
+            'failed',
+          ])
+          .optional(),
+        subject: z.string().min(1).optional(),
+        strategy: z.string().min(1).optional(),
+        artifact_mode: z.enum(['implementation', 'plan']).optional(),
+        auctions: z.array(recordSchema).optional(),
         decision_id: z.string().optional(),
         verdict: z.string().optional(),
         decision_mode: z.string().optional(),
@@ -136,9 +153,11 @@ export const runSnapshotSchema = z
         proposals: z.array(recordSchema).optional(),
         reviews: z.array(recordSchema).optional(),
         synthesis: recordSchema.optional(),
+        implementation: recordSchema.optional(),
         output: recordSchema.optional(),
         result: recordSchema.optional(),
         outcome: councilOutcomeEvidenceSchema.optional(),
+        fatal_error: recordSchema.optional(),
       })
       .strict()
       .optional(),

@@ -656,6 +656,19 @@ describe('backend RPC stdio entrypoint', () => {
       unsubscribe();
       expect(councilSnapshot.status).toBe('completed');
       const externalCouncilSnapshot = service.getRunSnapshot(councilCreated.run_id);
+      expect(externalCouncilSnapshot.council).toMatchObject({
+        phase: 'completed',
+        subject: 'Exercise production council composition.',
+        strategy: 'classic',
+        artifact_mode: 'implementation',
+      });
+      expect(externalCouncilSnapshot.council?.auctions).toHaveLength(1);
+      expect(externalCouncilSnapshot.council?.auctions?.[0]).toMatchObject({
+        selection_scope: 'primary',
+        selection_mode: 'auction',
+        status: 'completed',
+        winner_role_id: 'role_ts_engineer',
+      });
       expect(externalCouncilSnapshot.council?.participants).toHaveLength(4);
       expect(
         externalCouncilSnapshot.council?.participants?.map(
@@ -669,6 +682,10 @@ describe('backend RPC stdio entrypoint', () => {
       ]);
       const councilEventTypes = councilSnapshot.events.map((event) => event.type);
       expect(councilEventTypes).toContain('market.selected');
+      expect(councilEventTypes).toContain('market.auction.started');
+      expect(councilEventTypes).toContain('market.auction.completed');
+      expect(councilEventTypes).toContain('council.participants.selected');
+      expect(councilEventTypes.filter((type) => type === 'council.phase.started')).toHaveLength(3);
       expect(
         councilEventTypes.filter((type) => type === 'council.proposal.completed'),
       ).toHaveLength(2);
@@ -693,6 +710,16 @@ describe('backend RPC stdio entrypoint', () => {
         final_artifact_ref: 'artifact_fake_acp',
         final_artifact_sha256: createHash('sha256').update(deliveredCouncilFile).digest('hex'),
         decision_record_ref: expect.stringMatching(/^council_decision_/),
+      });
+      const readableArtifact = await service.getArtifactContent(
+        councilCreated.run_id,
+        'artifact_fake_acp',
+      );
+      expect(readableArtifact).toMatchObject({
+        artifact_id: 'artifact_fake_acp',
+        target_path: 'council-output.txt',
+        content: 'COUNCIL_FINAL\n',
+        truncated: false,
       });
       const audit = readFileSync(
         path.join('.newide', 'runs', councilCreated.run_id, 'audit.jsonl'),

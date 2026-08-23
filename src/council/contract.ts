@@ -216,9 +216,14 @@ export type CouncilRoundInput = CouncilRunRequest;
 
 export interface CouncilLifecycleEvent {
   type:
+    | 'market.auction.started'
+    | 'market.auction.completed'
+    | 'council.participants.selected'
+    | 'council.phase.started'
     | 'council.proposal.completed'
     | 'council.review.completed'
     | 'council.synthesis.completed'
+    | 'council.implementation.completed'
     | 'council.role.failed'
     | 'council.failed';
   payload: Record<string, unknown>;

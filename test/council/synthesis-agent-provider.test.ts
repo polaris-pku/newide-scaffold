@@ -236,9 +236,14 @@ describe('SynthesisAgentCouncilProvider', () => {
       can_create_merge_authorization: false,
     });
     expect(lifecycleEvents).toEqual([
+      'council.participants.selected',
+      'council.phase.started',
       'council.proposal.completed',
+      'council.phase.started',
       'council.proposal.completed',
+      'council.phase.started',
       'council.review.completed',
+      'council.phase.started',
       'council.synthesis.completed',
     ]);
     await fs.rm(councilRoot, { recursive: true, force: true });
