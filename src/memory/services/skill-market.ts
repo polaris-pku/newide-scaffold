@@ -2,15 +2,16 @@
  * SkillMarket — 技能市场服务
  *
  * 对应 Spec §6.2 的 `skill.market_search` / `skill.market_import` 逻辑接口。
- * 技能市场是跨 Agent 共享的能力池：任意 Agent 可以检索（market_search）并
- * 引入（market_import）其他 Agent 晋升的、已审核通过的技能。
+ * 技能市场是市场池（__market__）内的共享能力池：任意 Agent 可以检索
+ * （market_search）并引入（market_import）已迁入市场池的、已审核通过的技能。
  *
  * 本服务保持纯函数式（只依赖 MemoryRepository + EmbeddingProvider），
  * 与 reviewSkill / disposeRetiredAssets 同一模式，便于单测。
  *
  * ## 语义
  *
- * - marketSearch：文本 query → embedding → 全库 top-K 向量召回
+ * - marketSearch：文本 query → embedding → 市场池（__market__）内 top-K 向量召回。
+ *   检索范围仅限市场池；未退休/未迁入市场池的 Agent 技能不可被检索到。
  *   （review_status=approved 且 market_status≠superseded，含 retired_unique 稀缺遗产）。
  * - marketImport：将市场技能克隆为引入方副本；副作用见
  *   MemoryRepository.marketImportSkill 的约定（imported_by / imported_skill_count）。
@@ -40,6 +41,8 @@ export interface MarketSearchQuery {
 
 /**
  * 技能市场检索。
+ *
+ * 仅检索市场池（__market__）内的技能；未退休/未迁入市场池的 Agent 技能不可被检索到。
  *
  * @param repository - MemoryRepository 端口
  * @param embedding  - EmbeddingProvider（query 文本 → 向量）

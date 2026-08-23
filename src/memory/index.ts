@@ -234,6 +234,24 @@ export {
 } from './services/retirement-detection';
 
 // ════════════════════════════════════════════════════════
+//  8.8 市场自学习（存活 Agent 扫描市场引入技能）
+//     决策 = tag 相似度 + persona 相似度加权
+// ════════════════════════════════════════════════════════
+
+export {
+  learnSkillsForAgent,
+  buildLearningQuery,
+  computeTagSimilarity,
+  evaluateSkillLearning,
+  DEFAULT_SKILL_LEARNING_OPTIONS,
+} from './services/skill-learning';
+export type {
+  SkillLearningOptions,
+  SkillLearningDecision,
+  SkillLearningOutcome,
+} from './services/skill-learning';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 
@@ -358,6 +376,7 @@ export type {
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
 export type { AgentToolConfig } from './runtime/agent';
 export type {
+  AgentArchiveRecord,
   AgentHandle,
   CreateAgentSpec,
   PersonaDef,

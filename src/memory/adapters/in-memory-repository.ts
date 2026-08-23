@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import {
   MARKET_POOL_ROLE_ID,
+  type AgentArchiveRecord,
   type AgentHandle,
   type AgentMetrics,
   type AgentStatus,
@@ -54,6 +55,8 @@ interface ScoredRecord<T> {
 
 export class InMemoryRepository implements MemoryRepository {
   private readonly agents = new Map<string, AgentStore>();
+  /** 退休归档（实体删除后保留的最小字段） */
+  private readonly archives = new Map<string, AgentArchiveRecord>();
 
   constructor(private readonly embedding: EmbeddingProvider = defaultHashEmbeddingProvider) {}
 
@@ -111,6 +114,14 @@ export class InMemoryRepository implements MemoryRepository {
     }
   }
 
+  async archiveAgent(roleId: string, archive: AgentArchiveRecord): Promise<void> {
+    this.archives.set(roleId, archive);
+  }
+
+  async getAgentArchive(roleId: string): Promise<AgentArchiveRecord | null> {
+    return this.archives.get(roleId) ?? null;
+  }
+
   async getAgent(role_id: string): Promise<AgentHandle> {
     return this.requireStore(role_id).handle;
   }
@@ -148,17 +159,16 @@ export class InMemoryRepository implements MemoryRepository {
   }
 
   async marketSearchSkills(options: MarketSearchOptions): Promise<SkillRecord[]> {
-    const candidates: SkillRecord[] = [];
-    for (const [agentId, store] of this.agents) {
-      if (options.exclude_agent_id === agentId) {
-        continue;
-      }
-      for (const skill of store.skills) {
-        if (isMarketEligibleSkill(skill)) {
-          candidates.push(skill);
-        }
-      }
+    // 技能市场仅检索市场池（__market__）内的技能：
+    // 未退休/未迁入市场池的 Agent 技能（即使已 approved 或已 publish 标记）不可被检索到。
+    if (options.exclude_agent_id === MARKET_POOL_ROLE_ID) {
+      return [];
     }
+    const market = this.agents.get(MARKET_POOL_ROLE_ID);
+    if (!market) {
+      return [];
+    }
+    const candidates = market.skills.filter(isMarketEligibleSkill);
     return rankByVectorSimilarity(candidates, options, this.embedding);
   }
 

@@ -5,6 +5,7 @@
  * 指标等。Buffer 队列见 BufferRepository。实现见 InMemoryRepository、PgMemoryRepository。
  */
 import type {
+  AgentArchiveRecord,
   AgentHandle,
   AgentMetrics,
   AgentStatus,
@@ -29,10 +30,12 @@ export interface MemoryVectorSearchOptions {
 }
 
 /**
- * 技能市场检索参数（跨 Agent 全库召回）。
+ * 技能市场检索参数（仅市场池召回）。
  *
- * 与 MemoryVectorSearchOptions 的区别：不限定 role_id，检索范围是全部
- * Agent 的「可市场技能」（review_status=approved 且 market_status≠superseded）。
+ * 与 MemoryVectorSearchOptions 的区别：检索范围限定在市场池
+ * （MARKET_POOL_ROLE_ID = __market__）内的技能——只有退休/迁入市场池的
+ * 技能可被检索到，未退休 Agent 的技能不可被检索。
+ * 资格过滤与 searchSkills 一致（review_status=approved 且 market_status≠superseded）。
  */
 export interface MarketSearchOptions {
   /** 检索 query 的 embedding 向量 */
@@ -88,6 +91,18 @@ export interface MemoryRepository {
    */
   deleteAgent(role_id: string): Promise<void>;
 
+  /**
+   * 写入退休归档（finalize 阶段调用）。在删除 Agent 实体前调用，保证删除后
+   * 仍有最小字段可追溯。实现须幂等（同 role_id 重复写入覆盖）。
+   */
+  archiveAgent(roleId: string, archive: AgentArchiveRecord): Promise<void>;
+
+  /**
+   * 读取退休归档；不存在返回 null。供 retireAgent 幂等返回 / deleteAgent
+   * 判定"已归档即已退休删除"使用。
+   */
+  getAgentArchive(roleId: string): Promise<AgentArchiveRecord | null>;
+
   /** 列出所有已注册的 Agent role_id */
   listAgentIds(): Promise<string[]>;
 
@@ -112,10 +127,10 @@ export interface MemoryRepository {
   ): Promise<ExperienceRecord[]>;
 
   /**
-   * 技能市场检索：跨 Agent 全库范围检索「可市场技能」（Spec §6.2 skill.market_search）。
+   * 技能市场检索：仅检索市场池（__market__）内的技能（Spec §6.2 skill.market_search）。
    *
-   * 过滤规则与 searchSkills 一致（approved 且非 superseded），但不受单个
-   * Agent 作用域限制；支持排除调用方自身。
+   * 过滤规则与 searchSkills 一致（approved 且非 superseded），但检索范围仅限
+   * 市场池——未退休/未迁入市场池的 Agent 技能不可被检索到。
    */
   marketSearchSkills(options: MarketSearchOptions): Promise<SkillRecord[]>;
 

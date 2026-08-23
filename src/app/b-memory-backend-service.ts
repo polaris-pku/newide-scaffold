@@ -345,7 +345,7 @@ export class BMemoryBackendService {
     return { ...promotion, skills };
   }
 
-  /** 技能市场检索：query 文本 → embedding → 全库 top-K 召回（Spec §6.2）。 */
+  /** 技能市场检索：query 文本 → embedding → 市场池（__market__）内 top-K 召回（Spec §6.2）。 */
   async marketSearch(query: MarketSearchQuery): Promise<SkillRecord[]> {
     if (!this.repository) {
       throw new Error('Market search requires a MemoryRepository');

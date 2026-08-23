@@ -11,12 +11,14 @@ import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import type { SqlPool } from '../ports/sql-pool';
 import {
+  AgentArchiveRecordSchema,
   AgentHandleSchema,
   AgentMetricsSchema,
   ExperienceRecordSchema,
   MARKET_POOL_ROLE_ID,
   PersonaDefSchema,
   SkillRecordSchema,
+  type AgentArchiveRecord,
   type AgentHandle,
   type AgentMetrics,
   type AgentStatus,
@@ -153,6 +155,26 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  async archiveAgent(roleId: string, archive: AgentArchiveRecord): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      `INSERT INTO memory_agent_archives (role_id, payload)
+       VALUES ($1, $2::jsonb)
+       ON CONFLICT (role_id) DO UPDATE SET payload = EXCLUDED.payload`,
+      [roleId, JSON.stringify(archive)],
+    );
+  }
+
+  async getAgentArchive(roleId: string): Promise<AgentArchiveRecord | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ payload: AgentArchiveRecord }>(
+      'SELECT payload FROM memory_agent_archives WHERE role_id = $1',
+      [roleId],
+    );
+    const row = result.rows[0];
+    return row ? AgentArchiveRecordSchema.parse(row.payload) : null;
+  }
+
   async getAgent(role_id: string): Promise<AgentHandle> {
     await this.ensureSchema();
     const row = await this.requireAgentRow(role_id);
@@ -249,13 +271,15 @@ export class PgMemoryRepository implements MemoryRepository {
     const result = await this.pool.query<{ payload: SkillRecord }>(
       `SELECT payload
        FROM memory_skills
-       WHERE payload->>'review_status' = 'approved'
+       WHERE role_id = $1
+         AND payload->>'review_status' = 'approved'
          AND COALESCE(payload->>'market_status', '') <> 'superseded'
-         AND ($1::text IS NULL OR role_id <> $1::text)
-         AND (1 - (description_embedding <=> $2::vector)) >= $3
-       ORDER BY description_embedding <=> $2::vector ASC
-       LIMIT $4`,
+         AND ($2::text IS NULL OR role_id <> $2::text)
+         AND (1 - (description_embedding <=> $3::vector)) >= $4
+       ORDER BY description_embedding <=> $3::vector ASC
+       LIMIT $5`,
       [
+        MARKET_POOL_ROLE_ID,
         options.exclude_agent_id ?? null,
         toPgVector(options.query_embedding),
         min_similarity,
