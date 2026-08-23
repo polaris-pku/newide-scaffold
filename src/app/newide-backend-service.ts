@@ -110,6 +110,10 @@ import type {
   SystemSchemaManifestV1,
   SystemVersionV1,
 } from '../protocol/system-status';
+import type {
+  RunArtifactContent,
+  RunArtifactContentReader,
+} from './run-artifact-content-reader';
 
 export interface RunCreateParams {
   prompt: string;
@@ -248,7 +252,15 @@ export class NewideBackendService {
     private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
     private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
     private readonly participantSessionProvisioner?: ParticipantSessionProvisioner,
+    private readonly artifactContentReader?: RunArtifactContentReader,
   ) {}
+
+  async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
+    if (!this.artifactContentReader) {
+      throw new Error('Artifact content reader is not configured');
+    }
+    return this.artifactContentReader.read(runId, artifactId);
+  }
 
   async recoverMailboxWaits(): Promise<void> {
     await this.mailboxRecovery;

@@ -54,8 +54,15 @@ import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
 import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
+import {
+  marketAuctionCompletedPayload,
+  marketAuctionStartedPayload,
+  type MarketEventContext,
+} from './market-event-payload';
 import { SystemRpcMethods } from '../rpc/system-methods';
+import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
+import { FileRunArtifactContentReader } from './run-artifact-content-reader';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -288,11 +295,40 @@ export async function createProductionBackendService(
               auctionEnabled: true,
               proposerCount: councilProposerCount,
               auctionSelector: async (input) => {
-                const result = await selectAgentHandler.execute({
-                  task_id: input.task_id,
-                  task_description: input.question,
-                  bootstrap_agent_ids: input.candidate_agent_ids,
-                  seed: `${input.run_id}:${input.seat}:${input.seat_index}`,
+                const marketContext: MarketEventContext = {
+                  selection_scope: 'council_seat',
+                  selection_mode: 'auction',
+                  seat: input.seat,
+                  seat_index: input.seat_index,
+                };
+                const result = await selectAgentHandler.execute(
+                  {
+                    task_id: input.task_id,
+                    task_description: input.question,
+                    bootstrap_agent_ids: input.candidate_agent_ids,
+                    seed: `${input.run_id}:${input.seat}:${input.seat_index}`,
+                  },
+                  {
+                    onCandidatesCollected: async (collected) => {
+                      await input.on_lifecycle_event?.({
+                        type: 'market.auction.started',
+                        payload: marketAuctionStartedPayload({
+                          context: marketContext,
+                          auction_id: collected.auction_id,
+                          task_description: collected.market_task.task_description,
+                          requirement_profile: collected.market_task.requirement_profile,
+                          candidates: collected.candidates,
+                        }),
+                      });
+                    },
+                  },
+                );
+                await input.on_lifecycle_event?.({
+                  type: 'market.auction.completed',
+                  payload: marketAuctionCompletedPayload({
+                    context: marketContext,
+                    result,
+                  }),
                 });
                 return {
                   agent_id: result.winner_agent_id,
@@ -410,6 +446,7 @@ export async function createProductionBackendService(
         participantSessions,
       ),
       (input) => agentExecutionFacade.provisionParticipantSession(input),
+      new FileRunArtifactContentReader(runsRoot),
     );
     await service.recoverMailboxWaits();
     return service;
@@ -550,11 +587,13 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   const mailboxMethods = new MailboxRpcMethods(service);
   const memoryMethods = new MemoryRpcMethods(service);
   const systemMethods = new SystemRpcMethods(service);
+  const artifactMethods = new ArtifactRpcMethods(service);
   systemMethods.register(dispatcher);
   runMethods.register(dispatcher);
   taskMethods.register(dispatcher);
   mailboxMethods.register(dispatcher);
   memoryMethods.register(dispatcher);
+  artifactMethods.register(dispatcher);
 
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   let pending = Promise.resolve();

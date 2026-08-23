@@ -4,6 +4,7 @@ import {
   type CouncilParticipantBinding,
   type CouncilSeat,
 } from './council-participant';
+import type { CouncilLifecycleEvent } from './contract';
 
 export interface CouncilParticipantResolutionInput {
   run_id: string;
@@ -14,7 +15,15 @@ export interface CouncilParticipantResolutionInput {
 }
 
 export interface CouncilParticipantResolver {
-  resolve(input: CouncilParticipantResolutionInput): Promise<CouncilParticipantBinding[]>;
+  readonly selectionMode?: 'fixed' | 'auction' | 'board_order';
+  resolve(
+    input: CouncilParticipantResolutionInput,
+    options?: CouncilParticipantResolutionOptions,
+  ): Promise<CouncilParticipantBinding[]>;
+}
+
+export interface CouncilParticipantResolutionOptions {
+  onLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
 }
 
 export interface CouncilParticipantAuctionInput {
@@ -25,6 +34,7 @@ export interface CouncilParticipantAuctionInput {
   seat_index: number;
   candidate_agent_ids: string[];
   excluded_agent_ids: string[];
+  on_lifecycle_event?: (event: CouncilLifecycleEvent) => void | Promise<void>;
 }
 
 export interface CouncilParticipantAuctionResult {
@@ -77,6 +87,11 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
   private readonly auctionEnabled: boolean;
   private readonly proposerCount: number;
 
+  get selectionMode(): 'fixed' | 'auction' | 'board_order' {
+    if (this.seatAssignments) return 'fixed';
+    return this.auctionEnabled ? 'auction' : 'board_order';
+  }
+
   constructor(options: AgentBoardCouncilParticipantResolverOptions) {
     this.boardQuery = options.boardQuery;
     this.allowedAgentIds = options.allowedAgentIds ? new Set(options.allowedAgentIds) : undefined;
@@ -93,6 +108,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
 
   async resolve(
     input: CouncilParticipantResolutionInput,
+    options: CouncilParticipantResolutionOptions = {},
   ): Promise<CouncilParticipantBinding[]> {
     const allowed = await this.resolveAllowedSet();
     if (this.ensureAgent) {
@@ -105,7 +121,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       return this.resolveFixedSeats(input, agents, allowed);
     }
     if (this.auctionEnabled) {
-      return this.resolveAuctionSeats(input, agents, allowed);
+      return this.resolveAuctionSeats(input, agents, allowed, options);
     }
     const candidates = orderCandidates(
       agents.filter(
@@ -171,6 +187,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     input: CouncilParticipantResolutionInput,
     agents: readonly AgentBoardListItem[],
     allowed: ReadonlySet<string>,
+    options: CouncilParticipantResolutionOptions,
   ): Promise<CouncilParticipantBinding[]> {
     if (!this.auctionSelector) {
       throw new Error('Council auction mode requires an auction selector');
@@ -200,12 +217,19 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     used.add(primary);
 
     for (let seatIndex = 1; seatIndex < this.proposerCount; seatIndex += 1) {
-      const selected = await this.selectAuctionSeat(input, 'proposer', seatIndex, candidates, used);
+      const selected = await this.selectAuctionSeat(
+        input,
+        'proposer',
+        seatIndex,
+        candidates,
+        used,
+        options,
+      );
       assignments.push(this.binding(input, 'proposer', seatIndex, selected.agent_id, selected.selection_refs));
       used.add(selected.agent_id);
     }
     for (const seat of ['reviewer', 'synthesizer'] as const) {
-      const selected = await this.selectAuctionSeat(input, seat, 0, candidates, used);
+      const selected = await this.selectAuctionSeat(input, seat, 0, candidates, used, options);
       assignments.push(this.binding(input, seat, 0, selected.agent_id, selected.selection_refs));
       used.add(selected.agent_id);
     }
@@ -230,6 +254,7 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
     seatIndex: number,
     candidates: readonly AgentBoardListItem[],
     used: ReadonlySet<string>,
+    options: CouncilParticipantResolutionOptions,
   ): Promise<CouncilParticipantAuctionResult> {
     const candidateAgentIds = candidates.map((candidate) => candidate.role_id);
     const available = candidateAgentIds.filter((agentId) => !used.has(agentId));
@@ -241,6 +266,9 @@ export class AgentBoardCouncilParticipantResolver implements CouncilParticipantR
       seat_index: seatIndex,
       candidate_agent_ids: available.length > 0 ? available : candidateAgentIds,
       excluded_agent_ids: [...used],
+      ...(options.onLifecycleEvent
+        ? { on_lifecycle_event: options.onLifecycleEvent }
+        : {}),
     });
     if (!candidateAgentIds.includes(selected.agent_id)) {
       throw new Error(`Council auction selected ineligible Agent ${selected.agent_id}`);

@@ -146,7 +146,7 @@ export function projectPersistedRunSnapshot(
       .map(eventRecord),
     ...(projectedMarket ? { market: projectedMarket } : {}),
     ...(run.mode === 'council'
-      ? { council: councilProjection(council, status) }
+      ? { council: councilProjection(events, status) }
       : {}),
     errors: run.error ? [{ ...run.error }] : [],
     ...(status !== 'running'
@@ -255,32 +255,148 @@ function marketProjection(
 }
 
 function councilProjection(
-  event: PersistedCoordinationEvent | undefined,
+  events: readonly PersistedCoordinationEvent[],
   status: 'running' | 'completed' | 'failed' | 'cancelled',
 ): NonNullable<RunSnapshot['council']> {
-  const payload = event?.payload ?? {};
+  const completed = lastEvent(events, 'council.completed');
+  const started = lastEvent(events, 'council.started');
+  const participantsSelected = lastEvent(events, 'council.participants.selected');
+  const proposalEvents = events.filter(
+    (event) => event.event_type === 'council.proposal.completed',
+  );
+  const reviewEvents = events.filter(
+    (event) => event.event_type === 'council.review.completed',
+  );
+  const synthesisCompleted = lastEvent(events, 'council.synthesis.completed');
+  const implementationCompleted = lastEvent(events, 'council.implementation.completed');
+  const decision = lastEvent(events, 'council.decision');
+  const fatal = lastEvent(events, 'council.failed');
+  const payload = completed?.payload ?? {};
   const output = asRecord(payload.output);
   const outcome = councilOutcomeEvidenceSchema.safeParse(payload.outcome);
+  const projectedDecision = decision?.payload ?? {};
+  const participants = preferRecords(
+    payload.participants,
+    participantsSelected?.payload.participants,
+  );
+  const proposals = preferRecords(
+    payload.proposals,
+    proposalEvents.map((event) => event.payload.proposal),
+  );
+  const reviews = preferRecords(
+    payload.reviews,
+    reviewEvents.flatMap((event) => asRecords(event.payload.reviews)),
+  );
+  const synthesis =
+    asRecord(payload.synthesis) ?? asRecord(synthesisCompleted?.payload.synthesis);
+  const implementation =
+    asRecord(payload.plan_execution) ?? asRecord(implementationCompleted?.payload);
+  const councilRunId = firstString(
+    payload.council_run_id,
+    projectedDecision.council_run_id,
+    participantsSelected?.payload.council_run_id,
+    synthesisCompleted?.payload.council_run_id,
+  );
   return {
     enabled: true,
     status,
-    ...(stringValue(payload.decision_id) ? { decision_id: stringValue(payload.decision_id) } : {}),
-    ...(stringValue(payload.verdict) ? { verdict: stringValue(payload.verdict) } : {}),
-    ...(stringValue(payload.decision_mode)
-      ? { decision_mode: stringValue(payload.decision_mode) }
+    ...(councilRunId ? { council_run_id: councilRunId } : {}),
+    ...(councilPhase(events) ? { phase: councilPhase(events) } : {}),
+    ...(stringValue(started?.payload.subject)
+      ? { subject: stringValue(started?.payload.subject) }
       : {}),
-    selected_artifact_refs: stringArray(payload.selected_artifact_refs),
+    ...(stringValue(started?.payload.strategy)
+      ? { strategy: stringValue(started?.payload.strategy) }
+      : {}),
+    ...(started?.payload.artifact_mode === 'plan' ||
+    started?.payload.artifact_mode === 'implementation'
+      ? { artifact_mode: started.payload.artifact_mode }
+      : {}),
+    auctions: projectAuctions(events),
+    ...(firstString(payload.decision_id, projectedDecision.decision_id)
+      ? { decision_id: firstString(payload.decision_id, projectedDecision.decision_id) }
+      : {}),
+    ...(firstString(payload.verdict, projectedDecision.verdict)
+      ? { verdict: firstString(payload.verdict, projectedDecision.verdict) }
+      : {}),
+    ...(firstString(payload.decision_mode, projectedDecision.decision_mode)
+      ? { decision_mode: firstString(payload.decision_mode, projectedDecision.decision_mode) }
+      : {}),
+    selected_artifact_refs:
+      stringArray(payload.selected_artifact_refs).length > 0
+        ? stringArray(payload.selected_artifact_refs)
+        : stringArray(projectedDecision.selected_artifact_refs),
     required_next_actions: stringArray(output?.required_next_actions),
     blocked_by: stringArray(output?.blocked_by),
     can_create_merge_authorization: output?.can_create_merge_authorization === true,
-    participants: asRecords(payload.participants),
-    proposals: asRecords(payload.proposals),
-    reviews: asRecords(payload.reviews),
-    ...(asRecord(payload.synthesis) ? { synthesis: asRecord(payload.synthesis) } : {}),
+    participants,
+    proposals,
+    reviews,
+    ...(synthesis ? { synthesis } : {}),
+    ...(implementation ? { implementation } : {}),
     ...(output ? { output } : {}),
     ...(asRecord(payload.result) ? { result: asRecord(payload.result) } : {}),
     ...(outcome.success ? { outcome: outcome.data } : {}),
+    ...(fatal ? { fatal_error: { ...fatal.payload } } : {}),
   };
+}
+
+function councilPhase(
+  events: readonly PersistedCoordinationEvent[],
+): NonNullable<RunSnapshot['council']>['phase'] | undefined {
+  for (const event of [...events].reverse()) {
+    if (event.event_type === 'council.completed') return 'completed';
+    if (event.event_type === 'council.failed') return 'failed';
+    if (event.event_type === 'council.decision') return 'decision';
+    if (event.event_type === 'council.implementation.completed') return 'implementation';
+    if (event.event_type === 'council.synthesis.completed') return 'synthesis';
+    if (event.event_type === 'council.review.completed') return 'review';
+    if (event.event_type === 'council.proposal.completed') return 'proposal';
+    if (event.event_type !== 'council.phase.started') continue;
+    const phase = event.payload.phase;
+    if (
+      phase === 'proposal' ||
+      phase === 'review' ||
+      phase === 'synthesis' ||
+      phase === 'implementation'
+    ) {
+      return phase;
+    }
+  }
+  return events.some((event) => event.event_type === 'council.started')
+    ? 'selecting'
+    : undefined;
+}
+
+function projectAuctions(
+  events: readonly PersistedCoordinationEvent[],
+): Record<string, unknown>[] {
+  const byAuction = new Map<string, Record<string, unknown>>();
+  for (const event of events) {
+    if (
+      event.event_type !== 'market.auction.started' &&
+      event.event_type !== 'market.auction.completed'
+    ) {
+      continue;
+    }
+    const auctionId = stringValue(event.payload.auction_id);
+    if (!auctionId) continue;
+    byAuction.set(auctionId, {
+      ...(byAuction.get(auctionId) ?? {}),
+      ...event.payload,
+      status: event.event_type.endsWith('.completed') ? 'completed' : 'running',
+    });
+  }
+  return [...byAuction.values()];
+}
+
+function preferRecords(primary: unknown, fallback: unknown): Record<string, unknown>[] {
+  const preferred = asRecords(primary);
+  return preferred.length > 0 ? preferred : asRecords(fallback);
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.map(stringValue).find((value) => value !== undefined);
 }
 
 function eventRecord(event: PersistedCoordinationEvent): Record<string, unknown> {

@@ -42,6 +42,11 @@ export type CouncilRoleFailureCode =
 type CouncilPhase = 'proposal' | 'review' | 'synthesis';
 type CouncilRoleFailureDetails = Record<string, unknown>;
 
+interface CouncilRoleExecution {
+  result: AgentExecutionResult;
+  phase_id: string;
+}
+
 export class CouncilRoleExecutionError extends Error {
   readonly code: CouncilRoleFailureCode;
   readonly phase = 'council';
@@ -96,7 +101,18 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
     const executionRunId = input.run_id ?? createId('run');
-    const participants = await this.resolveParticipants(input, executionRunId);
+    const councilRunId = createId('council_run');
+    const participants = await this.resolveParticipants(input, executionRunId, options);
+    await emitLifecycle(options, {
+      type: 'council.participants.selected',
+      payload: {
+        council_run_id: councilRunId,
+        selection_mode: input.participants
+          ? 'explicit'
+          : (this.participantResolver?.selectionMode ?? 'explicit'),
+        participants: participants.map((participant) => ({ ...participant })),
+      },
+    });
     const proposers = participants
       .filter((participant) => participant.seat === 'proposer')
       .sort((left, right) => left.seat_index - right.seat_index);
@@ -115,7 +131,10 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         (candidate) => candidate.agent_id === proposal.agent_id,
       );
       if (participant) {
-        await emitLifecycle(options, completedReusedProposalEvent(proposal, participant));
+        await emitLifecycle(
+          options,
+          completedReusedProposalEvent(councilRunId, proposal, participant),
+        );
       }
     }
 
@@ -124,9 +143,10 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       const label = String.fromCharCode(65 + participant.seat_index);
       const workspace = participantWorkspace(councilDir, participant);
       await prepareCouncilWorkspace(input.workspace_path, workspace);
-      const result = await this.tryRunRole(
+      const execution = await this.tryRunRole(
         input,
         executionRunId,
+        councilRunId,
         participant,
         buildProposalInstruction(input.question, label, options?.artifact_mode),
         input.evidence_pack?.artifact_refs ?? [],
@@ -134,12 +154,23 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         workspace,
         options,
         diagnosticRefs,
+        1,
       );
+      const result = execution?.result;
       if (!result) continue;
       generatedResults.push(result);
       const proposal = buildProposal(input, participant, result);
       generatedProposals.push(proposal);
-      await emitLifecycle(options, completedProposalEvent(proposal, participant, result));
+      await emitLifecycle(
+        options,
+        completedProposalEvent(
+          councilRunId,
+          execution.phase_id,
+          proposal,
+          participant,
+          result,
+        ),
+      );
     }
 
     const proposals = [...input.proposals, ...generatedProposals];
@@ -150,9 +181,10 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     const reviewerWorkspace = participantWorkspace(councilDir, reviewerParticipant);
     await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
     await stageCouncilArtifacts(reviewerWorkspace, candidateArtifacts);
-    const reviewer = await this.tryRunRole(
+    const reviewerExecution = await this.tryRunRole(
       input,
       executionRunId,
+      councilRunId,
       reviewerParticipant,
       buildReviewerInstruction(input.question, proposals, options?.artifact_mode),
       proposals.flatMap((proposal) => proposal.artifact_refs),
@@ -160,13 +192,17 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       reviewerWorkspace,
       options,
       diagnosticRefs,
+      1,
     );
+    const reviewer = reviewerExecution?.result;
     if (reviewer) generatedResults.push(reviewer);
     const reviews = buildReviews(proposals, reviewerParticipant, reviewer);
     if (reviewer) {
       await emitLifecycle(options, {
         type: 'council.review.completed',
         payload: {
+          council_run_id: councilRunId,
+          phase_id: reviewerExecution!.phase_id,
           ...participantAuditPayload(reviewerParticipant),
           agent_run_id: reviewer.agent_run_id,
           driver_run_result_id: reviewer.driver_run_result_id,
@@ -175,6 +211,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           session_id: reviewer.session_id,
           proposal_ids: proposals.map((proposal) => proposal.proposal_id),
           review_ids: reviews.map((review) => review.review_id),
+          reviews: reviews.map((review) => ({ ...review })),
           artifact_refs: reviewer.artifact_refs.map((artifact) => artifact.artifact_id),
         },
       });
@@ -190,11 +227,13 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       'utf-8',
     );
     let synthesizer: AgentExecutionResult | undefined;
+    let synthesisPhaseId: string | undefined;
     const maxRounds = Math.min(Math.max(input.max_rounds ?? 2, 1), 2);
     for (let round = 1; round <= maxRounds; round += 1) {
-      synthesizer = await this.tryRunRole(
+      const synthesisExecution = await this.tryRunRole(
         input,
         executionRunId,
+        councilRunId,
         synthesizerParticipant,
         buildSynthesisInstruction(input.question, round, options?.artifact_mode),
         proposals.flatMap((proposal) => proposal.artifact_refs),
@@ -202,8 +241,13 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         synthesizerWorkspace,
         options,
         diagnosticRefs,
+        round,
       );
-      if (synthesizer) generatedResults.push(synthesizer);
+      synthesizer = synthesisExecution?.result;
+      if (synthesizer) {
+        synthesisPhaseId = synthesisExecution!.phase_id;
+        generatedResults.push(synthesizer);
+      }
       if (synthesizer?.artifact_refs.some(isMaterializableFileArtifact)) break;
     }
 
@@ -214,6 +258,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       await emitLifecycle(options, {
         type: 'council.synthesis.completed',
         payload: {
+          council_run_id: councilRunId,
+          ...(synthesisPhaseId ? { phase_id: synthesisPhaseId } : {}),
           ...participantAuditPayload(synthesizerParticipant),
           agent_run_id: synthesizer.agent_run_id,
           driver_run_result_id: synthesizer.driver_run_result_id,
@@ -221,6 +267,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           memory_buffer_ref: synthesizer.memory_buffer_ref,
           session_id: synthesizer.session_id,
           synthesis_id: synthesis.synthesis_id,
+          synthesis: { ...synthesis },
           artifact_refs: synthesis.artifact_refs,
         },
       });
@@ -233,7 +280,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     const decision = buildDecision(input, synthesis, selectedArtifactRefs);
 
     return {
-      council_run_id: createId('council_run'),
+      council_run_id: councilRunId,
       ...(input.run_id ? { run_id: input.run_id } : {}),
       task_id: input.task_id,
       participants,
@@ -253,6 +300,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private async tryRunRole(
     input: CouncilRoundInput,
     executionRunId: string,
+    councilRunId: string,
     participant: CouncilParticipantBinding,
     instruction: string,
     inputArtifactRefs: string[],
@@ -260,18 +308,36 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     workspacePath: string,
     options: CouncilExecutionOptions | undefined,
     diagnosticRefs: string[],
-  ): Promise<AgentExecutionResult | undefined> {
-    try {
-      return await this.runRole(
-        input,
-        executionRunId,
-        participant,
-        instruction,
-        inputArtifactRefs,
+    attempt: number,
+  ): Promise<CouncilRoleExecution | undefined> {
+    const phaseId = createId('council_phase');
+    await emitLifecycle(options, {
+      type: 'council.phase.started',
+      payload: {
+        council_run_id: councilRunId,
+        phase_id: phaseId,
         phase,
-        workspacePath,
-        options,
-      );
+        attempt,
+        ...participantAuditPayload(participant),
+        input_artifact_refs: [...inputArtifactRefs],
+      },
+    });
+    try {
+      return {
+        result: await this.runRole(
+          input,
+          executionRunId,
+          councilRunId,
+          participant,
+          instruction,
+          inputArtifactRefs,
+          phase,
+          workspacePath,
+          options,
+          phaseId,
+        ),
+        phase_id: phaseId,
+      };
     } catch (error) {
       if (options?.signal?.aborted) throw error;
       if (!(error instanceof CouncilRoleExecutionError)) throw error;
@@ -283,12 +349,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private async runRole(
     input: CouncilRoundInput,
     executionRunId: string,
+    councilRunId: string,
     participant: CouncilParticipantBinding,
     instruction: string,
     inputArtifactRefs: string[] = input.evidence_pack?.artifact_refs ?? [],
     phase: CouncilPhase,
     workspacePath: string,
     options?: CouncilExecutionOptions,
+    phaseId?: string,
   ): Promise<AgentExecutionResult> {
     await fs.mkdir(workspacePath, { recursive: true });
     let result: AgentExecutionResult;
@@ -324,7 +392,11 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         'failed',
         undefined,
         undefined,
-        errorDetails(error),
+        {
+          ...errorDetails(error),
+          council_run_id: councilRunId,
+          ...(phaseId ? { phase_id: phaseId } : {}),
+        },
       );
       await emitFailureLifecycle(options, failure);
       throw failure;
@@ -337,7 +409,11 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         result.status,
         result.agent_run_id,
         result.driver_run_result_id,
-        agentFailureDetails(result),
+        {
+          ...agentFailureDetails(result),
+          council_run_id: councilRunId,
+          ...(phaseId ? { phase_id: phaseId } : {}),
+        },
       );
       await emitFailureLifecycle(options, failure);
       throw failure;
@@ -354,7 +430,11 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           'failed',
           result.agent_run_id,
           result.driver_run_result_id,
-          errorDetails(error),
+          {
+            ...errorDetails(error),
+            council_run_id: councilRunId,
+            ...(phaseId ? { phase_id: phaseId } : {}),
+          },
         );
         await emitFailureLifecycle(options, failure);
         throw failure;
@@ -366,18 +446,24 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private async resolveParticipants(
     input: CouncilRoundInput,
     executionRunId: string,
+    options?: CouncilExecutionOptions,
   ): Promise<CouncilParticipantBinding[]> {
     const participants =
       input.participants ??
-      (await this.participantResolver?.resolve({
-        run_id: executionRunId,
-        task_id: input.task_id,
-        question: input.question,
-        ...(input.participant_profile_refs
-          ? { participant_profile_refs: input.participant_profile_refs }
-          : {}),
-        ...(input.primary_agent_id ? { primary_agent_id: input.primary_agent_id } : {}),
-      }));
+      (await this.participantResolver?.resolve(
+        {
+          run_id: executionRunId,
+          task_id: input.task_id,
+          question: input.question,
+          ...(input.participant_profile_refs
+            ? { participant_profile_refs: input.participant_profile_refs }
+            : {}),
+          ...(input.primary_agent_id ? { primary_agent_id: input.primary_agent_id } : {}),
+        },
+        options?.onLifecycleEvent
+          ? { onLifecycleEvent: options.onLifecycleEvent }
+          : undefined,
+      ));
     if (!participants) {
       throw new Error(
         'Council participants are required; configure a participant resolver or pass explicit bindings',
@@ -388,6 +474,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
 }
 
 function completedProposalEvent(
+  councilRunId: string,
+  phaseId: string,
   proposal: Proposal,
   participant: CouncilParticipantBinding,
   result: AgentExecutionResult,
@@ -395,6 +483,8 @@ function completedProposalEvent(
   return {
     type: 'council.proposal.completed',
     payload: {
+      council_run_id: councilRunId,
+      phase_id: phaseId,
       ...participantAuditPayload(participant),
       agent_run_id: result.agent_run_id,
       driver_run_result_id: result.driver_run_result_id,
@@ -402,20 +492,24 @@ function completedProposalEvent(
       memory_buffer_ref: result.memory_buffer_ref,
       session_id: result.session_id,
       proposal_id: proposal.proposal_id,
+      proposal: { ...proposal },
       artifact_refs: proposal.artifact_refs,
     },
   };
 }
 
 function completedReusedProposalEvent(
+  councilRunId: string,
   proposal: Proposal,
   participant: CouncilParticipantBinding,
 ): CouncilLifecycleEvent {
   return {
     type: 'council.proposal.completed',
     payload: {
+      council_run_id: councilRunId,
       ...participantAuditPayload(participant),
       proposal_id: proposal.proposal_id,
+      proposal: { ...proposal },
       artifact_refs: proposal.artifact_refs,
       reused: true,
     },
@@ -423,7 +517,14 @@ function completedReusedProposalEvent(
 }
 
 function failedEvent(error: CouncilRoleExecutionError): CouncilLifecycleEvent {
-  return { type: 'council.role.failed', payload: { code: error.code, ...error.details } };
+  return {
+    type: 'council.role.failed',
+    payload: {
+      code: error.code,
+      ...error.details,
+      fallback_action: 'continue_with_available_evidence',
+    },
+  };
 }
 
 async function emitLifecycle(
