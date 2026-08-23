@@ -510,14 +510,16 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         };
       }
       if (
-        invocation.context_policy?.startsWith('council_') &&
+        shouldFinalizeAfterSuccessfulDriver(invocation.context_policy) &&
         invocation.execution?.status === 'succeeded'
       ) {
-        // Council phases persist their substantive result through the Driver.
+        // Council and single-agent production persist their result through the Driver.
         // A second top-level model turn only restates completion and can fail
         // independently after the artifact was already written.
         return {
-          content: 'The Council Driver phase completed successfully. [done]',
+          content: invocation.context_policy?.startsWith('council_')
+            ? 'The Council Driver phase completed successfully. [done]'
+            : 'The Driver phase completed successfully. [done]',
           tool_calls: undefined,
         };
       }
@@ -1220,6 +1222,10 @@ function buildAgentRuntimeEvidence(
     persona_generated_at: persona.generated_at,
     ...(systemPromptSha256 ? { system_prompt_sha256: systemPromptSha256 } : {}),
   };
+}
+
+function shouldFinalizeAfterSuccessfulDriver(contextPolicy: string | undefined): boolean {
+  return Boolean(contextPolicy?.startsWith('council_') || contextPolicy === 'production_task_loop');
 }
 
 function mapStatus(

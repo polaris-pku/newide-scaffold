@@ -219,33 +219,36 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     }
   });
 
-  it('finalizes every Council phase after a successful Driver without another model turn', async () => {
-    let calls = 0;
-    const llm: ToolCallingClient = {
-      async completeWithTools() {
-        calls += 1;
-        if (calls === 1) return driverToolCalls('final_plan_driver');
-        throw new Error('The post-Driver model turn must not be reached');
-      },
-    };
-    const { facade } = createFacade(
-      new CapturingDriver('succeeded'),
-      new InMemoryBufferRepository(),
-      llm,
-    );
+  it.each(['council_synthesizer', 'production_task_loop'] as const)(
+    'finalizes %s after a successful Driver without another model turn',
+    async (contextPolicy) => {
+      let calls = 0;
+      const llm: ToolCallingClient = {
+        async completeWithTools() {
+          calls += 1;
+          if (calls === 1) return driverToolCalls('final_plan_driver');
+          throw new Error('The post-Driver model turn must not be reached');
+        },
+      };
+      const { facade } = createFacade(
+        new CapturingDriver('succeeded'),
+        new InMemoryBufferRepository(),
+        llm,
+      );
 
-    const result = await facade.runAgent({
-      ...request('task_final_plan', 'role_primary'),
-      context_policy: 'council_synthesizer',
-    });
+      const result = await facade.runAgent({
+        ...request('task_final_plan', 'role_primary'),
+        context_policy: contextPolicy,
+      });
 
-    expect(result).toMatchObject({
-      status: 'completed',
-      diagnostics: { driver_status: 'succeeded', dispatch_status: 'completed' },
-      memory_buffer_ref: 'role_primary:1',
-    });
-    expect(calls).toBe(1);
-  });
+      expect(result).toMatchObject({
+        status: 'completed',
+        diagnostics: { driver_status: 'succeeded', dispatch_status: 'completed' },
+        memory_buffer_ref: 'role_primary:1',
+      });
+      expect(calls).toBe(1);
+    },
+  );
 
   it('projects app-owned B maintenance evidence into execution diagnostics', async () => {
     const requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
