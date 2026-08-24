@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
 SCAFFOLD = Path(__file__).resolve().parents[2]
-sys.path.insert(0, "/data/shiyangziran/SWE-EVO/SWE-bench")
+swe_bench_root = Path(os.environ.get('NEWIDE_SWE_EVO_ROOT', '')).expanduser() / 'SWE-bench'
+if swe_bench_root.is_dir():
+    sys.path.insert(0, str(swe_bench_root))
 
 WRAPPER_PATH = SCAFFOLD / "eval" / "harness" / "secure-sweevo-evaluate.py"
 spec = importlib.util.spec_from_file_location("secure_sweevo_evaluate", WRAPPER_PATH)
