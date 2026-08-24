@@ -75,6 +75,16 @@ def sanitize_patch(patch_text: str, instance_id: str) -> str:
     return patch_text or ""
 
 
+def instance_for_hidden_eval(instance: dict[str, Any], hidden_patch: str) -> dict[str, Any]:
+    """Copy used only for eval-script generation; on-disk `test_patch` stays blank.
+
+    SWE-EVO's `get_test_directives` reads `instance["test_patch"]` to choose pytest
+    files. The anti-hacking blanking step would otherwise make pytest run the
+    whole repo and hit the 1800s timeout.
+    """
+    return {**instance, "test_patch": hidden_patch}
+
+
 def secure_make_eval_script_list(
     instance: dict[str, Any],
     specs: dict[str, Any],
@@ -86,7 +96,7 @@ def secure_make_eval_script_list(
     hidden_patch = HIDDEN_TEST_PATCHES.get(instance["instance_id"], "")
     original = secure_make_eval_script_list.original
     commands = original(
-        instance,
+        instance_for_hidden_eval(instance, hidden_patch),
         specs,
         env_name,
         repo_directory,
