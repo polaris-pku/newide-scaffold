@@ -77,7 +77,7 @@ export function isEligibleSkill(skill: SkillRecord): boolean {
 /**
  * 技能市场资格（Spec §3.2 / §7.7）。
  *
- * 市场中的技能 = 已审核通过 且 未被 superseded 淘汰。
+ * 市场池（__market__）内可被检索/引入的技能 = 已审核通过 且 未被 superseded 淘汰。
  * 注意：retired_unique（稀缺遗产）同样在市场中，且应获得更高推荐优先级。
  */
 export function isMarketEligibleSkill(skill: SkillRecord): boolean {

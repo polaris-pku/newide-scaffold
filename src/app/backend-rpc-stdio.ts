@@ -62,6 +62,7 @@ import {
 import { SystemRpcMethods } from '../rpc/system-methods';
 import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
+import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
 
 export interface BackendRpcServerOptions {
@@ -187,9 +188,11 @@ export async function createProductionBackendService(
   let bRuntime: BackendBRuntime | undefined;
   let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
   let coordinationStore: SqliteCoordinationStore | undefined;
+  let maintenanceScheduler: AgentMaintenanceScheduler | undefined;
   const closeRuntime = onceAsync(async () => {
     const failures: unknown[] = [];
     for (const close of [
+      () => maintenanceScheduler?.stop(),
       () => driver.shutdown(),
       () => memoryMaintenance?.waitForIdle(),
       () => bRuntime?.close(),
@@ -378,6 +381,31 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
 
+    // 定时维护：退休检查（默认只出报告，不自动退休）+ 存活 Agent 市场自学习
+    maintenanceScheduler = new AgentMaintenanceScheduler(
+      {
+        repository: bRuntime.repository,
+        ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
+        retirement: {
+          retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
+          runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
+        },
+      },
+      {
+        autoRetire: env.NEWIDE_B_AUTO_RETIRE === '1',
+        retireConfidenceFloor: readNumberEnv(env.NEWIDE_B_RETIRE_CONFIDENCE_FLOOR, 0.5),
+        autoLearn: env.NEWIDE_B_AUTO_LEARN !== '0',
+        learning: {
+          minPersonaSimilarity: readNumberEnv(env.NEWIDE_B_LEARN_PERSONA_FLOOR, 0.3),
+          tagWeight: readNumberEnv(env.NEWIDE_B_LEARN_TAG_WEIGHT, 0.4),
+          personaWeight: readNumberEnv(env.NEWIDE_B_LEARN_PERSONA_WEIGHT, 0.6),
+          learnThreshold: readNumberEnv(env.NEWIDE_B_LEARN_THRESHOLD, 0.45),
+          maxSkillsPerAgentPerCycle: readIntEnv(env.NEWIDE_B_LEARN_MAX_PER_CYCLE, 3),
+        },
+      },
+    );
+    maintenanceScheduler.start(readIntEnv(env.NEWIDE_MAINTENANCE_INTERVAL_MS, 3600_000));
+
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
       mailboxStore: coordinationStore,
@@ -534,6 +562,25 @@ function readDriverTimeout(value: string | undefined): number {
     throw new Error('ACP_DRIVER_TIMEOUT_MS must be a positive integer');
   }
   return timeout;
+}
+
+/** 读取带默认值的浮点环境变量；非法值抛错。 */
+function readNumberEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid numeric env value: ${value}`);
+  }
+  return parsed;
+}
+
+/** 读取带默认值的整数环境变量（>=0）；非法值抛错。 */
+function readIntEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  if (!/^\d+$/.test(value.trim())) {
+    throw new Error(`Invalid integer env value: ${value}`);
+  }
+  return Number(value.trim());
 }
 
 function readJson(filePath: string): unknown {

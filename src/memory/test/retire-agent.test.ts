@@ -1,14 +1,14 @@
 /**
- * AgentManager.retireAgent 测试
+ * AgentManager.retireAgent 测试（预退休 + 归档删除语义）
  *
  * 验证：
- *   1. 退休后状态置为 retired，写入 retired_at / retired_reason
- *   2. 退休后 dispatchTask 返回 blocked
- *   3. 退休后 collectCompetitionClaims 返回 unavailable
- *   4. 资产处置：保留 Skill 迁移到市场池（__market__，标记 retired_unique/available），
- *      rejected Skill 丢弃；高置信经验保留、低置信经验丢弃
- *   5. seeded_slate 创建替代 Agent 并继承 Level A 经验
- *   6. 幂等：重复 retire 返回 retired 且不重复处置
+ *   1. 退休后：实体从仓库/内存删除，归档（role_id/name/时间/原因/资产处置计数）保留
+ *   2. 退休后 dispatchTask 返回 blocked、collectCompetitionClaims 不再产生声明
+ *   3. 资产处置：保留 Skill 迁移到市场池（__market__，retired_unique/available），
+ *      rejected Skill 丢弃；经验仅计数，随实体级联删除
+ *   4. seeded_slate 创建替代 Agent 并继承 Level A 经验，替代者立即进内存 map
+ *   5. 幂等：重复 retire 返回归档摘要且不重复处置
+ *   6. 预退休：有在跑任务时返回 pre_retired，任务完成后 dispatchTask 收尾自动退休
  *   7. dispatchTask 会累计 Metrics（won/completed/partial）
  */
 import { randomUUID } from 'node:crypto';
@@ -88,7 +88,7 @@ function experience(overrides: Partial<ExperienceRecord> = {}): ExperienceRecord
 }
 
 describe('AgentManager.retireAgent', () => {
-  it('退休后状态置为 retired，并写入 retired_at / retired_reason', async () => {
+  it('退休后实体删除、归档保留（retired_at / retired_reason / asset_disposition）', async () => {
     const { repository, manager } = await setup();
     await manager.dispatchTask(ROLE, task());
 
@@ -100,10 +100,21 @@ describe('AgentManager.retireAgent', () => {
     });
     expect(result.retired_at).toBeTruthy();
 
-    const handle = await repository.getAgent(ROLE);
-    expect(handle.status).toBe('retired');
-    expect(handle.retired_at).toBe(result.retired_at);
-    expect(handle.retired_reason).toBe('inactivity');
+    // 实体已删：仓库与内存 map 均不再存在
+    await expect(repository.getAgent(ROLE)).rejects.toThrow(/Agent not found/);
+    expect(manager.getAgent(ROLE)).toBeUndefined();
+    expect(await repository.listAgentIds()).not.toContain(ROLE);
+
+    // 归档保留必要字段
+    const archive = await repository.getAgentArchive(ROLE);
+    expect(archive).toMatchObject({
+      role_id: ROLE,
+      name: 'Retire Me',
+      status: 'retired',
+      retired_reason: 'inactivity',
+      tags: ['typescript', 'backend'],
+    });
+    expect(archive!.retired_at).toBe(result.retired_at);
   });
 
   it('退休后 dispatchTask 返回 blocked', async () => {
@@ -112,20 +123,19 @@ describe('AgentManager.retireAgent', () => {
 
     const result = await manager.dispatchTask(ROLE, task('task_after_retire'));
     expect(result.status).toBe('blocked');
-    expect(result.cycle.buffer_snapshot.driver_return.summary).toContain('retired');
   });
 
-  it('退休后 collectCompetitionClaims 返回 unavailable', async () => {
+  it('退休后 collectCompetitionClaims 不再产生该 Agent 的声明（已驱逐）', async () => {
     const { manager } = await setup();
     await manager.retireAgent(ROLE);
 
     const batch = await manager.collectCompetitionClaims(task('task_claim_after_retire'));
-    expect(batch.summary.unavailable).toBe(1);
-    expect(batch.summary.participated).toBe(0);
     expect(batch.claims).toHaveLength(0);
+    expect(batch.summary.total).toBe(0);
+    expect(batch.summary.unavailable).toBe(0);
   });
 
-  it('资产处置：保留 Skill 迁移到市场池（__market__），rejected 丢弃；高置信经验保留、低置信丢弃', async () => {
+  it('资产处置：保留 Skill 迁移到市场池，rejected 丢弃；经验仅计数并随实体删除', async () => {
     const { repository, manager } = await setup();
     const goodSkill = skill();
     const importedSkill = skill({ imported_by: ['role_other'] });
@@ -147,9 +157,10 @@ describe('AgentManager.retireAgent', () => {
       experiences_discarded: 1,
     });
 
-    // 保留的技能迁移到市场池，退休 Agent 名下技能清空
-    expect(await repository.listSkills(ROLE)).toHaveLength(0);
+    // 实体删除：退休 Agent 名下技能/经验不再可查
+    await expect(repository.listSkills(ROLE)).rejects.toThrow(/Agent not found/);
 
+    // 保留技能迁移到市场池，溯源 origin_agent_id
     const pooled = await repository.listSkills(MARKET_POOL_ROLE_ID);
     expect(pooled).toHaveLength(2);
     const byId = new Map(pooled.map((s) => [s.id, s]));
@@ -164,12 +175,12 @@ describe('AgentManager.retireAgent', () => {
     expect(await repository.getAgent(MARKET_POOL_ROLE_ID)).toBeDefined();
     expect(await repository.listAgentIds()).not.toContain(MARKET_POOL_ROLE_ID);
 
-    const experiences = await repository.listExperiences(ROLE);
-    expect(experiences).toHaveLength(1);
-    expect(experiences[0]!.id).toBe(highExp.id);
+    // 归档记录经验计数（经验记录随实体级联删除）
+    const archive = await repository.getAgentArchive(ROLE);
+    expect(archive!.asset_disposition).toEqual(result.asset_disposition);
   });
 
-  it('seeded_slate 创建替代 Agent 并继承 Level A 经验', async () => {
+  it('seeded_slate 创建替代 Agent 并继承 Level A 经验，源实体删除', async () => {
     const { repository, manager } = await setup();
     const levelA = experience({ confidence: 0.95, referenced_count: 4 });
     const levelB = experience({ confidence: 0.75, referenced_count: 1 });
@@ -183,9 +194,9 @@ describe('AgentManager.retireAgent', () => {
 
     const replacementId = result.replacement_role_id;
     expect(replacementId).toBe(`${ROLE}__replacement`);
-    expect((await repository.listAgentIds()).sort()).toEqual(
-      [ROLE, replacementId!].sort(),
-    );
+    // 源实体已删，只剩替代 Agent
+    expect((await repository.listAgentIds()).sort()).toEqual([replacementId!].sort());
+    expect(await repository.getAgentArchive(ROLE)).not.toBeNull();
 
     const replacementHandle = await repository.getAgent(replacementId!);
     expect(replacementHandle.status).toBe('created');
@@ -202,25 +213,64 @@ describe('AgentManager.retireAgent', () => {
     expect(manager.getAgent(replacementId!)).toBeDefined();
   });
 
-  it('幂等：重复 retire 返回 retired 且不重复处置', async () => {
+  it('幂等：重复 retire 返回归档摘要且不重复处置', async () => {
     const { repository, manager } = await setup();
     await repository.saveExperience(ROLE, experience({ confidence: 0.9 }));
 
     const first = await manager.retireAgent(ROLE);
-    expect(first.asset_disposition.experiences_retained).toBe(1);
+    expect(first.asset_disposition?.experiences_retained).toBe(1);
 
     const second = await manager.retireAgent(ROLE);
     expect(second.status).toBe('retired');
-    expect(second.asset_disposition).toEqual({
-      skills_retained: 0,
-      skills_discarded: 0,
-      experiences_retained: 0,
-      experiences_discarded: 0,
-    });
+    // 返回归档摘要（首次处置的结果），不重复处置
+    expect(second.asset_disposition).toEqual(first.asset_disposition);
 
-    // 经验仍在（未因二次调用被再次处置/删除）
-    const experiences = await repository.listExperiences(ROLE);
-    expect(experiences).toHaveLength(1);
+    // 实体已删，归档仍在
+    await expect(repository.getAgent(ROLE)).rejects.toThrow(/Agent not found/);
+    expect(await repository.getAgentArchive(ROLE)).not.toBeNull();
+  });
+
+  it('预退休：有在跑任务时返回 pre_retired，任务完成后自动退休', async () => {
+    const repository = new InMemoryRepository();
+    const bufferRepository = new InMemoryBufferRepository();
+    const gate = createDeferred<void>();
+    const manager = await AgentManager.create(repository, bufferRepository, {
+      tools: {
+        llm: {
+          completeWithTools: async () => {
+            await gate.promise;
+            return { content: 'Task completed. [done]', tool_calls: undefined };
+          },
+        },
+        tools: [],
+      },
+    });
+    await manager.createAgent({ role_id: ROLE, name: 'PreRetire', tags: [] });
+
+    // 启动一个在跑任务（LLM 被 gate 卡住）
+    const dispatchPromise = manager.dispatchTask(ROLE, task('task_pre_retire'));
+    await tick();
+
+    // 预退休：返回 pre_retired，不真正退休
+    const retireResult = await manager.retireAgent(ROLE, { reason: 'manual' });
+    expect(retireResult).toMatchObject({ role_id: ROLE, status: 'pre_retired', pending: true });
+
+    // 预退休期间仍不可被竞标选中
+    const batch = await manager.collectCompetitionClaims(task('task_claim_while_pre_retired'));
+    expect(batch.claims).toHaveLength(0);
+
+    // 放行 LLM → 任务完成 → dispatchTask 收尾自动 finalize
+    gate.resolve();
+    const dispatchResult = await dispatchPromise;
+    expect(dispatchResult.status).toBe('no_driver_invocation');
+
+    // 现在真正退休：实体删除、归档保留
+    expect(await repository.getAgentArchive(ROLE)).toMatchObject({
+      role_id: ROLE,
+      status: 'retired',
+      retired_reason: 'manual',
+    });
+    expect(await repository.listAgentIds()).not.toContain(ROLE);
   });
 
   it('dispatchTask 会累计 Metrics（won/completed/partial）', async () => {
@@ -233,3 +283,18 @@ describe('AgentManager.retireAgent', () => {
     expect(m.last_won_at).toBeTruthy();
   });
 });
+
+function createDeferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+function tick(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}

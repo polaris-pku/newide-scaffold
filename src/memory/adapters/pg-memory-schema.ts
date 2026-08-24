@@ -50,4 +50,11 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
     CREATE INDEX IF NOT EXISTS memory_experiences_role_id_idx
       ON memory_experiences (role_id);
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS memory_agent_archives (
+      role_id TEXT PRIMARY KEY,
+      payload JSONB NOT NULL
+    );
+  `);
 }
