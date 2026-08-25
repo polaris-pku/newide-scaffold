@@ -249,6 +249,8 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
     listMemoryExperiences: (roleId) => service.listExperiences(roleId),
     listMemoryMaintenance: (roleId) => service.listMaintenance(roleId),
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
+    promoteMemoryExperience: (roleId, experienceId) =>
+      service.promoteExperience(roleId, experienceId),
     marketSearchMemorySkills: (query) => service.marketSearch(query),
     marketImportMemorySkill: (roleId, sourceSkillId) =>
       service.marketImport(roleId, sourceSkillId),

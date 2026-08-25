@@ -1,6 +1,6 @@
 /**
  * MemoryWriter — 手动写入口服务（memory.createSkill / updateSkill / deleteSkill /
- * publishSkillToMarket / updateExperience / deleteExperience）
+ * publishSkillToMarket / updateExperience / deleteExperience / promoteExperience）
  *
  * 对应方案书 M2：为前端提供「从零写入」技能 / 经验通道，解决 curation 零写入口
  * 与「无法手动导入 Skill」两个局限。与 skill-review 同模式：纯函数式，只依赖
@@ -9,6 +9,7 @@
  *
  * 幂等约定：createSkill 以 (agent_id, description + content) 去重，重复创建返回
  * 已存在项；updateSkill / updateExperience 为 PATCH 语义，未提供的字段保持不变。
+ * promoteExperience 为严格语义：已晋升的经验再次晋升直接抛错（防重复）。
  */
 import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
@@ -33,6 +34,14 @@ export interface CreateSkillInput {
 export interface CreateSkillOptions {
   /** 创建后直接置 approved（NEWIDE_B_SKILL_AUTO_APPROVE=1 时由 B 服务透传） */
   autoApprove?: boolean;
+}
+
+/** 手动晋升一条经验为 Skill 的入参 */
+export interface PromoteExperienceInput {
+  /** 所属 Agent 的 role_id */
+  role_id: string;
+  /** 待晋升经验的 id */
+  experience_id: string;
 }
 
 /** Skill PATCH 补丁（未提供的字段保持不变） */
@@ -90,6 +99,64 @@ export async function createSkill(
     updated_at: now,
   };
   await repository.saveSkill(input.role_id, skill);
+  return (await requireStoredSkill(repository, input.role_id, skill.id)) ?? skill;
+}
+
+/**
+ * 手动晋升一条经验为 Skill（memory.promoteExperience）。
+ *
+ * 与批量晋升（ruleBasedSkillPromotion / LLM 晋升）互补：由前端 / 人工显式指定
+ * 某条经验晋升，产出 review_status='pending' 的技能进入待审核队列，审核仍走
+ * skill-review 的 approveSkill / rejectSkill。
+ *
+ * 校验规则（对齐 Spec §4.3 与规则版晋升）：
+ *   1. Agent 与经验必须存在
+ *   2. 仅允许正经验（type === 'positive'），负经验是失败教训、不可晋升为技能
+ *   3. 尚未晋升（promoted_to 未设置），已晋升直接抛错（防重复晋升）
+ *
+ * 落库：saveSkill 写入 pending Skill（promoted_from 指向来源经验，
+ * description_embedding 置空由仓库补向量），updateExperience 回写 promoted_to。
+ * saveSkill 同时递增 AgentMetrics.promoted_skill_count。
+ */
+export async function promoteExperienceToSkill(
+  repository: MemoryRepository,
+  input: PromoteExperienceInput,
+): Promise<SkillRecord> {
+  // 校验 Agent 存在（不存在时 getAgent 抛错）
+  await repository.getAgent(input.role_id);
+
+  const experiences = await repository.listExperiences(input.role_id);
+  const experience = experiences.find((item) => item.id === input.experience_id);
+  if (!experience) {
+    throw new Error(`Experience not found: ${input.experience_id}`);
+  }
+  if (experience.type !== 'positive') {
+    throw new Error(`Only positive experiences can be promoted: ${input.experience_id}`);
+  }
+  if (experience.promoted_to) {
+    throw new Error(`Experience already promoted to skill: ${experience.promoted_to}`);
+  }
+
+  const now = nowTimestamp();
+  const skill: SkillRecord = {
+    id: randomUUID(),
+    description: experience.description,
+    description_embedding: [],
+    content: experience.content,
+    version: '1.0.0',
+    review_status: 'pending',
+    tags: [...experience.tags],
+    promoted_from: experience.id,
+    promoted_at: now,
+    agent_id: input.role_id,
+    market_status: 'available',
+    created_at: now,
+    updated_at: now,
+  };
+
+  await repository.saveSkill(input.role_id, skill);
+  await repository.updateExperience(input.role_id, { ...experience, promoted_to: skill.id });
+
   return (await requireStoredSkill(repository, input.role_id, skill.id)) ?? skill;
 }
 

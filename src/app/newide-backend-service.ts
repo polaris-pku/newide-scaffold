@@ -366,6 +366,10 @@ export class NewideBackendService {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
   }
 
+  promoteMemoryExperience(roleId: string, experienceId: string): Promise<SkillView> {
+    return this.requireBMemoryService().promoteExperience(roleId, experienceId);
+  }
+
   marketSearchMemorySkills(query: MarketSearchQuery): Promise<SkillRecord[]> {
     return this.requireBMemoryService().marketSearch(query);
   }
