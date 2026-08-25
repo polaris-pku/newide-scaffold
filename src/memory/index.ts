@@ -108,8 +108,10 @@ export {
   publishSkillToMarket,
   updateExperience,
   deleteExperience,
+  promoteExperienceToSkill,
   type CreateSkillInput,
   type CreateSkillOptions,
+  type PromoteExperienceInput,
   type SkillWritePatch,
   type ExperienceWritePatch,
 } from './services/memory-writer';

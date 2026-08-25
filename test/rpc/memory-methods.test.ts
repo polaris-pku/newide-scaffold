@@ -10,6 +10,12 @@ describe('MemoryRpcMethods', () => {
       role_id: roleId,
       requested_by: requestedBy,
     }));
+    const promoteMemoryExperience = vi.fn(async (roleId: string, experienceId: string) => ({
+      id: 'skill_promoted',
+      review_status: 'pending',
+      promoted_from: experienceId,
+      agent_id: roleId,
+    }));
     const marketSearchMemorySkills = vi.fn(async () => [marketSkill()]);
     const marketImportMemorySkill = vi.fn(
       async (roleId: string, sourceSkillId: string) => ({
@@ -54,6 +60,7 @@ describe('MemoryRpcMethods', () => {
     const deleteMemoryAgent = vi.fn(async () => undefined);
     const service = fakeService({
       promoteMemorySkills,
+      promoteMemoryExperience,
       marketSearchMemorySkills,
       marketImportMemorySkill,
       retireMemoryAgent,
@@ -226,6 +233,12 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":53,"method":"memory.listExperiencesBySourceTask","params":{"task_id":""}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":54,"method":"memory.promoteExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":55,"method":"memory.promoteExperience","params":{"role_id":"role_ts_engineer"}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -343,8 +356,16 @@ describe('MemoryRpcMethods', () => {
       { id: 51, result: { skills: [{ id: 'skill_pending' }] } },
       { id: 52, result: { experiences: [{ id: 'experience_1' }] } },
       { id: 53, error: { code: -32602, message: 'Invalid params' } },
+      {
+        id: 54,
+        result: {
+          skill: { id: 'skill_promoted', review_status: 'pending', promoted_from: 'experience_1' },
+        },
+      },
+      { id: 55, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
+    expect(promoteMemoryExperience).toHaveBeenCalledWith('role_ts_engineer', 'experience_1');
     expect(approveMemorySkill).toHaveBeenCalledWith(
       'role_ts_engineer',
       'skill_1',
@@ -390,6 +411,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         list_skills: { status: 'available' },
         list_maintenance: { status: 'available' },
         promote_skills: { status: 'available' },
+        promote_experience: { status: 'available' },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
         update_persona: { status: 'available' },
@@ -443,6 +465,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     listMemoryExperiences: async () => [{ id: 'experience_1' } as never],
     listMemoryMaintenance: async () => [maintenance()],
     promoteMemorySkills: async () => maintenance(),
+    promoteMemoryExperience: async () => ({ id: 'skill_promoted' } as never),
     marketSearchMemorySkills: async () => [marketSkill()],
     marketImportMemorySkill: async () => ({
       imported: marketSkill(),

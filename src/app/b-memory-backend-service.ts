@@ -41,6 +41,7 @@ import {
   type MemoryOverview,
   cosineSimilarity,
   type DeadLetterEntry,
+  promoteExperienceToSkill,
 } from '../memory';
 import type {
   AgentContextSnapshot,
@@ -74,6 +75,7 @@ export interface BMemoryCapabilities {
     list_skills: BMemoryOperationCapability;
     list_maintenance: BMemoryOperationCapability;
     promote_skills: BMemoryOperationCapability;
+    promote_experience: BMemoryOperationCapability;
     approve_skill: BMemoryOperationCapability;
     reject_skill: BMemoryOperationCapability;
     update_persona: BMemoryOperationCapability;
@@ -161,6 +163,12 @@ export class BMemoryBackendService {
           reason: this.options.autoApprovePromotedSkills
             ? 'Promoted Skills are approved automatically.'
             : 'Promotion creates pending Skills for explicit review.',
+        },
+        promote_experience: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
@@ -343,6 +351,21 @@ export class BMemoryBackendService {
       }),
     );
     return { ...promotion, skills };
+  }
+
+  /**
+   * 手动晋升一条经验为 Skill（memory.promoteExperience）。
+   * 显式指定经验晋升，产出 review_status='pending' 的技能进入待审核队列，
+   * 审核走 approveSkill / rejectSkill。校验（仅正经验、未晋升过）在 memory 服务内完成。
+   */
+  async promoteExperience(roleId: string, experienceId: string): Promise<SkillView> {
+    const repository = this.requireRepository('Experience promotion');
+    return toSkillView(
+      await promoteExperienceToSkill(repository, {
+        role_id: roleId,
+        experience_id: experienceId,
+      }),
+    );
   }
 
   /** 技能市场检索：query 文本 → embedding → 市场池（__market__）内 top-K 召回（Spec §6.2）。 */

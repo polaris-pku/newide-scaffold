@@ -40,6 +40,8 @@ export interface MemoryMethodsService {
   listMemoryExperiences(roleId: string, filter?: ExperienceListFilter): Promise<ExperienceView[]>;
   listMemoryMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]>;
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence>;
+  /** 手动晋升一条经验为 Skill（memory.promoteExperience），产出 pending Skill 待审核 */
+  promoteMemoryExperience(roleId: string, experienceId: string): Promise<SkillView>;
   /** 技能市场检索（Spec §6.2 skill.market_search） */
   marketSearchMemorySkills(query: MarketSearchQuery): Promise<SkillRecord[]>;
   /** 技能市场引入（Spec §6.2 skill.market_import） */
@@ -167,6 +169,12 @@ const promoteParamsSchema = z
   .object({
     role_id: z.string().trim().min(1),
     requested_by: z.string().trim().min(1).default('user'),
+  })
+  .strict();
+const promoteExperienceParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    experience_id: z.string().trim().min(1),
   })
   .strict();
 const marketSearchParamsSchema = z
@@ -405,6 +413,12 @@ export class MemoryRpcMethods {
       return this.service
         .promoteMemorySkills(parsed.role_id, parsed.requested_by)
         .then((maintenance) => ({ maintenance }));
+    });
+    dispatcher.register('memory.promoteExperience', (params) => {
+      const parsed = parseParams(promoteExperienceParamsSchema, params);
+      return this.service
+        .promoteMemoryExperience(parsed.role_id, parsed.experience_id)
+        .then((skill) => ({ skill }));
     });
     dispatcher.register('memory.marketSearch', (params) => {
       const parsed = parseParams(marketSearchParamsSchema, params ?? {});

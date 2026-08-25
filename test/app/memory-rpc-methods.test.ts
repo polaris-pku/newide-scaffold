@@ -257,6 +257,86 @@ describe('memory RPC market and retire wiring', () => {
     });
   });
 
+  it('promotes a specific experience into a pending skill through memory RPC', async () => {
+    const embedding = new HashEmbeddingProvider(32);
+    const repository = new InMemoryRepository(embedding);
+    const bufferRepository = new InMemoryBufferRepository();
+    await repository.initializeAgent({ role_id: 'role_alpha', name: 'Alpha', tags: [] });
+    const now = nowTimestamp();
+    const positive = {
+      id: randomUUID(),
+      description: 'Use explicit contracts',
+      description_embedding: [],
+      content: 'Define shared contracts before coding.',
+      confidence: 0.6,
+      tags: ['typescript'],
+      agent_id: 'role_alpha',
+      confidence_history: [],
+      referenced_count: 0,
+      source_task_id: 'task_001',
+      source_driver: 'capturing-driver',
+      type: 'positive' as const,
+      created_at: now,
+      updated_at: now,
+    };
+    const negative = { ...positive, id: randomUUID(), type: 'negative' as const };
+    await repository.saveExperience('role_alpha', positive);
+    await repository.saveExperience('role_alpha', negative);
+
+    const service = new BMemoryBackendService(
+      {
+        boardQuery: new RepositoryAgentBoardQuery(repository),
+        maintenance: fakeMaintenance(),
+        reviewSkill: (input) => reviewSkill(repository, input),
+        bufferRepository,
+      },
+      { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
+      {},
+      repository,
+    );
+
+    const output: string[] = [];
+    const session = new JsonRpcLineSession(dispatcherFor(service), (line) => output.push(line));
+    const send = async (...lines: string[]) => {
+      output.length = 0;
+      for (const line of lines) await session.handleLine(line);
+      return output.map((line) => JSON.parse(line) as Record<string, unknown>);
+    };
+
+    // 晋升正经验 → pending Skill（promoted_from 溯源），经验回写 promoted_to
+    const [promoted] = await send(
+      `{"jsonrpc":"2.0","id":0,"method":"memory.promoteExperience","params":{"role_id":"role_alpha","experience_id":"${positive.id}"}}`,
+    );
+    expect(promoted!).toMatchObject({
+      id: 0,
+      result: {
+        skill: {
+          review_status: 'pending',
+          promoted_from: positive.id,
+          agent_id: 'role_alpha',
+          description: positive.description,
+        },
+      },
+    });
+    const [storedSkill] = await repository.listSkills('role_alpha');
+    expect(storedSkill!.promoted_from).toBe(positive.id);
+    expect(storedSkill!.description_embedding.length).toBeGreaterThan(0);
+    const [storedPositive] = await repository.listExperiences('role_alpha');
+    expect(storedPositive!.promoted_to).toBe(storedSkill!.id);
+
+    // 负经验不可晋升 → 应用错误
+    const [rejected] = await send(
+      `{"jsonrpc":"2.0","id":1,"method":"memory.promoteExperience","params":{"role_id":"role_alpha","experience_id":"${negative.id}"}}`,
+    );
+    expect(rejected!).toMatchObject({ id: 1, error: { code: -32603 } });
+
+    // 缺 experience_id → Invalid params
+    const [invalid] = await send(
+      '{"jsonrpc":"2.0","id":2,"method":"memory.promoteExperience","params":{"role_id":"role_alpha"}}',
+    );
+    expect(invalid!).toMatchObject({ id: 2, error: { code: -32602 } });
+  });
+
   it('routes market import and retire through NewideBackendService + DriverRuntimeAgentExecutionFacade', async () => {
     const embedding = new HashEmbeddingProvider(32);
     const repository = new InMemoryRepository(embedding);
@@ -396,6 +476,8 @@ function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
     listMemoryExperiences: (roleId) => service.listExperiences(roleId),
     listMemoryMaintenance: (roleId) => service.listMaintenance(roleId),
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
+    promoteMemoryExperience: (roleId, experienceId) =>
+      service.promoteExperience(roleId, experienceId),
     marketSearchMemorySkills: (query) => service.marketSearch(query),
     marketImportMemorySkill: (roleId, sourceSkillId) =>
       service.marketImport(roleId, sourceSkillId),

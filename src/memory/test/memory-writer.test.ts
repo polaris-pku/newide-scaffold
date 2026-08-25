@@ -1,6 +1,6 @@
 /**
  * MemoryWriter（M2：memory.createSkill / updateSkill / deleteSkill /
- * publishSkillToMarket / updateExperience / deleteExperience）测试
+ * publishSkillToMarket / updateExperience / deleteExperience / promoteExperience）测试
  *
  * 验证：
  *   1. createSkill：pending 默认 / autoApprove 直接 approved；embedding 由仓库补全；
@@ -9,6 +9,8 @@
  *   3. publishSkillToMarket：置 market_status='available'，保留归属
  *   4. updateExperience：confidence 调整写入 confidence_history 并重算 avg_confidence
  *   5. deleteSkill / deleteExperience：删除成功、不存在抛错
+ *   6. promoteExperienceToSkill：正经验晋升为 pending Skill 并回写 promoted_to；
+ *      负经验 / 已晋升 / 不存在 抛错
  */
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
@@ -18,6 +20,7 @@ import {
   createSkill,
   deleteExperience,
   deleteSkill,
+  promoteExperienceToSkill,
   publishSkillToMarket,
   updateExperience,
   updateSkill,
@@ -204,5 +207,67 @@ describe('deleteSkill / deleteExperience', () => {
     await expect(deleteExperience(repository, ROLE, target.id)).rejects.toThrow(
       /Experience not found/,
     );
+  });
+});
+
+describe('promoteExperienceToSkill', () => {
+  it('promotes a positive experience into a pending skill and binds promoted_to', async () => {
+    const repository = await setup();
+    const target = experience({
+      description: 'Use explicit contracts',
+      content: 'Define shared contracts before coding.',
+      tags: ['typescript', 'design'],
+    });
+    await repository.saveExperience(ROLE, target);
+
+    const skill = await promoteExperienceToSkill(repository, {
+      role_id: ROLE,
+      experience_id: target.id,
+    });
+
+    expect(skill.review_status).toBe('pending');
+    expect(skill.promoted_from).toBe(target.id);
+    expect(skill.description).toBe(target.description);
+    expect(skill.content).toBe(target.content);
+    expect(skill.tags).toEqual(['typescript', 'design']);
+    expect(skill.version).toBe('1.0.0');
+    expect(skill.agent_id).toBe(ROLE);
+
+    const stored = (await repository.listSkills(ROLE))[0]!;
+    expect(stored.id).toBe(skill.id);
+    expect(stored.description_embedding.length).toBeGreaterThan(0);
+    const bound = (await repository.listExperiences(ROLE))[0]!;
+    expect(bound.promoted_to).toBe(skill.id);
+    const metrics = await repository.getMetrics(ROLE);
+    expect(metrics.promoted_skill_count).toBe(1);
+  });
+
+  it('rejects negative experiences', async () => {
+    const repository = await setup();
+    const target = experience({ type: 'negative' });
+    await repository.saveExperience(ROLE, target);
+
+    await expect(
+      promoteExperienceToSkill(repository, { role_id: ROLE, experience_id: target.id }),
+    ).rejects.toThrow(/Only positive experiences can be promoted/);
+    expect(await repository.listSkills(ROLE)).toHaveLength(0);
+  });
+
+  it('rejects an already promoted experience', async () => {
+    const repository = await setup();
+    const target = experience({ promoted_to: randomUUID() });
+    await repository.saveExperience(ROLE, target);
+
+    await expect(
+      promoteExperienceToSkill(repository, { role_id: ROLE, experience_id: target.id }),
+    ).rejects.toThrow(/already promoted/);
+    expect(await repository.listSkills(ROLE)).toHaveLength(0);
+  });
+
+  it('throws when the experience does not exist', async () => {
+    const repository = await setup();
+    await expect(
+      promoteExperienceToSkill(repository, { role_id: ROLE, experience_id: randomUUID() }),
+    ).rejects.toThrow(/Experience not found/);
   });
 });
