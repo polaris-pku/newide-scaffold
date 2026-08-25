@@ -464,6 +464,108 @@ describe('memory RPC market and retire wiring', () => {
 
     await service.close();
   });
+
+  it('rebuilds the vector index via memory.reindex (embedding model switch)', async () => {
+    // 旧模型：仓库按 32 维写入；B 服务注入 8 维新 provider（模拟切换 embedding 模型）
+    const repository = new InMemoryRepository(new HashEmbeddingProvider(32));
+    const bufferRepository = new InMemoryBufferRepository();
+    await repository.initializeAgent({ role_id: 'role_alpha', name: 'Alpha', tags: [] });
+    await seedSkill(repository, 'role_alpha', 'TypeScript service patterns');
+    const now = nowTimestamp();
+    await repository.saveExperience('role_alpha', {
+      id: randomUUID(),
+      description: 'Handle TypeScript contract boundaries.',
+      description_embedding: [],
+      content: 'full experience content body',
+      confidence: 0.8,
+      tags: ['typescript'],
+      agent_id: 'role_alpha',
+      confidence_history: [],
+      referenced_count: 1,
+      source_task_id: 'task_001',
+      source_driver: 'capturing-driver',
+      type: 'positive',
+      created_at: now,
+      updated_at: now,
+    });
+    expect((await repository.listSkills('role_alpha'))[0].description_embedding).toHaveLength(32);
+
+    const newEmbedding = new HashEmbeddingProvider(8);
+    const service = new BMemoryBackendService(
+      {
+        boardQuery: new RepositoryAgentBoardQuery(repository),
+        maintenance: fakeMaintenance(),
+        reviewSkill: (input) => reviewSkill(repository, input),
+        bufferRepository,
+      },
+      { provider: 'HashEmbeddingProvider', dimensions: 8, readiness: 'verified' },
+      {},
+      repository,
+      undefined,
+      newEmbedding,
+    );
+
+    const output: string[] = [];
+    const session = new JsonRpcLineSession(dispatcherFor(service), (line) => output.push(line));
+    const send = async (...lines: string[]) => {
+      output.length = 0;
+      for (const line of lines) await session.handleLine(line);
+      return output.map((line) => JSON.parse(line) as Record<string, unknown>);
+    };
+
+    // capabilities 报告 reindex 可用
+    const [capabilities] = await send(
+      '{"jsonrpc":"2.0","id":0,"method":"memory.getCapabilities","params":{}}',
+    );
+    expect(capabilities!).toMatchObject({
+      id: 0,
+      result: { capabilities: { operations: { reindex: { status: 'available' } } } },
+    });
+
+    // 全量重建：存量 32 维全部重算为 8 维
+    const [reindexed] = await send(
+      '{"jsonrpc":"2.0","id":1,"method":"memory.reindex","params":{}}',
+    );
+    expect(reindexed!).toMatchObject({
+      id: 1,
+      result: {
+        reindex: {
+          scope: 'all',
+          agents_processed: 1,
+          skills_reindexed: 1,
+          skills_skipped: 0,
+          experiences_reindexed: 1,
+          experiences_skipped: 0,
+          failures: [],
+          dimensions: 8,
+        },
+      },
+    });
+    // 直写路径生效：仓库（32 维守卫）未覆盖新向量，存量记录已是 8 维
+    expect((await repository.listSkills('role_alpha'))[0].description_embedding).toHaveLength(8);
+    expect((await repository.listExperiences('role_alpha'))[0].description_embedding).toHaveLength(
+      8,
+    );
+
+    // 单 Agent 作用域 + force 无条件重算
+    const [scoped] = await send(
+      '{"jsonrpc":"2.0","id":2,"method":"memory.reindex","params":{"role_id":"role_alpha","force":true}}',
+    );
+    expect(scoped!).toMatchObject({
+      id: 2,
+      result: { reindex: { scope: 'role', role_id: 'role_alpha', agents_processed: 1 } },
+    });
+
+    // 非法参数 / 不存在的 Agent
+    const [invalid] = await send(
+      '{"jsonrpc":"2.0","id":3,"method":"memory.reindex","params":{"role_id":""}}',
+    );
+    expect(invalid!).toMatchObject({ id: 3, error: { code: -32602 } });
+    const [missing] = await send(
+      '{"jsonrpc":"2.0","id":4,"method":"memory.reindex","params":{"role_id":"role_missing"}}',
+    );
+    expect(missing!).toMatchObject({ id: 4, error: { code: -32603 } });
+  });
 });
 
 function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
@@ -487,6 +589,7 @@ function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
       service.approveSkill(roleId, skillId, reviewedBy),
     rejectMemorySkill: (roleId, skillId, reviewedBy) =>
       service.rejectSkill(roleId, skillId, reviewedBy),
+    reindexMemory: (roleId, options) => service.reindexMemory(roleId, options),
   }).register(dispatcher);
   return dispatcher;
 }

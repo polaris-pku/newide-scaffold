@@ -254,6 +254,17 @@ export type {
 } from './services/skill-learning';
 
 // ════════════════════════════════════════════════════════
+//  8.9 向量索引维护（memory.reindex：切换 embedding 模型后全量重建索引）
+// ════════════════════════════════════════════════════════
+
+export {
+  reindexMemory,
+  type ReindexMemoryOptions,
+  type ReindexMemoryResult,
+  type ReindexFailure,
+} from './services/memory-reindex';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 

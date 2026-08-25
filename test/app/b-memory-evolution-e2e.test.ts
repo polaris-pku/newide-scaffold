@@ -260,6 +260,7 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
       service.approveSkill(roleId, skillId, reviewedBy),
     rejectMemorySkill: (roleId, skillId, reviewedBy) =>
       service.rejectSkill(roleId, skillId, reviewedBy),
+    reindexMemory: (roleId, options) => service.reindexMemory(roleId, options),
   }).register(dispatcher);
   return dispatcher;
 }

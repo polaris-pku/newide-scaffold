@@ -19,6 +19,7 @@ import type {
   RetireOptions,
   RetireResult,
   RetirementScanResult,
+  ReindexMemoryResult,
   SkillListFilter,
   SkillView,
   SkillWritePatch,
@@ -123,6 +124,14 @@ export interface MemoryMethodsService {
   listMemoryPendingReviews(): Promise<SkillView[]>;
   /** 按任务溯源经验（memory.listExperiencesBySourceTask） */
   listMemoryExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]>;
+  /**
+   * 重建向量索引（memory.reindex）：切换 embedding 模型后重算存量
+   * description_embedding（Spec §7.2）。roleId 缺省全量，force=true 无条件重算。
+   */
+  reindexMemory(
+    roleId: string | undefined,
+    options: { force?: boolean },
+  ): Promise<ReindexMemoryResult>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -329,6 +338,12 @@ const bufferSeqParamsSchema = z
 const taskIdParamsSchema = z
   .object({
     task_id: z.string().trim().min(1),
+  })
+  .strict();
+const reindexParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1).optional(),
+    force: z.boolean().optional(),
   })
   .strict();
 
@@ -605,6 +620,13 @@ export class MemoryRpcMethods {
       const parsed = parseParams(bufferSeqParamsSchema, params);
       const maintenance = await this.service.retryMemoryExtraction(parsed.role_id, parsed.seq);
       return { maintenance };
+    });
+    dispatcher.register('memory.reindex', async (params) => {
+      const parsed = parseParams(reindexParamsSchema, params ?? {});
+      const reindex = await this.service.reindexMemory(parsed.role_id, {
+        ...(parsed.force !== undefined ? { force: parsed.force } : {}),
+      });
+      return { reindex };
     });
   }
 }
