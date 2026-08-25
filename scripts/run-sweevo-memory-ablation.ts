@@ -22,6 +22,7 @@ import {
   removeEphemeralWorktree,
 } from '../eval/prepare-worktree';
 import { runEvalInstance } from '../eval/run-instance-core';
+import { resolveHarnessTimeoutSeconds } from '../eval/sweevo-harness-adapter';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
 import {
   collectClaudeSessionUsage,
@@ -220,9 +221,14 @@ baseEnv.ACP_DENY_PATH_SUBSTRINGS_JSON ??= JSON.stringify([
   'dist-packages',
   'miniconda',
   'anaconda',
+  '/usr/local/aegis',
+  'PythonLoader/third_party',
 ]);
 baseEnv.ACP_PROCESS_SANDBOX ??= baseEnv.NEWIDE_EVAL_FS_JAIL;
 baseEnv.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES ??= '1';
+// A process-level tmpfs HOME intentionally cannot reload a session created by
+// an earlier driver process. B memory remains external and is still enabled.
+baseEnv.NEWIDE_EPHEMERAL_ACP_SESSIONS ??= baseEnv.NEWIDE_EVAL_FS_JAIL;
 baseEnv.ACP_PROCESS_SANDBOX_RO_PATHS_JSON ??= JSON.stringify([
   '.claude/settings.json',
   '.git/config',
@@ -233,10 +239,42 @@ if (baseEnv.NEWIDE_EVAL_FS_JAIL_BWRAP) {
 if (baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE) {
   baseEnv.ACP_PROCESS_SANDBOX_NPM_CACHE ??= baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE;
 }
+const sandboxExtraRoBinds = new Set(
+  parseJsonStringArray(
+    baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
+    'ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON',
+  ),
+);
 if (baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS) {
-  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON ??= JSON.stringify(
-    baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS.split(path.delimiter).filter(Boolean),
+  for (const bind of baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS.split(path.delimiter)) {
+    if (bind) sandboxExtraRoBinds.add(bind);
+  }
+}
+if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
+  // `npx -y` cannot bootstrap claude-agent-acp after HOME/cache isolation and
+  // DNS default-deny are enabled. Execute the dependency already installed in
+  // the ACP runner and expose only its node_modules tree read-only.
+  const runnerNodeModules = path.join(String(baseEnv.ACP_DRIVER_RUNNER_DIR), 'node_modules');
+  const claudeAcpEntry = path.join(
+    runnerNodeModules,
+    '@agentclientprotocol',
+    'claude-agent-acp',
+    'dist',
+    'index.js',
   );
+  if (!existsSync(claudeAcpEntry)) {
+    throw new Error(
+      `Offline ACP adapter entrypoint missing: ${claudeAcpEntry}. Run pnpm install in ${String(baseEnv.ACP_DRIVER_RUNNER_DIR)}.`,
+    );
+  }
+  sandboxExtraRoBinds.add(runnerNodeModules);
+  baseEnv.CLAUDE_CLI_COMMAND ??= process.execPath;
+  baseEnv.CLAUDE_CLI_ARGS ??= `${claudeAcpEntry} acp`;
+}
+if (sandboxExtraRoBinds.size > 0) {
+  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON = JSON.stringify([
+    ...sandboxExtraRoBinds,
+  ]);
 }
 
 log(`experiment root: ${experimentRoot}`);
@@ -249,6 +287,16 @@ log(
 log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
 log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
 log(`NEWIDE_SWE_EVO_PYTHON: ${process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python (default)'}`);
+log(
+  `NEWIDE_B_EMBEDDING_PROVIDER: ${baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash'}`,
+);
+log(
+  `NEWIDE_B_EMBEDDING_DIMENSIONS: ${baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32'}`,
+);
+const harnessTimeoutEnv = process.env.NEWIDE_SWE_EVO_HARNESS_TIMEOUT?.trim();
+log(
+  `NEWIDE_SWE_EVO_HARNESS_TIMEOUT: ${harnessTimeoutEnv && harnessTimeoutEnv.length > 0 ? harnessTimeoutEnv : 'default 1800; dask__dask_2024.1.0_2024.1.1 -> 10800'}`,
+);
 log(`NEWIDE_EVAL_FS_JAIL: ${baseEnv.NEWIDE_EVAL_FS_JAIL}`);
 const permissionBuildPath = path.join(
   String(baseEnv.ACP_DRIVER_RUNNER_DIR),
@@ -260,11 +308,25 @@ const permissionBuildPath = path.join(
 const permissionBuildSupportsOfflineBlock =
   existsSync(permissionBuildPath) &&
   readFileSync(permissionBuildPath, 'utf-8').includes('ACP_DENY_NETWORK_TOOLS');
+const permissionBuildBlocksPackageIndex =
+  existsSync(permissionBuildPath) &&
+  /pip3\?|PACKAGE_INDEX_FETCH_RE|SCRIPT_NETWORK_RE/.test(
+    readFileSync(permissionBuildPath, 'utf-8'),
+  );
 if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !permissionBuildSupportsOfflineBlock) {
   throw new Error(
     [
       'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP driver build',
       `at ${permissionBuildPath} does not enforce the internet block.`,
+      'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
+    ].join(' '),
+  );
+}
+if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !permissionBuildBlocksPackageIndex) {
+  throw new Error(
+    [
+      'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP driver build',
+      `at ${permissionBuildPath} does not deny pip/package-index fetches.`,
       'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
     ].join(' '),
   );
@@ -311,6 +373,50 @@ if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
     );
   }
   log(`eval FS jail bwrap: ${bwrapPath}`);
+  const jailBuild = existsSync(jailBuildPath) ? readFileSync(jailBuildPath, 'utf-8') : '';
+  const dnsBlockBuildPath = path.join(
+    String(baseEnv.ACP_DRIVER_RUNNER_DIR),
+    'dist',
+    'src',
+    'security',
+    'package-index-block.js',
+  );
+  const dnsBlockBuild = existsSync(dnsBlockBuildPath)
+    ? readFileSync(dnsBlockBuildPath, 'utf-8')
+    : '';
+  if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !jailBuild.includes('PIP_NO_INDEX')) {
+    throw new Error(
+      [
+        'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP FS jail build',
+        `at ${jailBuildPath} does not force pip offline.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
+      ].join(' '),
+    );
+  }
+  if (
+    baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' &&
+    (!jailBuild.includes('writeOfflineDnsFiles') || !dnsBlockBuild.includes('hosts: files'))
+  ) {
+    throw new Error(
+      [
+        'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP FS jail build',
+        `at ${jailBuildPath} does not default-deny DNS.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
+      ].join(' '),
+    );
+  }
+  if (
+    baseEnv.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES !== '0' &&
+    (!jailBuild.includes('listHostOracleHideDirs') || !jailBuild.includes('pushUsrMergeOrRoBind'))
+  ) {
+    throw new Error(
+      [
+        'Eval FS jail requested but the ACP driver build',
+        `at ${jailBuildPath} does not hide usr-merge /lib package aliases or host oracle trees.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_EVAL_FS_JAIL=0 (debug only).',
+      ].join(' '),
+    );
+  }
 }
 const armReports: Array<{
   ablation: MemoryAblation;
@@ -427,6 +533,10 @@ const summary = {
   ablations: [...new Set([...ablations, ...mergedArms.map((arm) => arm.ablation)])],
   run_mode: runMode,
   model_name: modelName,
+  b_embedding: {
+    provider: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
+    dimensions: Number(baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32'),
+  },
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
   skip_eval: skipEval,
@@ -573,6 +683,12 @@ async function runOneInstance(input: {
     }
 
     try {
+      const harnessTimeoutSeconds = resolveHarnessTimeoutSeconds(instance.instance_id);
+      if (harnessTimeoutSeconds) {
+        log(
+          `  harness timeout override ${instance.instance_id}: ${String(harnessTimeoutSeconds)}s`,
+        );
+      }
       const evalResult = await runEvalInstance({
         instanceId: instance.instance_id,
         predictionMode: 'real',
@@ -588,6 +704,7 @@ async function runOneInstance(input: {
         keepWorktree: true,
         runSweEvoHarness: runHarness || harnessDryRun,
         harnessDryRun,
+        ...(harnessTimeoutSeconds ? { harnessTimeoutSeconds } : {}),
         ...(baseEnv.NEWIDE_SWE_EVO_ROOT ? { sweEvoRoot: baseEnv.NEWIDE_SWE_EVO_ROOT } : {}),
       });
       row.eval_run_dir = evalResult.runDir;
@@ -673,6 +790,20 @@ function buildEvalClaudeSettings(): Record<string, unknown> {
         'Bash(gh *)',
         'Bash(Invoke-WebRequest *)',
         'Bash(iwr *)',
+        'Bash(pip *)',
+        'Bash(pip3 *)',
+        'Bash(python -m pip *)',
+        'Bash(python3 -m pip *)',
+        'Bash(python3 -mpip *)',
+        'Bash(python -mpip *)',
+        'Bash(python3.9 -m pip *)',
+        'Bash(python3.10 -m pip *)',
+        'Bash(python3.11 -m pip *)',
+        'Bash(python3.12 -m pip *)',
+        'Bash(uv pip *)',
+        'Bash(uv add *)',
+        'Bash(poetry add *)',
+        'Bash(conda *)',
       ],
     };
   }
@@ -1030,6 +1161,22 @@ function loadEnvFile(filePath: string): NodeJS.ProcessEnv {
         return [[key, value]];
       }),
   );
+}
+
+function parseJsonStringArray(raw: string | undefined, name: string): string[] {
+  if (!raw?.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `${name} must be a JSON string array: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== 'string')) {
+    throw new Error(`${name} must be a JSON string array`);
+  }
+  return parsed;
 }
 
 async function readJsonIfExists(filePath: string): Promise<unknown> {
