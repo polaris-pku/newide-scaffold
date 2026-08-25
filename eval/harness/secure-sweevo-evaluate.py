@@ -188,12 +188,54 @@ def restore(backups: dict[Path, bytes]) -> None:
         file_path.write_bytes(content)
 
 
+def resolve_timeout_seconds(cli_timeout: int | None) -> int | None:
+    if cli_timeout is not None:
+        if cli_timeout <= 0:
+            raise SystemExit("--timeout must be a positive integer")
+        return cli_timeout
+    raw = os.environ.get("NEWIDE_SWE_EVO_HARNESS_TIMEOUT", "").strip()
+    if not raw:
+        return None
+    try:
+        timeout = int(raw)
+    except ValueError as exc:
+        raise SystemExit(
+            "NEWIDE_SWE_EVO_HARNESS_TIMEOUT must be a positive integer"
+        ) from exc
+    if timeout <= 0:
+        raise SystemExit("NEWIDE_SWE_EVO_HARNESS_TIMEOUT must be a positive integer")
+    return timeout
+
+
+def apply_timeout_override(timeout: int) -> None:
+    """Override the hardcoded 1800s timeout in SWE-EVO's evaluate_instance.py."""
+    import swebench.harness.run_evaluation as run_evaluation
+
+    original = run_evaluation.run_instances
+
+    def run_instances(*args: Any, **kwargs: Any):
+        if "timeout" in kwargs:
+            kwargs = {**kwargs, "timeout": timeout}
+        elif len(args) >= 8:
+            args = (*args[:7], timeout, *args[8:])
+        else:
+            kwargs = {**kwargs, "timeout": timeout}
+        print(f"[newide] harness timeout override: {timeout}s", flush=True)
+        return original(*args, **kwargs)
+
+    run_evaluation.run_instances = run_instances
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--official-script", required=True)
     parser.add_argument("--trajectories_path", required=True)
     parser.add_argument("--scaffold", default="OpenHands")
+    parser.add_argument("--timeout", type=int, default=None)
     known, remaining = parser.parse_known_args()
+    timeout = resolve_timeout_seconds(known.timeout)
+    if timeout is not None:
+        apply_timeout_override(timeout)
 
     output_final = Path.cwd() / "output_final"
     instance_backups = prepare_instances(output_final)

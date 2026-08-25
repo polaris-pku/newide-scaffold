@@ -72,7 +72,23 @@ def test_pytest_command_includes_hidden_test_files() -> None:
     assert instance["test_patch"] == ""
 
 
+def test_timeout_cli_overrides_env() -> None:
+    previous = os.environ.get("NEWIDE_SWE_EVO_HARNESS_TIMEOUT")
+    os.environ["NEWIDE_SWE_EVO_HARNESS_TIMEOUT"] = "1800"
+    try:
+        assert wrapper.resolve_timeout_seconds(10800) == 10800
+        assert wrapper.resolve_timeout_seconds(None) == 1800
+        del os.environ["NEWIDE_SWE_EVO_HARNESS_TIMEOUT"]
+        assert wrapper.resolve_timeout_seconds(None) is None
+    finally:
+        if previous is None:
+            os.environ.pop("NEWIDE_SWE_EVO_HARNESS_TIMEOUT", None)
+        else:
+            os.environ["NEWIDE_SWE_EVO_HARNESS_TIMEOUT"] = previous
+
+
 if __name__ == "__main__":
     test_hidden_copy_does_not_mutate_source()
     test_pytest_command_includes_hidden_test_files()
+    test_timeout_cli_overrides_env()
     print("ok")

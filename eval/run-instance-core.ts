@@ -8,7 +8,11 @@ import { loadDatasetSubset, loadManifest, resolveDatasetJsonl, resolveRunDir } f
 import { buildPrediction, writePredictionsJsonl } from './prediction-writer';
 import { getInstanceReport, hasP2pRegression, readHarnessReport } from './harness-report';
 import { buildEvalSummary, writeJson, writeRunMeta } from './run-summary';
-import { runSweEvoHarnessAdapter, type SweEvoHarnessAdapterResult } from './sweevo-harness-adapter';
+import {
+  resolveHarnessTimeoutSeconds,
+  runSweEvoHarnessAdapter,
+  type SweEvoHarnessAdapterResult,
+} from './sweevo-harness-adapter';
 import type {
   EvalRunMeta,
   EvalSummary,
@@ -53,6 +57,7 @@ export interface RunInstanceOptions {
   harnessDryRun?: boolean;
   sweEvoRoot?: string;
   harnessMaxWorkers?: number;
+  harnessTimeoutSeconds?: number;
 }
 
 export interface RunInstanceResult {
@@ -147,13 +152,17 @@ export async function runEvalInstance(options: RunInstanceOptions): Promise<RunI
     let harness: SweEvoHarnessAdapterResult | undefined;
 
     if (options.runSweEvoHarness) {
+      const timeoutSeconds =
+        options.harnessTimeoutSeconds ?? resolveHarnessTimeoutSeconds(instance.instance_id);
       harness = await runSweEvoHarnessAdapter({
         predictionsPath,
         runId,
         datasetPath,
+        instanceId: instance.instance_id,
         ...(options.outRoot ? { outRoot: options.outRoot } : {}),
         ...(options.sweEvoRoot ? { sweEvoRoot: options.sweEvoRoot } : {}),
         ...(options.harnessMaxWorkers ? { maxWorkers: options.harnessMaxWorkers } : {}),
+        ...(timeoutSeconds ? { timeoutSeconds } : {}),
         dryRun: options.harnessDryRun ?? false,
       });
       harnessReportPath = harness.harnessReportPath;
