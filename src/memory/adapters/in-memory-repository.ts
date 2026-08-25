@@ -316,6 +316,33 @@ export class InMemoryRepository implements MemoryRepository {
     store.experiences[index] = await this.withDescriptionEmbedding(experience);
   }
 
+  async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {
+    const store = this.requireStore(role_id);
+    const index = store.skills.findIndex((item) => item.id === skill_id);
+    const existing = store.skills[index];
+    if (!existing) {
+      throw new Error(`Skill not found: ${skill_id}`);
+    }
+    store.skills[index] = { ...existing, description_embedding: embedding };
+  }
+
+  async updateExperienceEmbedding(
+    role_id: string,
+    experience_id: string,
+    embedding: number[],
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    const index = store.experiences.findIndex((item) => item.id === experience_id);
+    const existing = store.experiences[index];
+    if (!existing) {
+      throw new Error(`Experience not found: ${experience_id}`);
+    }
+    store.experiences[index] = {
+      ...existing,
+      description_embedding: embedding,
+    };
+  }
+
   async deleteSkill(role_id: string, skill_id: string): Promise<void> {
     const store = this.requireStore(role_id);
     const before = store.skills.length;

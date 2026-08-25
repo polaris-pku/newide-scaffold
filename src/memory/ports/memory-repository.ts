@@ -173,6 +173,23 @@ export interface MemoryRepository {
   updateSkill(role_id: string, skill: SkillRecord): Promise<void>;
   /** 更新已有经验（如晋升后写入 promoted_to） */
   updateExperience(role_id: string, experience: ExperienceRecord): Promise<void>;
+
+  /**
+   * 直写技能向量（memory.reindex 全量重建索引用）。
+   *
+   * 与 updateSkill 的区别：不做 withDescriptionEmbedding 守卫，按传入向量原样
+   * 落库（含载荷 JSON 内的 description_embedding 字段同步），避免重建索引时被
+   * 旧 provider 二次 embed。记录不存在时抛错。
+   */
+  updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void>;
+
+  /** 直写经验向量（同 updateSkillEmbedding）。 */
+  updateExperienceEmbedding(
+    role_id: string,
+    experience_id: string,
+    embedding: number[],
+  ): Promise<void>;
+
   /** 删除一条技能（如退休时资产处置丢弃 rejected Skill） */
   deleteSkill(role_id: string, skill_id: string): Promise<void>;
   /** 删除一条经验（如退休时资产处置丢弃低置信度 Experience） */

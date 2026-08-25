@@ -61,6 +61,27 @@ function toPgVector(values: number[]): string {
   return `[${values.join(',')}]`;
 }
 
+/**
+ * 读取表内 description_embedding 列的 vector(N) 维度；列不存在返回 undefined。
+ * 用于检测 embedding 模型切换后的维度漂移（migrateVectorColumnDimensions）。
+ */
+async function readVectorColumnDimensions(
+  pool: SqlPool,
+  table: string,
+): Promise<number | undefined> {
+  const result = await pool.query<{ type: string }>(
+    `SELECT format_type(a.atttypid, a.atttypmod) AS type
+     FROM pg_attribute a
+     JOIN pg_class c ON c.oid = a.attrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = $1 AND a.attname = 'description_embedding'`,
+    [table],
+  );
+  const type = result.rows[0]?.type;
+  const match = type ? /^vector\((\d+)\)$/.exec(type) : null;
+  return match ? Number(match[1]) : undefined;
+}
+
 export class PgMemoryRepository implements MemoryRepository {
   private readonly pool: SqlPool;
   private readonly embedding: EmbeddingProvider;
@@ -597,6 +618,40 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `UPDATE memory_skills
+       SET payload = jsonb_set(payload, '{description_embedding}', $3::jsonb),
+           description_embedding = $4::vector
+       WHERE role_id = $1 AND id = $2`,
+      [role_id, skill_id, JSON.stringify(embedding), toPgVector(embedding)],
+    );
+
+    if (result.rowCount === 0) {
+      throw new Error(`Skill not found: ${skill_id}`);
+    }
+  }
+
+  async updateExperienceEmbedding(
+    role_id: string,
+    experience_id: string,
+    embedding: number[],
+  ): Promise<void> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `UPDATE memory_experiences
+       SET payload = jsonb_set(payload, '{description_embedding}', $3::jsonb),
+           description_embedding = $4::vector
+       WHERE role_id = $1 AND id = $2`,
+      [role_id, experience_id, JSON.stringify(embedding), toPgVector(embedding)],
+    );
+
+    if (result.rowCount === 0) {
+      throw new Error(`Experience not found: ${experience_id}`);
+    }
+  }
+
   async deleteSkill(role_id: string, skill_id: string): Promise<void> {
     await this.ensureSchema();
     const result = await this.pool.query(
@@ -702,9 +757,33 @@ export class PgMemoryRepository implements MemoryRepository {
       return;
     }
     if (!this.schemaReady) {
-      this.schemaReady = ensurePgMemorySchema(this.pool, this.embedding.dimensions);
+      this.schemaReady = (async () => {
+        await ensurePgMemorySchema(this.pool, this.embedding.dimensions);
+        await this.migrateVectorColumnDimensions(this.embedding.dimensions);
+      })();
     }
     await this.schemaReady;
+  }
+
+  /**
+   * 切换 embedding 模型后，存量 vector(N) 列维度与当前 provider 不一致：
+   * CREATE TABLE IF NOT EXISTS 不会改已有列。pgvector 的 vector 类型转换不允许
+   * 改变维度（cast 直接报 "expected N dimensions, not M"），因此 DROP + ADD
+   * 重建列；存量向量随列删除，由 memory.reindex 从载荷 JSON 重算回填
+   * （重算前该列对旧行为 NULL，向量检索自然召回为空）。
+   * 幂等：列维度一致时跳过。
+   */
+  private async migrateVectorColumnDimensions(dimensions: number): Promise<void> {
+    for (const table of ['memory_skills', 'memory_experiences']) {
+      const current = await readVectorColumnDimensions(this.pool, table);
+      if (current !== undefined && current !== dimensions) {
+        await this.pool.query(
+          `ALTER TABLE ${table}
+           DROP COLUMN description_embedding,
+           ADD COLUMN description_embedding vector(${dimensions})`,
+        );
+      }
+    }
   }
 
   private async requireAgentRow(role_id: string): Promise<{

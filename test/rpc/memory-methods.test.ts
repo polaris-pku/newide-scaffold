@@ -58,6 +58,7 @@ describe('MemoryRpcMethods', () => {
     }) as never);
     
     const deleteMemoryAgent = vi.fn(async () => undefined);
+    const reindexMemory = vi.fn(async () => reindexEvidence());
     const service = fakeService({
       promoteMemorySkills,
       promoteMemoryExperience,
@@ -68,6 +69,7 @@ describe('MemoryRpcMethods', () => {
       approveMemorySkill,
       rejectMemorySkill,
       deleteMemoryAgent,
+      reindexMemory,
     });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
@@ -239,6 +241,13 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":55,"method":"memory.promoteExperience","params":{"role_id":"role_ts_engineer"}}',
     );
+    await session.handleLine('{"jsonrpc":"2.0","id":56,"method":"memory.reindex","params":{}}');
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":57,"method":"memory.reindex","params":{"role_id":"role_ts_engineer","force":true}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":58,"method":"memory.reindex","params":{"role_id":""}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -363,6 +372,9 @@ describe('MemoryRpcMethods', () => {
         },
       },
       { id: 55, error: { code: -32602, message: 'Invalid params' } },
+      { id: 56, result: { reindex: reindexEvidence() } },
+      { id: 57, result: { reindex: reindexEvidence() } },
+      { id: 58, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
     expect(promoteMemoryExperience).toHaveBeenCalledWith('role_ts_engineer', 'experience_1');
@@ -390,8 +402,25 @@ describe('MemoryRpcMethods', () => {
     expect(runRetirementScan).toHaveBeenLastCalledWith('role_ts_engineer');
     expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', undefined);
     expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', { force: true });
+    expect(reindexMemory).toHaveBeenCalledWith(undefined, {});
+    expect(reindexMemory).toHaveBeenLastCalledWith('role_ts_engineer', { force: true });
   });
 });
+
+function reindexEvidence() {
+  return {
+    scope: 'all' as const,
+    agents_processed: 1,
+    skills_reindexed: 1,
+    skills_skipped: 0,
+    experiences_reindexed: 1,
+    experiences_skipped: 0,
+    failures: [],
+    dimensions: 4,
+    started_at: '2026-07-21T00:00:00.000Z',
+    completed_at: '2026-07-21T00:00:01.000Z',
+  };
+}
 
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
@@ -437,6 +466,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         get_overview: { status: 'available' },
         list_pending_reviews: { status: 'available' },
         list_experiences_by_source_task: { status: 'available' },
+        reindex: { status: 'available' },
       },
     }),
     listMemoryAgents: async () => [
@@ -560,6 +590,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     }),
     listMemoryPendingReviews: async () => [{ id: 'skill_pending' } as never],
     listMemoryExperiencesBySourceTask: async () => [{ id: 'experience_1' } as never],
+    reindexMemory: async () => reindexEvidence(),
     ...overrides,
   };
 }
