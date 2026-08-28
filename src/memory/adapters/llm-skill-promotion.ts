@@ -1,7 +1,8 @@
 /**
  * LlmSkillPromotion — SkillPromotionHandler 的 LLM 增强实现
  *
- * 系统逻辑判断 eligibility（type === 'positive' && confidence > 0.95 && !promoted_to），
+ * 系统逻辑判断 eligibility（type === 'positive' && confidence > 阈值 && !promoted_to，
+ * 默认阈值 0.95，构造时可注入 confidenceThreshold 覆盖——全自动化测评降阈值用），
  * 符合条件后调用 LLM 将经验泛化为更通用的 SkillRecord（description / content / tags 由 LLM 改写）。
  *
  * 处理流程：
@@ -17,10 +18,12 @@ import type { ExperienceRecord } from '../schemas';
 import type { AgentTaskRequest } from '../agent-types';
 import type { PromotionOutcome } from '../types';
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
-import { ruleBasedSkillPromotion } from '../services/skill-promotion';
+import {
+  PROMOTION_CONFIDENCE_THRESHOLD,
+  ruleBasedSkillPromotion,
+  type RuleBasedPromotionOptions,
+} from '../services/skill-promotion';
 import { PROMOTER_SYSTEM_PROMPT } from '../prompts/skill-promotion';
-
-const PROMOTION_CONFIDENCE_THRESHOLD = 0.95;
 
 // ═══════════════════════════════════════════
 //  LLM response schema
@@ -80,7 +83,14 @@ Tags: ${candidate.tags.join(', ')}`);
 // ═══════════════════════════════════════════
 
 export class LlmSkillPromotion {
-  constructor(private readonly llm: LlmClient) {}
+  private readonly confidenceThreshold: number;
+
+  constructor(
+    private readonly llm: LlmClient,
+    options: { confidenceThreshold?: number } = {},
+  ) {
+    this.confidenceThreshold = options.confidenceThreshold ?? PROMOTION_CONFIDENCE_THRESHOLD;
+  }
 
   promote = async (
     memory: AgentMemoryScope,
@@ -89,11 +99,14 @@ export class LlmSkillPromotion {
   ): Promise<PromotionOutcome> => {
     const candidate = experiences.find(
       (e) =>
-        e.type === 'positive' && e.confidence > PROMOTION_CONFIDENCE_THRESHOLD && !e.promoted_to,
+        e.type === 'positive' && e.confidence > this.confidenceThreshold && !e.promoted_to,
     );
 
     if (!candidate) {
-      return ruleBasedSkillPromotion(memory, _task, experiences);
+      const fallbackOptions: RuleBasedPromotionOptions = {
+        confidenceThreshold: this.confidenceThreshold,
+      };
+      return ruleBasedSkillPromotion(memory, _task, experiences, fallbackOptions);
     }
 
     try {
@@ -143,7 +156,10 @@ export class LlmSkillPromotion {
         skill,
       };
     } catch {
-      return ruleBasedSkillPromotion(memory, _task, experiences);
+      const fallbackOptions: RuleBasedPromotionOptions = {
+        confidenceThreshold: this.confidenceThreshold,
+      };
+      return ruleBasedSkillPromotion(memory, _task, experiences, fallbackOptions);
     }
   };
 }

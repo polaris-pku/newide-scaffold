@@ -127,6 +127,12 @@ export {
   type UserRatingResult,
 } from './services/feedback';
 export {
+  applyUsageFeedback,
+  type UsageReference,
+  type UsageFeedbackEntry,
+  type UsageFeedbackResult,
+} from './services/usage-feedback';
+export {
   computeMemoryOverview,
   type MemoryOverview,
 } from './services/memory-overview';

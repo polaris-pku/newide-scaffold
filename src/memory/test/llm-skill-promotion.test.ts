@@ -157,6 +157,28 @@ describe('LlmSkillPromotion', () => {
     expect(result.skill).toBeUndefined();
   });
 
+  it('confidenceThreshold 下调后低置信度经验调用 LLM 晋升（全自动化测评用）', async () => {
+    const llm = new MockLlmClient([
+      {
+        response: JSON.stringify({
+          description: 'Prefer stable identifiers over positional indexes',
+          content: 'Use stable keys to avoid breakage.',
+          tags: ['best-practice'],
+        }),
+      },
+    ]);
+    const promoter = new LlmSkillPromotion(llm, { confidenceThreshold: 0.5 });
+    const experience = makeExperience({ confidence: 0.6 });
+    await seedExperience(repository, experience);
+
+    const result = await promoter.promote(memory, defaultTask, [experience]);
+
+    expect(result.check.eligible).toBe(true);
+    expect(result.skill).toBeDefined();
+    expect(result.skill!.description).toBe('Prefer stable identifiers over positional indexes');
+    expect(result.skill!.review_status).toBe('pending');
+  });
+
   it('负经验 → 不晋升', async () => {
     const llm = new MockLlmClient([{ response: 'ERROR:Should not be called' }]);
     const promoter = new LlmSkillPromotion(llm);

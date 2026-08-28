@@ -14,30 +14,39 @@ import type { PromotionTriggerPolicy } from '../ports/promotion-trigger-policy';
 import type { ExperienceRecord } from '../schemas';
 import type { AgentTaskRequest } from '../agent-types';
 import type { PromotionOutcome } from '../types';
+import {
+  PROMOTION_CONFIDENCE_THRESHOLD,
+  type RuleBasedPromotionOptions,
+} from '../services/skill-promotion';
 
 export type SkillPromotionHandler = (
   memory: AgentMemoryScope,
   task: AgentTaskRequest,
   experiences: ExperienceRecord[],
+  /** 晋升选项透传（如 confidenceThreshold）；不支持选项的 handler 可忽略 */
+  options?: RuleBasedPromotionOptions,
 ) => Promise<PromotionOutcome>;
 
-/** 晋升置信度门槛（与 ruleBasedSkillPromotion 一致） */
-const PROMOTION_CONFIDENCE_THRESHOLD = 0.95;
 /** 高置信度门槛（用于 PromotionTriggerPolicy 的 has_high_confidence 判断） */
 const HIGH_CONFIDENCE_THRESHOLD = 0.98;
 
 export class SkillPromotionProcessor {
+  private readonly confidenceThreshold: number;
+
   constructor(
     private readonly policy: PromotionTriggerPolicy,
     private readonly promote: SkillPromotionHandler,
-  ) {}
+    options: { confidenceThreshold?: number } = {},
+  ) {
+    this.confidenceThreshold = options.confidenceThreshold ?? PROMOTION_CONFIDENCE_THRESHOLD;
+  }
 
   /**
    * 手动模式：晋升所有符合条件的经验。
    *
-   * 筛选条件（与 Spec §4.3 一致）：
+   * 筛选条件（与 Spec §4.3 一致，阈值可用构造选项覆盖）：
    *   - type === 'positive'
-   *   - confidence > 0.95
+   *   - confidence > 阈值（默认 0.95）
    *   - promoted_to === undefined
    */
   async promoteAll(memory: AgentMemoryScope): Promise<PromotionOutcome[]> {
@@ -94,6 +103,8 @@ export class SkillPromotionProcessor {
 
   /**
    * 晋升单条经验：调用 promote handler → saveSkill → updateExperience。
+   * 处理器自身过滤与 handler 判定共用同一阈值（通过 options 透传），
+   * 避免 filter 放行后 handler 按默认 0.95 复查而拒绝。
    */
   private async promoteOne(
     memory: AgentMemoryScope,
@@ -106,7 +117,9 @@ export class SkillPromotionProcessor {
       source_driver: 'promotion-processor',
     };
 
-    const outcome = await this.promote(memory, dummyTask, [experience]);
+    const outcome = await this.promote(memory, dummyTask, [experience], {
+      confidenceThreshold: this.confidenceThreshold,
+    });
     return outcome;
   }
 
@@ -122,7 +135,7 @@ export class SkillPromotionProcessor {
     return experiences.filter(
       (e) =>
         e.type === 'positive' &&
-        e.confidence > PROMOTION_CONFIDENCE_THRESHOLD &&
+        e.confidence > this.confidenceThreshold &&
         e.promoted_to === undefined,
     );
   }

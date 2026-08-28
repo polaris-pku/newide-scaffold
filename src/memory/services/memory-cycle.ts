@@ -156,22 +156,30 @@ export async function extractBuffer(
  *
  * 筛选条件：
  *   - type === 'positive'
- *   - confidence > 0.95
+ *   - confidence > 阈值（默认 0.95，options.confidenceThreshold 可覆盖）
  *   - promoted_to === undefined
  *
  * 每条经验晋升后自动调用 memory.saveSkill() 和 memory.updateExperience()。
  *
  * @param memory   - Agent 记忆作用域
  * @param promoter - 技能晋升处理器（由组合根注入）
+ * @param options  - confidenceThreshold：晋升置信度门槛（全自动化测评降阈值用）
  * @returns 晋升结果列表（每个 eligible 经验一条）
  */
+export interface PromotionServiceOptions {
+  /** 晋升置信度门槛，默认 0.95（对齐 Spec §4.3） */
+  confidenceThreshold?: number;
+}
+
 export async function promoteExperiences(
   memory: AgentMemoryScope,
   promoter: SkillPromotion,
+  options: PromotionServiceOptions = {},
 ): Promise<PromotionOutcome[]> {
+  const threshold = options.confidenceThreshold ?? 0.95;
   const all = await memory.listExperiences();
   const eligible = all.filter(
-    (e) => e.type === 'positive' && e.confidence > 0.95 && e.promoted_to === undefined,
+    (e) => e.type === 'positive' && e.confidence > threshold && e.promoted_to === undefined,
   );
 
   if (eligible.length === 0) {
@@ -242,13 +250,14 @@ export async function promoteAllExperiences(
   bufferRepository: BufferRepository,
   scopeFactory: MemoryScopeFactory,
   promoter: SkillPromotion,
+  options: PromotionServiceOptions = {},
 ): Promise<{ role_id: string; outcomes: PromotionOutcome[] }[]> {
   const agentIds = await repository.listAgentIds();
   const allResults: { role_id: string; outcomes: PromotionOutcome[] }[] = [];
 
   for (const role_id of agentIds) {
     const memory = scopeFactory(role_id);
-    const outcomes = await promoteExperiences(memory, promoter);
+    const outcomes = await promoteExperiences(memory, promoter, options);
     allResults.push({ role_id, outcomes });
   }
 
@@ -279,12 +288,14 @@ export async function extractBufferForAgent(
  * @param role_id          - 目标 Agent
  * @param scopeFactory     - 构造 AgentMemoryScope 的工厂
  * @param promoter         - 技能晋升处理器
+ * @param options          - confidenceThreshold：晋升置信度门槛（全自动化测评降阈值用）
  */
 export async function promoteExperiencesForAgent(
   role_id: string,
   scopeFactory: MemoryScopeFactory,
   promoter: SkillPromotion,
+  options: PromotionServiceOptions = {},
 ): Promise<PromotionOutcome[]> {
   const memory = scopeFactory(role_id);
-  return promoteExperiences(memory, promoter);
+  return promoteExperiences(memory, promoter, options);
 }
