@@ -56,6 +56,24 @@ describe('ExternalDriverRuntime', () => {
     );
   });
 
+  it('starts a fresh session when session loading is unsupported', async () => {
+    let receivedPrompt: DriverPrompt | undefined;
+    const runtime = new ExternalDriverRuntime({
+      driver_id: 'external-acp-driver',
+      capabilities: { supports_session_load: false },
+      transport: {
+        invoke: async (input) => {
+          receivedPrompt = input;
+          return driverRunResult();
+        },
+      },
+    });
+
+    await runtime.sendPrompt({ ...PROMPT, session_id: 'stale-process-local-session' });
+
+    expect(receivedPrompt?.session_id).toBeUndefined();
+  });
+
   it('returns a failed DriverRunResult when the transport throws', async () => {
     const runtime = new ExternalDriverRuntime({
       driver_id: 'external-acp-driver',

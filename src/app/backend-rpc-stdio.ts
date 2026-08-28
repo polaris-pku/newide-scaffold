@@ -124,11 +124,14 @@ export async function createProductionBackendService(
     : path.join(runnerDir, '.env');
   const driverEnv = loadEnvFile(driverEnvFile);
   const productionLlm = resolveProductionLlmRuntime(env, driverEnv);
+  const ephemeralAcpSessions =
+    env.NEWIDE_EPHEMERAL_ACP_SESSIONS === '1' ||
+    env.NEWIDE_EPHEMERAL_ACP_SESSIONS?.toLowerCase() === 'true';
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     capabilities: {
       supports_acp_extension: true,
-      supports_session_load: true,
+      supports_session_load: !ephemeralAcpSessions,
       supports_tool_events: true,
     },
     transport: new CommandDriverTransport({
@@ -142,6 +145,12 @@ export async function createProductionBackendService(
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
         ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
+        // Offline evals execute the already-installed ACP adapter entrypoint
+        // instead of letting npx resolve/download a package inside the jail.
+        ...(env.CLAUDE_CLI_COMMAND !== undefined
+          ? { CLAUDE_CLI_COMMAND: env.CLAUDE_CLI_COMMAND }
+          : {}),
+        ...(env.CLAUDE_CLI_ARGS !== undefined ? { CLAUDE_CLI_ARGS: env.CLAUDE_CLI_ARGS } : {}),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
         // NewIDE owns benchmark policy; ACP receives only generic enforcement settings.
@@ -267,8 +276,8 @@ export async function createProductionBackendService(
       }),
       mailbox: {
         service: mailboxService,
-        allowedRoleIds: agentCatalogProvider,
-        sessionRegistry: participantSessions,
+        allowedRoleIds: bRuntime.market_agent_ids,
+        ...(ephemeralAcpSessions ? {} : { sessionRegistry: participantSessions }),
       },
     });
     const selectAgentHandler = new SelectAgentHandler({

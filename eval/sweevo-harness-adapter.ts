@@ -13,6 +13,11 @@ import { writeJson } from './run-summary';
 import type { SweBenchHarnessReport, SweBenchPrediction, SweEvoInstance } from './types';
 import { assertSafeCandidatePatch } from './patch-policy';
 
+/** Instances whose pytest suite previously always hit the 1800s harness cap. */
+export const HARNESS_TIMEOUT_OVERRIDE_SECONDS: Readonly<Record<string, number>> = {
+  'dask__dask_2024.1.0_2024.1.1': 10_800,
+};
+
 export interface SweEvoHarnessAdapterOptions {
   predictionsPath: string;
   runId: string;
@@ -23,6 +28,9 @@ export interface SweEvoHarnessAdapterOptions {
   maxWorkers?: number;
   dryRun?: boolean;
   reportSource?: string;
+  /** Per-instance pytest timeout in seconds. Overrides the 1800s SWE-EVO default. */
+  timeoutSeconds?: number;
+  instanceId?: string;
 }
 
 export interface SweEvoHarnessAdapterResult {
@@ -118,11 +126,27 @@ function resolveSweEvoWslPython(sweEvoRoot?: string): string {
   return toWslPath(resolve(root, raw));
 }
 
+export function resolveHarnessTimeoutSeconds(instanceId?: string): number | undefined {
+  const envRaw = process.env.NEWIDE_SWE_EVO_HARNESS_TIMEOUT?.trim();
+  if (envRaw) {
+    const parsed = Number(envRaw);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      throw new Error('NEWIDE_SWE_EVO_HARNESS_TIMEOUT must be a positive integer');
+    }
+    return parsed;
+  }
+  if (instanceId && instanceId in HARNESS_TIMEOUT_OVERRIDE_SECONDS) {
+    return HARNESS_TIMEOUT_OVERRIDE_SECONDS[instanceId];
+  }
+  return undefined;
+}
+
 export function buildSweEvoHarnessCommand(input: {
   sweEvoRoot: string;
   workDir: string;
   trajectoryDir: string;
   maxWorkers: number;
+  timeoutSeconds?: number;
 }): SweEvoHarnessAdapterResult['command'] {
   const python = resolveSweEvoPython();
   const officialScriptPath = join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py');
@@ -143,6 +167,7 @@ export function buildSweEvoHarnessCommand(input: {
     trajectoriesPath,
     '--max_workers',
     String(input.maxWorkers),
+    ...(input.timeoutSeconds ? ['--timeout', String(input.timeoutSeconds)] : []),
   ];
 
   if (viaWsl) {
@@ -252,7 +277,9 @@ export async function runSweEvoHarnessAdapter(
     assertSafeCandidatePatch(prediction.model_patch);
   }
   const runDir = resolveRunDir(options.runId, options.outRoot);
-  const trajectoryDir = join(runDir, 'sweevo-openhands');
+  // Folder basename becomes SWE-EVO's docker run_id. Keep it unique per arm so
+  // parallel B1/B2 harness jobs do not collide on sweb.eval.<instance>.<run_id>.
+  const trajectoryDir = join(runDir, options.runId);
   const trajectoryPath = join(trajectoryDir, 'output.jsonl');
   const workDir = join(runDir, 'sweevo-work');
   const outputFinalDir = join(workDir, 'output_final');
@@ -260,6 +287,8 @@ export async function runSweEvoHarnessAdapter(
   const harnessReportPath = join(runDir, 'harness-report.json');
   const sweEvoRoot = resolve(options.sweEvoRoot ?? resolveSweEvoRoot() ?? '../SWE-EVO');
   const maxWorkers = options.maxWorkers ?? 4;
+  const timeoutSeconds =
+    options.timeoutSeconds ?? resolveHarnessTimeoutSeconds(options.instanceId);
 
   mkdirSync(runDir, { recursive: true });
   const storedPredictionsPath = join(runDir, 'predictions.jsonl');
@@ -274,6 +303,7 @@ export async function runSweEvoHarnessAdapter(
     workDir,
     trajectoryDir,
     maxWorkers,
+    ...(timeoutSeconds ? { timeoutSeconds } : {}),
   });
   writeJson(commandPath, {
     ...command,
@@ -282,6 +312,7 @@ export async function runSweEvoHarnessAdapter(
     trajectory_path: trajectoryPath,
     output_final_dir: outputFinalDir,
     swe_evo_python: resolveSweEvoPython(),
+    ...(timeoutSeconds ? { timeout_seconds: timeoutSeconds } : {}),
     note: 'Run this command in the SWE-EVO environment. On Windows, set NEWIDE_SWE_EVO_PYTHON=wsl to invoke via WSL. Pass --report-source when a harness report is available to normalize it into harness-report.json.',
   });
 

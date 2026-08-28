@@ -177,6 +177,14 @@ fi
 
 export ACP_DRIVER_RUNNER_DIR="$DRIVER_RUNNER"
 export ACP_DRIVER_TIMEOUT_MS="$DRIVER_TIMEOUT_MS"
+# CLI overlays process.env on .env.local. Read the file first so a LiteLLM
+# embedding config is not forced back to the local hash provider.
+if [[ -z "${NEWIDE_B_EMBEDDING_PROVIDER:-}" && -f "$REPO_ROOT/.env.local" ]]; then
+  NEWIDE_B_EMBEDDING_PROVIDER="$(
+    grep -E '^NEWIDE_B_EMBEDDING_PROVIDER=' "$REPO_ROOT/.env.local" \
+      | tail -n1 | cut -d= -f2- | tr -d '\r' | sed -e 's/^["'\'']//' -e 's/["'\'']$//'
+  )"
+fi
 export NEWIDE_B_EMBEDDING_PROVIDER="${NEWIDE_B_EMBEDDING_PROVIDER:-hash}"
 if [[ "$NEWIDE_B_EMBEDDING_PROVIDER" == 'hash' ]]; then
   export NEWIDE_B_EMBEDDING_DIMENSIONS="${NEWIDE_B_EMBEDDING_DIMENSIONS:-32}"

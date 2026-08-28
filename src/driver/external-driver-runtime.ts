@@ -47,7 +47,11 @@ export class ExternalDriverRuntime implements DriverRuntimeHandle {
   }
 
   async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
-    const result = await this.invokeTransport(input);
+    const effectiveInput =
+      !this.capabilities.supports_session_load && input.session_id
+        ? withoutSessionId(input)
+        : input;
+    const result = await this.invokeTransport(effectiveInput);
     assertDriverRunResult(result);
     this.latestTranscriptRef = result.transcript_ref;
     return result;
@@ -86,6 +90,12 @@ export class ExternalDriverRuntime implements DriverRuntimeHandle {
   subscribeToEvents(listener: DriverStreamEventListener): () => void {
     return this.transport.subscribeToEvents?.(listener) ?? (() => undefined);
   }
+}
+
+function withoutSessionId(input: DriverPrompt): DriverPrompt {
+  const copy = { ...input };
+  delete copy.session_id;
+  return copy;
 }
 
 export function assertDriverRunResult(
