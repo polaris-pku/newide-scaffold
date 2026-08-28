@@ -148,3 +148,24 @@ function nonemptyString(value: unknown): string | undefined {
 function finiteNonnegative(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
+
+export function isDriverStreamUsage(value: unknown): value is TaskDriverUsage {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.available === true &&
+    record.source === 'driver_stream_usage_update' &&
+    typeof record.context_tokens_used === 'number' &&
+    Number.isFinite(record.context_tokens_used)
+  );
+}
+
+export function preferDriverUsage(
+  existing: unknown,
+  projected?: TaskDriverUsage,
+): TaskDriverUsage | undefined {
+  const current = isDriverStreamUsage(existing) ? existing : undefined;
+  if (!projected?.available) return current;
+  if (!current || projected.context_tokens_used > current.context_tokens_used) return projected;
+  return current;
+}

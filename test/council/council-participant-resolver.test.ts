@@ -50,6 +50,39 @@ describe('AgentBoardCouncilParticipantResolver', () => {
     );
   });
 
+  it('resolves the roster from a dynamic provider so runtime-created Agents participate', async () => {
+    const board = [agent('role_ts_engineer', ['market_eligible'])];
+    const resolver = new AgentBoardCouncilParticipantResolver({
+      boardQuery: boardQuery(board),
+      resolveAllowedAgentIds: async () => board.map((entry) => entry.role_id),
+    });
+    const input = {
+      run_id: 'run_dynamic_roster',
+      task_id: 'task_dynamic_roster',
+      question: 'Choose an implementation.',
+    };
+
+    // 单 Agent 时 Council 不可用
+    await expect(resolver.resolve(input)).rejects.toThrow(
+      'Council requires at least two distinct persisted Agents',
+    );
+
+    // 运行时新增 Agent（memory.createAgent 后）无需重启即可参与
+    board.push(agent('role_fullstack_engineer', ['market_eligible']));
+    const participants = await resolver.resolve(input);
+
+    expect(participants.map(({ seat, seat_index, agent_id }) => ({
+      seat,
+      seat_index,
+      agent_id,
+    }))).toEqual([
+      { seat: 'proposer', seat_index: 0, agent_id: 'role_fullstack_engineer' },
+      { seat: 'proposer', seat_index: 1, agent_id: 'role_ts_engineer' },
+      { seat: 'reviewer', seat_index: 0, agent_id: 'role_ts_engineer' },
+      { seat: 'synthesizer', seat_index: 0, agent_id: 'role_fullstack_engineer' },
+    ]);
+  });
+
   it('rejects a Council when no eligible persisted Agent exists', async () => {
     const resolver = new AgentBoardCouncilParticipantResolver({
       boardQuery: boardQuery([agent('reviewer', ['council_only'])]),
@@ -63,6 +96,64 @@ describe('AgentBoardCouncilParticipantResolver', () => {
         question: 'No eligible agent.',
       }),
     ).rejects.toThrow('No eligible persisted Agent');
+  });
+
+  it('selects the primary and remaining seats through independent auctions when enabled', async () => {
+    const calls: Array<{
+      seat: string;
+      seat_index: number;
+      candidate_agent_ids: string[];
+      excluded_agent_ids: string[];
+    }> = [];
+    const winners = ['role_ts_engineer', 'role_reviewer', 'role_synthesizer'];
+    const resolver = new AgentBoardCouncilParticipantResolver({
+      boardQuery: boardQuery([
+        agent('role_primary', ['market_eligible']),
+        agent('role_ts_engineer', ['market_eligible']),
+        agent('role_reviewer', ['market_eligible']),
+        agent('role_synthesizer', ['market_eligible']),
+      ]),
+      allowedAgentIds: [
+        'role_primary',
+        'role_ts_engineer',
+        'role_reviewer',
+        'role_synthesizer',
+      ],
+      auctionEnabled: true,
+      auctionSelector: async (input) => {
+        calls.push({
+          seat: input.seat,
+          seat_index: input.seat_index,
+          candidate_agent_ids: input.candidate_agent_ids,
+          excluded_agent_ids: input.excluded_agent_ids,
+        });
+        return {
+          agent_id: winners[calls.length - 1]!,
+          selection_refs: [`audit_${calls.length}`],
+        };
+      },
+    });
+
+    const participants = await resolver.resolve({
+      run_id: 'run_auction',
+      task_id: 'task_auction',
+      question: 'Choose an implementation.',
+      primary_agent_id: 'role_primary',
+    });
+
+    expect(
+      participants.map(({ seat, seat_index, agent_id }) => ({ seat, seat_index, agent_id })),
+    ).toEqual([
+      { seat: 'proposer', seat_index: 0, agent_id: 'role_primary' },
+      { seat: 'proposer', seat_index: 1, agent_id: 'role_ts_engineer' },
+      { seat: 'reviewer', seat_index: 0, agent_id: 'role_reviewer' },
+      { seat: 'synthesizer', seat_index: 0, agent_id: 'role_synthesizer' },
+    ]);
+    expect(calls).toHaveLength(3);
+    expect(calls.map((call) => call.seat)).toEqual(['proposer', 'reviewer', 'synthesizer']);
+    expect(calls[0]?.excluded_agent_ids).toEqual(['role_primary']);
+    expect(calls[1]?.excluded_agent_ids).toEqual(['role_primary', 'role_ts_engineer']);
+    expect(participants[1]?.selection_refs).toEqual(['audit_1']);
   });
 
   it('binds Council seats to fixed role_ids when seatAssignments is configured', async () => {

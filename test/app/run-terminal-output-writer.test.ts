@@ -162,8 +162,69 @@ describe('FileRunTerminalOutputWriter', () => {
 
     await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
 
+    const summary = await readJson(path.join(runDir, 'summary.json'));
+    expect(summary).toMatchObject({
+      driver_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        context_tokens_used: 321,
+        sessions: [{ session_id: 'session_usage', role_id: 'role_usage' }],
+      },
+    });
+    expect(summary).not.toHaveProperty('token_usage');
+  });
+
+  it('merges driver_usage into an existing v1 summary without replacing billed tokens', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_failed');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, 'summary.json'),
+      `${JSON.stringify({
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        token_usage: {
+          schema_version: 'newide.token_usage.v1',
+          source: 'proxy',
+          input_tokens: 12,
+          output_tokens: 3,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          total_input_tokens: 12,
+          total_tokens: 15,
+          call_count: 1,
+          sources: ['proxy'],
+          by_source: {},
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(runDir, 'driver-stream.jsonl'),
+      `${JSON.stringify({
+        task_id: 'task_failed',
+        recorded_at: '2026-08-14T00:00:00Z',
+        event: {
+          event_type: 'usage_update',
+          session_id: 'session_usage',
+          role_id: 'role_usage',
+          payload: { update: { used: 321, size: 200_000 } },
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
+
     await expect(readJson(path.join(runDir, 'summary.json'))).resolves.toMatchObject({
       token_usage: {
+        schema_version: 'newide.token_usage.v1',
+        source: 'proxy',
+        total_tokens: 15,
+        call_count: 1,
+      },
+      driver_usage: {
         available: true,
         source: 'driver_stream_usage_update',
         context_tokens_used: 321,

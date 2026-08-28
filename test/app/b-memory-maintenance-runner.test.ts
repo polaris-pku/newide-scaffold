@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +12,7 @@ import {
   InMemoryBufferRepository,
   InMemoryRepository,
   createAgentMemoryScope,
+  type ExperienceExtractor,
   type LlmClient,
 } from '../../src/memory';
 import type { BufferSnapshot } from '../../src/memory/schemas';
@@ -276,11 +277,150 @@ describe('BMemoryMaintenanceRunner', () => {
     await idle;
     expect(idleResolved).toBe(true);
   });
+
+  it('automatically dead-letters the buffer with the failure reason when extraction fails', async () => {
+    const { runner, repository, bufferRepository, evidenceStore } = await fixture(
+      maintenanceLlm(),
+      undefined,
+      failingExtractor(),
+    );
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_fail');
+
+    const result = await runner.processBuffer({
+      task_id: 'task_fail',
+      run_id: 'run_fail',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    expect(result).toMatchObject({
+      kind: 'experience_extraction',
+      status: 'failed',
+      error: 'LLM provider unavailable',
+      buffer_seq: seq,
+    });
+    // 自动死信闭环：buffer 移入死信并记录失败原因
+    expect(await bufferRepository.listDeadLetterSeqs('role_ts_engineer')).toEqual([seq]);
+    expect(await bufferRepository.listPendingBufferSeqs('role_ts_engineer')).toEqual([]);
+    const entries = await bufferRepository.listDeadLetterEntries('role_ts_engineer');
+    expect(entries[0]).toMatchObject({
+      seq,
+      task_id: 'task_fail',
+      reason: 'LLM provider unavailable',
+    });
+    // evidence 仍持久化为 failed
+    await expect(evidenceStore.get(result.maintenance_ref)).resolves.toMatchObject({
+      status: 'failed',
+      error: 'LLM provider unavailable',
+    });
+  });
+
+  it('returns failed evidence even when auto dead-lettering itself fails', async () => {
+    const { runner, repository, bufferRepository } = await fixture(
+      maintenanceLlm(),
+      undefined,
+      failingExtractor(),
+    );
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_lock');
+    const markSpy = vi
+      .spyOn(bufferRepository, 'markBufferDeadLetter')
+      .mockRejectedValue(new Error('store locked'));
+
+    const result = await runner.processBuffer({
+      task_id: 'task_lock',
+      run_id: 'run_lock',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    expect(result).toMatchObject({ status: 'failed', error: 'LLM provider unavailable' });
+    expect(markSpy).toHaveBeenCalledWith('role_ts_engineer', seq, 'LLM provider unavailable');
+    // 置死信失败不应影响 failed evidence 返回
+    expect(await bufferRepository.listDeadLetterSeqs('role_ts_engineer')).toEqual([]);
+  });
+
+  it('keeps council driver-stream usage when refreshing summary after extraction', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-b-maint-runs-'));
+    roots.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_token_refresh');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, 'summary.json'),
+      `${JSON.stringify({
+        run_id: 'run_token_refresh',
+        task_id: 'task_token_refresh',
+        session_id: 'session_primary',
+        worktree_path: '/tmp/worktree',
+        token_usage: {
+          schema_version: 'newide.token_usage.v1',
+          source: 'proxy',
+          input_tokens: 12,
+          output_tokens: 3,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          total_input_tokens: 12,
+          total_tokens: 15,
+          call_count: 1,
+          sources: ['proxy'],
+          by_source: {},
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(runDir, 'driver-stream.jsonl'),
+      `${JSON.stringify({
+        task_id: 'task_token_refresh',
+        recorded_at: '2026-08-14T00:00:00Z',
+        event: {
+          event_type: 'usage_update',
+          session_id: 'session_primary',
+          role_id: 'role_ts_engineer',
+          payload: { update: { used: 321, size: 200_000 } },
+        },
+      })}\n`,
+      'utf8',
+    );
+    const { runner, repository, bufferRepository } = await fixture(
+      maintenanceLlm(),
+      undefined,
+      undefined,
+      { runsRoot },
+    );
+    const seq = await writePending(
+      repository,
+      bufferRepository,
+      'role_ts_engineer',
+      'task_token_refresh',
+    );
+
+    await runner.processBuffer({
+      task_id: 'task_token_refresh',
+      run_id: 'run_token_refresh',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    const summary = JSON.parse(await readFile(path.join(runDir, 'summary.json'), 'utf8')) as {
+      token_usage?: { source?: string; schema_version?: string };
+      driver_usage?: { source?: string; context_tokens_used?: number };
+    };
+    expect(summary.driver_usage).toMatchObject({
+      source: 'driver_stream_usage_update',
+      context_tokens_used: 321,
+    });
+    expect(summary.token_usage).toMatchObject({
+      schema_version: 'newide.token_usage.v1',
+    });
+    expect(summary.token_usage?.source).not.toBe('driver_stream_usage_update');
+  });
 });
 
 async function fixture(
   llm: LlmClient = maintenanceLlm(),
   providedEvidenceStore?: BMemoryMaintenanceEvidenceStore,
+  extractor?: ExperienceExtractor,
+  extra?: { runsRoot?: string },
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-maintenance-'));
   roots.push(root);
@@ -295,8 +435,19 @@ async function fixture(
     bufferRepository,
     llm,
     evidenceStore,
+    ...(extractor ? { extractor } : {}),
+    ...(extra?.runsRoot ? { runsRoot: extra.runsRoot } : {}),
   });
   return { runner, repository, bufferRepository, evidenceStore };
+}
+
+/** 提取总是失败的提取器（模拟 LLM 与规则版降级均失败） */
+function failingExtractor(): ExperienceExtractor {
+  return {
+    async extract() {
+      throw new Error('LLM provider unavailable');
+    },
+  };
 }
 
 async function writePending(

@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import {
   MARKET_POOL_ROLE_ID,
+  type AgentArchiveRecord,
   type AgentHandle,
   type AgentMetrics,
   type AgentStatus,
@@ -54,6 +55,8 @@ interface ScoredRecord<T> {
 
 export class InMemoryRepository implements MemoryRepository {
   private readonly agents = new Map<string, AgentStore>();
+  /** 退休归档（实体删除后保留的最小字段） */
+  private readonly archives = new Map<string, AgentArchiveRecord>();
 
   constructor(private readonly embedding: EmbeddingProvider = defaultHashEmbeddingProvider) {}
 
@@ -88,6 +91,35 @@ export class InMemoryRepository implements MemoryRepository {
   async listAgentIds(): Promise<string[]> {
     // 隐藏市场池 Agent（方案 A）：它只作为技能的归属容器，不参与竞标/派发/展示
     return [...this.agents.keys()].filter((id) => id !== MARKET_POOL_ROLE_ID);
+  }
+
+  async updateAgentMeta(
+    role_id: string,
+    patch: { name?: string; tags?: string[] },
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    store.handle = {
+      ...store.handle,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+    };
+  }
+
+  async deleteAgent(role_id: string): Promise<void> {
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot delete market pool agent: ${role_id}`);
+    }
+    if (!this.agents.delete(role_id)) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
+  async archiveAgent(roleId: string, archive: AgentArchiveRecord): Promise<void> {
+    this.archives.set(roleId, archive);
+  }
+
+  async getAgentArchive(roleId: string): Promise<AgentArchiveRecord | null> {
+    return this.archives.get(roleId) ?? null;
   }
 
   async getAgent(role_id: string): Promise<AgentHandle> {
@@ -127,17 +159,16 @@ export class InMemoryRepository implements MemoryRepository {
   }
 
   async marketSearchSkills(options: MarketSearchOptions): Promise<SkillRecord[]> {
-    const candidates: SkillRecord[] = [];
-    for (const [agentId, store] of this.agents) {
-      if (options.exclude_agent_id === agentId) {
-        continue;
-      }
-      for (const skill of store.skills) {
-        if (isMarketEligibleSkill(skill)) {
-          candidates.push(skill);
-        }
-      }
+    // 技能市场仅检索市场池（__market__）内的技能：
+    // 未退休/未迁入市场池的 Agent 技能（即使已 approved 或已 publish 标记）不可被检索到。
+    if (options.exclude_agent_id === MARKET_POOL_ROLE_ID) {
+      return [];
     }
+    const market = this.agents.get(MARKET_POOL_ROLE_ID);
+    if (!market) {
+      return [];
+    }
+    const candidates = market.skills.filter(isMarketEligibleSkill);
     return rankByVectorSimilarity(candidates, options, this.embedding);
   }
 
@@ -283,6 +314,33 @@ export class InMemoryRepository implements MemoryRepository {
       throw new Error(`Experience not found: ${experience.id}`);
     }
     store.experiences[index] = await this.withDescriptionEmbedding(experience);
+  }
+
+  async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {
+    const store = this.requireStore(role_id);
+    const index = store.skills.findIndex((item) => item.id === skill_id);
+    const existing = store.skills[index];
+    if (!existing) {
+      throw new Error(`Skill not found: ${skill_id}`);
+    }
+    store.skills[index] = { ...existing, description_embedding: embedding };
+  }
+
+  async updateExperienceEmbedding(
+    role_id: string,
+    experience_id: string,
+    embedding: number[],
+  ): Promise<void> {
+    const store = this.requireStore(role_id);
+    const index = store.experiences.findIndex((item) => item.id === experience_id);
+    const existing = store.experiences[index];
+    if (!existing) {
+      throw new Error(`Experience not found: ${experience_id}`);
+    }
+    store.experiences[index] = {
+      ...existing,
+      description_embedding: embedding,
+    };
   }
 
   async deleteSkill(role_id: string, skill_id: string): Promise<void> {

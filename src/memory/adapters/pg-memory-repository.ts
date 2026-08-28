@@ -11,12 +11,14 @@ import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import type { SqlPool } from '../ports/sql-pool';
 import {
+  AgentArchiveRecordSchema,
   AgentHandleSchema,
   AgentMetricsSchema,
   ExperienceRecordSchema,
   MARKET_POOL_ROLE_ID,
   PersonaDefSchema,
   SkillRecordSchema,
+  type AgentArchiveRecord,
   type AgentHandle,
   type AgentMetrics,
   type AgentStatus,
@@ -57,6 +59,27 @@ export interface PgMemoryRepositoryOptions {
 
 function toPgVector(values: number[]): string {
   return `[${values.join(',')}]`;
+}
+
+/**
+ * 读取表内 description_embedding 列的 vector(N) 维度；列不存在返回 undefined。
+ * 用于检测 embedding 模型切换后的维度漂移（migrateVectorColumnDimensions）。
+ */
+async function readVectorColumnDimensions(
+  pool: SqlPool,
+  table: string,
+): Promise<number | undefined> {
+  const result = await pool.query<{ type: string }>(
+    `SELECT format_type(a.atttypid, a.atttypmod) AS type
+     FROM pg_attribute a
+     JOIN pg_class c ON c.oid = a.attrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = $1 AND a.attname = 'description_embedding'`,
+    [table],
+  );
+  const type = result.rows[0]?.type;
+  const match = type ? /^vector\((\d+)\)$/.exec(type) : null;
+  return match ? Number(match[1]) : undefined;
 }
 
 export class PgMemoryRepository implements MemoryRepository {
@@ -113,6 +136,64 @@ export class PgMemoryRepository implements MemoryRepository {
       [MARKET_POOL_ROLE_ID],
     );
     return result.rows.map((row) => row.role_id);
+  }
+
+  async updateAgentMeta(
+    role_id: string,
+    patch: { name?: string; tags?: string[] },
+  ): Promise<void> {
+    await this.ensureSchema();
+    const handle = await this.getAgent(role_id);
+    const nextHandle: AgentHandle = {
+      ...handle,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+    };
+    AgentHandleSchema.parse(nextHandle);
+
+    const result = await this.pool.query(
+      `UPDATE memory_agents
+       SET handle = $2::jsonb
+       WHERE role_id = $1`,
+      [role_id, JSON.stringify(nextHandle)],
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
+  async deleteAgent(role_id: string): Promise<void> {
+    await this.ensureSchema();
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot delete market pool agent: ${role_id}`);
+    }
+    // memory_skills / memory_experiences 的 FK 均带 ON DELETE CASCADE，级联清理
+    const result = await this.pool.query('DELETE FROM memory_agents WHERE role_id = $1', [
+      role_id,
+    ]);
+    if (result.rowCount === 0) {
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+  }
+
+  async archiveAgent(roleId: string, archive: AgentArchiveRecord): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      `INSERT INTO memory_agent_archives (role_id, payload)
+       VALUES ($1, $2::jsonb)
+       ON CONFLICT (role_id) DO UPDATE SET payload = EXCLUDED.payload`,
+      [roleId, JSON.stringify(archive)],
+    );
+  }
+
+  async getAgentArchive(roleId: string): Promise<AgentArchiveRecord | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ payload: AgentArchiveRecord }>(
+      'SELECT payload FROM memory_agent_archives WHERE role_id = $1',
+      [roleId],
+    );
+    const row = result.rows[0];
+    return row ? AgentArchiveRecordSchema.parse(row.payload) : null;
   }
 
   async getAgent(role_id: string): Promise<AgentHandle> {
@@ -211,13 +292,15 @@ export class PgMemoryRepository implements MemoryRepository {
     const result = await this.pool.query<{ payload: SkillRecord }>(
       `SELECT payload
        FROM memory_skills
-       WHERE payload->>'review_status' = 'approved'
+       WHERE role_id = $1
+         AND payload->>'review_status' = 'approved'
          AND COALESCE(payload->>'market_status', '') <> 'superseded'
-         AND ($1::text IS NULL OR role_id <> $1::text)
-         AND (1 - (description_embedding <=> $2::vector)) >= $3
-       ORDER BY description_embedding <=> $2::vector ASC
-       LIMIT $4`,
+         AND ($2::text IS NULL OR role_id <> $2::text)
+         AND (1 - (description_embedding <=> $3::vector)) >= $4
+       ORDER BY description_embedding <=> $3::vector ASC
+       LIMIT $5`,
       [
+        MARKET_POOL_ROLE_ID,
         options.exclude_agent_id ?? null,
         toPgVector(options.query_embedding),
         min_similarity,
@@ -535,6 +618,40 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `UPDATE memory_skills
+       SET payload = jsonb_set(payload, '{description_embedding}', $3::jsonb),
+           description_embedding = $4::vector
+       WHERE role_id = $1 AND id = $2`,
+      [role_id, skill_id, JSON.stringify(embedding), toPgVector(embedding)],
+    );
+
+    if (result.rowCount === 0) {
+      throw new Error(`Skill not found: ${skill_id}`);
+    }
+  }
+
+  async updateExperienceEmbedding(
+    role_id: string,
+    experience_id: string,
+    embedding: number[],
+  ): Promise<void> {
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      `UPDATE memory_experiences
+       SET payload = jsonb_set(payload, '{description_embedding}', $3::jsonb),
+           description_embedding = $4::vector
+       WHERE role_id = $1 AND id = $2`,
+      [role_id, experience_id, JSON.stringify(embedding), toPgVector(embedding)],
+    );
+
+    if (result.rowCount === 0) {
+      throw new Error(`Experience not found: ${experience_id}`);
+    }
+  }
+
   async deleteSkill(role_id: string, skill_id: string): Promise<void> {
     await this.ensureSchema();
     const result = await this.pool.query(
@@ -640,9 +757,33 @@ export class PgMemoryRepository implements MemoryRepository {
       return;
     }
     if (!this.schemaReady) {
-      this.schemaReady = ensurePgMemorySchema(this.pool, this.embedding.dimensions);
+      this.schemaReady = (async () => {
+        await ensurePgMemorySchema(this.pool, this.embedding.dimensions);
+        await this.migrateVectorColumnDimensions(this.embedding.dimensions);
+      })();
     }
     await this.schemaReady;
+  }
+
+  /**
+   * 切换 embedding 模型后，存量 vector(N) 列维度与当前 provider 不一致：
+   * CREATE TABLE IF NOT EXISTS 不会改已有列。pgvector 的 vector 类型转换不允许
+   * 改变维度（cast 直接报 "expected N dimensions, not M"），因此 DROP + ADD
+   * 重建列；存量向量随列删除，由 memory.reindex 从载荷 JSON 重算回填
+   * （重算前该列对旧行为 NULL，向量检索自然召回为空）。
+   * 幂等：列维度一致时跳过。
+   */
+  private async migrateVectorColumnDimensions(dimensions: number): Promise<void> {
+    for (const table of ['memory_skills', 'memory_experiences']) {
+      const current = await readVectorColumnDimensions(this.pool, table);
+      if (current !== undefined && current !== dimensions) {
+        await this.pool.query(
+          `ALTER TABLE ${table}
+           DROP COLUMN description_embedding,
+           ADD COLUMN description_embedding vector(${dimensions})`,
+        );
+      }
+    }
   }
 
   private async requireAgentRow(role_id: string): Promise<{

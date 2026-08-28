@@ -52,9 +52,18 @@ import {
 } from './b-memory-maintenance-runner';
 import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
+import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
+import {
+  marketAuctionCompletedPayload,
+  marketAuctionStartedPayload,
+  type MarketEventContext,
+} from './market-event-payload';
 import { SystemRpcMethods } from '../rpc/system-methods';
+import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
+import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
+import { FileRunArtifactContentReader } from './run-artifact-content-reader';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -188,9 +197,11 @@ export async function createProductionBackendService(
   let bRuntime: BackendBRuntime | undefined;
   let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
   let coordinationStore: SqliteCoordinationStore | undefined;
+  let maintenanceScheduler: AgentMaintenanceScheduler | undefined;
   const closeRuntime = onceAsync(async () => {
     const failures: unknown[] = [];
     for (const close of [
+      () => maintenanceScheduler?.stop(),
       () => driver.shutdown(),
       () => memoryMaintenance?.waitForIdle(),
       () => bRuntime?.close(),
@@ -213,14 +224,16 @@ export async function createProductionBackendService(
       dependencies.bRuntime ??
       (await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot }));
     assertValidMarketAgentIds(bRuntime.market_agent_ids);
+    // B 侧文本 LLM：memoryMaintenance 与 BMemoryBackendService（persona 重生成）共享
+    const memoryLlm =
+      dependencies.memoryLlm ??
+      new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env));
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
         repository: bRuntime.repository,
         bufferRepository: bRuntime.bufferRepository,
-        llm:
-          dependencies.memoryLlm ??
-          new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env)),
+        llm: memoryLlm,
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
@@ -232,6 +245,12 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
     const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    // 动态 Agent 目录：选人 / 议会 / 邮箱协作每次使用时查询当前注册 Agent，
+    // 使 memory.createAgent 新增的 Agent 无需重启即可进入协作流程。
+    const agentCatalogProvider = createAgentCatalogProvider(
+      bCapabilities.boardQuery,
+      bRuntime.market_agent_ids,
+    );
     const configuredDatabasePath =
       env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
     const databasePath =
@@ -266,7 +285,6 @@ export async function createProductionBackendService(
         competitionQuery: agentExecutionFacade,
         boardQuery: bCapabilities.boardQuery,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
-        allowedAgentIds: bRuntime.market_agent_ids,
         candidateSource: 'allowed_catalog',
       }),
       evidenceStore: new FileMarketEvidenceStore({
@@ -274,14 +292,63 @@ export async function createProductionBackendService(
       }),
     });
     const councilSeatAssignments = readCouncilSeatAssignments(env.NEWIDE_COUNCIL_SEATS);
+    const councilAuctionEnabled = readCouncilAuctionEnabled(env.NEWIDE_COUNCIL_AUCTION_ENABLED);
+    const councilProposerCount = readCouncilProposerCount(env.NEWIDE_COUNCIL_PROPOSERS);
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
-        allowedAgentIds: bRuntime.market_agent_ids,
+        resolveAllowedAgentIds: agentCatalogProvider,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
         ...(councilSeatAssignments ? { seatAssignments: councilSeatAssignments } : {}),
+        ...(!councilSeatAssignments && councilAuctionEnabled
+          ? {
+              auctionEnabled: true,
+              proposerCount: councilProposerCount,
+              auctionSelector: async (input) => {
+                const marketContext: MarketEventContext = {
+                  selection_scope: 'council_seat',
+                  selection_mode: 'auction',
+                  seat: input.seat,
+                  seat_index: input.seat_index,
+                };
+                const result = await selectAgentHandler.execute(
+                  {
+                    task_id: input.task_id,
+                    task_description: input.question,
+                    bootstrap_agent_ids: input.candidate_agent_ids,
+                    seed: `${input.run_id}:${input.seat}:${input.seat_index}`,
+                  },
+                  {
+                    onCandidatesCollected: async (collected) => {
+                      await input.on_lifecycle_event?.({
+                        type: 'market.auction.started',
+                        payload: marketAuctionStartedPayload({
+                          context: marketContext,
+                          auction_id: collected.auction_id,
+                          task_description: collected.market_task.task_description,
+                          requirement_profile: collected.market_task.requirement_profile,
+                          candidates: collected.candidates,
+                        }),
+                      });
+                    },
+                  },
+                );
+                await input.on_lifecycle_event?.({
+                  type: 'market.auction.completed',
+                  payload: marketAuctionCompletedPayload({
+                    context: marketContext,
+                    result,
+                  }),
+                });
+                return {
+                  agent_id: result.winner_agent_id,
+                  selection_refs: [result.ledger_ref, result.audit_ref],
+                };
+              },
+            }
+          : {}),
       }),
     });
     const councilProvider = createCouncilStrategyProvider(
@@ -309,8 +376,12 @@ export async function createProductionBackendService(
       {
         retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
         runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
+        createAgent: (spec) => agentExecutionFacade.createAgent(spec),
+        updateAgent: (roleId, patch) => agentExecutionFacade.updateAgent(roleId, patch),
+        deleteAgent: (roleId, options) => agentExecutionFacade.deleteAgent(roleId, options),
       },
       bRuntime.embedding,
+      memoryLlm,
     );
 
     try {
@@ -318,6 +389,31 @@ export async function createProductionBackendService(
     } catch {
       throw new Error('Production B Agent manager readiness check failed');
     }
+
+    // 定时维护：退休检查（默认只出报告，不自动退休）+ 存活 Agent 市场自学习
+    maintenanceScheduler = new AgentMaintenanceScheduler(
+      {
+        repository: bRuntime.repository,
+        ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
+        retirement: {
+          retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
+          runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
+        },
+      },
+      {
+        autoRetire: env.NEWIDE_B_AUTO_RETIRE === '1',
+        retireConfidenceFloor: readNumberEnv(env.NEWIDE_B_RETIRE_CONFIDENCE_FLOOR, 0.5),
+        autoLearn: env.NEWIDE_B_AUTO_LEARN !== '0',
+        learning: {
+          minPersonaSimilarity: readNumberEnv(env.NEWIDE_B_LEARN_PERSONA_FLOOR, 0.3),
+          tagWeight: readNumberEnv(env.NEWIDE_B_LEARN_TAG_WEIGHT, 0.4),
+          personaWeight: readNumberEnv(env.NEWIDE_B_LEARN_PERSONA_WEIGHT, 0.6),
+          learnThreshold: readNumberEnv(env.NEWIDE_B_LEARN_THRESHOLD, 0.45),
+          maxSkillsPerAgentPerCycle: readIntEnv(env.NEWIDE_B_LEARN_MAX_PER_CYCLE, 3),
+        },
+      },
+    );
+    maintenanceScheduler.start(readIntEnv(env.NEWIDE_MAINTENANCE_INTERVAL_MS, 3600_000));
 
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
@@ -333,7 +429,7 @@ export async function createProductionBackendService(
         agentExecutionFacade,
         councilProvider,
         gateExecutor,
-        bootstrapAgentIds: bRuntime.market_agent_ids,
+        bootstrapAgentIds: agentCatalogProvider,
         auctionEnabled: readAuctionEnabled(env.NEWIDE_AUCTION_ENABLED),
         ...(env.NEWIDE_PRIMARY_AGENT_ID?.trim()
           ? { primaryAgentId: env.NEWIDE_PRIMARY_AGENT_ID.trim() }
@@ -387,6 +483,7 @@ export async function createProductionBackendService(
         participantSessions,
       ),
       (input) => agentExecutionFacade.provisionParticipantSession(input),
+      new FileRunArtifactContentReader(runsRoot),
     );
     await service.recoverMailboxWaits();
     return service;
@@ -476,6 +573,25 @@ function readDriverTimeout(value: string | undefined): number {
   return timeout;
 }
 
+/** 读取带默认值的浮点环境变量；非法值抛错。 */
+function readNumberEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid numeric env value: ${value}`);
+  }
+  return parsed;
+}
+
+/** 读取带默认值的整数环境变量（>=0）；非法值抛错。 */
+function readIntEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  if (!/^\d+$/.test(value.trim())) {
+    throw new Error(`Invalid integer env value: ${value}`);
+  }
+  return Number(value.trim());
+}
+
 function readJson(filePath: string): unknown {
   if (!existsSync(filePath)) return undefined;
   try {
@@ -527,11 +643,13 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   const mailboxMethods = new MailboxRpcMethods(service);
   const memoryMethods = new MemoryRpcMethods(service);
   const systemMethods = new SystemRpcMethods(service);
+  const artifactMethods = new ArtifactRpcMethods(service);
   systemMethods.register(dispatcher);
   runMethods.register(dispatcher);
   taskMethods.register(dispatcher);
   mailboxMethods.register(dispatcher);
   memoryMethods.register(dispatcher);
+  artifactMethods.register(dispatcher);
 
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   let pending = Promise.resolve();
@@ -786,4 +904,27 @@ export function readAuctionEnabled(value: string | undefined): boolean {
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
   throw new Error(`Invalid NEWIDE_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
+}
+
+export function readCouncilAuctionEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return false;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(
+    `Invalid NEWIDE_COUNCIL_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`,
+  );
+}
+
+export function readCouncilProposerCount(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw) return 2;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Invalid NEWIDE_COUNCIL_PROPOSERS: ${value}. Expected an integer >= 2.`);
+  }
+  const count = Number(raw);
+  if (!Number.isSafeInteger(count) || count < 2) {
+    throw new Error(`Invalid NEWIDE_COUNCIL_PROPOSERS: ${value}. Expected an integer >= 2.`);
+  }
+  return count;
 }

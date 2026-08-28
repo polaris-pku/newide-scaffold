@@ -59,11 +59,8 @@ describe('memory RPC market and retire wiring', () => {
       embedding,
     });
 
-    const alphaSkill = await seedSkill(
-      repository,
-      'role_alpha',
-      'TypeScript service contract patterns',
-    );
+    // role_alpha 的技能始终不退休，用于验证"未退休技能不可被市场检索"
+    await seedSkill(repository, 'role_alpha', 'TypeScript service contract patterns');
     const betaSkill = await seedSkill(
       repository,
       'role_beta',
@@ -75,6 +72,7 @@ describe('memory RPC market and retire wiring', () => {
         boardQuery: new RepositoryAgentBoardQuery(repository),
         maintenance: fakeMaintenance(),
         reviewSkill: (input) => reviewSkill(repository, input),
+        bufferRepository,
       },
       { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
       {},
@@ -112,18 +110,15 @@ describe('memory RPC market and retire wiring', () => {
       },
     });
 
-    // marketSearch：全库召回 / exclude_agent_id 排除调用方 / top_k 截断
-    const [searchAll, searchExcluded, searchTop1] = await send(
+    // marketSearch（退休前）：role_alpha / role_beta 均未退休，技能不可被检索
+    const [searchAllBefore, searchExcludedBefore, searchTop1Before] = await send(
       '{"jsonrpc":"2.0","id":1,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0}}',
       '{"jsonrpc":"2.0","id":2,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"exclude_agent_id":"role_alpha"}}',
       '{"jsonrpc":"2.0","id":3,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"top_k":1}}',
     );
-    expect(skillIds(searchAll!)).toEqual(
-      expect.arrayContaining([alphaSkill.id, betaSkill.id]),
-    );
-    expect(skillIds(searchExcluded!)).toHaveLength(1);
-    expect(skillIds(searchExcluded!)).not.toContain(alphaSkill.id);
-    expect(skillIds(searchTop1!)).toHaveLength(1);
+    expect(skillIds(searchAllBefore!)).toHaveLength(0);
+    expect(skillIds(searchExcludedBefore!)).toHaveLength(0);
+    expect(skillIds(searchTop1Before!)).toHaveLength(0);
 
     // marketImport：克隆副本 + 幂等 + 缺失源技能抛错
     const [imported, importedAgain, importMissing] = await send(
@@ -176,8 +171,20 @@ describe('memory RPC market and retire wiring', () => {
       },
     });
 
-    // 退休后：技能不再挂在退休 Agent 名下，进入市场池并溯源 origin_agent_id
-    expect(await repository.listSkills('role_beta')).toHaveLength(0);
+    // 退休后：role_beta 实体删除（仅留归档），技能已进入市场池并溯源 origin_agent_id
+    await expect(repository.getAgent('role_beta')).rejects.toThrow(/Agent not found/);
+    expect(await repository.getAgentArchive('role_beta')).toMatchObject({
+      role_id: 'role_beta',
+      status: 'retired',
+      retired_reason: 'performance_degradation',
+      asset_disposition: {
+        skills_retained: 1,
+        skills_discarded: 0,
+        experiences_retained: 0,
+        experiences_discarded: 0,
+      },
+    });
+    expect(await repository.listAgentIds()).not.toContain('role_beta');
     const marketSkills = await repository.listSkills(MARKET_POOL_ROLE_ID);
     expect(marketSkills).toContainEqual(
       expect.objectContaining({
@@ -190,6 +197,20 @@ describe('memory RPC market and retire wiring', () => {
     // 市场池 Agent 对 Board 隐藏（listAgentIds 过滤 __market__）
     expect(await repository.listAgentIds()).not.toContain(MARKET_POOL_ROLE_ID);
 
+    // marketSearch（退休后）：betaSkill 已入池可检索；role_alpha（未退休）技能不可检索；
+    // exclude_agent_id 仅对市场池本身生效（排除 __market__ → 空），排除未退休 Agent 无影响
+    const [searchAllAfter, searchExcludedAfter, searchTop1After, searchExcludeMarket] =
+      await send(
+        '{"jsonrpc":"2.0","id":10,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0}}',
+        '{"jsonrpc":"2.0","id":11,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"exclude_agent_id":"role_alpha"}}',
+        '{"jsonrpc":"2.0","id":12,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"top_k":1}}',
+        '{"jsonrpc":"2.0","id":13,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"exclude_agent_id":"__market__"}}',
+      );
+    expect(skillIds(searchAllAfter!)).toEqual([betaSkill.id]);
+    expect(skillIds(searchExcludedAfter!)).toEqual([betaSkill.id]);
+    expect(skillIds(searchTop1After!)).toHaveLength(1);
+    expect(skillIds(searchExcludeMarket!)).toHaveLength(0);
+
     // 幂等退休：已退休 Agent 再次 retire 不重复处置
     const [retiredAgain, invalidReason] = await send(
       '{"jsonrpc":"2.0","id":8,"method":"memory.retireAgent","params":{"role_id":"role_beta","reason":"manual"}}',
@@ -200,8 +221,10 @@ describe('memory RPC market and retire wiring', () => {
       result: {
         retire: {
           status: 'retired',
+          retired_reason: 'performance_degradation',
+          // 幂等返回归档摘要：首次退休时的实际处置结果（1 个技能入市）
           asset_disposition: {
-            skills_retained: 0,
+            skills_retained: 1,
             skills_discarded: 0,
             experiences_retained: 0,
             experiences_discarded: 0,
@@ -216,22 +239,102 @@ describe('memory RPC market and retire wiring', () => {
 
     // retirementScan：三重门控。role_alpha（无任务历史）→ keep；role_beta 已退休 → 跳过/抛错
     const [scanAll, scanOne, scanRetired] = await send(
-      '{"jsonrpc":"2.0","id":10,"method":"memory.retirementScan","params":{}}',
-      '{"jsonrpc":"2.0","id":11,"method":"memory.retirementScan","params":{"role_id":"role_alpha"}}',
-      '{"jsonrpc":"2.0","id":12,"method":"memory.retirementScan","params":{"role_id":"role_beta"}}',
+      '{"jsonrpc":"2.0","id":14,"method":"memory.retirementScan","params":{}}',
+      '{"jsonrpc":"2.0","id":15,"method":"memory.retirementScan","params":{"role_id":"role_alpha"}}',
+      '{"jsonrpc":"2.0","id":16,"method":"memory.retirementScan","params":{"role_id":"role_beta"}}',
     );
     const scanAllScans = (scanAll!.result as { scans: Array<{ role_id: string; action: string }> })
       .scans;
     expect(scanAllScans).toHaveLength(1);
     expect(scanAllScans[0]).toMatchObject({ role_id: 'role_alpha', action: 'keep' });
     expect(scanOne!).toMatchObject({
-      id: 11,
+      id: 15,
       result: { scans: [{ role_id: 'role_alpha', action: 'keep' }] },
     });
     expect(scanRetired!).toMatchObject({
-      id: 12,
+      id: 16,
       error: { code: -32603 },
     });
+  });
+
+  it('promotes a specific experience into a pending skill through memory RPC', async () => {
+    const embedding = new HashEmbeddingProvider(32);
+    const repository = new InMemoryRepository(embedding);
+    const bufferRepository = new InMemoryBufferRepository();
+    await repository.initializeAgent({ role_id: 'role_alpha', name: 'Alpha', tags: [] });
+    const now = nowTimestamp();
+    const positive = {
+      id: randomUUID(),
+      description: 'Use explicit contracts',
+      description_embedding: [],
+      content: 'Define shared contracts before coding.',
+      confidence: 0.6,
+      tags: ['typescript'],
+      agent_id: 'role_alpha',
+      confidence_history: [],
+      referenced_count: 0,
+      source_task_id: 'task_001',
+      source_driver: 'capturing-driver',
+      type: 'positive' as const,
+      created_at: now,
+      updated_at: now,
+    };
+    const negative = { ...positive, id: randomUUID(), type: 'negative' as const };
+    await repository.saveExperience('role_alpha', positive);
+    await repository.saveExperience('role_alpha', negative);
+
+    const service = new BMemoryBackendService(
+      {
+        boardQuery: new RepositoryAgentBoardQuery(repository),
+        maintenance: fakeMaintenance(),
+        reviewSkill: (input) => reviewSkill(repository, input),
+        bufferRepository,
+      },
+      { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
+      {},
+      repository,
+    );
+
+    const output: string[] = [];
+    const session = new JsonRpcLineSession(dispatcherFor(service), (line) => output.push(line));
+    const send = async (...lines: string[]) => {
+      output.length = 0;
+      for (const line of lines) await session.handleLine(line);
+      return output.map((line) => JSON.parse(line) as Record<string, unknown>);
+    };
+
+    // 晋升正经验 → pending Skill（promoted_from 溯源），经验回写 promoted_to
+    const [promoted] = await send(
+      `{"jsonrpc":"2.0","id":0,"method":"memory.promoteExperience","params":{"role_id":"role_alpha","experience_id":"${positive.id}"}}`,
+    );
+    expect(promoted!).toMatchObject({
+      id: 0,
+      result: {
+        skill: {
+          review_status: 'pending',
+          promoted_from: positive.id,
+          agent_id: 'role_alpha',
+          description: positive.description,
+        },
+      },
+    });
+    const [storedSkill] = await repository.listSkills('role_alpha');
+    expect(storedSkill!.promoted_from).toBe(positive.id);
+    expect(storedSkill!.description_embedding.length).toBeGreaterThan(0);
+    const [storedPositive] = await repository.listExperiences('role_alpha');
+    expect(storedPositive!.promoted_to).toBe(storedSkill!.id);
+
+    // 负经验不可晋升 → 应用错误
+    const [rejected] = await send(
+      `{"jsonrpc":"2.0","id":1,"method":"memory.promoteExperience","params":{"role_id":"role_alpha","experience_id":"${negative.id}"}}`,
+    );
+    expect(rejected!).toMatchObject({ id: 1, error: { code: -32603 } });
+
+    // 缺 experience_id → Invalid params
+    const [invalid] = await send(
+      '{"jsonrpc":"2.0","id":2,"method":"memory.promoteExperience","params":{"role_id":"role_alpha"}}',
+    );
+    expect(invalid!).toMatchObject({ id: 2, error: { code: -32602 } });
   });
 
   it('routes market import and retire through NewideBackendService + DriverRuntimeAgentExecutionFacade', async () => {
@@ -264,6 +367,7 @@ describe('memory RPC market and retire wiring', () => {
         boardQuery: new RepositoryAgentBoardQuery(repository),
         maintenance: fakeMaintenance(),
         reviewSkill: (input) => reviewSkill(repository, input),
+        bufferRepository,
       },
       { provider: 'HashEmbeddingProvider', dimensions: 32, readiness: 'verified' },
       {},
@@ -332,8 +436,13 @@ describe('memory RPC market and retire wiring', () => {
       },
     });
 
-    // 仓库层状态验证：退休状态落库、技能进入市场池并溯源
-    expect((await repository.getAgent('role_beta')).status).toBe('retired');
+    // 仓库层状态验证：实体删除（仅归档）、技能进入市场池并溯源
+    await expect(repository.getAgent('role_beta')).rejects.toThrow(/Agent not found/);
+    expect(await repository.getAgentArchive('role_beta')).toMatchObject({
+      role_id: 'role_beta',
+      status: 'retired',
+      retired_reason: 'persona_drift',
+    });
     const marketSkills = await repository.listSkills(MARKET_POOL_ROLE_ID);
     expect(marketSkills).toContainEqual(
       expect.objectContaining({
@@ -355,6 +464,108 @@ describe('memory RPC market and retire wiring', () => {
 
     await service.close();
   });
+
+  it('rebuilds the vector index via memory.reindex (embedding model switch)', async () => {
+    // 旧模型：仓库按 32 维写入；B 服务注入 8 维新 provider（模拟切换 embedding 模型）
+    const repository = new InMemoryRepository(new HashEmbeddingProvider(32));
+    const bufferRepository = new InMemoryBufferRepository();
+    await repository.initializeAgent({ role_id: 'role_alpha', name: 'Alpha', tags: [] });
+    await seedSkill(repository, 'role_alpha', 'TypeScript service patterns');
+    const now = nowTimestamp();
+    await repository.saveExperience('role_alpha', {
+      id: randomUUID(),
+      description: 'Handle TypeScript contract boundaries.',
+      description_embedding: [],
+      content: 'full experience content body',
+      confidence: 0.8,
+      tags: ['typescript'],
+      agent_id: 'role_alpha',
+      confidence_history: [],
+      referenced_count: 1,
+      source_task_id: 'task_001',
+      source_driver: 'capturing-driver',
+      type: 'positive',
+      created_at: now,
+      updated_at: now,
+    });
+    expect((await repository.listSkills('role_alpha'))[0].description_embedding).toHaveLength(32);
+
+    const newEmbedding = new HashEmbeddingProvider(8);
+    const service = new BMemoryBackendService(
+      {
+        boardQuery: new RepositoryAgentBoardQuery(repository),
+        maintenance: fakeMaintenance(),
+        reviewSkill: (input) => reviewSkill(repository, input),
+        bufferRepository,
+      },
+      { provider: 'HashEmbeddingProvider', dimensions: 8, readiness: 'verified' },
+      {},
+      repository,
+      undefined,
+      newEmbedding,
+    );
+
+    const output: string[] = [];
+    const session = new JsonRpcLineSession(dispatcherFor(service), (line) => output.push(line));
+    const send = async (...lines: string[]) => {
+      output.length = 0;
+      for (const line of lines) await session.handleLine(line);
+      return output.map((line) => JSON.parse(line) as Record<string, unknown>);
+    };
+
+    // capabilities 报告 reindex 可用
+    const [capabilities] = await send(
+      '{"jsonrpc":"2.0","id":0,"method":"memory.getCapabilities","params":{}}',
+    );
+    expect(capabilities!).toMatchObject({
+      id: 0,
+      result: { capabilities: { operations: { reindex: { status: 'available' } } } },
+    });
+
+    // 全量重建：存量 32 维全部重算为 8 维
+    const [reindexed] = await send(
+      '{"jsonrpc":"2.0","id":1,"method":"memory.reindex","params":{}}',
+    );
+    expect(reindexed!).toMatchObject({
+      id: 1,
+      result: {
+        reindex: {
+          scope: 'all',
+          agents_processed: 1,
+          skills_reindexed: 1,
+          skills_skipped: 0,
+          experiences_reindexed: 1,
+          experiences_skipped: 0,
+          failures: [],
+          dimensions: 8,
+        },
+      },
+    });
+    // 直写路径生效：仓库（32 维守卫）未覆盖新向量，存量记录已是 8 维
+    expect((await repository.listSkills('role_alpha'))[0].description_embedding).toHaveLength(8);
+    expect((await repository.listExperiences('role_alpha'))[0].description_embedding).toHaveLength(
+      8,
+    );
+
+    // 单 Agent 作用域 + force 无条件重算
+    const [scoped] = await send(
+      '{"jsonrpc":"2.0","id":2,"method":"memory.reindex","params":{"role_id":"role_alpha","force":true}}',
+    );
+    expect(scoped!).toMatchObject({
+      id: 2,
+      result: { reindex: { scope: 'role', role_id: 'role_alpha', agents_processed: 1 } },
+    });
+
+    // 非法参数 / 不存在的 Agent
+    const [invalid] = await send(
+      '{"jsonrpc":"2.0","id":3,"method":"memory.reindex","params":{"role_id":""}}',
+    );
+    expect(invalid!).toMatchObject({ id: 3, error: { code: -32602 } });
+    const [missing] = await send(
+      '{"jsonrpc":"2.0","id":4,"method":"memory.reindex","params":{"role_id":"role_missing"}}',
+    );
+    expect(missing!).toMatchObject({ id: 4, error: { code: -32603 } });
+  });
 });
 
 function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
@@ -367,6 +578,8 @@ function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
     listMemoryExperiences: (roleId) => service.listExperiences(roleId),
     listMemoryMaintenance: (roleId) => service.listMaintenance(roleId),
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
+    promoteMemoryExperience: (roleId, experienceId) =>
+      service.promoteExperience(roleId, experienceId),
     marketSearchMemorySkills: (query) => service.marketSearch(query),
     marketImportMemorySkill: (roleId, sourceSkillId) =>
       service.marketImport(roleId, sourceSkillId),
@@ -376,6 +589,7 @@ function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
       service.approveSkill(roleId, skillId, reviewedBy),
     rejectMemorySkill: (roleId, skillId, reviewedBy) =>
       service.rejectSkill(roleId, skillId, reviewedBy),
+    reindexMemory: (roleId, options) => service.reindexMemory(roleId, options),
   }).register(dispatcher);
   return dispatcher;
 }

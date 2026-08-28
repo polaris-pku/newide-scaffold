@@ -20,7 +20,13 @@
 import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import type { MemoryRepository } from '../ports/memory-repository';
-import type { AgentHandle, ExperienceRecord, RetiredReason, SkillRecord } from '../schemas';
+import type {
+  AgentArchiveRecord,
+  AgentHandle,
+  ExperienceRecord,
+  RetiredReason,
+  SkillRecord,
+} from '../schemas';
 
 export interface RetireAssetDisposition {
   skills_retained: number;
@@ -38,11 +44,17 @@ export interface RetireOptions {
 
 export interface RetireResult {
   role_id: string;
-  status: 'retired';
-  retired_at: string;
-  retired_reason: RetiredReason;
-  asset_disposition: RetireAssetDisposition;
+  /**
+   * - 'retired'：退休完成，实体已归档并删除
+   * - 'pre_retired'：已标记预退休（不再接新任务），等待在跑任务完成后自动退休
+   */
+  status: 'retired' | 'pre_retired';
+  retired_at?: string;
+  retired_reason?: RetiredReason;
+  asset_disposition?: RetireAssetDisposition;
   replacement_role_id?: string;
+  /** status='pre_retired' 时为 true：仍有在跑任务，尚未真正退休 */
+  pending?: boolean;
 }
 
 /** 资产处置入参（由 AgentManager 在 retireAgent 时从仓库读取） */
@@ -153,4 +165,31 @@ export async function createReplacementAgent(
   }
 
   return roleId;
+}
+
+/**
+ * 构建退休归档（最小字段）。
+ *
+ * 退休 finalize 时在删除 Agent 实体之前写入，保证删除后仍有 role_id /
+ * 名称 / 时间 / 原因 / 资产处置计数等必要字段可追溯。
+ */
+export function buildAgentArchive(
+  handle: AgentHandle,
+  input: {
+    retired_at: string;
+    retired_reason: RetiredReason;
+    asset_disposition: RetireAssetDisposition;
+    replacement_role_id?: string;
+  },
+): AgentArchiveRecord {
+  return {
+    role_id: handle.role_id,
+    name: handle.name,
+    status: 'retired',
+    retired_at: input.retired_at,
+    retired_reason: input.retired_reason,
+    ...(handle.tags !== undefined ? { tags: handle.tags } : {}),
+    asset_disposition: input.asset_disposition,
+    ...(input.replacement_role_id ? { replacement_role_id: input.replacement_role_id } : {}),
+  };
 }

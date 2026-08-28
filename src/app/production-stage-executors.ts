@@ -50,13 +50,19 @@ import type {
   TaskExecutionLoopExecutors,
   TaskStageExecutionContext,
 } from '../coordination';
+import {
+  marketAuctionCompletedPayload,
+  marketAuctionStartedPayload,
+  type MarketEventContext,
+} from './market-event-payload';
 
 export interface ProductionStageExecutorDependencies {
   selectAgentHandler: Pick<SelectAgentHandler, 'execute'>;
   agentExecutionFacade: AgentExecutionFacade;
   councilProvider: CouncilProvider;
   gateExecutor: IntegrationV0GateExecutor;
-  bootstrapAgentIds: readonly string[];
+  /** 默认候选 Agent：静态数组或动态提供者（每次选择时查询，支持运行时新增 Agent） */
+  bootstrapAgentIds: readonly string[] | (() => Promise<readonly string[]>);
   runsRoot: string;
   councilRoot: string;
   worktreesRoot: string;
@@ -137,20 +143,58 @@ export function createProductionStageExecutors(
         );
       }
       // 关闭竞标时把候选固定为 primary（单候选短路，MarketAuctionEngine 直接返回它）。
+      const bootstrapAgentIds =
+        typeof dependencies.bootstrapAgentIds === 'function'
+          ? await dependencies.bootstrapAgentIds()
+          : dependencies.bootstrapAgentIds;
       const candidateIds = auctionDisabled
         ? [dependencies.primaryAgentId!]
         : context.cursor_input.candidate_ids.length > 0
           ? context.cursor_input.candidate_ids
           : context.task_request.role_id
             ? [context.task_request.role_id]
-            : [...dependencies.bootstrapAgentIds];
-      const result = await dependencies.selectAgentHandler.execute({
-        task_id: context.task_id,
-        task_description: context.task_request.spec,
-        bootstrap_agent_ids: candidateIds,
-        seed: context.cursor_input.seed,
-      });
+            : [...bootstrapAgentIds];
+      const marketContext: MarketEventContext = {
+        selection_scope: 'primary',
+        selection_mode: 'auction',
+      };
+      const result = await dependencies.selectAgentHandler.execute(
+        {
+          task_id: context.task_id,
+          task_description: context.task_request.spec,
+          bootstrap_agent_ids: candidateIds,
+          seed: context.cursor_input.seed,
+        },
+        auctionDisabled
+          ? undefined
+          : {
+              onCandidatesCollected: (collected) =>
+                emit(
+                  context,
+                  'market.auction.started',
+                  collected.auction_id,
+                  marketAuctionStartedPayload({
+                    context: marketContext,
+                    auction_id: collected.auction_id,
+                    task_description: collected.market_task.task_description,
+                    requirement_profile: collected.market_task.requirement_profile,
+                    candidates: collected.candidates,
+                  }),
+                ),
+            },
+      );
+      const auctionCompleted = auctionDisabled
+        ? undefined
+        : marketAuctionCompletedPayload({ context: marketContext, result });
+      const auctionId = auctionCompleted
+        ? String(auctionCompleted.auction_id)
+        : undefined;
+      if (auctionCompleted && auctionId) {
+        emit(context, 'market.auction.completed', auctionId, auctionCompleted);
+      }
       emit(context, 'market.selected', result.winner_agent_id, {
+        ...(auctionId ? { auction_id: auctionId } : {}),
+        selection_mode: auctionDisabled ? 'fixed' : 'auction',
         winner_agent_id: result.winner_agent_id,
         winner_bid_id: result.winner_bid_id,
         ledger_ref: result.ledger_ref,
@@ -470,6 +514,10 @@ export function createProductionStageExecutors(
       ).strategyName;
       emit(context, 'council.started', context.run_id, {
         trigger: context.cursor_input.trigger,
+        subject: context.task_request.spec,
+        decision_mode: 'advisory',
+        artifact_mode: strategyName === 'plan_first' ? 'plan' : 'implementation',
+        primary_role_id: primary.agent_id ?? primary.role_id,
         candidate_artifact_refs: evidencePack.artifact_refs,
         ...(strategyName ? { strategy: strategyName } : {}),
       });
@@ -480,30 +528,51 @@ export function createProductionStageExecutors(
           councilProvider: dependencies.councilProvider,
         }),
       });
-      const selected = await selector.selectArtifacts(
-        {
-          run_id: context.run_id,
-          task_id: context.task_id,
-          driver_result: driverResult,
-          gate_results: [],
-          evidence_pack: evidencePack,
-          question: context.task_request.spec,
-          workspace_path: context.workspace_path,
-          proposal_agent_id: primary.agent_id ?? primary.role_id,
-          ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
-        },
-        {
-          ...(context.signal ? { signal: context.signal } : {}),
-          ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
-          onCouncilLifecycleEvent: (event) =>
-            emit(context, event.type, context.run_id, event.payload),
-        },
-      );
+      let selected;
+      try {
+        selected = await selector.selectArtifacts(
+          {
+            run_id: context.run_id,
+            task_id: context.task_id,
+            driver_result: driverResult,
+            gate_results: [],
+            evidence_pack: evidencePack,
+            question: context.task_request.spec,
+            workspace_path: context.workspace_path,
+            proposal_agent_id: primary.agent_id ?? primary.role_id,
+            ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
+          },
+          {
+            ...(context.signal ? { signal: context.signal } : {}),
+            ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
+            onCouncilLifecycleEvent: (event) =>
+              emit(
+                context,
+                event.type,
+                lifecycleSubjectId(event.payload, context.run_id),
+                event.payload,
+              ),
+          },
+        );
+      } catch (error) {
+        emit(context, 'council.failed', context.run_id, {
+          code: 'COUNCIL_EXECUTION_FAILED',
+          message: error instanceof Error ? error.message : String(error),
+          fatal: true,
+        });
+        throw error;
+      }
       if (selected.selected_artifacts.length === 0) {
-        throw new Error('Council produced no selected artifact');
+        const error = new Error('Council produced no selected artifact');
+        emitCouncilFailure(context, 'COUNCIL_NO_SELECTED_ARTIFACT', error);
+        throw error;
       }
       let councilRunResult = selected.council_run_result;
-      if (!councilRunResult) throw new Error('Council stage returned no CouncilRunResult');
+      if (!councilRunResult) {
+        const error = new Error('Council stage returned no CouncilRunResult');
+        emitCouncilFailure(context, 'COUNCIL_RESULT_MISSING', error);
+        throw error;
+      }
       let selectedArtifacts = selected.selected_artifacts;
       let producerAgentId =
         councilRunResult.participants?.find((participant) => participant.seat === 'synthesizer')
@@ -512,22 +581,40 @@ export function createProductionStageExecutors(
         primary.role_id;
       let response = councilRunResult.decision.reason || primary.response;
       if (strategyName === 'plan_first') {
-        const finalPlans = assertCouncilPlanArtifacts(selectedArtifacts, 'final synthesis');
-        const implementation = await executeFinalCouncilPlan({
-          context,
-          primary,
-          finalPlans,
-          dependencies,
-        });
-        selectedArtifacts = implementation.artifact_refs;
-        producerAgentId = primary.agent_id ?? primary.role_id;
-        response = implementation.result.response;
-        councilRunResult = await attachPlanExecution(
-          councilRunResult,
-          finalPlans,
-          implementation.result,
-          implementation.artifact_refs,
-        );
+        try {
+          const finalPlans = assertCouncilPlanArtifacts(selectedArtifacts, 'final synthesis');
+          const implementationPhaseId = createId('council_phase');
+          emit(context, 'council.phase.started', implementationPhaseId, {
+            council_run_id: councilRunResult.council_run_id,
+            phase_id: implementationPhaseId,
+            phase: 'implementation',
+            attempt: 1,
+            role_id: primary.role_id,
+            agent_id: primary.agent_id ?? primary.role_id,
+            session_id: primary.session_id,
+            input_artifact_refs: finalPlans.map((artifact) => artifact.artifact_id),
+          });
+          const implementation = await executeFinalCouncilPlan({
+            context,
+            primary,
+            finalPlans,
+            dependencies,
+            councilRunId: councilRunResult.council_run_id,
+            phaseId: implementationPhaseId,
+          });
+          selectedArtifacts = implementation.artifact_refs;
+          producerAgentId = primary.agent_id ?? primary.role_id;
+          response = implementation.result.response;
+          councilRunResult = await attachPlanExecution(
+            councilRunResult,
+            finalPlans,
+            implementation.result,
+            implementation.artifact_refs,
+          );
+        } catch (error) {
+          emitCouncilFailure(context, 'COUNCIL_IMPLEMENTATION_FAILED', error);
+          throw error;
+        }
       }
       const selection = await selectionState({
         context,
@@ -547,10 +634,13 @@ export function createProductionStageExecutors(
         context.restarted_from_run_id,
       );
       emit(context, 'council.decision', councilRunResult.decision.decision_id, {
+        council_run_id: councilRunResult.council_run_id,
         ...councilRunResult.decision,
         participants: councilRunResult.participants ?? [],
+        outcome: councilRunResult.outcome,
       });
       emit(context, 'council.completed', councilRunResult.council_run_id, {
+        council_run_id: councilRunResult.council_run_id,
         decision_id: councilRunResult.decision.decision_id,
         verdict: councilRunResult.decision.verdict,
         decision_mode: councilRunResult.decision.decision_mode,
@@ -814,6 +904,8 @@ async function executeFinalCouncilPlan(input: {
   primary: AgentExecutionResult;
   finalPlans: ArtifactRef[];
   dependencies: ProductionStageExecutorDependencies;
+  councilRunId: string;
+  phaseId: string;
 }): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[] }> {
   const workspace = path.join(
     councilRunWorkspaceRoot(
@@ -896,6 +988,21 @@ async function executeFinalCouncilPlan(input: {
     memory_buffer_ref: result.memory_buffer_ref,
     driver_run_result_id: result.driver_run_result_id,
     diagnostics: result.diagnostics,
+  });
+  emit(input.context, 'council.implementation.completed', input.phaseId, {
+    council_run_id: input.councilRunId,
+    phase_id: input.phaseId,
+    phase: 'implementation',
+    executor_role_id: result.role_id,
+    agent_id: result.agent_id ?? result.role_id,
+    session_id: result.session_id,
+    agent_run_id: result.agent_run_id,
+    driver_run_result_id: result.driver_run_result_id,
+    final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
+    implementation_artifact_refs: implementationArtifacts.map(
+      (artifact) => artifact.artifact_id,
+    ),
+    response: result.response,
   });
   return { result, artifact_refs: implementationArtifacts };
 }
@@ -1086,6 +1193,26 @@ function emit<TCursor extends TaskResumeCursor>(
     schema_version: SCHEMA_VERSION,
   };
   context.on_event(event);
+}
+
+function lifecycleSubjectId(payload: Record<string, unknown>, fallback: string): string {
+  for (const key of ['auction_id', 'phase_id', 'council_run_id', 'participant_id']) {
+    const value = payload[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return fallback;
+}
+
+function emitCouncilFailure<TCursor extends TaskResumeCursor>(
+  context: TaskStageExecutionContext<TCursor>,
+  code: string,
+  error: unknown,
+): void {
+  emit(context, 'council.failed', context.run_id, {
+    code,
+    message: error instanceof Error ? error.message : String(error),
+    fatal: true,
+  });
 }
 
 class ProductionStageStateStore {

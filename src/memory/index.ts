@@ -48,6 +48,7 @@ export * as schemas from './schemas';
 
 export { InMemoryRepository } from './adapters/in-memory-repository';
 export { InMemoryBufferRepository } from './adapters/in-memory-buffer-repository';
+export { cosineSimilarity } from './utils/vector';
 export {
   PgMemoryRepository,
   type PgMemoryRepositoryOptions,
@@ -100,6 +101,35 @@ export {
   type ReviewSkillInput,
   type SkillReviewDecision,
 } from './services/skill-review';
+export {
+  createSkill,
+  updateSkill,
+  deleteSkill,
+  publishSkillToMarket,
+  updateExperience,
+  deleteExperience,
+  promoteExperienceToSkill,
+  type CreateSkillInput,
+  type CreateSkillOptions,
+  type PromoteExperienceInput,
+  type SkillWritePatch,
+  type ExperienceWritePatch,
+} from './services/memory-writer';
+export {
+  mergePersonaPatch,
+  regeneratePersona,
+  type PersonaPatch,
+  type PersonaInducer,
+} from './services/persona-update';
+export {
+  applyUserRating,
+  type RateTaskInput,
+  type UserRatingResult,
+} from './services/feedback';
+export {
+  computeMemoryOverview,
+  type MemoryOverview,
+} from './services/memory-overview';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,
@@ -206,6 +236,35 @@ export {
 } from './services/retirement-detection';
 
 // ════════════════════════════════════════════════════════
+//  8.8 市场自学习（存活 Agent 扫描市场引入技能）
+//     决策 = tag 相似度 + persona 相似度加权
+// ════════════════════════════════════════════════════════
+
+export {
+  learnSkillsForAgent,
+  buildLearningQuery,
+  computeTagSimilarity,
+  evaluateSkillLearning,
+  DEFAULT_SKILL_LEARNING_OPTIONS,
+} from './services/skill-learning';
+export type {
+  SkillLearningOptions,
+  SkillLearningDecision,
+  SkillLearningOutcome,
+} from './services/skill-learning';
+
+// ════════════════════════════════════════════════════════
+//  8.9 向量索引维护（memory.reindex：切换 embedding 模型后全量重建索引）
+// ════════════════════════════════════════════════════════
+
+export {
+  reindexMemory,
+  type ReindexMemoryOptions,
+  type ReindexMemoryResult,
+  type ReindexFailure,
+} from './services/memory-reindex';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 
@@ -217,6 +276,7 @@ export { RepositoryMemoryProvider } from './adapters/repository-memory-provider'
 // ════════════════════════════════════════════════════════
 
 export { RepositoryAgentBoardQuery } from './adapters/agent-board-query';
+export { toSkillView, toExperienceView } from './adapters/agent-board-query';
 
 // ════════════════════════════════════════════════════════
 //  11. Agent 运行时
@@ -297,7 +357,11 @@ export { createMockCompetitionClaimEvaluator } from './adapters/mock-competition
 //  20. Port 接口类型（供外部实现者使用）
 // ════════════════════════════════════════════════════════
 
-export type { BufferRepository, SaveBufferResult } from './ports/buffer-repository';
+export type {
+  BufferRepository,
+  DeadLetterEntry,
+  SaveBufferResult,
+} from './ports/buffer-repository';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';
@@ -314,6 +378,8 @@ export type {
   AgentBoardAgentView,
   SkillView,
   ExperienceView,
+  SkillListFilter,
+  ExperienceListFilter,
 } from './ports/agent-board-query';
 
 // ════════════════════════════════════════════════════════
@@ -322,6 +388,13 @@ export type {
 
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
 export type { AgentToolConfig } from './runtime/agent';
+export type {
+  AgentArchiveRecord,
+  AgentHandle,
+  CreateAgentSpec,
+  PersonaDef,
+  UserRating,
+} from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  22. Tool-calling 类型

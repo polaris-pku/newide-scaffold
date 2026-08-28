@@ -676,6 +676,7 @@ describe('production stage executors', () => {
     const workspace = path.join(root, 'workspace');
     await mkdir(workspace, { recursive: true });
     const requestedCandidateIds: string[][] = [];
+    const emittedEvents: Event[] = [];
     const executors = createProductionStageExecutors({
       selectAgentHandler: {
         execute: async (input) => {
@@ -745,11 +746,14 @@ describe('production stage executors', () => {
       mode: 'council',
       task_request: { spec: 'implement', completion_criteria: [] },
       workspace_path: workspace,
+      on_event: (event: Event) => emittedEvents.push(event),
       cursor_input: { cursor: 'select_agent', seed: 'run_no_auction', candidate_ids: [] },
     });
 
     expect(requestedCandidateIds).toEqual([['role_primary']]);
     expect(selected.winner_agent_id).toBe('role_primary');
+    expect(emittedEvents.map((event) => event.event_type)).toEqual(['market.selected']);
+    expect(emittedEvents[0]?.payload).toMatchObject({ selection_mode: 'fixed' });
   });
 
   it('rejects an auction-disabled select without a primaryAgentId', async () => {

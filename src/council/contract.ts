@@ -194,6 +194,8 @@ export interface CouncilRunRequest {
   candidate_artifacts?: ArtifactRef[];
   context_pack_ref?: string;
   participant_profile_refs?: string[];
+  /** Initial select_agent winner; used as proposer seat 0 in auction mode. */
+  primary_agent_id?: string;
   participants?: CouncilParticipantBinding[];
   proposals: Proposal[];
   reviews?: Review[];
@@ -214,9 +216,14 @@ export type CouncilRoundInput = CouncilRunRequest;
 
 export interface CouncilLifecycleEvent {
   type:
+    | 'market.auction.started'
+    | 'market.auction.completed'
+    | 'council.participants.selected'
+    | 'council.phase.started'
     | 'council.proposal.completed'
     | 'council.review.completed'
     | 'council.synthesis.completed'
+    | 'council.implementation.completed'
     | 'council.role.failed'
     | 'council.failed';
   payload: Record<string, unknown>;

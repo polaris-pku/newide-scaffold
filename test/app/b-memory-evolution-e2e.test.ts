@@ -167,7 +167,7 @@ describe('B memory evolution end to end', () => {
             promote_skills: { status: 'available' },
             approve_skill: { status: 'available' },
             reject_skill: { status: 'available' },
-            update_persona: { status: 'unavailable', reason: expect.any(String) },
+            update_persona: { status: 'available' },
           },
         },
       },
@@ -249,6 +249,8 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
     listMemoryExperiences: (roleId) => service.listExperiences(roleId),
     listMemoryMaintenance: (roleId) => service.listMaintenance(roleId),
     promoteMemorySkills: (roleId, requestedBy) => service.promoteSkills(roleId, requestedBy),
+    promoteMemoryExperience: (roleId, experienceId) =>
+      service.promoteExperience(roleId, experienceId),
     marketSearchMemorySkills: (query) => service.marketSearch(query),
     marketImportMemorySkill: (roleId, sourceSkillId) =>
       service.marketImport(roleId, sourceSkillId),
@@ -258,6 +260,7 @@ function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
       service.approveSkill(roleId, skillId, reviewedBy),
     rejectMemorySkill: (roleId, skillId, reviewedBy) =>
       service.rejectSkill(roleId, skillId, reviewedBy),
+    reindexMemory: (roleId, options) => service.reindexMemory(roleId, options),
   }).register(dispatcher);
   return dispatcher;
 }

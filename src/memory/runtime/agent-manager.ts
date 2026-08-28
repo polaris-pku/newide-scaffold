@@ -5,7 +5,12 @@
  * 持有共享 MemoryRepository 与 BufferRepository，为每个 Agent 创建独立 AgentMemoryScope。
  * 通过 AgentManagerOptions.tools 配置 LLM tool-calling。
  */
-import { MARKET_POOL_ROLE_ID, type AgentHandle, type CreateAgentSpec } from '../schemas';
+import {
+  MARKET_POOL_ROLE_ID,
+  type AgentHandle,
+  type CreateAgentSpec,
+  type RetiredReason,
+} from '../schemas';
 import type { BufferRepository } from '../ports/buffer-repository';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { AgentTaskRequest } from '../agent-types';
@@ -24,6 +29,7 @@ import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import { QueryMemoryTool } from './tools/query-memory-tool';
 import { recordBid, recordTaskOutcome } from '../services/metrics';
 import {
+  buildAgentArchive,
   createReplacementAgent,
   disposeRetiredAssets,
 } from '../services/retirement';
@@ -47,13 +53,24 @@ export interface AgentManagerOptions {
 }
 
 /**
+ * deleteAgent 的选项。
+ *
+ * - `force`: 删除未退休 Agent 时必传。未退休 Agent 的 skills 尚未迁移
+ *   市场池、experiences 尚未分级处置，强制删除会级联丢弃其名下全部
+ *   资产且不可恢复——仅应在用户明确二次确认后置 true。已退休 Agent
+ *   删除无需该标志。
+ */
+export interface DeleteAgentOptions {
+  force?: boolean;
+}
+
+/**
  * dispatchTask 的返回结果。
  *
  * - 不包含 winner_role_id 和 scores（Memory 不负责选赢家）
  * - role_id 即 dispatchTask 指定的目标 Agent
  * - status 反映任务执行结果
- */
-export interface DispatchTaskResult {
+ */export interface DispatchTaskResult {
   role_id: string;
   status:
     | 'completed'
@@ -115,6 +132,8 @@ export function toMemoryTaskProjection(result: DispatchTaskResult): MemoryTaskPr
 
 export class AgentManager {
   private readonly agents = new Map<string, Agent>();
+  /** 预退休待完成意图（role_id → 退休选项）。dispatchTask 收尾时用于自动 finalize。 */
+  private readonly pendingRetirement = new Map<string, RetireOptions>();
 
   constructor(
     private readonly repository: MemoryRepository,
@@ -166,6 +185,43 @@ export class AgentManager {
     const agent = await this.instantiateAgent(spec.role_id);
     this.agents.set(spec.role_id, agent);
     return agent.getHandle();
+  }
+
+  /**
+   * 删除 Agent（硬删除，级联清理全部持久化记忆与 buffer 存储）。
+   *
+   * 默认安全前置条件：Agent 必须已 retired（skills 已在退休时迁移市场池，
+   * 名下保留的 experiences 随删除级联清理）。活跃 / draining Agent 若确认要
+   * 彻底移除（级联丢弃名下全部资产且不可恢复），可传 `{ force: true }`
+   * 显式二次确认后删除；资产想保留应先 retireAgent（skills 进市场池）。
+   *
+   * 已归档角色（退休已完成、实体已删）→ 幂等成功（归档记录保留），不报错。
+   * 市场池 Agent 禁止删除。
+   */
+  async deleteAgent(role_id: string, options: DeleteAgentOptions = {}): Promise<void> {
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot delete market pool agent: ${role_id}`);
+    }
+    const handle = await this.repository.getAgent(role_id).catch(() => null);
+    if (!handle) {
+      // 实体不存在：若已归档（退休已完成、实体已删）→ 幂等成功（归档保留）
+      const archived = await this.repository.getAgentArchive(role_id).catch(() => null);
+      if (archived) {
+        return;
+      }
+      throw new Error(`Agent not found: ${role_id}`);
+    }
+    if (handle.status !== 'retired' && !options.force) {
+      throw new Error(
+        `Agent must be retired before deletion: ${role_id} ` +
+          `(current status: ${handle.status}); ` +
+          `pass force: true to delete it anyway — this permanently discards ` +
+          `all of its skills, experiences and persona`,
+      );
+    }
+    await this.repository.deleteAgent(role_id);
+    await this.bufferRepository.deleteAgent(role_id);
+    this.agents.delete(role_id);
   }
 
   /**
@@ -497,9 +553,12 @@ export class AgentManager {
 
       const status = noDriverInvocation ? 'no_driver_invocation' : 'completed';
       await this.recordDispatchMetrics(role_id, status);
+      // 任务完成收尾：若该 role 处于预退休（draining）且无在跑任务 → 自动 finalize
+      await this.finalizeIfPreRetired(role_id);
       return { role_id, status, cycle };
     } catch (err) {
       await this.recordDispatchMetrics(role_id, 'failed');
+      await this.finalizeIfPreRetired(role_id);
       return {
         role_id,
         status: 'failed',
@@ -587,17 +646,34 @@ export class AgentManager {
   }
 
   /**
-   * 优雅退休（week3 RFC §12.1）：
+   * 优雅退休（week3 RFC §12.1）— 两阶段：
    *
-   * Phase 1 — drain：状态置为 'draining'（不再参与竞标 / 不再被派发）
-   * Phase 2 — preserve：资产处置（Skills 进入市场、Experiences 分级保留/丢弃）
-   * Phase 3 — archive：状态置为 'retired'，写入 retired_at / retired_reason
+   * Phase 1 — 预退休（draining）：状态置为 'draining'，不再参与竞标 / 不再被派发；
+   *           若有在跑任务，返回 status='pre_retired'，等任务完成后由 dispatchTask
+   *           收尾自动触发 finalize。
+   * Phase 2 — finalize：资产处置（Skills 进入市场、Experiences 计数/删除）→
+   *           归档最小字段 → 删除 Agent 实体（保留经验随实体级联删除）→ 从内存 map 驱逐。
    *
-   * 可选创建替代 Agent（clean_slate / seeded_slate）。
+   * 可选创建替代 Agent（clean_slate / seeded_slate），须在删除源实体之前创建。
    *
-   * 对已退休 Agent 幂等：再次调用直接返回当前归档状态，不做重复处置。
+   * 对已归档（退休完成、实体已删）Agent 幂等：返回归档摘要，不做重复处置。
    */
   async retireAgent(role_id: string, options: RetireOptions = {}): Promise<RetireResult> {
+    // 已归档（退休完成、实体已删）→ 幂等返回归档摘要
+    const archived = await this.repository.getAgentArchive(role_id).catch(() => null);
+    if (archived) {
+      return {
+        role_id,
+        status: 'retired',
+        retired_at: archived.retired_at,
+        retired_reason: archived.retired_reason,
+        asset_disposition: archived.asset_disposition,
+        ...(archived.replacement_role_id
+          ? { replacement_role_id: archived.replacement_role_id }
+          : {}),
+      };
+    }
+
     const handle = await this.repository.getAgent(role_id).catch(() => null);
     if (!handle) {
       throw new Error(`Agent not found: ${role_id}`);
@@ -606,29 +682,49 @@ export class AgentManager {
       throw new Error(`Cannot retire market pool agent: ${role_id}`);
     }
 
-    const retiredAt = nowTimestamp();
-    const reason = options.reason ?? 'manual';
+    // 记录退休意图（reason / replacement），供后续 finalize（含 dispatchTask 自动触发）读取
+    this.pendingRetirement.set(role_id, options);
 
-    // 已退休 → 幂等返回（不做重复资产处置）
+    // 兼容旧数据：实体仍为 retired（未归档）→ 直接归档并删除
     if (handle.status === 'retired') {
-      return {
-        role_id,
-        status: 'retired',
-        retired_at: handle.retired_at ?? retiredAt,
-        retired_reason: handle.retired_reason ?? reason,
-        asset_disposition: {
-          skills_retained: 0,
-          skills_discarded: 0,
-          experiences_retained: 0,
-          experiences_discarded: 0,
-        },
-      };
+      return this.finalizeRetirement(role_id, handle);
     }
 
-    // Phase 1: draining
+    // 已是预退休（draining）：无在跑任务则 finalize，否则保持预退休
+    if (handle.status === 'draining') {
+      if (this.agents.get(role_id)?.hasPendingTask()) {
+        return preRetiredResult(role_id, options.reason ?? 'manual');
+      }
+      return this.finalizeRetirement(role_id, handle);
+    }
+
+    // Phase 1: 置预退休标记（不再接新任务/竞标）
     await this.repository.updateAgentStatus(role_id, 'draining');
 
-    // Phase 2: 资产处置
+    // 尚有在跑任务 → 保持预退休，等 dispatchTask 收尾自动 finalize
+    if (this.agents.get(role_id)?.hasPendingTask()) {
+      return preRetiredResult(role_id, options.reason ?? 'manual');
+    }
+
+    // 无在跑任务 → 立即 finalize
+    return this.finalizeRetirement(role_id, handle);
+  }
+
+  /**
+   * 退休 finalize：资产处置 → 归档 → 删除实体 → 驱逐内存实例。
+   *
+   * reason / replacement 从 pendingRetirement 读取（首次 retireAgent 调用时记录）。
+   */
+  private async finalizeRetirement(
+    role_id: string,
+    handle: AgentHandle,
+  ): Promise<RetireResult> {
+    const retireOptions = this.pendingRetirement.get(role_id) ?? {};
+    const reason = retireOptions.reason ?? 'manual';
+    const retiredAt = nowTimestamp();
+    this.pendingRetirement.delete(role_id);
+
+    // Phase 2: 资产处置（skills 入市；低置信经验删除，高置信经验随后随实体级联删除）
     const [skills, experiences] = await Promise.all([
       this.repository.listSkills(role_id),
       this.repository.listExperiences(role_id),
@@ -639,25 +735,32 @@ export class AgentManager {
       experiences,
     });
 
-    // Phase 3: archive
-    await this.repository.updateAgentStatus(role_id, 'retired', {
-      retired_at: retiredAt,
-      retired_reason: reason,
-    });
-
+    // 替代 Agent 必须在删除源实体之前创建（需要读取 source handle / experiences）
     let replacementRoleId: string | undefined;
-    if (options.replacement && options.replacement !== 'none') {
+    if (retireOptions.replacement && retireOptions.replacement !== 'none') {
       replacementRoleId = await createReplacementAgent(
         this.repository,
         handle,
         experiences,
-        options.replacement,
+        retireOptions.replacement,
       );
       // 让替代 Agent 立即进入内存 map，可被后续竞标/派发使用
       if (!this.agents.has(replacementRoleId)) {
         this.agents.set(replacementRoleId, await this.instantiateAgent(replacementRoleId));
       }
     }
+
+    // Phase 3: 归档 + 删除实体 + 驱逐
+    const archive = buildAgentArchive(handle, {
+      retired_at: retiredAt,
+      retired_reason: reason,
+      asset_disposition: assetDisposition,
+      ...(replacementRoleId ? { replacement_role_id: replacementRoleId } : {}),
+    });
+    await this.repository.archiveAgent(role_id, archive);
+    await this.repository.deleteAgent(role_id);
+    await this.bufferRepository.deleteAgent(role_id);
+    this.agents.delete(role_id);
 
     return {
       role_id,
@@ -667,6 +770,21 @@ export class AgentManager {
       asset_disposition: assetDisposition,
       ...(replacementRoleId ? { replacement_role_id: replacementRoleId } : {}),
     };
+  }
+
+  /**
+   * dispatchTask 收尾钩子：任务完成后，若该 role 处于预退休（draining）且无在跑任务，
+   * 则自动触发 finalize。
+   */
+  private async finalizeIfPreRetired(role_id: string): Promise<void> {
+    const agent = this.agents.get(role_id);
+    if (agent?.hasPendingTask()) {
+      return; // 仍有在跑任务，继续等待
+    }
+    const handle = await this.repository.getAgent(role_id).catch(() => null);
+    if (handle && handle.status === 'draining') {
+      await this.finalizeRetirement(role_id, handle);
+    }
   }
 
   /**
@@ -694,6 +812,16 @@ export class AgentManager {
       // 指标采集失败不影响任务派发结果（best-effort）
     }
   }
+}
+
+/** 预退休结果：标记退休意图但仍有在跑任务，等待任务完成后自动 finalize。 */
+function preRetiredResult(role_id: string, reason: RetiredReason): RetireResult {
+  return {
+    role_id,
+    status: 'pre_retired',
+    retired_reason: reason,
+    pending: true,
+  };
 }
 
 export type { RetireOptions, RetireResult } from '../services/retirement';

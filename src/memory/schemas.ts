@@ -53,6 +53,9 @@ export type MarketStatus = z.infer<typeof MarketStatusSchema>;
  * Agent」（满足 Pg FK），同时退休 Agent 可安全归档。该 Agent 是隐藏的
  * 系统角色：listAgentIds() 会过滤掉它，因此不会出现在 Agent Board、
  * loadAllAgents 实例化、竞标或派发中。
+ *
+ * 技能市场检索（marketSearchSkills）**仅在该池内进行**：未退休/未迁入
+ * 市场池的 Agent 技能不可被检索到。
  */
 export const MARKET_POOL_ROLE_ID = '__market__';
 
@@ -553,6 +556,42 @@ export const AgentHandleSchema = z.object({
   metric: AgentMetricsSchema,
 });
 export type AgentHandle = z.infer<typeof AgentHandleSchema>;
+
+// ═══════════════════════════════════════════
+//  Agent Archive（退休归档）
+// ═══════════════════════════════════════════
+
+/**
+ * 退休归档（最小字段）。
+ *
+ * 退休 finalize 后，Agent 实体从数据库中删除，仅保留此归档记录用于追溯。
+ * 详细的经验/技能数据随实体删除（技能在资产处置时已迁入市场池；保留经验
+ * 不再单独留存，仅保留计数摘要）。
+ */
+export const AgentArchiveRecordSchema = z.object({
+  /** 退休 Agent 的 role_id */
+  role_id: z.string(),
+  /** 显示名称 */
+  name: z.string(),
+  /** 归档状态（固定 retired） */
+  status: z.literal('retired'),
+  /** 退休时间 */
+  retired_at: z.iso.datetime(),
+  /** 退休原因 */
+  retired_reason: RetiredReasonSchema,
+  /** 标签（用于追溯） */
+  tags: z.array(z.string()).optional(),
+  /** 资产处置摘要（计数） */
+  asset_disposition: z.object({
+    skills_retained: z.number().int().min(0),
+    skills_discarded: z.number().int().min(0),
+    experiences_retained: z.number().int().min(0),
+    experiences_discarded: z.number().int().min(0),
+  }),
+  /** 替代 Agent role_id（若创建） */
+  replacement_role_id: z.string().optional(),
+});
+export type AgentArchiveRecord = z.infer<typeof AgentArchiveRecordSchema>;
 
 // ═══════════════════════════════════════════
 //  Extract Result

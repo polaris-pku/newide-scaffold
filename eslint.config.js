@@ -5,7 +5,7 @@ import prettier from 'eslint-config-prettier';
 
 export default tseslint.config(
   {
-    ignores: ['dist/', 'node_modules/', 'coverage/', '.newide/', '.claude/worktrees/'],
+    ignores: ['dist/', 'node_modules/', 'coverage/', '.newide/', '.claude/worktrees/', 'evalResult/'],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

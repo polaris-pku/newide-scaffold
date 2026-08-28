@@ -158,6 +158,19 @@ export function summarizeLlmUsageEntries(entries: readonly LlmUsageEntry[]): Llm
   return { ...overall, sources, by_source };
 }
 
+export function isPopulatedRunTokenUsage(value: unknown): value is RunTokenUsageSummary {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Partial<RunTokenUsageSummary>;
+  if (record.schema_version !== 'newide.token_usage.v1') return false;
+  const totalTokens = Number(record.total_tokens ?? 0);
+  const callCount = Number(record.call_count ?? 0);
+  return (
+    Number.isFinite(totalTokens) &&
+    Number.isFinite(callCount) &&
+    (totalTokens > 0 || callCount > 0)
+  );
+}
+
 export function emptyTokenUsageSummary(
   extras: Partial<RunTokenUsageSummary> = {},
 ): RunTokenUsageSummary {

@@ -2,8 +2,9 @@
  * 技能市场（Skill Market）测试
  *
  * 验证：
- *   1. marketSearchSkills 跨 Agent 返回「可市场技能」（approved 且非 superseded），
- *      排除 rejected / superseded，支持 exclude_agent_id
+ *   1. marketSearchSkills 仅检索市场池（__market__）内的技能：
+ *      - 未迁入市场池的 Agent 技能（即使 approved / publish 标记）不可被检索到
+ *      - 迁入市场池后按资格过滤（approved 且非 superseded），排除 rejected / superseded
  *   2. marketImportSkill 克隆副本：新 id、agent_id=引入方、imported_from=源技能 id
  *   3. 引入副作用：源技能 imported_by 追加、引入方 imported_skill_count++ / skill_count++
  *   4. 幂等：重复引入返回 created=false，不重复克隆、imported_by 不重复
@@ -16,7 +17,7 @@ import { nowTimestamp } from '../../core';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { defaultHashEmbeddingProvider } from '../adapters/hash-embedding-provider';
 import { marketSearch, marketImport } from '../services/skill-market';
-import type { SkillRecord } from '../schemas';
+import { MARKET_POOL_ROLE_ID, type SkillRecord } from '../schemas';
 
 const embedding = defaultHashEmbeddingProvider;
 
@@ -73,42 +74,71 @@ async function setupMarket() {
 }
 
 describe('MemoryRepository.marketSearchSkills', () => {
-  it('跨 Agent 返回 approved 且非 superseded 的技能，排除 rejected / superseded', async () => {
+  it('仅检索市场池（__market__）内的技能；未迁入市场池的 Agent 技能不可被检索', async () => {
     const { repository, tsSkill, rustSkill, rejectedSkill, supersededSkill } =
       await setupMarket();
     const queryEmbedding = await embedding.embed('typescript');
+
+    // 迁入市场池前：任何 Agent 的技能（即使 approved）都不可被检索到
+    const before = await repository.marketSearchSkills({
+      query_embedding: queryEmbedding,
+      top_k: 10,
+      min_similarity: -1,
+    });
+    expect(before).toHaveLength(0);
+
+    // 将 tsSkill 迁入市场池（模拟退休资产处置）
+    await repository.transferSkillToMarket('src', tsSkill.id, {
+      market_status: 'retired_unique',
+    });
 
     const results = await repository.marketSearchSkills({
       query_embedding: queryEmbedding,
       top_k: 10,
       min_similarity: -1,
     });
-
     const ids = results.map((skill) => skill.id);
     expect(ids).toContain(tsSkill.id);
-    expect(ids).toContain(rustSkill.id);
+    // 仍归 src / dst 的未退休技能（即使 approved）不可被检索
+    expect(ids).not.toContain(rustSkill.id);
+    // 资格过滤：rejected / superseded 排除
     expect(ids).not.toContain(rejectedSkill.id);
     expect(ids).not.toContain(supersededSkill.id);
     // 最相关的 typescript 技能应排在最前
     expect(ids[0]).toBe(tsSkill.id);
   });
 
-  it('exclude_agent_id 排除指定 Agent 的技能', async () => {
+  it('exclude_agent_id 排除市场池时返回空；排除其他 Agent 不影响市场池结果', async () => {
     const { repository, tsSkill } = await setupMarket();
+    await repository.transferSkillToMarket('src', tsSkill.id, {
+      market_status: 'retired_unique',
+    });
     const queryEmbedding = await embedding.embed('typescript');
 
-    const results = await repository.marketSearchSkills({
+    // 排除未退休 Agent（dst）不影响市场池结果（其技能本就不在市场池）
+    const excludingOther = await repository.marketSearchSkills({
       query_embedding: queryEmbedding,
       top_k: 10,
       min_similarity: -1,
       exclude_agent_id: 'dst',
     });
+    expect(excludingOther.map((skill) => skill.id)).toEqual([tsSkill.id]);
 
-    expect(results.map((skill) => skill.id)).toEqual([tsSkill.id]);
+    // 排除市场池本身 → 空
+    const excludingMarket = await repository.marketSearchSkills({
+      query_embedding: queryEmbedding,
+      top_k: 10,
+      min_similarity: -1,
+      exclude_agent_id: MARKET_POOL_ROLE_ID,
+    });
+    expect(excludingMarket).toHaveLength(0);
   });
 
   it('top_k 限制返回条数', async () => {
     const { repository, tsSkill } = await setupMarket();
+    await repository.transferSkillToMarket('src', tsSkill.id, {
+      market_status: 'retired_unique',
+    });
     const queryEmbedding = await embedding.embed('typescript');
 
     const results = await repository.marketSearchSkills({
@@ -190,8 +220,11 @@ describe('MemoryRepository.marketImportSkill', () => {
 });
 
 describe('services/skill-market（marketSearch / marketImport）', () => {
-  it('marketSearch 用文本 query 检索，返回相关技能', async () => {
+  it('marketSearch 用文本 query 检索市场池，返回相关技能', async () => {
     const { repository, tsSkill } = await setupMarket();
+    await repository.transferSkillToMarket('src', tsSkill.id, {
+      market_status: 'retired_unique',
+    });
 
     const results = await marketSearch(repository, embedding, {
       query: 'typescript',
