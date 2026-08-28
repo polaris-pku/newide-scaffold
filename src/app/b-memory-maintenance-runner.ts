@@ -4,6 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { SCHEMA_VERSION, nowTimestamp } from '../core';
 import {
+  applyUsageFeedback,
   LlmExperienceExtractor,
   LlmSkillPromotion,
   createAgentMemoryScope,
@@ -17,6 +18,7 @@ import {
   type MemoryRepository,
 } from '../memory';
 import type { SkillRecord } from '../memory/schemas';
+import type { UsageFeedbackEntry } from '../memory';
 import {
   isDriverStreamUsage,
   preferDriverUsage,
@@ -64,6 +66,8 @@ export interface BMemoryMaintenanceEvidence {
   skills: unknown[];
   warnings: string[];
   error?: string;
+  /** 用后验证回写明细：逐条列出置信度增长 before/after（写入磁盘 evidence JSON） */
+  usage_feedback?: UsageFeedbackEntry[];
   evidence_uri?: string;
   created_at: string;
   completed_at: string;
@@ -89,18 +93,35 @@ export interface BMemoryMaintenanceRunnerOptions {
   runsRoot?: string;
   /** 可选提取器注入（默认 LlmExperienceExtractor + 规则版降级）；测试注入失败提取器用。 */
   extractor?: ExperienceExtractor;
+  /**
+   * 技能晋升配置（全自动化测评用）：
+   * - confidenceThreshold：晋升置信度门槛（默认 0.95；无人评分时经验置信度难达标，
+   *   测评侧可调低让晋升真正发生）
+   * - autoApprove：晋升产出的 pending Skill 直接置 approved（进入检索资格），
+   *   替代人工审核；对齐 B 服务 NEWIDE_B_SKILL_AUTO_APPROVE 语义
+   */
+  promotion?: {
+    confidenceThreshold?: number;
+    autoApprove?: boolean;
+  };
 }
 
 export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
   private readonly extractor: ExperienceExtractor;
   private readonly promoter: LlmSkillPromotion;
+  private readonly promotionConfidenceThreshold: number;
+  private readonly promotionAutoApprove: boolean;
   private readonly roleQueues = new Map<string, Promise<void>>();
   private readonly scheduleFlights = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
   private readonly jobs = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
 
   constructor(private readonly options: BMemoryMaintenanceRunnerOptions) {
     this.extractor = options.extractor ?? new LlmExperienceExtractor(options.llm);
-    this.promoter = new LlmSkillPromotion(options.llm);
+    this.promotionConfidenceThreshold = options.promotion?.confidenceThreshold ?? 0.95;
+    this.promotionAutoApprove = options.promotion?.autoApprove === true;
+    this.promoter = new LlmSkillPromotion(options.llm, {
+      confidenceThreshold: this.promotionConfidenceThreshold,
+    });
   }
 
   scheduleBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence> {
@@ -193,6 +214,32 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
       });
     }
 
+    // 用后验证回写（方向 2）：把本次任务对已存经验的引用效果
+    // （DriverReturn.referenced_experiences[].effectiveness）回写为置信度与
+    // 引用计数——全自动测评中这是置信度增长的唯一真实信号（无人评分时提取
+    // 自评不可靠），使真正被反复使用且有效的经验能滚雪球达到 0.95 晋升门槛。
+    // best-effort：失败只记入 warnings，不阻断提取/晋升主流程。
+    const usageWarnings: string[] = [];
+    let usageFeedbackDetails: UsageFeedbackEntry[] = [];
+    try {
+      const usage = await applyUsageFeedback(
+        this.options.repository,
+        input.role_id,
+        pending.snapshot.driver_return.referenced_experiences,
+      );
+      usageFeedbackDetails = usage.details;
+      if (usage.updated_experiences > 0) {
+        usageWarnings.push(
+          `Usage feedback applied to ${usage.updated_experiences} referenced experience(s)` +
+            ` (${usage.skipped_missing} missing skipped).`,
+        );
+      }
+    } catch (error) {
+      usageWarnings.push(
+        `Usage feedback write-back skipped: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
     try {
       const evidence = await runWithLlmUsageLedger(
         {
@@ -222,7 +269,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
           });
 
           let skills: SkillRecord[] = [];
-          const warnings: string[] = [];
+          const warnings: string[] = [...usageWarnings];
           if (ablationPolicy.promote_skills) {
             const outcomes = await promoteExperiencesForAgent(
               input.role_id,
@@ -233,6 +280,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
                   role_id,
                 ),
               this.promoter,
+              { confidenceThreshold: this.promotionConfidenceThreshold },
             );
             skills = [];
             for (const outcome of outcomes) {
@@ -264,6 +312,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
             experiences: result.extraction.experiences,
             skills,
             warnings,
+            ...(usageFeedbackDetails.length > 0 ? { usage_feedback: usageFeedbackDetails } : {}),
             created_at: startedAt,
             completed_at: nowTimestamp(),
             schema_version: SCHEMA_VERSION,
@@ -325,8 +374,38 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
             role_id,
           ),
         this.promoter,
+        { confidenceThreshold: this.promotionConfidenceThreshold },
       );
-      const skills = outcomes.flatMap((outcome) => (outcome.skill ? [outcome.skill] : []));
+      let skills = outcomes.flatMap((outcome) => (outcome.skill ? [outcome.skill] : []));
+      const warnings: string[] = [];
+      if (this.promotionAutoApprove && skills.length > 0) {
+        // 全自动化测评：晋升即批准，进入检索资格（替代人工审核）。
+        // 与 B 服务 autoApprovePromotedSkills 语义一致（reviewed_by=system:auto-approval），
+        // 此处内聚在 runner，使 memory.promoteSkills RPC 路径无需依赖 B 服务包装层。
+        const approved: SkillRecord[] = [];
+        for (const skill of skills) {
+          if (skill.review_status !== 'pending') {
+            approved.push(skill);
+            continue;
+          }
+          const now = nowTimestamp();
+          const reviewed: SkillRecord = {
+            ...skill,
+            review_status: 'approved',
+            reviewed_by: 'system:auto-approval',
+            reviewed_at: now,
+            updated_at: now,
+          };
+          await this.options.repository.updateSkill(input.role_id, reviewed);
+          approved.push(reviewed);
+        }
+        skills = approved;
+        warnings.push('Promoted Skills auto-approved for automated evaluation.');
+      } else if (skills.length === 0) {
+        warnings.push('No eligible Experience was promoted.');
+      } else {
+        warnings.push('Promoted Skills remain pending until B exposes an approval transition.');
+      }
       return this.persist({
         maintenance_ref: maintenanceRef,
         kind: 'skill_promotion',
@@ -334,10 +413,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
         ...input,
         experiences: [],
         skills,
-        warnings:
-          skills.length === 0
-            ? ['No eligible Experience was promoted.']
-            : ['Promoted Skills remain pending until B exposes an approval transition.'],
+        warnings,
         created_at: startedAt,
         completed_at: nowTimestamp(),
         schema_version: SCHEMA_VERSION,

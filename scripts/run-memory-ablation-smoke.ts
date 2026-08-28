@@ -104,6 +104,11 @@ const baseEnv = {
   ACP_DRIVER_TIMEOUT_MS:
     process.env.ACP_DRIVER_TIMEOUT_MS ?? configuredEnv.ACP_DRIVER_TIMEOUT_MS ?? '300000',
 };
+// 全自动化测评：无人审核 → 晋升即批准（替代人工 reviewSkill）。
+// 晋升置信度门槛保持默认 0.95：用后验证回写（usage-feedback）会在任务间
+// 把 driver 上报的引用效果累计为经验置信度，真正常被复用且有效的经验
+// 会自然跨过 0.95；无需（也不应）调低阈值——调低会让所有经验都晋升。
+baseEnv.NEWIDE_B_SKILL_AUTO_APPROVE ??= '1';
 
 log(`experiment root: ${experimentRoot}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);

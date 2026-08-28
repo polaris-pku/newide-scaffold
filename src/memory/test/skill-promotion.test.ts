@@ -92,6 +92,30 @@ describe('ruleBasedSkillPromotion', () => {
     expect(result.skill).toBeUndefined();
   });
 
+  it('options.confidenceThreshold 下调后低置信度正经验可晋升（全自动化测评用）', async () => {
+    const experience = makeExperience({ confidence: 0.6 });
+    await seedExperience(repository, experience);
+    const result = await ruleBasedSkillPromotion(memory, defaultTask, [experience], {
+      confidenceThreshold: 0.5,
+    });
+
+    expect(result.check.eligible).toBe(true);
+    expect(result.skill).toBeDefined();
+    expect(result.skill!.promoted_from).toBe(experience.id);
+    expect(result.skill!.review_status).toBe('pending');
+  });
+
+  it('options.confidenceThreshold 上调后高置信度经验也不晋升', async () => {
+    const experience = makeExperience({ confidence: 0.8 });
+    const result = await ruleBasedSkillPromotion(memory, defaultTask, [experience], {
+      confidenceThreshold: 0.9,
+    });
+
+    expect(result.check.eligible).toBe(false);
+    expect(result.skill).toBeUndefined();
+    expect(result.check.blocking_rules.join(' ')).toContain('0.9');
+  });
+
   it('负经验即使 confidence > 0.95 也不晋升', async () => {
     const experience = makeExperience({ confidence: 0.99, type: 'negative' });
     const result = await ruleBasedSkillPromotion(memory, defaultTask, [experience]);

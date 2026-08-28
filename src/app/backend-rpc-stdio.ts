@@ -229,6 +229,13 @@ export async function createProductionBackendService(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
         runsRoot,
+        promotion: {
+          confidenceThreshold: readNumberEnv(
+            env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD,
+            0.95,
+          ),
+          autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
+        },
       });
     try {
       await memoryMaintenance.replayPending();

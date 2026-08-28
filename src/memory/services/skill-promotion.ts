@@ -5,9 +5,11 @@
  *
  * 晋升规则（Spec §4.3）：
  *   1. 仅晋升正经验（type === 'positive'）
- *   2. 置信度严格大于 0.95（不含 0.95）
+ *   2. 置信度严格大于阈值（默认 0.95，可用 options.confidenceThreshold 覆盖——
+ *      全自动化测评无人评分时经验置信度难以达标，降阈值是测评侧开关）
  *   3. 尚未被晋升（!promoted_to）
- *   4. 晋升后 SkillRecord.review_status 为 'pending'（需人工审核）
+ *   4. 晋升后 SkillRecord.review_status 为 'pending'（需人工审核；测评自动批准走
+ *      B 服务 autoApprovePromotedSkills 或 maintenance runner 的 promotion.autoApprove）
  *   5. 原 experience 的 promoted_to 指向新 skill.id
  */
 import { randomUUID } from 'node:crypto';
@@ -17,15 +19,22 @@ import type { ExperienceRecord } from '../schemas';
 import type { AgentTaskRequest } from '../agent-types';
 import type { PromotionOutcome } from '../types';
 
-const PROMOTION_CONFIDENCE_THRESHOLD = 0.95;
+export const PROMOTION_CONFIDENCE_THRESHOLD = 0.95;
+
+/** 规则版晋升的选项：confidenceThreshold 覆盖默认 0.95 门槛（全自动化测评用） */
+export interface RuleBasedPromotionOptions {
+  confidenceThreshold?: number;
+}
 
 export async function ruleBasedSkillPromotion(
   memory: AgentMemoryScope,
   _task: AgentTaskRequest,
   experiences: ExperienceRecord[],
+  options: RuleBasedPromotionOptions = {},
 ): Promise<PromotionOutcome> {
+  const threshold = options.confidenceThreshold ?? PROMOTION_CONFIDENCE_THRESHOLD;
   const candidate = experiences.find(
-    (e) => e.type === 'positive' && e.confidence > PROMOTION_CONFIDENCE_THRESHOLD && !e.promoted_to,
+    (e) => e.type === 'positive' && e.confidence > threshold && !e.promoted_to,
   );
 
   if (!candidate) {
@@ -38,19 +47,19 @@ export async function ruleBasedSkillPromotion(
         reasons.push('No positive experiences in batch');
       } else {
         const eligible = positives.filter(
-          (e) => e.confidence > PROMOTION_CONFIDENCE_THRESHOLD && !e.promoted_to,
+          (e) => e.confidence > threshold && !e.promoted_to,
         );
         if (eligible.length === 0) {
           const alreadyPromoted = positives.filter((e) => e.promoted_to);
           const lowConfidence = positives.filter(
-            (e) => e.confidence <= PROMOTION_CONFIDENCE_THRESHOLD && !e.promoted_to,
+            (e) => e.confidence <= threshold && !e.promoted_to,
           );
           if (alreadyPromoted.length > 0) {
             reasons.push(`${alreadyPromoted.length} positive experience(s) already promoted`);
           }
           if (lowConfidence.length > 0) {
             reasons.push(
-              `${lowConfidence.length} positive experience(s) below confidence threshold (${PROMOTION_CONFIDENCE_THRESHOLD})`,
+              `${lowConfidence.length} positive experience(s) below confidence threshold (${threshold})`,
             );
           }
         }

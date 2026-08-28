@@ -114,6 +114,28 @@ describe('SkillPromotionProcessor', () => {
       expect(results).toHaveLength(0);
     });
 
+    it('confidenceThreshold 下调后低置信度经验可晋升（全自动化测评用）', async () => {
+      const { memory } = await createTestInfra('role_promote_low_threshold');
+
+      // 保存低于默认 0.95、但高于下调后阈值的经验
+      const exp = createExperience({ confidence: 0.6 });
+      await memory.saveExperience(exp);
+
+      const processor = new SkillPromotionProcessor(
+        new DefaultPromotionTriggerPolicy(5, 0.98, 86400000),
+        ruleBasedSkillPromotion,
+        { confidenceThreshold: 0.5 },
+      );
+
+      const results = await processor.promoteAll(memory);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.check.eligible).toBe(true);
+      expect(results[0]!.skill).toBeDefined();
+
+      const skills = await memory.listSkills();
+      expect(skills).toHaveLength(1);
+    });
+
     it('跳过已晋升的经验', async () => {
       const { memory } = await createTestInfra('role_promote_skip');
 

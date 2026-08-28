@@ -59,6 +59,78 @@ describe('BMemoryMaintenanceRunner', () => {
     });
   });
 
+  it('writes back usage feedback: referenced Experience confidence grows from driver effectiveness', async () => {
+    const { runner, repository, bufferRepository, evidenceStore } = await fixture();
+    // 预存一条经验，供后续任务在 DriverReturn.referenced_experiences 中引用
+    const now = new Date().toISOString();
+    const referenced = {
+      id: '00000000-0000-0000-0000-00000000feed',
+      description: 'Reusable normalization pattern',
+      description_embedding: [],
+      content: 'Trim/lowercase then collapse separators into a single hyphen.',
+      confidence: 0.7,
+      tags: ['typescript'],
+      agent_id: 'role_ts_engineer',
+      confidence_history: [{ value: 0.7, updated_at: now, reason: 'seed' }],
+      referenced_count: 0,
+      source_task_id: 'task_seed',
+      source_driver: 'test-driver',
+      type: 'positive',
+      created_at: now,
+      updated_at: now,
+    };
+    await repository.saveExperience('role_ts_engineer', referenced);
+
+    const seq = await writePending(
+      repository,
+      bufferRepository,
+      'role_ts_engineer',
+      'task_usage',
+      [
+        {
+          experience_id: referenced.id,
+          applied: true,
+          effectiveness: 'fully_effective',
+          note: 'normalization pattern worked',
+        },
+      ],
+    );
+
+    const result = await runner.processBuffer({
+      task_id: 'task_usage',
+      run_id: 'run_usage',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.warnings.join(' ')).toContain(
+      'Usage feedback applied to 1 referenced experience(s)',
+    );
+    // 磁盘 evidence JSON 中间产物：带逐条置信度增长明细
+    expect(result.usage_feedback).toEqual([
+      {
+        experience_id: referenced.id,
+        description: 'Reusable normalization pattern',
+        effectiveness: 'fully_effective',
+        from_confidence: 0.7,
+        to_confidence: 0.8,
+        referenced_count: 1,
+      },
+    ]);
+    // 从磁盘重新读取落盘的 evidence 文件，确认产物确实存在且内容一致
+    const persisted = await evidenceStore.get(result.maintenance_ref);
+    expect(persisted?.usage_feedback).toEqual(result.usage_feedback);
+    expect(persisted?.evidence_uri).toMatch(/^file:/);
+    const experiences = await repository.listExperiences('role_ts_engineer');
+    const updated = experiences.find((experience) => experience.id === referenced.id)!;
+    expect(updated.confidence).toBeCloseTo(0.8);
+    expect(updated.referenced_count).toBe(1);
+    expect(updated.confidence_history.at(-1)).toMatchObject({
+      reason: 'usage_validation:fully_effective',
+    });
+  });
+
   it('replays durable pending Buffers after application restart', async () => {
     let markExtractionStarted!: () => void;
     const extractionStarted = new Promise<void>((resolve) => {
@@ -179,6 +251,89 @@ describe('BMemoryMaintenanceRunner', () => {
     await expect(repository.listSkills('role_ts_engineer')).resolves.toMatchObject([
       { review_status: 'pending', agent_id: 'role_ts_engineer' },
     ]);
+  });
+
+  it('auto-approves promoted Skills via promotion.autoApprove (automated evaluation)', async () => {
+    const { runner, repository, bufferRepository } = await fixture(maintenanceLlm(), undefined, undefined, {
+      promotion: { autoApprove: true },
+    });
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_auto');
+    await runner.processBuffer({
+      task_id: 'task_auto',
+      run_id: 'run_auto',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    const result = await runner.promoteSkills({
+      role_id: 'role_ts_engineer',
+      requested_by: 'user',
+    });
+
+    expect(result).toMatchObject({
+      kind: 'skill_promotion',
+      status: 'completed',
+      skills: [expect.objectContaining({ review_status: 'approved' })],
+    });
+    await expect(repository.listSkills('role_ts_engineer')).resolves.toMatchObject([
+      { review_status: 'approved' },
+    ]);
+  });
+
+  it('promotes below-default-confidence Experience when promotion.confidenceThreshold is lowered', async () => {
+    const { runner, repository, bufferRepository } = await fixture(
+      confidenceLlm(0.6),
+      undefined,
+      undefined,
+      { promotion: { confidenceThreshold: 0.5 } },
+    );
+    const seq = await writePending(
+      repository,
+      bufferRepository,
+      'role_ts_engineer',
+      'task_threshold_low',
+    );
+    await runner.processBuffer({
+      task_id: 'task_threshold_low',
+      run_id: 'run_threshold_low',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    const result = await runner.promoteSkills({
+      role_id: 'role_ts_engineer',
+      requested_by: 'user',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.skills).toHaveLength(1);
+    expect(result.skills[0]).toMatchObject({ review_status: 'pending' });
+    await expect(repository.listSkills('role_ts_engineer')).resolves.toHaveLength(1);
+  });
+
+  it('keeps the default 0.95 gate: confidence 0.6 Experience is not promoted', async () => {
+    const { runner, repository, bufferRepository } = await fixture(confidenceLlm(0.6));
+    const seq = await writePending(
+      repository,
+      bufferRepository,
+      'role_ts_engineer',
+      'task_threshold_default',
+    );
+    await runner.processBuffer({
+      task_id: 'task_threshold_default',
+      run_id: 'run_threshold_default',
+      role_id: 'role_ts_engineer',
+      buffer_seq: seq,
+    });
+
+    const result = await runner.promoteSkills({
+      role_id: 'role_ts_engineer',
+      requested_by: 'user',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.skills).toEqual([]);
+    await expect(repository.listSkills('role_ts_engineer')).resolves.toEqual([]);
   });
 
   it('auto-approves Skills when processing Buffer under ablation B2', async () => {
@@ -420,7 +575,7 @@ async function fixture(
   llm: LlmClient = maintenanceLlm(),
   providedEvidenceStore?: BMemoryMaintenanceEvidenceStore,
   extractor?: ExperienceExtractor,
-  extra?: { runsRoot?: string },
+  extra?: { runsRoot?: string; promotion?: { confidenceThreshold?: number; autoApprove?: boolean } },
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-maintenance-'));
   roots.push(root);
@@ -437,6 +592,7 @@ async function fixture(
     evidenceStore,
     ...(extractor ? { extractor } : {}),
     ...(extra?.runsRoot ? { runsRoot: extra.runsRoot } : {}),
+    ...(extra?.promotion ? { promotion: extra.promotion } : {}),
   });
   return { runner, repository, bufferRepository, evidenceStore };
 }
@@ -455,6 +611,7 @@ async function writePending(
   bufferRepository: InMemoryBufferRepository,
   roleId: string,
   taskId: string,
+  references: BufferSnapshot['driver_return']['referenced_experiences'] = [],
 ): Promise<number> {
   const memory = createAgentMemoryScope(repository, bufferRepository, roleId);
   const snapshot: BufferSnapshot = {
@@ -465,7 +622,7 @@ async function writePending(
       artifacts: [],
       decisions: [],
       blockers: [],
-      referenced_experiences: [],
+      referenced_experiences: references,
       assumptions: [],
     },
     source_task_id: taskId,
@@ -499,6 +656,34 @@ function maintenanceLlm(): LlmClient {
         description: 'Keep B behind public ports',
         content: 'Compose B dependencies in the application layer.',
         tags: ['architecture'],
+      });
+    },
+  };
+}
+
+/** 提取出的经验置信度固定为给定值（低于默认 0.95 门槛，用于阈值测试） */
+function confidenceLlm(confidence: number): LlmClient {
+  let calls = 0;
+  return {
+    async complete() {
+      calls += 1;
+      if (calls % 2 === 1) {
+        return JSON.stringify({
+          experiences: [
+            {
+              description: 'Low confidence experience',
+              content: 'Some reusable content.',
+              type: 'positive',
+              confidence,
+              tags: ['test'],
+            },
+          ],
+        });
+      }
+      return JSON.stringify({
+        description: 'Promoted low confidence experience',
+        content: 'Generalized reusable content.',
+        tags: ['test'],
       });
     },
   };
