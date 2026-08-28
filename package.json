@@ -20,7 +20,6 @@
   "scripts": {
     "build": "tsc -b && pnpm build:cli",
     "build:cli": "node scripts/build-cli.mjs",
-    "review:skills": "node --import tsx scripts/review-skills.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --check .",
