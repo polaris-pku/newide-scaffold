@@ -17,6 +17,8 @@ export interface CommandDriverTransportOptions {
   env?: NodeJS.ProcessEnv;
   unsetEnv?: readonly string[];
   timeoutMs?: number;
+  /** Terminate only when the child produces no stdout/stderr activity. */
+  inactivityTimeoutMs?: number;
   onEvent?: DriverStreamEventListener;
 }
 
@@ -27,6 +29,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   private readonly env: NodeJS.ProcessEnv | undefined;
   private readonly unsetEnv: readonly string[];
   private readonly timeoutMs: number | undefined;
+  private readonly inactivityTimeoutMs: number | undefined;
   private readonly activeChildren = new Map<string, ChildProcess>();
   private readonly eventListeners = new Set<DriverStreamEventListener>();
   private readonly requestedInterrupts = new Set<string>();
@@ -39,6 +42,9 @@ export class CommandDriverTransport implements ExternalDriverTransport {
     if (options.timeoutMs !== undefined && options.timeoutMs <= 0) {
       throw new Error('Command driver timeoutMs must be greater than 0');
     }
+    if (options.inactivityTimeoutMs !== undefined && options.inactivityTimeoutMs <= 0) {
+      throw new Error('Command driver inactivityTimeoutMs must be greater than 0');
+    }
 
     this.command = options.command;
     this.args = options.args ?? [];
@@ -46,6 +52,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
     this.env = options.env;
     this.unsetEnv = options.unsetEnv ?? [];
     this.timeoutMs = options.timeoutMs;
+    this.inactivityTimeoutMs = options.inactivityTimeoutMs;
     if (options.onEvent) this.eventListeners.add(options.onEvent);
   }
 
@@ -106,8 +113,10 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       let eventSequence = 0;
       let stdinError: Error | undefined;
       let timedOut = false;
+      let inactive = false;
       let settled = false;
       let timeout: NodeJS.Timeout | undefined;
+      let inactivityTimeout: NodeJS.Timeout | undefined;
       let forceKillTimeout: NodeJS.Timeout | undefined;
 
       const child = spawn(this.command, this.args, this.spawnOptions());
@@ -122,6 +131,9 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       const clearTimers = (): void => {
         if (timeout) {
           clearTimeout(timeout);
+        }
+        if (inactivityTimeout) {
+          clearTimeout(inactivityTimeout);
         }
         if (forceKillTimeout) {
           clearTimeout(forceKillTimeout);
@@ -148,11 +160,27 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         }, this.timeoutMs);
       }
 
+      const armInactivityTimeout = (): void => {
+        if (this.inactivityTimeoutMs === undefined) return;
+        if (inactivityTimeout) clearTimeout(inactivityTimeout);
+        inactivityTimeout = setTimeout(() => {
+          inactive = true;
+          terminateChild(child.pid, 'SIGTERM');
+          forceKillTimeout = setTimeout(() => {
+            terminateChild(child.pid, 'SIGKILL');
+          }, 1_000);
+        }, this.inactivityTimeoutMs);
+        inactivityTimeout.unref?.();
+      };
+      armInactivityTimeout();
+
       child.stdout.on('data', (chunk: Buffer) => {
+        armInactivityTimeout();
         stdoutChunks.push(chunk);
       });
 
       child.stderr.on('data', (chunk: Buffer) => {
+        armInactivityTimeout();
         stderrPending += chunk.toString('utf8');
         for (;;) {
           const newline = stderrPending.indexOf('\n');
@@ -192,6 +220,15 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           reject(
             new Error(
               `Command driver timed out after ${String(this.timeoutMs)}ms: ${this.commandLabel()}. stderr: ${stderrSummary}`,
+            ),
+          );
+          return;
+        }
+
+        if (inactive && !this.requestedInterrupts.has(input.run_id)) {
+          reject(
+            new Error(
+              `Command driver produced no output for ${String(this.inactivityTimeoutMs)}ms: ${this.commandLabel()}. stderr: ${stderrSummary}`,
             ),
           );
           return;
