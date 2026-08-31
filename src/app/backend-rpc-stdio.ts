@@ -191,7 +191,9 @@ export async function createProductionBackendService(
           (key) => driverEnv[key] === undefined && env[key] === undefined,
         ),
       ],
-      timeoutMs: readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS),
+      inactivityTimeoutMs: readDriverTimeout(
+        env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
+      ),
     }),
   });
   let bRuntime: BackendBRuntime | undefined;
@@ -304,6 +306,9 @@ export async function createProductionBackendService(
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
+      roleInactivityTimeoutMs: readDriverTimeout(
+        env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS,
+      ),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
         resolveAllowedAgentIds: agentCatalogProvider,

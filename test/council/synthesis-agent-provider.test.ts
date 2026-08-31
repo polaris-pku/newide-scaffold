@@ -193,25 +193,47 @@ describe('SynthesisAgentCouncilProvider', () => {
       },
     );
 
-    expect(requests.map((request) => request.role_id)).toEqual([
-      COUNCIL_AGENTS.proposerA,
-      COUNCIL_AGENTS.proposerB,
+    expect(new Set(requests.slice(0, 2).map((request) => request.role_id))).toEqual(
+      new Set([COUNCIL_AGENTS.proposerA, COUNCIL_AGENTS.proposerB]),
+    );
+    expect(requests.slice(2).map((request) => request.role_id)).toEqual([
       COUNCIL_AGENTS.reviewer,
       COUNCIL_AGENTS.synthesizer,
     ]);
-    expect(requests[0]).toMatchObject({
+    const proposerARequest = requests.find(
+      (request) => request.role_id === COUNCIL_AGENTS.proposerA,
+    );
+    expect(proposerARequest).toMatchObject({
       participant_id: 'participant_proposer_0',
       council_seat: 'proposer',
       council_seat_index: 0,
       role_id: COUNCIL_AGENTS.proposerA,
     });
     expect(signals).toEqual(Array(4).fill(controller.signal));
-    expect(requests.map((request) => request.workspace_path)).toEqual([
-      path.join(councilRoot, councilRunDirName('run_001'), 'participant_proposer_0'),
-      path.join(councilRoot, councilRunDirName('run_001'), 'participant_proposer_1'),
-      path.join(councilRoot, councilRunDirName('run_001'), 'participant_reviewer_0'),
-      path.join(councilRoot, councilRunDirName('run_001'), 'participant_synthesizer_0'),
-    ]);
+    expect(
+      Object.fromEntries(requests.map((request) => [request.role_id, request.workspace_path])),
+    ).toEqual({
+      [COUNCIL_AGENTS.proposerA]: path.join(
+        councilRoot,
+        councilRunDirName('run_001'),
+        'participant_proposer_0',
+      ),
+      [COUNCIL_AGENTS.proposerB]: path.join(
+        councilRoot,
+        councilRunDirName('run_001'),
+        'participant_proposer_1',
+      ),
+      [COUNCIL_AGENTS.reviewer]: path.join(
+        councilRoot,
+        councilRunDirName('run_001'),
+        'participant_reviewer_0',
+      ),
+      [COUNCIL_AGENTS.synthesizer]: path.join(
+        councilRoot,
+        councilRunDirName('run_001'),
+        'participant_synthesizer_0',
+      ),
+    });
     for (const request of requests) {
       await expect(fs.stat(request.workspace_path!)).resolves.toMatchObject({});
     }
@@ -238,8 +260,8 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(lifecycleEvents).toEqual([
       'council.participants.selected',
       'council.phase.started',
-      'council.proposal.completed',
       'council.phase.started',
+      'council.proposal.completed',
       'council.proposal.completed',
       'council.phase.started',
       'council.review.completed',
@@ -247,6 +269,160 @@ describe('SynthesisAgentCouncilProvider', () => {
       'council.synthesis.completed',
     ]);
     await fs.rm(councilRoot, { recursive: true, force: true });
+  });
+
+  it('runs independent proposer roles concurrently', async () => {
+    let activeProposers = 0;
+    let maxActiveProposers = 0;
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        if (input.council_seat === 'proposer') {
+          activeProposers += 1;
+          maxActiveProposers = Math.max(maxActiveProposers, activeProposers);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          activeProposers -= 1;
+        }
+        return completedExecution(input);
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+
+    await provider.runCouncilRound(baseInput());
+
+    expect(maxActiveProposers).toBe(2);
+  });
+
+  it('steers a silent Driver and continues once in the same Session', async () => {
+    const requests: AgentExecutionRequest[] = [];
+    const lifecycleEvents: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    let slowAttempt = true;
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input, options) {
+        requests.push(input);
+        if (input.role_id === COUNCIL_AGENTS.proposerA && slowAttempt) {
+          slowAttempt = false;
+          options?.onDriverEvent?.({
+            schema_version: 'driver-event.v1',
+            event_type: 'driver.turn_started',
+            run_id: input.run_id,
+            session_id: 'session_slow_proposer',
+          });
+          await new Promise<never>((_resolve, reject) => {
+            options?.signal?.addEventListener(
+              'abort',
+              () => reject(options.signal?.reason ?? new Error('aborted')),
+              { once: true },
+            );
+          });
+        }
+        return completedExecution(input);
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade,
+      roleInactivityTimeoutMs: 5,
+    });
+
+    const result = await provider.runCouncilRound(baseInput(), {
+      onLifecycleEvent: (event) => lifecycleEvents.push(event),
+    });
+
+    const proposerRequests = requests.filter(
+      (request) => request.role_id === COUNCIL_AGENTS.proposerA,
+    );
+    expect(proposerRequests).toHaveLength(2);
+    expect(proposerRequests[1]).toMatchObject({ session_id: 'session_slow_proposer' });
+    expect(proposerRequests[1]?.driver_instruction).toContain('STEERED CONTINUATION');
+    expect(result.proposals).toHaveLength(2);
+    expect(lifecycleEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'council.phase.started',
+        payload: expect.objectContaining({ recovery: 'same_session_continuation' }),
+      }),
+    );
+  });
+
+  it('does not interrupt a long role while the Driver keeps emitting events', async () => {
+    let proposerAttempts = 0;
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input, options) {
+        if (input.role_id === COUNCIL_AGENTS.proposerA) {
+          proposerAttempts += 1;
+          options?.onDriverEvent?.({
+            schema_version: 'driver-event.v1',
+            event_type: 'driver.turn_started',
+            run_id: input.run_id,
+            session_id: 'session_active_proposer',
+          });
+          for (let index = 0; index < 5; index += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 3));
+            options?.onDriverEvent?.({
+              schema_version: 'driver-event.v1',
+              event_type: 'agent_thought_chunk',
+              run_id: input.run_id,
+              session_id: 'session_active_proposer',
+            });
+          }
+        }
+        return completedExecution(input);
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade,
+      roleInactivityTimeoutMs: 5,
+    });
+
+    const result = await provider.runCouncilRound(baseInput());
+
+    expect(proposerAttempts).toBe(1);
+    expect(result.proposals).toHaveLength(2);
+  });
+
+  it('does not suspend the whole Council when an internal role waits on Mailbox', async () => {
+    const lifecycleEvents: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        const result = completedExecution(input);
+        if (input.role_id !== COUNCIL_AGENTS.proposerA) return result;
+        return {
+          ...result,
+          artifact_refs: [],
+          diagnostics: {
+            ...result.diagnostics,
+            mailbox_outcomes: [
+              {
+                kind: 'request',
+                wait_for_reply: true,
+                delivery_id: 'delivery_waiting',
+                to_role_id: COUNCIL_AGENTS.reviewer,
+              },
+            ],
+          },
+        };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+
+    const result = await provider.runCouncilRound(baseInput(), {
+      onLifecycleEvent: (event) => lifecycleEvents.push(event),
+    });
+
+    expect(result.proposals).toHaveLength(1);
+    expect(result.selected_artifact_refs).toEqual([
+      `artifact_${COUNCIL_AGENTS.synthesizer}`,
+    ]);
+    expect(result.diagnostic_refs).toContain(
+      'COUNCIL_PROPOSAL_FAILED:participant_proposer_0',
+    );
+    expect(lifecycleEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'council.role.failed',
+        payload: expect.objectContaining({
+          participant_id: 'participant_proposer_0',
+          fallback_action: 'continue_with_available_evidence',
+        }),
+      }),
+    );
   });
 
   it('does not turn an unstructured reviewer response into approve', async () => {
@@ -312,22 +488,16 @@ describe('SynthesisAgentCouncilProvider', () => {
         { onLifecycleEvent: (event) => lifecycleEvents.push(event) },
       );
       expect(result.diagnostic_refs).toContain(`${expectedCode}:${failedParticipant}`);
-      expect(requests).toEqual(
-        failedAgent === COUNCIL_AGENTS.synthesizer
-          ? [
-              COUNCIL_AGENTS.proposerA,
-              COUNCIL_AGENTS.proposerB,
-              COUNCIL_AGENTS.reviewer,
-              COUNCIL_AGENTS.synthesizer,
-              COUNCIL_AGENTS.synthesizer,
-            ]
-          : [
-              COUNCIL_AGENTS.proposerA,
-              COUNCIL_AGENTS.proposerB,
-              COUNCIL_AGENTS.reviewer,
-              COUNCIL_AGENTS.synthesizer,
-            ],
+      expect(new Set(requests.slice(0, 2))).toEqual(
+        new Set([COUNCIL_AGENTS.proposerA, COUNCIL_AGENTS.proposerB]),
       );
+      expect(requests.slice(2)).toEqual([
+        COUNCIL_AGENTS.reviewer,
+        COUNCIL_AGENTS.synthesizer,
+        ...(failedAgent === COUNCIL_AGENTS.synthesizer
+          ? [COUNCIL_AGENTS.synthesizer]
+          : []),
+      ]);
       expect(lifecycleEvents).toContainEqual(
         expect.objectContaining({
           type: 'council.role.failed',
@@ -439,6 +609,25 @@ function createFacade(failedRole?: string): AgentExecutionFacade {
         schema_version: SCHEMA_VERSION,
       };
     },
+  };
+}
+
+function completedExecution(input: AgentExecutionRequest) {
+  return {
+    agent_run_id: `agent_run_${input.role_id}`,
+    agent_id: input.role_id,
+    role_id: input.role_id,
+    context_pack_ref: `context_${input.role_id}`,
+    driver_run_result_id: `driver_result_${input.role_id}`,
+    artifact_refs: [createArtifact(`artifact_${input.role_id}`, input.role_id)],
+    transcript_ref: createArtifact(`transcript_${input.role_id}`, input.role_id, 'transcript'),
+    session_id: input.session_id ?? `session_${input.role_id}`,
+    response: 'completed',
+    tool_events: [],
+    diagnostics: { driver_id: `driver_${input.role_id}` },
+    status: 'completed' as const,
+    created_at: '2026-07-07T00:00:00.000Z',
+    schema_version: SCHEMA_VERSION,
   };
 }
 

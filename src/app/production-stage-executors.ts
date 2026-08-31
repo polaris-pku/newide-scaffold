@@ -1017,9 +1017,18 @@ function shouldResumeFinalCouncilPlan(
   result: AgentExecutionResult,
   implementationArtifacts: readonly ArtifactRef[],
 ): boolean {
+  const driverError = result.diagnostics.driver_error;
+  const retryableDriverFailure =
+    result.status === 'failed' &&
+    ((driverError !== null &&
+      typeof driverError === 'object' &&
+      !Array.isArray(driverError) &&
+      Reflect.get(driverError, 'retryable') === true) ||
+      result.diagnostics.driver_error_code === 'EXTERNAL_DRIVER_TRANSPORT_ERROR');
   return (
     result.status === 'interrupted' ||
     (result.status === 'failed' && result.diagnostics.driver_error_code === 'B_BLOCKED') ||
+    retryableDriverFailure ||
     (result.status === 'completed' && implementationArtifacts.length === 0)
   );
 }

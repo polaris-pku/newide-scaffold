@@ -61,6 +61,36 @@ describe('CommandDriverTransport', () => {
     await expect(transport.run(PROMPT)).rejects.toThrow(/Command driver timed out after 50ms/);
   });
 
+  it('kills a Driver only after it stops producing output', async () => {
+    const transport = new CommandDriverTransport({
+      ...nodeCommand(`
+        readInput(() => {
+          setTimeout(() => {}, 60000);
+        });
+      `),
+      inactivityTimeoutMs: 50,
+    });
+
+    await expect(transport.run(PROMPT)).rejects.toThrow(/produced no output for 50ms/);
+  });
+
+  it('does not cap total turn duration while the Driver remains active', async () => {
+    const transport = new CommandDriverTransport({
+      ...nodeCommand(`
+        readInput((raw) => {
+          const heartbeat = setInterval(() => process.stderr.write('active\\n'), 20);
+          setTimeout(() => {
+            clearInterval(heartbeat);
+            process.stdout.write(JSON.stringify(driverRunResult(JSON.parse(raw).task_id)));
+          }, 250);
+        });
+      `),
+      inactivityTimeoutMs: 100,
+    });
+
+    await expect(transport.run(PROMPT)).resolves.toMatchObject({ status: 'succeeded' });
+  });
+
   it('interrupts only the command child owned by the requested run', async () => {
     const transport = new CommandDriverTransport(
       nodeCommand(`

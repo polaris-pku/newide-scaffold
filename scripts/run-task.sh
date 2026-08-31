@@ -14,7 +14,8 @@ DRIVER_RUNNER_INPUT="${ACP_DRIVER_RUNNER_DIR:-$REPO_ROOT/../acp-client-prototype
 # synthesis, and implementation). Fifteen minutes can terminate a healthy M3
 # run during the final implementation turn.
 RUN_TIMEOUT_MS='1800000'
-DRIVER_TIMEOUT_MS="${ACP_DRIVER_TIMEOUT_MS:-300000}"
+# Backward-compatible option name for the maximum silent interval of an ACP turn.
+DRIVER_TIMEOUT_MS="${ACP_DRIVER_INACTIVITY_TIMEOUT_MS:-${ACP_DRIVER_TIMEOUT_MS:-300000}}"
 USE_LOCAL_POSTGRES=0
 SKIP_BUILD=0
 
@@ -35,7 +36,7 @@ Options:
   --state-root PATH         Runtime state and evidence directory
   --driver-runner PATH      ACP client checkout (default: sibling directory)
   --timeout-ms NUMBER       Whole-task timeout (default: 1800000)
-  --driver-timeout-ms NUM   Timeout for each ACP driver call (default: 300000)
+  --driver-timeout-ms NUM   Maximum silent interval for an ACP turn (default: 300000)
   --local-postgres          Start/reuse the repository's local PostgreSQL container
   --skip-build              Use existing backend and ACP client build output
   -h, --help                Show this help
@@ -176,7 +177,7 @@ else
 fi
 
 export ACP_DRIVER_RUNNER_DIR="$DRIVER_RUNNER"
-export ACP_DRIVER_TIMEOUT_MS="$DRIVER_TIMEOUT_MS"
+export ACP_DRIVER_INACTIVITY_TIMEOUT_MS="$DRIVER_TIMEOUT_MS"
 # CLI overlays process.env on .env.local. Read the file first so a LiteLLM
 # embedding config is not forced back to the local hash provider.
 if [[ -z "${NEWIDE_B_EMBEDDING_PROVIDER:-}" && -f "$REPO_ROOT/.env.local" ]]; then
