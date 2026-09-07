@@ -46,6 +46,8 @@
     "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
     "eval:build-pr-context": "tsx eval/scripts/build-sweevo-pr-context.ts",
     "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
+    "eval:role-diversity": "tsx eval/role-diversity/run.ts",
+    "eval:role-diversity:analyze": "tsx eval/role-diversity/analyze.ts",
     "prepare": "husky"
   },
   "lint-staged": {
