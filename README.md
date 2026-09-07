@@ -31,6 +31,30 @@ NEWIDE_B_EMBEDDING_DIMENSIONS=32
 # NEWIDE_COUNCIL_STRATEGY=plan_first
 ```
 
+### 5 个质量维度角色（skills 语料开箱自举，可选）
+
+仓库自带 `skills/` 语料资产（5 个质量维度：正确性 / 可维护性 / 性能 / 可靠性 /
+安全；66 个活动技能 + 9 个路由指针，来源与授权见 `skills/README.md`、各角色
+README 来源表与 `skills/THIRD-PARTY-NOTICES.md`）。在任何一台机器上
+"开箱即用"这 5 个 role agent（`role_correctness` / `role_maintainability` /
+`role_performance` / `role_reliability` / `role_security`，各自带 Persona 与
+技能集）：
+
+1. Node.js `>=22.22.1`、pnpm `>=11.8`（见 `.nvmrc`）；
+2. `.env.local` 增加 `NEWIDE_B_SEED_ROLES=1`——与后端共享同一存储时保持
+   `NEWIDE_B_EMBEDDING_PROVIDER` / `NEWIDE_B_EMBEDDING_DIMENSIONS` 一致
+   （示例 hash + 32，离线可用、无需 embedding API）；
+3. 启动后端：启动日志出现
+   `seeded 66 corpus skills into 5 quality-dimension role agents` 即成功
+   （幂等，可重复启动）；或手动 `pnpm seed:roles` 预览/导入。
+
+校验：`pnpm exec vitest run src/memory/test/skill-corpus-snapshot.test.ts`
+（CI 守卫：语料结构与已提交基线一致，任何改动未重写基线会失败）。
+
+语料更新（维护者）：改语料主源后 `pnpm skills:sync` → `pnpm seed:roles` →
+`pnpm seed:roles:baseline` → 提交。本目录 `skills/` 是随仓库提交的只读资产副本，
+行尾由 `.gitattributes` 强制 LF（保证 sha256 基线跨机稳定）。
+
 固定 Council 工作流（主/副出方案 + 评审 + 合成，主最后实现计划）：设
 `NEWIDE_COUNCIL_STRATEGY=plan_first`、`NEWIDE_DEFAULT_RUN_MODE=council`，
 并用 `NEWIDE_COUNCIL_SEATS` 固定 4 个席位；关闭竞标用

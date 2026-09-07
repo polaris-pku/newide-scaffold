@@ -1,0 +1,3 @@
+# skills/ 语料源码资产：导入 sha256 基线、幂等与 CI 快照测试依赖逐字节稳定，
+# 强制 LF 行尾，禁止 core.autocrlf 在换机 checkout 时转成 CRLF。
+skills/** text eol=lf
