@@ -1,0 +1,401 @@
+{
+  "schema": "newide-skill-baseline/v1",
+  "skills": [
+    {
+      "slug": "agentic-code-reasoning",
+      "role": "correctness",
+      "id": "925cab1e-84da-56cf-95b6-0839fe9b2427",
+      "sha256": "3fe5e8d00dffe2165a386f91d0c31c8cb9c7df807de6bc4e320400f0a718ff6c"
+    },
+    {
+      "slug": "bug-hunter-hunter",
+      "role": "correctness",
+      "id": "474ea5b9-6855-58d8-831d-bd12068cd7b9",
+      "sha256": "44cccbb94f83bb08d7b2e842ca47ad970796622e3492f32addce53d6daa36df1"
+    },
+    {
+      "slug": "bug-hunter-referee",
+      "role": "correctness",
+      "id": "cdb62f5b-63b1-59ca-9bf7-6377aad082b2",
+      "sha256": "dca263489b364febcbd4785253d612fb7e3cfcd2d3728936e119ee18dfb88ba9"
+    },
+    {
+      "slug": "bug-hunter-skeptic",
+      "role": "correctness",
+      "id": "28fc95ea-3995-57c9-80e9-2988604298fd",
+      "sha256": "dfd9db6bbfdbc937575ae42d2c4e6be0ce09f16646c1b71a14e649e7368c9304"
+    },
+    {
+      "slug": "bugsweep",
+      "role": "correctness",
+      "id": "298ac27f-9576-5c6a-9704-adf816b30c31",
+      "sha256": "d58561e26b2e9ffeb70dae71a381552ac91b6f16078866fcfde704d781809fd7"
+    },
+    {
+      "slug": "concurrency-correctness-review",
+      "role": "correctness",
+      "id": "3abb1b0b-744f-53f6-9642-1e791ca92317",
+      "sha256": "10bd5f9a7a617109f950191df26201b6fcffb6d664b0af9de58e5d51e5a8f27d"
+    },
+    {
+      "slug": "coverage-gap-auditor",
+      "role": "correctness",
+      "id": "34b50e4a-7ab3-525b-9920-d6eb07063b34",
+      "sha256": "22ddf40f7fbc22dc415bca60266ccaf2bf469fc7b37369f1e4e799d1933b533b"
+    },
+    {
+      "slug": "fp-check",
+      "role": "correctness",
+      "id": "53df7abf-161f-56ad-ac67-eb414ca72967",
+      "sha256": "a2f21b0b38f67bbd788e66afcfd62db64f6d7283717bd7760e005cac5868082f"
+    },
+    {
+      "slug": "spec-to-code-compliance",
+      "role": "correctness",
+      "id": "b8cfab11-b17f-5d8d-84c6-61eda1b6576b",
+      "sha256": "bd2feebd614cbc35fd8295acb59d9071c122be4d39267ecc251f9ddac83a12b0"
+    },
+    {
+      "slug": "variant-analysis",
+      "role": "correctness",
+      "id": "6584758b-04b0-5c64-8adc-6d46b10965d7",
+      "sha256": "8f185b9a73831e57bef93887590fba8dab4322031cc90cf340654b4b9a7aecf6"
+    },
+    {
+      "slug": "api-contract-review",
+      "role": "maintainability",
+      "id": "81bc62b6-6752-5a31-ac35-c7ea48e8a4c2",
+      "sha256": "ea218bb8108b1d0be3b52e6c629382712549dcd117ca388b72b8416ca483558b"
+    },
+    {
+      "slug": "clean-architecture-reviewer",
+      "role": "maintainability",
+      "id": "5b10f6d9-7207-5b3b-b36f-c85a36d983f3",
+      "sha256": "3d6201f2208a6b561821ef126e10e3e4f0a2bc768532395266b582ffb766b676"
+    },
+    {
+      "slug": "clean-code",
+      "role": "maintainability",
+      "id": "bc8d929c-62db-56c5-9f55-23c29a89dc0b",
+      "sha256": "c18639432d2dfd204849240c1f7df238545327cc6e2ad623b7a0d9e4fa3bb5a4"
+    },
+    {
+      "slug": "evolutionary-naming",
+      "role": "maintainability",
+      "id": "f6ebbf8d-67d4-52e9-8a27-79b4c6db29e6",
+      "sha256": "6c9ca8cfd788cb1706a46101a391f93b6afdb63d0904b8435d826cf9f262fd7f"
+    },
+    {
+      "slug": "module-boundary-reviewer",
+      "role": "maintainability",
+      "id": "2116eb23-fae4-59d1-abaa-08a3d7cd49c4",
+      "sha256": "8b44fc7e73b91d5e0593d5508293e6572df4049a44b8b0ebdf5a78897ab083a3"
+    },
+    {
+      "slug": "refactoring",
+      "role": "maintainability",
+      "id": "7bf39d2a-7c34-5239-848c-5319ac0ad5bc",
+      "sha256": "6277536ac9aabc7ce17814aa1ba0f7065c8dda82257287cd505fa0418f371084"
+    },
+    {
+      "slug": "simplify-swarm",
+      "role": "maintainability",
+      "id": "1cb976d5-406e-5b8c-a606-1b71f52285d9",
+      "sha256": "52e9b14bcdf64e3ef84ed9cc59a0312897ef5c3695125f744d116957dba498e2"
+    },
+    {
+      "slug": "structurize",
+      "role": "maintainability",
+      "id": "a176447c-59e5-5abf-989c-8e0662bad953",
+      "sha256": "723c8bc75cdbc9cde55bcd41043ba1dd78d4382d684df5738b02af98a26d85aa"
+    },
+    {
+      "slug": "tech-debt-planner",
+      "role": "maintainability",
+      "id": "4a0b9423-b926-5682-b6ed-62eb07f9314f",
+      "sha256": "d1b8a8e8d61fc905db93cb9dfaf25f40c554231838fbc5494aef94e5c60bfc68"
+    },
+    {
+      "slug": "android-performance",
+      "role": "performance",
+      "id": "4115b9dc-cb64-5283-b29f-916cb859f9e9",
+      "sha256": "e28e41038fd2c40dd489d0d90f2d12f596bdc9c58a060c1028adca33323e22cd"
+    },
+    {
+      "slug": "backend-performance-review",
+      "role": "performance",
+      "id": "633ba1b1-732d-5af3-94e9-a8cf53ff009b",
+      "sha256": "0a1770ec330cb51c070a442c8d5609b9836974f83c7f622ad34b51b1c1f49972"
+    },
+    {
+      "slug": "caching-cdn-strategy-planner",
+      "role": "performance",
+      "id": "8505deab-1a13-5e1e-9277-a188b9bd7c05",
+      "sha256": "d37bca209a924011dde969b4b776f90de90bd864f48efecf2fcfa70f95a2c5ae"
+    },
+    {
+      "slug": "core-web-vitals-tuner",
+      "role": "performance",
+      "id": "7c7c2e14-238a-51b0-ae71-0c5087bc1d7a",
+      "sha256": "ded38dab4331634ef96d5d2f163f46df01119de9819daf407add81f13629eb6a"
+    },
+    {
+      "slug": "golang-performance",
+      "role": "performance",
+      "id": "715acf4f-87a5-507f-b3a0-187140d54a44",
+      "sha256": "893086b4faa408d8ecef1c9868fe07250881c37ad20f801dee2a057693aa4a39"
+    },
+    {
+      "slug": "load-test-scenario-builder",
+      "role": "performance",
+      "id": "2eaac395-773f-55f4-9650-9059c489d5c2",
+      "sha256": "f1e93f4cc79f78382e293b0cfb0aa778b37e142048eef58a30f05b5bf39e59c9"
+    },
+    {
+      "slug": "performance-budget-setter",
+      "role": "performance",
+      "id": "688fd3fd-5c9b-550d-9989-449b5e75e1ae",
+      "sha256": "404bce21f8bb826b84a826f85ecd621a64d27314021fe03c931af0c4f4f5f93b"
+    },
+    {
+      "slug": "react-performance",
+      "role": "performance",
+      "id": "a40a07a8-df1d-5917-9f13-72574b71f267",
+      "sha256": "eb44b3d8c300e04280e37c050540b587d7853e9fa0345a769ff0d4776fb151d7"
+    },
+    {
+      "slug": "rust-performance-core",
+      "role": "performance",
+      "id": "4bbb0725-d9dd-573e-aaa7-3e36fc99934b",
+      "sha256": "1896654e6951531ff46db15c0347f19381731e346c7f25e1e538c12c962bad90"
+    },
+    {
+      "slug": "sql-query-optimizer",
+      "role": "performance",
+      "id": "c32566cb-4fd7-565f-bd98-63121384817a",
+      "sha256": "833fd754dfdeaece4fad6ff2882bbe9ab21d6c20657a9430552ebd742b5ebbdd"
+    },
+    {
+      "slug": "swift-performance-engineering",
+      "role": "performance",
+      "id": "c820447d-d1e4-5e2f-8c85-e071e91e9068",
+      "sha256": "d7bf145fd50a8802903258ab0d001a4aa0720a8548e4803f016edc6c703b1003"
+    },
+    {
+      "slug": "backup-restore-runbook",
+      "role": "reliability",
+      "id": "bea4340d-f415-5ac4-93c2-2cc64e5434f1",
+      "sha256": "8aa5e7ac38660e64e057711bd799236110779dd64a90c23c0674071e57ddde31"
+    },
+    {
+      "slug": "chaos-engineering",
+      "role": "reliability",
+      "id": "232942f1-ef05-5f48-900f-6fc3f54b39bc",
+      "sha256": "cd5c29aae069fc6e36981955600612d0d38992ed15a0b4f212fed8fb28314ede"
+    },
+    {
+      "slug": "data-resiliency-failure-injection",
+      "role": "reliability",
+      "id": "246779fb-11ea-53d7-8b1b-7a80773c31dc",
+      "sha256": "85c613e5bf4a062fbe7fd5e42e7a6a0223cc157d8901570857806acc41db4cd1"
+    },
+    {
+      "slug": "error-handling-standardizer",
+      "role": "reliability",
+      "id": "75d72e8d-1de1-503b-82a7-be90de0c951d",
+      "sha256": "7720574118f1e52811255db9df17f69eb210e0857b57c1381176a33b78a7cd3e"
+    },
+    {
+      "slug": "evals-ops-guardrails",
+      "role": "reliability",
+      "id": "e9c3bed6-aad2-50f1-a864-5bc77d967605",
+      "sha256": "5758a10748c58a8a21fa9c66e3d994c071da55a4522ae7818924b5b7ce623072"
+    },
+    {
+      "slug": "feature-flags-architect",
+      "role": "reliability",
+      "id": "d9c6be4d-f734-5a9c-9dd6-f171da723abd",
+      "sha256": "2099cdcb1ba8dd62f78df588d181570fad7202b695d0d88503777592f1d5a16d"
+    },
+    {
+      "slug": "incident-response",
+      "role": "reliability",
+      "id": "085c3afc-440b-56ae-89e4-cfaafb1e9def",
+      "sha256": "a3dc9d3dfd78f467a0542ee9c5ca40988409ab7a9355e90f216bb52eaf3da009"
+    },
+    {
+      "slug": "observability-designer",
+      "role": "reliability",
+      "id": "58de012f-6fd9-53bd-98f6-c7eac6cc8e0d",
+      "sha256": "76516782d9bb1df67a2fa61e4a2c1e8672e40ece67fd3c7a70a8fa4bc261408c"
+    },
+    {
+      "slug": "production-autopsy",
+      "role": "reliability",
+      "id": "59267c39-dff8-55c7-8eab-702a3adf9a22",
+      "sha256": "d7e546b04bd2ab71e9229c6efa493ec96ba4ee9891fc2752188ca91554374b3f"
+    },
+    {
+      "slug": "reliability-strategy-builder",
+      "role": "reliability",
+      "id": "ad295acc-7ce2-57b4-a91e-a06643db6d73",
+      "sha256": "e15a89d4b452bdebddbe767e162709022e0d4cfd3e9c14339cfedbdd9d597d16"
+    },
+    {
+      "slug": "rollback-workflow-builder",
+      "role": "reliability",
+      "id": "beb68dcc-8a98-5cfe-92da-43d272523def",
+      "sha256": "d014490eb4b24c0119d52f5a91a4dca73fab6ae7dd63cbaad15331ae47d8608c"
+    },
+    {
+      "slug": "ship-check",
+      "role": "reliability",
+      "id": "c78b670a-5a87-5f2f-8623-c401255541c7",
+      "sha256": "6ff852c34bfc030d7d2318f5f2f68552e8a60b59f4851c0a67bd2fb38f1a8cae"
+    },
+    {
+      "slug": "agentic-supply-chain-detection",
+      "role": "security",
+      "id": "ba145a58-f447-5e4f-b296-089358ee2cbe",
+      "sha256": "c66c82e01d265b8de2844050a6974ddfe9dbab3527ccbc393251186c41bb28a5"
+    },
+    {
+      "slug": "audit-context-building",
+      "role": "security",
+      "id": "af04091d-1e06-558c-b443-ab03e8f43363",
+      "sha256": "99201a7f03eefef1adba3a40414ed41444cb3e446e928fd2714cb40b0f90ce4b"
+    },
+    {
+      "slug": "auth-security-reviewer",
+      "role": "security",
+      "id": "cf0e903f-b4ea-522b-8d53-38e823dbc512",
+      "sha256": "ef277a137f0ad84a3e2006f27db5e851820ef2a9823d81349ece379df65cd825"
+    },
+    {
+      "slug": "authorization-bypass-detection",
+      "role": "security",
+      "id": "ec8d2b44-d070-5a4f-bf12-8bce8b74f00b",
+      "sha256": "3a0d19bc34f54d2cc988ca7fc0a3d05ef9b8e12737d9d2d857aadb49a927fbb0"
+    },
+    {
+      "slug": "cascading-failure-detection",
+      "role": "security",
+      "id": "fb057c4f-c62c-5e1d-910b-219e8d13bb72",
+      "sha256": "92e220a22ed87a9e236c8442eff28b6946be88baefee052410b9ea491faf718e"
+    },
+    {
+      "slug": "cloud-iac-posture-auditor",
+      "role": "security",
+      "id": "b1e62466-361f-5952-b7d7-e3122c636008",
+      "sha256": "e6fd94a7250e8ed30929348b36a957e383634289e51b25ed36474b315f6b424f"
+    },
+    {
+      "slug": "code-security-audit",
+      "role": "security",
+      "id": "2da8d015-928b-5b09-9629-0b5e1ba80859",
+      "sha256": "533ce4931183a2f2395c5203d1ea3f68786266ce324d594e01fd419e87eb38a7"
+    },
+    {
+      "slug": "container-security-auditor",
+      "role": "security",
+      "id": "4d9341e9-56f6-59ec-bfb1-e89d521129d8",
+      "sha256": "3b99b34c0f8dbf8fba553ef47783bf2973902fd2e1f0a86a73e06e6ccf656115"
+    },
+    {
+      "slug": "cryptography-reviewer",
+      "role": "security",
+      "id": "58b58d29-5fef-5387-b1b7-6ebc3c057a8a",
+      "sha256": "d5a904dc736cceaa4392fa9a8158ad1fe6129f14f57f47f40813d2879b935241"
+    },
+    {
+      "slug": "data-leakage-detection",
+      "role": "security",
+      "id": "4ffe2f88-8f6e-5366-8c73-f9a895de41de",
+      "sha256": "85d0bc4d8aa031daec27de105519b24b695e30e39802af69165d25c638a8d3aa"
+    },
+    {
+      "slug": "direct-injection-detection",
+      "role": "security",
+      "id": "8fb714af-6ccd-5218-bbbc-0c5bca28a694",
+      "sha256": "b72c4bd9231350f62d5080fbd78d0c611277745e4b4c89fef04f515501e4ca7d"
+    },
+    {
+      "slug": "human-agent-trust-exploit-detection",
+      "role": "security",
+      "id": "4284d357-1cf4-597e-a298-2dcc1b05392e",
+      "sha256": "83a375c1dac75158f3b63a78482dcc348e53b015828d5a8f646ed19b1729e25e"
+    },
+    {
+      "slug": "indirect-injection-detection",
+      "role": "security",
+      "id": "95b3443c-54e3-5fb3-97e9-65b7bb5ef8f1",
+      "sha256": "93cef14147e4489136716d4d7bea5d123ded3d3838d7f176e1ef73b8e4032c19"
+    },
+    {
+      "slug": "input-validation-sanitization-auditor",
+      "role": "security",
+      "id": "a53b528c-ad29-541c-b51e-52c785d6c56d",
+      "sha256": "6e3b69980d3ccb6ee421801408f71f9a880ed3b86435a8037db9016a9c0ae09d"
+    },
+    {
+      "slug": "inter-agent-comm-security-detection",
+      "role": "security",
+      "id": "1ccbf5a8-89fe-54c5-9b5a-7d2d3a47c226",
+      "sha256": "08a6bf4705bc1955600acf48e2f4e959e9a0b90d564143f1b202e7916c6355ee"
+    },
+    {
+      "slug": "mobile-app-security",
+      "role": "security",
+      "id": "98d43ca2-e9d2-5406-992b-d31e93513475",
+      "sha256": "279c3b9094acdaa85a75787ac890c484afff129279580efe58a3dc0b5b59e1f0"
+    },
+    {
+      "slug": "offensive-api-security",
+      "role": "security",
+      "id": "9752a680-aec5-56a4-a81c-75d1e9dabfc9",
+      "sha256": "58541de0875ed7d2176a485ff21d99a1d2c59e176faffced4ef5e2eadbdb664d"
+    },
+    {
+      "slug": "owasp-asi",
+      "role": "security",
+      "id": "e4470ec2-6809-5231-a874-08e997872356",
+      "sha256": "39c6f4f4026f22b5283e06e740357d26b81d5d52dda2d2f7d3c4d78ae6dec45d"
+    },
+    {
+      "slug": "secrets-scanner",
+      "role": "security",
+      "id": "c991a3a1-55aa-5e8f-9536-4bbc4d5f6468",
+      "sha256": "2cdba316155088de7000636c056bef0a74aab203b7497187709e7675da6ce9da"
+    },
+    {
+      "slug": "security-audit-owasp",
+      "role": "security",
+      "id": "5cffea73-eb67-5401-854f-9dba4074a956",
+      "sha256": "5a00cfd44f8d63fb66c33c767b22d681c4edb4ef07740819918eecca7a31d354"
+    },
+    {
+      "slug": "supply-chain-risk-auditor",
+      "role": "security",
+      "id": "f9aafd59-684a-564a-82a1-c194ffb2e5bc",
+      "sha256": "6b3bef26f140a4366791ab896128478c920ec2e625aae4ec52b15b2d701fce6c"
+    },
+    {
+      "slug": "threat-model-generator",
+      "role": "security",
+      "id": "d90b671d-ae98-5c06-9180-cb3646efa7a8",
+      "sha256": "edacb5c7d752d02b2f4e209082ac1dc56501276ddddf2d995b4b3b50e245bd10"
+    },
+    {
+      "slug": "tool-abuse-detection",
+      "role": "security",
+      "id": "49426f3d-b096-5125-9bab-5ca4e4dd8c21",
+      "sha256": "c93b8efd7840f864b9cb7e9e1f67b8b0f9ffd50eaffc9a1766abc8a858bda69f"
+    },
+    {
+      "slug": "unexpected-code-execution-detection",
+      "role": "security",
+      "id": "5e0dca22-716e-5bf3-a65c-4ee95fc73429",
+      "sha256": "519b3522658b3030a9b34409aef76a274f168d6f41d63ebc6abd44e0c4135d81"
+    }
+  ]
+}

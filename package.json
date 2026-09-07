@@ -46,6 +46,10 @@
     "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
     "eval:build-pr-context": "tsx eval/scripts/build-sweevo-pr-context.ts",
     "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
+    "skills:sync": "node scripts/sync-skills.mjs",
+    "seed:roles": "node --import tsx scripts/seed-roles.ts",
+    "seed:roles:dry": "node --import tsx scripts/seed-roles.ts --dry-run",
+    "seed:roles:baseline": "node --import tsx scripts/seed-roles.ts --write-baseline",
     "prepare": "husky"
   },
   "lint-staged": {

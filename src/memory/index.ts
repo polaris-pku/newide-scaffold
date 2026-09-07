@@ -414,3 +414,33 @@ export type {
   ToolCallResult,
   ToolCallingClient,
 } from './runtime/tool';
+
+// ════════════════════════════════════════════════════════
+//  23. 预置技能语料种子（skills/ 导入 + role 名册）
+// ════════════════════════════════════════════════════════
+
+export {
+  BASELINE_FILE_NAME,
+  CORPUS_ROLES,
+  COUNCIL_TRIO_SLUGS,
+  POINTER_TARGETS,
+  ROLE_AGENT_IDS,
+  buildBaselineManifest,
+  readBaselineManifest,
+  scanCorpus,
+  skillContentHash,
+  slugToSkillId,
+  writeBaselineManifest,
+  type CorpusBaselineManifest,
+  type CorpusRole,
+  type CorpusSkillBaselineEntry,
+  type CorpusSkillFile,
+} from './seeds/skill-corpus';
+export { ROLE_ROSTER, rosterByRole, type RoleSeedSpec } from './seeds/role-roster';
+export {
+  importSkillCorpus,
+  skillTagsFor,
+  type CorpusImportOptions,
+  type CorpusImportReport,
+  type RoleImportSummary,
+} from './seeds/skill-import';
