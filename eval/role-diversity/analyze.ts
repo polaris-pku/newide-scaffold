@@ -7,8 +7,12 @@ if (!resultArgument) {
   throw new Error('Usage: tsx analyze-role-diversity.ts <result-root>');
 }
 
+const experimentSummary = await readJson<ExperimentSummary>(
+  path.join(resultRoot, 'experiment-summary.json'),
+);
 const cellPaths = await findFiles(resultRoot, 'cell.json');
-const cells = await Promise.all(cellPaths.map((file) => readJson<Cell>(file)));
+const discoveredCells = await Promise.all(cellPaths.map((file) => readJson<Cell>(file)));
+const cells = experimentSummary?.cells ?? discoveredCells;
 const completed = cells.filter((cell): cell is Cell => cell?.status === 'completed');
 const groups = new Map<string, Cell[]>();
 for (const cell of completed) {
@@ -266,6 +270,10 @@ interface Cell {
   patch_sha256?: string;
   shared_plan_sha256?: string;
   driver_usage?: unknown;
+}
+
+interface ExperimentSummary {
+  cells: Array<Cell | undefined>;
 }
 
 interface CellMetrics extends Cell {
