@@ -108,7 +108,7 @@ export async function createProductionBRuntime(
     await seedCatalog(storage.repository, bufferRepository);
     // 开箱自举（可选）：NEWIDE_B_SEED_ROLES=1 → skills/ 语料导入为 5 个质量维度 role agent
     if (roleSeedingEnabled(env)) {
-      await seedQualityDimensionRoles(storage.repository, bufferRepository, repoRoot);
+      await seedQualityDimensionRoles(storage.repository, bufferRepository, repoRoot, env);
     }
     return {
       repository: storage.repository,
@@ -304,16 +304,20 @@ async function seedCatalog(
 }
 
 /**
- * 开箱自举：把 scaffold `skills/` 语料导入为 5 个质量维度 role agent（幂等，
- * 复用 skill-import 引擎）。目录缺失时告警跳过（不阻断启动）；导入失败则
- * 抛错让 readiness 检查失败（语料损坏应被运维发现）。
+ * 开箱自举：把 skills/ 语料（目录由 NEWIDE_SKILLS_DIR 指定，缺省
+ * repoRoot/skills）导入为 5 个质量维度 role agent（幂等，复用 skill-import
+ * 引擎）。目录缺失时告警跳过（不阻断启动）；导入失败则抛错让 readiness
+ * 检查失败（语料损坏应被运维发现）。
  */
 async function seedQualityDimensionRoles(
   repository: MemoryRepository,
   bufferRepository: BufferRepository,
   repoRoot: string,
+  env: NodeJS.ProcessEnv,
 ): Promise<void> {
-  const skillsDir = path.join(repoRoot, 'skills');
+  const skillsDir = env.NEWIDE_SKILLS_DIR?.trim()
+    ? path.resolve(env.NEWIDE_SKILLS_DIR.trim())
+    : path.join(repoRoot, 'skills');
   if (!existsSync(skillsDir)) {
     console.warn(
       `[production-b-runtime] ${ROLE_SEEDING_ENV}=1 but no skills corpus at ${skillsDir}; skipping quality-dimension role seeding`,
