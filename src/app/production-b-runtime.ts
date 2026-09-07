@@ -1,9 +1,11 @@
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { Pool } from 'pg';
 import { LiteLLMClient } from '../litellm';
 import {
   FileBufferRepository,
   HashEmbeddingProvider,
+  importSkillCorpus,
   LiteLLMEmbeddingProvider,
   PgMemoryRepository,
   createPGlitePool,
@@ -14,6 +16,14 @@ import {
 
 /** HashEmbeddingProvider 的原生维度，与库中既有 vector(32) 一致。 */
 const HASH_EMBEDDING_DIMENSIONS = 32;
+
+/** 开箱自举开关：NEWIDE_B_SEED_ROLES=1 时启动即把 skills/ 语料导入为 5 个质量维度 role agent（幂等） */
+const ROLE_SEEDING_ENV = 'NEWIDE_B_SEED_ROLES';
+
+function roleSeedingEnabled(env: NodeJS.ProcessEnv): boolean {
+  const value = env[ROLE_SEEDING_ENV]?.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
 
 const MARKET_AGENT_CATALOG = [
   {
@@ -96,6 +106,10 @@ export async function createProductionBRuntime(
       agentStateRoot: path.join(appStateRoot, 'b', 'agent-state'),
     });
     await seedCatalog(storage.repository, bufferRepository);
+    // 开箱自举（可选）：NEWIDE_B_SEED_ROLES=1 → skills/ 语料导入为 5 个质量维度 role agent
+    if (roleSeedingEnabled(env)) {
+      await seedQualityDimensionRoles(storage.repository, bufferRepository, repoRoot);
+    }
     return {
       repository: storage.repository,
       bufferRepository,
@@ -287,6 +301,36 @@ async function seedCatalog(
   for (const roleId of [...existing].sort(compareCodeUnits)) {
     await bufferRepository.ensureAgent(roleId);
   }
+}
+
+/**
+ * 开箱自举：把 scaffold `skills/` 语料导入为 5 个质量维度 role agent（幂等，
+ * 复用 skill-import 引擎）。目录缺失时告警跳过（不阻断启动）；导入失败则
+ * 抛错让 readiness 检查失败（语料损坏应被运维发现）。
+ */
+async function seedQualityDimensionRoles(
+  repository: MemoryRepository,
+  bufferRepository: BufferRepository,
+  repoRoot: string,
+): Promise<void> {
+  const skillsDir = path.join(repoRoot, 'skills');
+  if (!existsSync(skillsDir)) {
+    console.warn(
+      `[production-b-runtime] ${ROLE_SEEDING_ENV}=1 but no skills corpus at ${skillsDir}; skipping quality-dimension role seeding`,
+    );
+    return;
+  }
+  const report = await importSkillCorpus(repository, { rootDir: skillsDir });
+  for (const roleId of report.created_role_ids) {
+    await bufferRepository.ensureAgent(roleId);
+  }
+  const summary =
+    report.created_role_ids.length > 0
+      ? `created ${report.created_role_ids.join(', ')}`
+      : 'all role agents already present (idempotent)';
+  console.log(
+    `[production-b-runtime] seeded ${report.activity_total} corpus skills into ${report.per_role.length} quality-dimension role agents (${summary})`,
+  );
 }
 
 function compareCodeUnits(left: string, right: string): number {
