@@ -14,9 +14,11 @@ import {
   COUNCIL_TRIO_SLUGS,
   readBaselineManifest,
   scanCorpus,
+  skillContentHash,
   slugToSkillId,
   type CorpusRole,
   type CorpusSkillFile,
+  type SkillEmbeddingsManifest,
 } from './skill-corpus';
 import { ROLE_ROSTER, type RoleSeedSpec } from './role-roster';
 
@@ -43,6 +45,25 @@ export interface CorpusImportOptions {
   rootDir: string;
   /** 只计算并报告，不写库（默认 false） */
   dryRun?: boolean;
+  /**
+   * 预计算向量资产（skills/skill-embeddings.json）。提供时以资产向量填充
+   * description_embedding，导入零 embedding 依赖；缺失条目 / sha256 过期 → 抛错
+   * （禁止静默现场向量化）。不提供时退回现场 embed（调用方自行保证 provider
+   * 维度与库 schema 一致）。
+   */
+  embeddings?: SkillEmbeddingsManifest | null;
+}
+
+/** 资产复用的逐条判定结果（dry-run 报告口径） */
+export interface EmbeddingAssetAudit {
+  /** 命中资产且 sha256 一致的技能数 */
+  reuse: number;
+  /** 资产缺失 / 过期（sha256 不一致），导入将抛错的技能数 */
+  stale: number;
+  /** 未提供资产的技能数（不报错，走现场 embed） */
+  absent: number;
+  /** 资产缺失 / 过期的技能 slug（报错文案 / dry-run 展示） */
+  stale_slugs: string[];
 }
 
 export interface RoleImportSummary {
@@ -63,6 +84,8 @@ export interface CorpusImportReport {
   created_role_ids: string[];
   activity_total: number;
   pointer_total: number;
+  /** 资产复用审计（预案指定 embeddings 时才有意义） */
+  embedding_asset?: EmbeddingAssetAudit;
 }
 
 /** 技能级 tags：dim 维度 + slug 分词（过滤停用词）+ corpus-seed；议会三件套加 deployment 标记 */
@@ -91,11 +114,12 @@ function toSkillRecord(
   now: string,
   subSkills: string[],
   version: string,
+  embedding: number[],
 ): SkillRecord {
   return {
     id: slugToSkillId(skill.slug),
     description: skill.description,
-    description_embedding: [],
+    description_embedding: embedding,
     content: skill.body,
     version,
     review_status: 'approved',
@@ -121,6 +145,50 @@ function buildRolePersona(spec: RoleSeedSpec, activityCount: number, now: string
     recent_performance: '等待首个任务。',
     notes: spec.boundary_zh,
     generated_at: now,
+  };
+}
+
+/**
+ * 预计算资产审计与向量表构建。
+ *
+ * 提供资产时：按 id 查找向量且校验 sha256 与当前语料一致 → 复用；任何条目
+ * 缺失或过期 → 报错提示重跑 `pnpm skills:embed`（禁止静默现场向量化）。实际
+ * 导入（dryRun=false）抛错中止；dry-run 只报告可复用/将报错条数，不抛错。
+ * 未提供资产：返回 null 向量表，导入退回现场 embed（调用方负责 provider 维度
+ * 与库一致）。
+ */
+async function buildEmbeddingTable(
+  assets: SkillEmbeddingsManifest | null | undefined,
+  activities: CorpusSkillFile[],
+  dryRun: boolean,
+): Promise<{ byId: Map<string, number[]>; audit: EmbeddingAssetAudit }> {
+  if (!assets) {
+    return {
+      byId: new Map(),
+      audit: { reuse: 0, stale: 0, absent: activities.length, stale_slugs: [] },
+    };
+  }
+  const assetBySlug = new Map(assets.skills.map((entry) => [entry.slug, entry]));
+  const byId = new Map<string, number[]>();
+  const staleSlugs = new Set<string>();
+  for (const activity of activities) {
+    const entry = assetBySlug.get(activity.slug);
+    if (entry === undefined || entry.sha256 !== skillContentHash(activity)) {
+      staleSlugs.add(activity.slug);
+    } else {
+      byId.set(activity.slug, entry.vector);
+    }
+  }
+  const stale = [...staleSlugs].sort();
+  if (!dryRun && stale.length > 0) {
+    throw new Error(
+      `Embedding asset stale/missing for ${stale.length} skill(s): ${stale.join(', ')}. ` +
+        'Re-run `pnpm skills:embed` to regenerate skills/skill-embeddings.json.',
+    );
+  }
+  return {
+    byId,
+    audit: { reuse: byId.size, stale: stale.length, absent: 0, stale_slugs: stale },
   };
 }
 
@@ -155,20 +223,28 @@ export async function importSkillCorpus(
   const baseline = await readBaselineManifest(rootDir);
   const priorIdToSlug = new Map((baseline?.skills ?? []).map((entry) => [entry.id, entry.slug]));
 
+  const activities = files.filter((file) => file.kind === 'activity');
+  const { byId: embeddingById, audit } = await buildEmbeddingTable(
+    options.embeddings,
+    activities,
+    dryRun,
+  );
+
   const registered = new Set(await repository.listAgentIds());
   const now = nowTimestamp();
   const report: CorpusImportReport = {
     per_role: [],
     created_role_ids: [],
-    activity_total: files.filter((file) => file.kind === 'activity').length,
+    activity_total: activities.length,
     pointer_total: files.filter((file) => file.kind === 'pointer').length,
+    ...(options.embeddings ? { embedding_asset: audit } : {}),
   };
 
   for (const spec of ROLE_ROSTER) {
-    const activities = (activityByRole.get(spec.role) ?? [])
+    const roleActivities = (activityByRole.get(spec.role) ?? [])
       .slice()
       .sort((left, right) => left.slug.localeCompare(right.slug));
-    const currentIds = new Set(activities.map((activity) => slugToSkillId(activity.slug)));
+    const currentIds = new Set(roleActivities.map((activity) => slugToSkillId(activity.slug)));
     const agentExisted = registered.has(spec.role_id);
 
     if (!agentExisted) {
@@ -193,7 +269,7 @@ export async function importSkillCorpus(
     let added = 0;
     let updated = 0;
     let skipped = 0;
-    for (const activity of activities) {
+    for (const activity of roleActivities) {
       const id = slugToSkillId(activity.slug);
       const previous = existingById.get(id);
       const changed =
@@ -201,7 +277,14 @@ export async function importSkillCorpus(
         (previous.content !== activity.body || previous.description !== activity.description);
       const version = previous === undefined || !changed ? '1.0.0' : bumpVersion(previous.version);
       const subSkills = (absorbersByHost.get(activity.slug) ?? []).slice().sort();
-      const record = toSkillRecord(activity, spec.role_id, now, subSkills, version);
+      const record = toSkillRecord(
+        activity,
+        spec.role_id,
+        now,
+        subSkills,
+        version,
+        embeddingById.get(activity.slug) ?? [],
+      );
 
       if (previous === undefined) {
         if (!dryRun) {

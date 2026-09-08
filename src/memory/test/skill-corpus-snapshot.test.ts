@@ -17,6 +17,7 @@ import {
   ROLE_AGENT_IDS,
   buildBaselineManifest,
   readBaselineManifest,
+  readSkillEmbeddings,
   scanCorpus,
   slugToSkillId,
 } from '../seeds/skill-corpus';
@@ -124,6 +125,31 @@ describe('skill corpus source assets (skills/)', () => {
     expect(stored, 'baseline missing; run `pnpm seed:roles:baseline`').not.toBeNull();
     expect(computed.skills).toEqual(stored?.skills);
     expect(computed.skills).toHaveLength(66);
+  });
+
+  it('向量资产存在且 schema/维度/对齐基线：skill-embeddings.json 为有效资产', async () => {
+    const asset = await readSkillEmbeddings(CORPUS_ROOT);
+    expect(asset, 'asset missing; run `pnpm skills:embed`').not.toBeNull();
+    expect(asset?.schema).toBe('newide-skill-embeddings/v1');
+    expect(asset?.embed_input).toBe('description');
+    expect(typeof asset?.model).toBe('string');
+    expect(asset?.model.length).toBeGreaterThan(0);
+    expect(asset?.dimensions).toBe(1024);
+    expect(asset?.skills).toHaveLength(66);
+
+    // 每条技能与基线同 id/sha256 对齐，且向量维度一致
+    const baseline = await readBaselineManifest(CORPUS_ROOT);
+    const bySlug = new Map(baseline?.skills.map((entry) => [entry.slug, entry]));
+    for (const entry of asset!.skills) {
+      const base = bySlug.get(entry.slug);
+      expect(base, `asset entry ${entry.slug} must be in baseline`).toBeDefined();
+      expect(entry.id).toBe(base!.id);
+      expect(entry.sha256).toBe(base!.sha256);
+      expect(entry.vector).toHaveLength(asset!.dimensions);
+      for (const value of entry.vector) {
+        expect(Number.isFinite(value)).toBe(true);
+      }
+    }
   });
 
   it('role 名册覆盖全部语料维度，role_id 与维度映射一致', async () => {

@@ -61,6 +61,9 @@ export const ROLE_README_FILE_NAME = 'README.md';
 /** 快照基线文件名（skills/ 下，导入后由 --write-baseline 生成并提交） */
 export const BASELINE_FILE_NAME = 'skill-manifest.baseline.json';
 
+/** 预计算向量资产文件名（skills/ 下，由 pnpm skills:embed 生成并提交） */
+export const EMBEDDINGS_FILE_NAME = 'skill-embeddings.json';
+
 export interface CorpusSkillFile {
   /** 目录名（= frontmatter name） */
   slug: string;
@@ -89,6 +92,40 @@ export interface CorpusBaselineManifest {
   schema: 'newide-skill-baseline/v1';
   /** 仅活动技能（指针不入库） */
   skills: CorpusSkillBaselineEntry[];
+}
+
+/**
+ * 单一技能预计算向量资产条目。sha256 与基线条目同源同值（skillContentHash），
+ * 导入时用于检测"语料已变"→ 资产过期，判定后须重跑 pnpm skills:embed。
+ */
+export interface SkillEmbeddingAssetEntry {
+  slug: string;
+  role: CorpusRole;
+  /** 确定性技能 ID（uuid v5），与基线条目一致 */
+  id: string;
+  /** 内容哈希（sha256 hex），与基线 build 对齐 */
+  sha256: string;
+  /** 向量化对象：SKILL.md frontmatter description；维度 = 资产 dimensions */
+  vector: number[];
+}
+
+/** 预计算向量资产清单（skills/skill-embeddings.json，由 embed-corpus.mjs 生成） */
+export interface SkillEmbeddingsManifest {
+  schema: 'newide-skill-embeddings/v1';
+  /** 实际模型名（与 LiteLLM embedding.yaml embed task 一致） */
+  model: string;
+  /** LiteLLM provider（如 openai） */
+  provider: string;
+  /** embedding 端点（注明用，不含 key） */
+  base_url: string;
+  /** 向量维度（= EMBEDDING_DIMENSIONS） */
+  dimensions: number;
+  /** 生成时间 ISO */
+  created_at: string;
+  /** 向量化对象 */
+  embed_input: 'description';
+  /** 仅活动技能（指针不入资产不入库） */
+  skills: SkillEmbeddingAssetEntry[];
 }
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
@@ -262,6 +299,19 @@ export async function readBaselineManifest(
   try {
     const raw = await fs.readFile(filePath, 'utf8');
     return JSON.parse(raw) as CorpusBaselineManifest;
+  } catch {
+    return null;
+  }
+}
+
+/** 读取已提交的预计算向量资产（不存在返回 null） */
+export async function readSkillEmbeddings(
+  rootDir: string,
+): Promise<SkillEmbeddingsManifest | null> {
+  const filePath = path.join(rootDir, EMBEDDINGS_FILE_NAME);
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw) as SkillEmbeddingsManifest;
   } catch {
     return null;
   }

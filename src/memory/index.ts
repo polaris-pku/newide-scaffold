@@ -78,6 +78,7 @@ export {
   HashEmbeddingProvider,
   defaultHashEmbeddingProvider,
 } from './adapters/hash-embedding-provider';
+export { AssetEmbeddingProvider } from './adapters/asset-embedding-provider';
 
 // ════════════════════════════════════════════════════════
 //  4. LLM 处理适配器（通过 LlmClient 接口依赖注入）
@@ -427,14 +428,18 @@ export {
   ROLE_AGENT_IDS,
   buildBaselineManifest,
   readBaselineManifest,
+  readSkillEmbeddings,
   scanCorpus,
   skillContentHash,
   slugToSkillId,
   writeBaselineManifest,
+  EMBEDDINGS_FILE_NAME,
   type CorpusBaselineManifest,
   type CorpusRole,
   type CorpusSkillBaselineEntry,
   type CorpusSkillFile,
+  type SkillEmbeddingsManifest,
+  type SkillEmbeddingAssetEntry,
 } from './seeds/skill-corpus';
 export { ROLE_ROSTER, rosterByRole, type RoleSeedSpec } from './seeds/role-roster';
 export {
@@ -442,5 +447,6 @@ export {
   skillTagsFor,
   type CorpusImportOptions,
   type CorpusImportReport,
+  type EmbeddingAssetAudit,
   type RoleImportSummary,
 } from './seeds/skill-import';
