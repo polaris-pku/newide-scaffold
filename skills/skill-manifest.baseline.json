@@ -17,7 +17,7 @@
       "slug": "bug-hunter-referee",
       "role": "correctness",
       "id": "cdb62f5b-63b1-59ca-9bf7-6377aad082b2",
-      "sha256": "dca263489b364febcbd4785253d612fb7e3cfcd2d3728936e119ee18dfb88ba9"
+      "sha256": "618adc44db8ef16cfa71f700f8541374b3bb7e1f7865e2d6b64431536b9c776d"
     },
     {
       "slug": "bug-hunter-skeptic",
@@ -29,7 +29,7 @@
       "slug": "bugsweep",
       "role": "correctness",
       "id": "298ac27f-9576-5c6a-9704-adf816b30c31",
-      "sha256": "d58561e26b2e9ffeb70dae71a381552ac91b6f16078866fcfde704d781809fd7"
+      "sha256": "583ffe4cb3578bf41cd3421de82912907f2a2e3f15e931b8d37eadaaedd75be4"
     },
     {
       "slug": "concurrency-correctness-review",
@@ -71,19 +71,19 @@
       "slug": "clean-architecture-reviewer",
       "role": "maintainability",
       "id": "5b10f6d9-7207-5b3b-b36f-c85a36d983f3",
-      "sha256": "3d6201f2208a6b561821ef126e10e3e4f0a2bc768532395266b582ffb766b676"
+      "sha256": "51de9e1fea56978402b97e4b459414a621cb389699ab5f7eb3a43113ca47ec03"
     },
     {
       "slug": "clean-code",
       "role": "maintainability",
       "id": "bc8d929c-62db-56c5-9f55-23c29a89dc0b",
-      "sha256": "c18639432d2dfd204849240c1f7df238545327cc6e2ad623b7a0d9e4fa3bb5a4"
+      "sha256": "99a10f1f02f005b37a84f7bbb716106e4ddf0e06d80743533ed4e69a27773609"
     },
     {
       "slug": "evolutionary-naming",
       "role": "maintainability",
       "id": "f6ebbf8d-67d4-52e9-8a27-79b4c6db29e6",
-      "sha256": "6c9ca8cfd788cb1706a46101a391f93b6afdb63d0904b8435d826cf9f262fd7f"
+      "sha256": "9841c1836d0952084376221cec22b15e8fc30933730a5942251bfa728c21299d"
     },
     {
       "slug": "module-boundary-reviewer",
@@ -95,7 +95,7 @@
       "slug": "refactoring",
       "role": "maintainability",
       "id": "7bf39d2a-7c34-5239-848c-5319ac0ad5bc",
-      "sha256": "6277536ac9aabc7ce17814aa1ba0f7065c8dda82257287cd505fa0418f371084"
+      "sha256": "b86a50c233c44c52179ad543b0cba4444c6e0e5c533b949582acdecda5a0d63b"
     },
     {
       "slug": "simplify-swarm",
@@ -125,7 +125,7 @@
       "slug": "backend-performance-review",
       "role": "performance",
       "id": "633ba1b1-732d-5af3-94e9-a8cf53ff009b",
-      "sha256": "0a1770ec330cb51c070a442c8d5609b9836974f83c7f622ad34b51b1c1f49972"
+      "sha256": "86898dd8bc218bca1543b7a179e0121aa57b2522a2be8b93a0e6f831246f19cb"
     },
     {
       "slug": "caching-cdn-strategy-planner",
@@ -167,7 +167,7 @@
       "slug": "rust-performance-core",
       "role": "performance",
       "id": "4bbb0725-d9dd-573e-aaa7-3e36fc99934b",
-      "sha256": "1896654e6951531ff46db15c0347f19381731e346c7f25e1e538c12c962bad90"
+      "sha256": "5271a8ee3bb979055abb0989c88126c15aef9c97eeecd58442bef660980992c0"
     },
     {
       "slug": "sql-query-optimizer",
@@ -179,7 +179,7 @@
       "slug": "swift-performance-engineering",
       "role": "performance",
       "id": "c820447d-d1e4-5e2f-8c85-e071e91e9068",
-      "sha256": "d7bf145fd50a8802903258ab0d001a4aa0720a8548e4803f016edc6c703b1003"
+      "sha256": "545448bcfcd1ced0fbe452d567dfd06b29076e262ffeac0bf915dc667de8d610"
     },
     {
       "slug": "backup-restore-runbook",
@@ -317,7 +317,7 @@
       "slug": "direct-injection-detection",
       "role": "security",
       "id": "8fb714af-6ccd-5218-bbbc-0c5bca28a694",
-      "sha256": "b72c4bd9231350f62d5080fbd78d0c611277745e4b4c89fef04f515501e4ca7d"
+      "sha256": "4f2b0d0e1b53e4844f48034251c70212d8de4ec436da773ca55e5fab3445bf3f"
     },
     {
       "slug": "human-agent-trust-exploit-detection",
@@ -359,7 +359,7 @@
       "slug": "owasp-asi",
       "role": "security",
       "id": "e4470ec2-6809-5231-a874-08e997872356",
-      "sha256": "39c6f4f4026f22b5283e06e740357d26b81d5d52dda2d2f7d3c4d78ae6dec45d"
+      "sha256": "a1dc0a66189649e945dd3a88febb3e4dea320682c1d484077c400de7b87a3ddb"
     },
     {
       "slug": "secrets-scanner",
