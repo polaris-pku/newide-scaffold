@@ -1,0 +1,18 @@
+{
+  "subset_id": "v0-dask-3-prctx",
+  "description": "Three dask instances from v0-repo-full-prctx: multi-fix, noisy release, and localization.",
+  "source_dataset_version": "hf_out-v1-prctx",
+  "source_jsonl": "eval/data/sweevo-v0-repo-full-prctx.jsonl",
+  "selection_rule": "Hand-picked from v0-repo-full-prctx: 2023.3.2_2023.4.0 (noisy monthly release), 2023.6.0_2023.6.1 (multi-subsystem patch), 2024.3.1_2024.4.0 (value_counts needle).",
+  "environment_notes": [
+    "Requires eval/data/sweevo-v0-repo-full-prctx.jsonl (pnpm eval:build-pr-context -- --subset v0-repo-full).",
+    "Use with NEWIDE_SWE_EVO_BLOCK_INTERNET=1.",
+    "F2P counts are inflated by test-collection imports on 2023.4.0 and 2023.6.1; score by independent fix clusters.",
+    "2024.3.1_2024.4.0 F2P is GroupBy.value_counts all-NA partitions only; changelog highlights for query planner / GPU dashboard are out-of-repo."
+  ],
+  "instance_ids": [
+    "dask__dask_2023.3.2_2023.4.0",
+    "dask__dask_2023.6.0_2023.6.1",
+    "dask__dask_2024.3.1_2024.4.0"
+  ]
+}
