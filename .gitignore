@@ -61,3 +61,10 @@ scripts/repro-*.ts
 
 *[^ -~]*
 docs/
+
+# 角色分歧实验：从本地运行归档回收的问题陈述（派生数据，不入仓）
+eval/data/*.recovered.jsonl
+eval/data/*.provenance.json
+
+# 本地临时脚本 / 派生数据（金标提取、离线核验脚本等），不入仓
+temp/

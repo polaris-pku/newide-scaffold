@@ -5,9 +5,6 @@ description: Detects leaked API keys, tokens, passwords, and credentials in code
 
 # Secrets Scanner
 
-> 边界标注（2026-09-07）：密钥专项（检测规则 + pre-commit/CI + 泄露处置）；全量审计内的密钥项并入 code-security-audit 处理。
-> Boundary (2026-09-07): secrets specialist (rules, pre-commit/CI, leak remediation); secret items inside a full audit are handled by code-security-audit.
-
 Detect and prevent leaked credentials in your codebase.
 
 ## Secret Detection Patterns
@@ -154,121 +151,6 @@ jobs:
           base: ${{ github.event.repository.default_branch }}
           head: HEAD
           extra_args: --debug --only-verified
-```
-
-## Custom Secret Scanner
-
-```typescript
-// scripts/scan-secrets.ts
-import * as fs from "fs";
-import * as path from "path";
-
-interface SecretPattern {
-  name: string;
-  regex: RegExp;
-  severity: "critical" | "high" | "medium";
-}
-
-const SECRET_PATTERNS: SecretPattern[] = [
-  {
-    name: "AWS Access Key",
-    regex: /(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}/g,
-    severity: "critical",
-  },
-  {
-    name: "Private Key",
-    regex: /-----BEGIN (RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----/g,
-    severity: "critical",
-  },
-  {
-    name: "Generic API Key",
-    regex:
-      /['"]?[a-zA-Z0-9_-]*api[_-]?key['"]?\s*[:=]\s*['"][a-zA-Z0-9]{32,}['"]/gi,
-    severity: "high",
-  },
-  {
-    name: "Database URL",
-    regex: /(postgresql|mysql|mongodb):\/\/[^\s:]+:[^\s@]+@[^\s\/]+/gi,
-    severity: "critical",
-  },
-  {
-    name: "JWT Token",
-    regex: /eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*/g,
-    severity: "high",
-  },
-];
-
-interface SecretFinding {
-  file: string;
-  line: number;
-  column: number;
-  pattern: string;
-  match: string;
-  severity: string;
-}
-
-function scanFile(filePath: string): SecretFinding[] {
-  const findings: SecretFinding[] = [];
-  const content = fs.readFileSync(filePath, "utf-8");
-  const lines = content.split("\n");
-
-  lines.forEach((line, lineIndex) => {
-    SECRET_PATTERNS.forEach((pattern) => {
-      const matches = line.matchAll(pattern.regex);
-
-      for (const match of matches) {
-        findings.push({
-          file: filePath,
-          line: lineIndex + 1,
-          column: match.index || 0,
-          pattern: pattern.name,
-          match: match[0].substring(0, 50) + "...",
-          severity: pattern.severity,
-        });
-      }
-    });
-  });
-
-  return findings;
-}
-
-function scanDirectory(dir: string): SecretFinding[] {
-  const findings: SecretFinding[] = [];
-  const files = fs.readdirSync(dir, { withFileTypes: true });
-
-  const ignorePaths = ["node_modules", ".git", "dist", "build"];
-
-  files.forEach((file) => {
-    const fullPath = path.join(dir, file.name);
-
-    if (file.isDirectory() && !ignorePaths.includes(file.name)) {
-      findings.push(...scanDirectory(fullPath));
-    } else if (file.isFile()) {
-      findings.push(...scanFile(fullPath));
-    }
-  });
-
-  return findings;
-}
-
-// Run scan
-const findings = scanDirectory("./src");
-
-if (findings.length > 0) {
-  console.error("🚨 Secrets detected!\n");
-
-  findings.forEach((f) => {
-    console.error(
-      `[${f.severity.toUpperCase()}] ${f.file}:${f.line}:${f.column}`
-    );
-    console.error(`  Pattern: ${f.pattern}`);
-    console.error(`  Match: ${f.match}\n`);
-  });
-
-  process.exit(1);
-} else {
-  console.log("✅ No secrets detected");
-}
 ```
 
 ## Remediation Steps
@@ -450,16 +332,3 @@ async function monitorSecretUsage(secretName: string) {
 5. **Least privilege**: Minimal secret access
 6. **Audit logs**: Track secret access
 7. **Incident response**: Have remediation playbook ready
-
-## Output Checklist
-
-- [ ] Gitleaks configuration created
-- [ ] Pre-commit hooks installed
-- [ ] CI secret scanning configured
-- [ ] Custom scanner implemented (optional)
-- [ ] Remediation playbook documented
-- [ ] Secret management best practices
-- [ ] Environment validation
-- [ ] Monitoring and alerts
-- [ ] .gitignore includes .env files
-- [ ] Team trained on secret handling

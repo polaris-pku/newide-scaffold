@@ -9,8 +9,8 @@ description: 'Applies safe, continuous refactoring that improves structure witho
 
 > 蒸馏自 Teqqles/cleanerCodeAISkills（skills/refactoring）。原为 6 文件（SKILL.md + 5 份语言示例参考），已内联合并为单文件。
 > Distilled from Teqqles/cleanerCodeAISkills (skills/refactoring); originally 6 files (SKILL.md + 5 per-language example references), now inlined as text.
-> 整合说明（2026-09-07）：本技能已收编 maintainability/cyclomatic-complexity-refactor（圈复杂度专项），其测量/战术/硬规则并入文末；cyclomatic-complexity-refactor 目录保留为指针。
-> Integration 2026-09-07: cyclomatic-complexity refactor tactic folded in; its directory is now a pointer.
+> 整合说明（2026-09-07）：圈复杂度（cyclomatic-complexity）专项的测量/战术/硬规则已并入文末。
+> Integration 2026-09-07: the cyclomatic-complexity tactic (measurement, tactics, hard rules) is folded in at the end.
 
 ## When to Use
 
@@ -38,6 +38,7 @@ Large refactors are hard to review, easy to break, and hard to revert.
 - Run the tests after every step: not at the end.
 - Write tests before refactoring if none exist.
 - The test suite proves behaviour has not changed.
+- The one exception is a *provably inert* edit — deleting something grep-verified as unreferenced, where no behaviour can change. There a syntax check plus an import/smoke check suffices; a behaviour-adjacent refactor never qualifies.
 
 ### Refactoring Must Not Alter Observable Behaviour
 A refactor changes structure, not behaviour.
@@ -56,7 +57,7 @@ Dead code confuses every reader who must determine whether it matters.
 
 ### Simplify Complex Logic Into Named Functions
 - Extract complex conditionals into a function named after the decision: `isEligibleForDiscount()` not `if (age > 65 && tier == 2)`.
-- Extract logic into named functions when the name adds meaning, even if used once.
+- Extract logic into named functions when the name adds meaning, even if used once — this bullet is about naming a *decision*, not about deduplicating (duplication has its own, separate threshold).
 - Each function operates at one level of abstraction.
 
 ### Replace Magic Values With Named Constants
@@ -111,7 +112,7 @@ if (response.status == HTTP_TOO_MANY_REQUESTS) {
 - [ ] Nesting flattened with early returns / guards (Scala: flat `match` on `Option`).
 - [ ] Leave the code clearer than you found it (Boy Scout Rule).
 
-## Cyclomatic Complexity Tactic — measure first, then refactor (folded in from cyclomatic-complexity-skill)
+## Cyclomatic Complexity Tactic — measure first, then refactor
 
 > Provenance: 并入自 saurabhkumar8112/cyclomatic-complexity-skill（repo: https://github.com/saurabhkumar8112/cyclomatic-complexity-skill，path: skills/cyclomatic-complexity，license unknown — see repo）。
 
@@ -123,7 +124,7 @@ CC = decision points + 1. Decision points: `if`, `else if`, `case`, loops, `catc
 
 Project linter config wins. If eslintrc, radon config, sonar config, or similar sets a complexity threshold, use that. No config: use defaults below.
 
-Thresholds:
+Thresholds (this skill's starting default, not a standard — tune them to the project's own linter and keep them stable within a run):
 - 1-5: fine, leave alone
 - 6-10: watch, refactor if touching anyway
 - 11-15: refactor now

@@ -10,7 +10,7 @@
  * 服用方 seed 导入时直接复用这份向量（离线、确定性、不现场向量化）。
  *
  * 用法（scaffold 根目录）：
- *   pnpm skills:embed            # 全量 66 条，需 .env.local 已有 embedding 服务配置
+ *   pnpm skills:embed            # 全量活动技能（当前 60 条），需 .env.local 已有 embedding 服务配置
  *   pnpm skills:embed --limit 2  # 只跑前 N 条（dry 验证维度/连通性，不落盘）
  *   pnpm skills:embed --from D:/path/to/skills
  *

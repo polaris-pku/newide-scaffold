@@ -120,6 +120,8 @@ logger.error("Payment processing failed", {
 
 ## Safe Client Messages
 
+The reliability concern is a **stable client contract**: every unexpected failure maps to one predictable message so callers can rely on the shape. (Whether that mapping leaks internals is a separate, out-of-scope concern.)
+
 ```typescript
 // Never expose internal errors to clients
 const getSafeErrorMessage = (err: Error): string => {

@@ -98,10 +98,8 @@ Every registry-verified package resolved by a supported lockfile beyond the dire
 
 ## Reading the report
 
-- **Unassessable is not risk.** PyPI publishes no maintainer ACL and Go has no registry; those rows say what could not be known, not what is wrong.
 - **The coverage table bounds every claim.** "No advisories" means "none among what was assessed" — check the assessed count before repeating a clean verdict.
 - **Quote figures verbatim.** Do not re-derive, round, or embellish the report's numbers; every one is reproducible from the artifact.
-- **Absence from the findings is not endorsement.** A dependency with no findings was measured against these criteria only.
 
 Report layout (renderer order, chosen for blast radius): header (subject, scanned path, commit, manifests read, scan time, direct-dependency count by ecosystem) → **Summary** (advisory headline that is honest about version sources — "checked at the versions this project resolves" is only claimed when every version came from the project; otherwise it names how many were latest-release/go.mod-minimum fallbacks; transitive summary; N of M flagged and how many reach production; and the **weakest coverage** figure — the criterion established for the fewest dependencies, because a reader must not infer safety from silence) → production-dependency section → findings (Tier A+B first, then upstream Scorecard hygiene separately) → transitive advisories → informational counts → per-tier coverage table → not-assessable rows → method and caveats (scope notes, unread lockfiles, umbrella-package caveat — e.g. rails 5.0.0 reports 0 advisories where actionpack 5.0.0 reports 10 — cache statistics). Third-party strings are escaped into report prose/tables (newlines collapsed, `|` and `[` escaped, backticks neutralised in code spans) so hostile deprecation text cannot forge headings or truncate tables.
 

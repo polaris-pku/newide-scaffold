@@ -5,32 +5,19 @@ description: Designs production observability - metrics, structured logs, tracin
 
 # Observability Designer (POWERFUL)
 
-**Category:** Engineering  
-**Tier:** POWERFUL  
-**Description:** Design comprehensive observability strategies for production systems including SLI/SLO frameworks, alerting optimization, and dashboard generation.
-
 ## Overview
 
 Observability Designer creates production-ready dashboards, alert configurations, and monitoring strategies across the three pillars (metrics, logs, traces).
 
-**When NOT to use → slo-architect.** For SLO/SLI design with error-budget math, multi-window burn-rate alerting thresholds, and SLO review gates, route to `slo-architect` — it is the authoritative skill for that half. This skill's `slo_designer.py` produces a quick scaffold only. This skill's lane: dashboards (`dashboard_generator.py`) and alert-noise reduction (`alert_optimizer.py`).
+**Scope boundary.** SLO/SLI *definitions* — error-budget math, multi-window burn-rate thresholds, SLO review gates — are out of scope here. This skill consumes the SLIs it agrees and turns them into measurable signals: dashboards, alert rules, and instrumentation. It does not define SLOs.
 
-## Quick Start
+## How to produce the artifacts
 
-```bash
-# Dashboard spec (Grafana JSON + docs) for a service
-python3 scripts/dashboard_generator.py --service-type api --name payments --criticality critical --role sre --format grafana -o dashboard.json --doc-output dashboard.md
+- **Dashboard spec** (Grafana JSON + doc) — parameterize by service type, name, criticality, and audience role.
+- **Alert-config analysis** — read the existing alert config and report noise, duplicates, and coverage gaps *first*; only emit an optimized config once that report has been reviewed.
+- **SLO scaffold** — a quick skeleton only; the real error-budget math is out of scope here.
 
-# Analyze an existing alert config for noise, duplicates, and coverage gaps
-python3 scripts/alert_optimizer.py --input alerts.json --analyze-only --report alert_report.json
-# ...then emit the optimized config once the report is reviewed:
-python3 scripts/alert_optimizer.py --input alerts.json --output alerts_optimized.json
-
-# Quick SLO scaffold (hand off to slo-architect for the real error-budget work)
-python3 scripts/slo_designer.py --service-type api --criticality high --user-facing true --service-name payments -o slo_scaffold.json
-```
-
-**Verification loop:** after deploying optimized alerts, track the report's noise metrics for one on-call rotation — if the actionable-alert ratio didn't improve, re-run `--analyze-only` against the live config and iterate. Import the generated dashboard into Grafana and confirm every golden-signal panel renders with live data before closing the task.
+**Verification loop:** after deploying optimized alerts, track the noise metrics for one on-call rotation — if the actionable-alert ratio did not improve, re-analyze the live config and iterate. Import the generated dashboard into Grafana and confirm every golden-signal panel renders with live data before closing the task.
 
 ## Core Competencies
 
@@ -68,8 +55,8 @@ python3 scripts/slo_designer.py --service-type api --criticality high --user-fac
 
 #### Information Architecture
 - **Hierarchy:** Overview → Service → Component → Instance drill-down paths
-- **Golden Ratio:** 80% operational metrics, 20% exploratory metrics
-- **Cognitive Load:** Maximum 7±2 panels per dashboard screen
+- **Purpose mix:** weight the dashboard toward operational signals, leaving room for exploratory ones — the split is a judgement call for the service, not a fixed ratio
+- **Cognitive Load:** keep a screen to what one on-call person can scan at a glance; split it rather than crowd it
 - **User Journey:** Role-based dashboard personas (SRE, Developer, Executive)
 
 #### Visualization Best Practices
@@ -177,6 +164,8 @@ python3 scripts/slo_designer.py --service-type api --criticality high --user-fac
 
 ### Cost Optimization for Observability
 
+The retention and sampling choices below keep the signal alive under a bounded telemetry budget. (Whether the ingestion spend itself is worth it — a cost-efficiency judgment — is out of scope here.)
+
 #### Data Management
 - **Metric Retention:** Tiered retention based on metric importance
 - **Log Sampling:** Intelligent sampling to reduce ingestion costs
@@ -189,28 +178,15 @@ python3 scripts/slo_designer.py --service-type api --criticality high --user-fac
 - **Ingestion Rate Limiting:** Controlled data ingestion to manage costs
 - **Cardinality Management:** High-cardinality metric detection and mitigation
 
-## Scripts Overview
+## Method: turning agreed SLIs into signals
 
-This skill includes three powerful Python scripts for comprehensive observability design:
+### SLI selection — consuming the SLO owner's definitions
 
-### 1. SLO Designer (`slo_designer.py`)
-Generates complete SLI/SLO frameworks based on service characteristics:
-- **Input:** Service description JSON (type, criticality, dependencies)
-- **Output:** SLI definitions, SLO targets, error budgets, burn rate alerts, SLA recommendations
-- **Features:** Multi-window burn rate calculations, error budget policies, alert rule generation
-
-### 2. Alert Optimizer (`alert_optimizer.py`)
-Analyzes and optimizes existing alert configurations:
-- **Input:** Alert configuration JSON with rules, thresholds, and routing
-- **Output:** Optimization report and improved alert configuration
-- **Features:** Noise detection, coverage gaps, duplicate identification, threshold optimization
-
-### 3. Dashboard Generator (`dashboard_generator.py`)
-Creates comprehensive dashboard specifications:
-- **Input:** Service/system description JSON
-- **Output:** Grafana-compatible dashboard JSON and documentation
-- **Features:** Golden signals coverage, RED/USE methods, drill-down paths, role-based views
-
+These are the parameters you *wire*, not definitions you own: the SLO/error-budget math and burn-rate thresholds are out of scope here (see the boundary note above).
+- **Pick SLIs that track user experience, not internals**: availability (ratio of good requests), latency (a percentile under a threshold), and — for request-driven services — the RED tuple (Rate, Errors, Duration). Resource health uses USE (Utilization, Saturation, Errors).
+- **Express each SLI as a ratio of good events to total events** over a rolling window; the SLO is the target ratio (e.g. 99.9% over 30 days).
+- **Error budget = 100% − SLO**, converted to allowed bad-minutes (0.1% of 30 days ≈ 43.2 min). The budget is the currency for release-velocity decisions.
+- **Burn-rate alerting**: alert on how fast the budget is consumed. A fast-burn short window (e.g. 2% of budget in 1 h) pages; a slow-burn long window (e.g. 5% in 6 h) opens a ticket. Combining windows avoids both flapping and blind spots.
 ## Integration Patterns
 
 ### Monitoring Stack Integration
@@ -244,12 +220,6 @@ Creates comprehensive dashboard specifications:
 - **API Gateway Monitoring:** Request routing and rate limiting observability
 - **Container Orchestration:** Kubernetes cluster and workload monitoring
 - **Service Discovery:** Dynamic service monitoring and health checks
-
-### Machine Learning Observability
-- **Model Performance:** Accuracy, drift, and bias monitoring
-- **Feature Store Monitoring:** Feature quality and freshness tracking
-- **Pipeline Observability:** ML pipeline execution and performance monitoring
-- **A/B Test Analysis:** Statistical significance and business impact measurement
 
 ## Best Practices
 

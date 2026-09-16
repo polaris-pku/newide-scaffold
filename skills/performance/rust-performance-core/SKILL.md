@@ -12,7 +12,7 @@ description: 'Use for core Rust performance optimization: profiling, benchmarkin
 
 ## When to Use
 
-Use this skill for **measured** Rust optimization — never optimize blind. Trigger on core Rust performance work: profiling, benchmarking, Cargo profile tuning, allocations, copies, cache behavior, type sizes, bounds checks, inlining, hashing, iterators, I/O, logging overhead, and data layout. Companion skills from the same repo cover adjacent territory: use the sibling skill `rust-memory-simd-io-performance` when allocator choice, SIMD, mmap, io_uring, huge pages, NUMA, or zero-copy byte layout dominates the change; use the sibling skill `rust-expert-rulebook` when choosing or reviewing one concrete optimization rule.
+Use this skill for **measured** Rust optimization — never optimize blind. Trigger on core Rust performance work: profiling, benchmarking, Cargo profile tuning, allocations, copies, cache behavior, type sizes, bounds checks, inlining, hashing, iterators, I/O, logging overhead, and data layout. (Allocator choice, SIMD, mmap, io_uring, huge pages, NUMA, zero-copy byte layout, and single-rule style questions are adjacent but out of scope here.)
 
 ## Core Principles
 
@@ -99,4 +99,4 @@ Report: bottleneck class, recommendation, applicable rule IDs, complexity cost, 
 - Source repo: https://github.com/madebyhost/rust-performance-skills
 - Original path: skills/rust-performance-core
 - License: unknown — see repo
-- 蒸馏说明：原含 3 文件（SKILL.md + 附属参考 performance-core.md + agents/openai.yaml agent 元数据）。附属参考已内联为 Measurement toolkit / Cargo profiles / Hot Path Tactics / Red Flags 章节；agent 元数据（display name、短描述、default prompt "Use $rust-performance-core to optimize this Rust hot path with measurement-first reasoning."）仅作触发说明，未逐字保留。相邻 skill（rust-memory-simd-io-performance、rust-expert-rulebook）仅以名称提及，其细节见原仓库。
+- 蒸馏说明：原含 3 文件（SKILL.md + 附属参考 performance-core.md + agents/openai.yaml agent 元数据）。附属参考已内联为 Measurement toolkit / Cargo profiles / Hot Path Tactics / Red Flags 章节；agent 元数据（display name、短描述、default prompt "Use $rust-performance-core to optimize this Rust hot path with measurement-first reasoning."）仅作触发说明，未逐字保留。相邻主题的细节未纳入，见原仓库。

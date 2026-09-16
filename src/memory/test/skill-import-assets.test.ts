@@ -71,7 +71,7 @@ describe('skill-import embedding asset path', () => {
     });
 
     expect(report.embedding_asset).toEqual({
-      reuse: 66,
+      reuse: 60,
       stale: 0,
       absent: 0,
       stale_slugs: [],
@@ -108,7 +108,7 @@ describe('skill-import embedding asset path', () => {
       dryRun: true,
       embeddings: asset,
     });
-    expect(report.embedding_asset?.reuse).toBe(65);
+    expect(report.embedding_asset?.reuse).toBe(59);
     expect(report.embedding_asset?.stale).toBe(1);
     expect(report.embedding_asset?.stale_slugs).toHaveLength(1);
   });
@@ -118,7 +118,7 @@ describe('skill-import embedding asset path', () => {
     const repository = new InMemoryRepository(provider);
     const report = await importSkillCorpus(repository, { rootDir: CORPUS_ROOT });
 
-    expect(report.activity_total).toBe(66);
+    expect(report.activity_total).toBe(60);
     expect(report.embedding_asset).toBeUndefined();
     expect(provider.calls).toBeGreaterThan(0);
     // 全部落库技能向量来自 provider（8 维零向量）

@@ -21,7 +21,7 @@ Audit REST API design for correctness, consistency, and compatibility.
 |-------|---------|--------|
 | Wrong HTTP verb | POST for idempotent operation | Confusion, caching issues |
 | Missing versioning | `/users` instead of `/v1/users` | Breaking changes affect all clients |
-| Entity leak | JPA entity in response | Exposes internals, N+1 risk |
+| Entity in response | JPA entity returned from a controller | Contract tracks the persistence schema; breaks whenever the schema changes |
 | 200 with error | `{"status": 200, "error": "..."}` | Breaks error handling |
 | Inconsistent naming | `/getUsers` vs `/users` | Hard to learn API |
 
@@ -116,11 +116,11 @@ public class UserController { }
 ### DTO vs Entity
 
 ```java
-// ❌ Entity in response (leaks internals)
+// ❌ Entity in response (couples the contract to the persistence schema)
 @GetMapping("/{id}")
 public User getUser(@PathVariable Long id) {
     return userRepository.findById(id).orElseThrow();
-    // Exposes: password hash, internal IDs, lazy collections
+    // The wire shape now mirrors ORM fields: add or rename a column and the contract changes
 }
 
 // ✅ DTO response
@@ -162,7 +162,7 @@ public ApiResponse<List<UserResponse>> getUsers() {
 // ❌ No pagination on collections
 @GetMapping("/users")
 public List<User> getAllUsers() {
-    return userRepository.findAll();  // Could be millions
+    return userRepository.findAll();  // No result-set contract; callers get the whole collection
 }
 
 // ✅ Paginated
@@ -196,7 +196,7 @@ public Page<UserResponse> getUsers(
 | 404 Not Found | Resource doesn't exist | Using 400 |
 | 409 Conflict | Duplicate, concurrent modification | Using 400 |
 | 422 Unprocessable | Semantic error (valid syntax, invalid meaning) | Using 400 |
-| 500 Internal Error | Unexpected server error | Exposing stack traces |
+| 500 Internal Error | Unexpected server error | Using 500 for client/validation errors |
 
 ### Anti-Pattern: 200 with Error Body
 
@@ -254,24 +254,13 @@ public ResponseEntity<ErrorResponse> handleNotFound(
 }
 ```
 
-### Security: Don't Expose Internals
+### What This Skill Does Not Cover
 
-```java
-// ❌ Exposes stack trace
-@ExceptionHandler(Exception.class)
-public ResponseEntity<String> handleAll(Exception ex) {
-    return ResponseEntity.status(500)
-        .body(ex.getStackTrace().toString());  // Security risk!
-}
-
-// ✅ Generic message, log details server-side
-@ExceptionHandler(Exception.class)
-public ResponseEntity<ErrorResponse> handleAll(Exception ex) {
-    log.error("Unexpected error", ex);  // Full details in logs
-    return ResponseEntity.status(500)
-        .body(ErrorResponse.of("INTERNAL_ERROR", "An unexpected error occurred"));
-}
-```
+> **Out of scope.** The *security exposure surface* (leaking internals, stack traces, or
+> secrets through error bodies) and response-cost concerns such as N+1 query risk are out
+> of scope here. This skill reviews only the contract's own naming, field semantics,
+> status-code and error-structure **self-consistency**, structural backward-compatibility
+> cost, and documentation readability.
 
 ---
 
@@ -319,43 +308,18 @@ public class UserControllerV1 {
 
 ## API Review Checklist
 
-### 1. HTTP Semantics
-- [ ] GET for retrieval only (no side effects)
-- [ ] POST for creation (returns 201 + Location)
-- [ ] PUT for full replacement (idempotent)
-- [ ] PATCH for partial updates
-- [ ] DELETE for removal (idempotent)
-
-### 2. URL Design
+### 1. URL Design
 - [ ] Versioned (`/v1/`, `/v2/`)
 - [ ] Nouns, not verbs (`/users`, not `/getUsers`)
 - [ ] Plural for collections (`/users`, not `/user`)
 - [ ] Hierarchical for relationships (`/users/{id}/orders`)
 - [ ] Consistent naming (kebab-case or camelCase, pick one)
 
-### 3. Request Handling
+### 2. Request Handling
 - [ ] Validation with `@Valid`
 - [ ] Clear error messages for validation failures
 - [ ] Request DTOs (not entities)
 - [ ] Reasonable size limits
-
-### 4. Response Design
-- [ ] Response DTOs (not entities)
-- [ ] Consistent structure across endpoints
-- [ ] Pagination for collections
-- [ ] Proper status codes (not 200 for errors)
-
-### 5. Error Handling
-- [ ] Consistent error format
-- [ ] Machine-readable error codes
-- [ ] Human-readable messages
-- [ ] No stack traces exposed
-- [ ] Proper 4xx vs 5xx distinction
-
-### 6. Compatibility
-- [ ] No breaking changes in current version
-- [ ] Deprecated endpoints documented
-- [ ] Migration path for breaking changes
 
 ---
 
@@ -367,7 +331,7 @@ For large APIs:
 3. Check `@ExceptionHandler` configuration once
 4. Grep for specific anti-patterns:
    ```bash
-   # Find potential entity leaks
+   # Find responses that return persistence entities directly
    grep -r "public.*Entity.*@GetMapping" --include="*.java"
 
    # Find 200 with error patterns

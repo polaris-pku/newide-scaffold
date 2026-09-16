@@ -22,6 +22,10 @@ export async function snapshotWorkspaceFiles(
     const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
       if (IGNORED_DIRECTORIES.has(entry.name)) continue;
+      // 链接（含 Windows junction）一律不跟随：它们指向工作区之外的共享内容，
+      // 既不是本格产出、也不该被完整遍历。角色分歧实验把只读仓库以 junction 挂在
+      // `<workspace>/repo`，这里跳过它，避免每格两次全仓 stat 扫描。
+      if (entry.isSymbolicLink()) continue;
       const absolutePath = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         await walk(absolutePath);

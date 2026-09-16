@@ -108,12 +108,13 @@ Improve LCP, INP, and CLS systematically.
 # Lighthouse CI
 npm run lighthouse -- --url=https://example.com
 
-# Web Vitals in production
-import { getCLS, getFID, getLCP } from 'web-vitals';
+# Web Vitals in production (web-vitals v4+: FID was replaced by INP, and all
+# getXXX() helpers were removed - use the onXXX() callbacks)
+import { onCLS, onINP, onLCP } from 'web-vitals';
 
-getCLS(console.log);
-getFID(console.log);
-getLCP(console.log);
+onCLS(console.log);
+onINP(console.log);
+onLCP(console.log);
 ```
 
 ## Output Checklist

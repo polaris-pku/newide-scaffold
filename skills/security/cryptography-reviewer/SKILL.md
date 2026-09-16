@@ -7,7 +7,7 @@ description: Audits cryptographic usage and key lifecycle against FIPS and NIST 
 
 Comprehensive cryptographic audit covering FIPS 140-3 compliance, European standards
 (BSI, ANSSI), NIST Special Publications, key management lifecycle, and academic
-cryptanalysis research. Supersedes the former `/fips-audit` skill with broader multi-standard coverage.
+cryptanalysis research, across multiple standards.
 
 ## When to Use
 
@@ -18,10 +18,12 @@ cryptanalysis research. Supersedes the former `/fips-audit` skill with broader m
 - When modifying key lifecycle state transitions or key management policies
 - When evaluating algorithm choices against international compliance requirements
 
-## Step 0 — Load Anti-Hallucination Discipline
+## Step 0 — Anti-Hallucination Discipline
 
-Read `.github/skills/shared/anti-hallucination.md` **before any analysis**. All rules in
-that file are mandatory for this skill. Do not proceed to Step 1 until you have read it.
+Apply anti-hallucination discipline throughout the analysis: cite only sources actually
+verified (files read, advisories found, bib keys located); never invent references, line
+numbers, advisory IDs, or bib keys; mark anything unverifiable as REQUIRES MANUAL
+VERIFICATION.
 
 ## Scope Resolution
 

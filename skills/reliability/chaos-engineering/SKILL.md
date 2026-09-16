@@ -18,8 +18,8 @@ Design experiments that surface real weaknesses in production systems — withou
 
 ## When NOT to use
 
-- General incident response (use `incident-response`)
-- Threat hunting / red-team (use `red-team`, `threat-detection`)
+- Operational incident response / SEV triage (out of scope here — use your on-call incident process)
+- Threat hunting / red-team offensive security work (out of scope here)
 - Performance load testing (different goal — chaos is about failure modes, not capacity)
 - Production debugging (chaos discovers weaknesses preemptively, not after-the-fact)
 
@@ -29,81 +29,52 @@ The 4 Principles of Chaos Engineering (Netflix, 2016):
 
 1. **Build a hypothesis around steady-state behavior.** Not "what breaks?" but "X holds; will it still hold under fault Y?"
 2. **Vary real-world events.** Inject realistic failures: kill nodes, slow networks, lose cache, throttle dependencies.
-3. **Run experiments in production.** Staging never has the same failure modes. Start small.
+3. **Run experiments in production** — once abort criteria, a bounded blast radius, and on-call coverage exist. Staging never has the same failure modes, so a staging-only program proves little; production is the *mature* rung, not the entry point. (Drills whose first concern is protecting real data instead default to non-production first.)
 4. **Automate experiments to run continuously.** One-off chaos is a press release; continuous chaos is engineering.
 
 Add a fifth: **Define abort criteria up front.** A chaos experiment with no abort criteria is an outage by another name.
 
-## Quick start
+## Experiment design protocol
 
-```bash
-SKILL=engineering/chaos-engineering/skills/chaos-engineering
+The three original helper programs (`scripts/experiment_designer.py`, `scripts/blast_radius_calculator.py`, `scripts/experiment_postmortem.py`) are **not distributed with this corpus**. Their rules are inlined here so an experiment can be designed, bounded, and written up without running a bundled tool.
 
-# 1. Design an experiment
-python "$SKILL/scripts/experiment_designer.py" --target "checkout-svc" --hypothesis "p99 latency stays <500ms" --attack latency --duration-min 15
+### 1. Experiment plan
 
-# 2. Calculate blast radius
-python "$SKILL/scripts/blast_radius_calculator.py" --traffic-share 0.05 --user-pop 1000000 --duration-min 15
+Every plan must contain these sections — a plan missing any of them is not runnable:
 
-# 3. Generate postmortem after the experiment
-python "$SKILL/scripts/experiment_postmortem.py" --plan experiment.json --result-log results.txt
-```
+| Section | What it must state |
+|---|---|
+| Hypothesis | "X holds; will it still hold under fault Y?" — e.g. "p99 latency stays <500ms when payment-svc is slow" |
+| Steady-state metric | The measurable baseline, captured *before* the experiment |
+| Attack | Which of the 7 taxonomy attacks, against which target |
+| Magnitude | The injected amount (e.g. +200ms) |
+| Duration | A bounded window (e.g. 15 min) |
+| Blast radius | The bounded scope (e.g. 5% of US traffic) |
+| Abort criteria | Concrete and measurable, e.g. "p99 > 1000ms OR error_rate > baseline + 1pp" |
+| Rollback | How the fault is removed and the system returned to baseline |
+| Monitoring | The dashboards/open panels watched during the run |
+| Learning question | The specific uncertainty the experiment resolves |
 
-## The 3 Python tools
+### 2. Blast-radius calculation
 
-All stdlib-only. Run with `--help`.
+The bands below are a starting default — calibrate them to your service's error budget and traffic before relying on them.
 
-### `experiment_designer.py`
+Before proceeding, bound the blast radius from traffic share, user population, duration, and the availability delta (baseline vs. expected impact). Derive:
 
-Generates a structured experiment plan from inputs. Enforces the required sections (hypothesis, steady-state metric, blast radius, abort criteria, rollback).
+- **Expected affected users** = population × traffic share.
+- **Error budget consumed** (in minutes) = the extra unavailability over the window, expressed against the SLO budget.
+- **Risk score**: GREEN = <1% of error budget; YELLOW = 1–10%; RED = >10%.
+- **Recommendation**: PROCEED (GREEN) / REDUCE (YELLOW) / ABORT (RED).
 
-```bash
-python scripts/experiment_designer.py \
-  --target "checkout-svc" \
-  --hypothesis "p99 latency stays <500ms when payment-svc is slow" \
-  --attack latency \
-  --magnitude "+200ms" \
-  --duration-min 15 \
-  --blast-radius "5% of US traffic" \
-  --abort-if "p99 > 1000ms OR error_rate > baseline + 1pp"
-```
+Never run an experiment that scores RED; REDUCE means lower the traffic share or shorten the window first.
 
-Outputs a markdown plan with: hypothesis, steady-state, attack, magnitude, duration, blast radius, abort criteria, rollback procedure, monitoring dashboards, and learning question.
+### 3. Experiment postmortem
 
-### `blast_radius_calculator.py`
-
-Computes the blast radius of a planned experiment. Given traffic share + user population + duration, calculates expected affected users, expected error budget burn, and a risk score.
-
-```bash
-python scripts/blast_radius_calculator.py \
-  --traffic-share 0.05 \
-  --user-pop 1000000 \
-  --duration-min 15 \
-  --baseline-availability 0.999 \
-  --expected-impact-availability 0.95
-```
-
-Outputs:
-- Expected affected users
-- Error budget consumed (in minutes of error budget)
-- Risk score: GREEN / YELLOW / RED
-- Recommendation: PROCEED / REDUCE / ABORT
-
-GREEN = <1% error budget; YELLOW = 1-10%; RED = >10%.
-
-### `experiment_postmortem.py`
-
-Produces a structured postmortem from an experiment plan + results. Catches the common postmortem failure modes: no learning recorded, no follow-up actions, blame-laden language.
-
-```bash
-python scripts/experiment_postmortem.py --plan experiment.json --result-log results.txt
-```
-
-Outputs markdown with: summary, hypothesis (was it confirmed/refuted?), what we learned, what surprised us, follow-up actions with owners, and link to next experiment.
+Write up the result with: summary; hypothesis — confirmed or refuted; what was learned; what surprised us; follow-up actions with owners; and a link to the next experiment. Guard against the classic failure modes: no learning recorded, no follow-up actions, blame-laden language.
 
 ## The 7 attack types (taxonomy)
 
-Different attacks reveal different weaknesses. See `references/attack_taxonomy.md` for full detail.
+Different attacks reveal different weaknesses:
 
 | Attack | What it tests | Tooling |
 |---|---|---|
@@ -134,22 +105,20 @@ Decision rules:
 - AWS-heavy + simple needs → AWS FIS
 - Enterprise + audit/compliance → Gremlin
 
-See `references/tooling_landscape.md` for trade-offs.
-
 ## Workflows
 
 ### Workflow 1: Design and run a single experiment
 
 ```
 1. State a hypothesis: "When [fault], steady-state metric X stays within Y."
-2. Identify the steady-state metric — must be measurable BEFORE the experiment.
-3. Run blast_radius_calculator.py — confirm GREEN before proceeding.
-4. Run experiment_designer.py to produce the plan.
-5. Get a peer review of the plan; confirm abort criteria are concrete.
+2. Identify the steady-state metric — it must be measurable BEFORE the experiment.
+3. Calculate the blast radius (Experiment design protocol §2) — confirm GREEN before proceeding.
+4. Produce the experiment plan (protocol §1) with all required sections.
+5. Get a peer review of the plan; confirm the abort criteria are concrete.
 6. Notify the on-call team in #incidents (or whatever channel).
 7. Run the experiment with monitoring open.
 8. If abort criteria are hit, abort immediately; record what happened.
-9. Run experiment_postmortem.py to capture learnings.
+9. Write the postmortem (protocol §3) to capture learnings.
 10. File follow-up actions; link to next experiment.
 ```
 
@@ -175,44 +144,6 @@ See `references/tooling_landscape.md` for trade-offs.
 4. Wire to deployment: every prod deploy triggers a baseline chaos sweep.
 5. Track: experiments per week, weaknesses discovered, MTTR trend.
 ```
-
-## Composition with other skills
-
-This skill explicitly composes with two others in this library:
-
-| Skill | Composition |
-|---|---|
-| `feature-flags-architect` | Kill switches defined there are the abort triggers here |
-| `kubernetes-operator` | Operators are common chaos targets (test reconcile under fault) |
-| `incident-response` | Chaos experiments that escalate become incidents |
-
-## Anti-patterns
-
-- **No hypothesis** — "let's break things" is sabotage, not engineering
-- **No steady-state metric** — without a baseline, you can't tell if X broke
-- **No blast radius bound** — full-prod experiment without limits = outage
-- **No abort criteria** — see above; this is mandatory
-- **No on-call coverage** — chaos without monitoring is unmonitored production
-- **Chaos in staging only** — staging never has prod failure modes
-- **Chaos in dev** — useless; dev has different failure modes from prod
-- **One-off chaos** — single experiment is a press release; learning requires recurrence
-- **Blame-laden postmortem** — record causes, not blame; teams stop running chaos otherwise
-
-## References
-
-- `references/chaos_principles.md` — the 4 principles, history, when to start
-- `references/experiment_design.md` — hypothesis structure, steady-state metrics, abort criteria
-- `references/attack_taxonomy.md` — 7 attack types with examples and tooling
-- `references/tooling_landscape.md` — Chaos Toolkit / Mesh / Litmus / Gremlin / FIS / DIY
-
-## Slash command
-
-`/chaos-experiment` — interactive experiment design wizard that runs all 3 tools.
-
-## Asset templates
-
-- `assets/experiment_template.md` — fill-in plan template
-- `assets/postmortem_template.md` — structured postmortem template
 
 ## Verifiable success
 

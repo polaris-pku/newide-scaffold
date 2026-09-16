@@ -9,59 +9,81 @@ Validate system capacity with realistic load tests.
 
 ## Load Test Scenarios
 
+Scenario *shapes* (baseline / peak / stress) are reusable; the *numbers* are not.
+Virtual users, durations, and thresholds must be derived from your traffic and SLO -
+see [Deriving Thresholds](#deriving-thresholds-do-not-hard-code-standard-numbers).
+
 ```typescript
 interface LoadTestScenario {
   name: string;
   description: string;
-  virtualUsers: number;
+  virtualUsers: number; // from expected concurrency, not a round constant
   duration: string;
   rampUp: string;
   successCriteria: {
-    p95Latency: number;
-    errorRate: number;
-    throughput: number;
+    p95Latency: number; // from the SLO or a measured baseline (see below)
+    errorRate: number;  // from the error budget
+    throughput: number; // from expected peak RPS
   };
 }
 
+// The values below reference your environment's SLO / baseline - fill them in.
+// Do NOT read the shapes' magnitudes as skill-provided defaults.
 const scenarios: LoadTestScenario[] = [
   {
     name: "Baseline Load",
     description: "Normal traffic pattern",
-    virtualUsers: 100,
+    virtualUsers: expectedConcurrency.baseline,
     duration: "10m",
     rampUp: "2m",
     successCriteria: {
-      p95Latency: 500, // ms
-      errorRate: 0.01, // 1%
-      throughput: 1000, // req/s
+      p95Latency: SLO.p95Latency,     // e.g. the product SLA target
+      errorRate: SLO.errorBudget,     // e.g. 0.01 for a 1% error budget
+      throughput: baseline.steadyRps, // observed steady-state RPS
     },
   },
   {
     name: "Peak Load",
-    description: "Black Friday traffic",
-    virtualUsers: 1000,
+    description: "Expected seasonal peak (e.g. Black Friday)",
+    virtualUsers: expectedConcurrency.peak,
     duration: "30m",
     rampUp: "5m",
     successCriteria: {
-      p95Latency: 2000,
-      errorRate: 0.05,
-      throughput: 5000,
+      p95Latency: SLO.p95Latency, // same SLO must hold under peak load
+      errorRate: SLO.errorBudget,
+      throughput: baseline.steadyRps * peakFactor,
     },
   },
   {
     name: "Stress Test",
-    description: "Find breaking point",
-    virtualUsers: 5000,
+    description: "Find the breaking point (raise load until the SLO breaks)",
+    virtualUsers: expectedConcurrency.peak * 3,
     duration: "20m",
     rampUp: "10m",
     successCriteria: {
-      p95Latency: 5000,
-      errorRate: 0.1,
-      throughput: 10000,
+      p95Latency: SLO.p95Latency, // keep the SLO so you can locate the knee
+      errorRate: SLO.errorBudget,
+      throughput: baseline.steadyRps * peakFactor,
     },
   },
 ];
 ```
+
+## Deriving Thresholds (do not hard-code "standard" numbers)
+
+There is no universal "good" p95 or RPS - a threshold is meaningful only relative to
+your SLO or a measured baseline. Derive each one:
+
+1. **Latency** - take the product SLO ("search responds in <300ms p95") as the pass
+   threshold, or run a baseline at expected load and set the threshold at the observed
+   steady-state p95 plus deliberate headroom (e.g. +20%).
+2. **Error rate** - derive from the error budget: a 1% budget becomes `rate<0.01`.
+3. **Throughput** - derive from peak traffic: `historical_peak_rps × peak_factor`.
+4. **Virtual users** - derive from expected concurrency, not a round number; confirm
+   with Little's Law (`VUs ≈ RPS × avg_latency`).
+
+Record the derivation next to each threshold so a failure is attributable to a
+specific SLO rather than to an arbitrary number.
 
 ## K6 Load Test Script
 
@@ -80,8 +102,9 @@ export let options = {
     { duration: "2m", target: 0 }, // Ramp down
   ],
   thresholds: {
-    http_req_duration: ["p(95)<500"], // 95% under 500ms
-    errors: ["rate<0.01"], // Error rate <1%
+    // Numbers must come from your SLO / baseline - see "Deriving Thresholds".
+    http_req_duration: ["p(95)<500"], // example: SLO p95 = 500ms
+    errors: ["rate<0.01"], // example: 1% error budget
   },
 };
 
@@ -170,48 +193,48 @@ export const trafficModels = {
 
 ## Success Thresholds
 
+Every value below is a placeholder - replace it with a number derived from your SLO or
+a measured baseline (see [Deriving Thresholds](#deriving-thresholds-do-not-hard-code-standard-numbers)).
+
 ```javascript
 export const thresholds = {
-  // Latency
+  // Latency: use the SLO percentiles (or baseline + agreed headroom).
   http_req_duration: [
-    "p(50)<200", // 50% under 200ms
-    "p(95)<500", // 95% under 500ms
-    "p(99)<1000", // 99% under 1s
+    "p(50)<P50_SLO",
+    "p(95)<P95_SLO",
+    "p(99)<P99_SLO",
   ],
 
-  // Error rate
-  http_req_failed: ["rate<0.01"], // <1% errors
+  // Error rate: the error budget, e.g. "rate<0.01" for 1%.
+  http_req_failed: ["rate<ERROR_BUDGET"],
 
-  // Throughput
-  http_reqs: ["rate>1000"], // >1000 req/s
+  // Throughput floor: expected peak RPS.
+  http_reqs: ["rate>PEAK_RPS"],
 
-  // Custom metrics
-  checkout_duration: ["p(95)<2000"],
-  checkout_success_rate: ["rate>0.95"],
+  // Custom journey metrics: give each its own SLO.
+  checkout_duration: ["p(95)<CHECKOUT_P95_SLO"],
+  checkout_success_rate: ["rate>CHECKOUT_SUCCESS_SLO"],
 };
 ```
 
 ## Running Load Tests
 
+Invoke k6 directly on a scenario script whose `options` already define the load
+profile:
+
 ```bash
-#!/bin/bash
-# scripts/run-load-tests.sh
-
-echo "Running load tests..."
-
-# Baseline test
-k6 run --vus 100 --duration 10m load-tests/checkout-flow.js
-
-# Peak load test
-k6 run --vus 1000 --duration 30m load-tests/checkout-flow.js
-
-# Stress test (find breaking point)
-k6 run --vus 5000 --duration 20m load-tests/stress-test.js
-
-# Generate report
+# options.stages sets the load profile - add no VU/duration flags here.
 k6 run --out json=results.json load-tests/checkout-flow.js
-k6 run --out influxdb=http://localhost:8086 load-tests/checkout-flow.js
 ```
+
+Do NOT combine `--vus`/`--duration` with a script that defines `options.stages`: k6
+rejects it because the CLI flags and the script configure different executors. Pick
+ONE source of truth for the load profile:
+
+- **Script-defined (recommended):** encode ramp-up / steady / ramp-down as
+  `options.stages`; run with no sizing flags.
+- **CLI-defined:** only for a script with no `options` - use either constant
+  `--vus N --duration Xm` OR staged `--stage 2m:100 --stage 10m:100`; never both.
 
 ## Result Analysis
 
@@ -244,12 +267,3 @@ function analyzeResults(results: LoadTestResult) {
   }
 }
 ```
-
-## Output Checklist
-
-- [ ] Scenarios defined
-- [ ] k6 scripts created
-- [ ] Traffic models configured
-- [ ] Success criteria set
-- [ ] CI integration
-- [ ] Results analysis

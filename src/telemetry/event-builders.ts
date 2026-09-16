@@ -27,6 +27,12 @@ export interface ProxyUsageTelemetryInput {
   case_id: string;
   input_tokens: number;
   output_tokens: number;
+  /**
+   * 缓存读写量。带上它们，遥测事件才能独立回答「缓存有没有生效」——否则只看得见一个
+   * 笼统的 input_tokens，命中率不可知。
+   */
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
   model?: string;
   scaffold_variant?: 'air_emulator' | 'zcode_router' | 'full_system' | string;
   temperature?: number;
@@ -131,6 +137,12 @@ export function buildProxyUsageTelemetry(input: ProxyUsageTelemetryInput): Telem
       case_id: input.case_id,
       input_tokens: input.input_tokens,
       output_tokens: input.output_tokens,
+      ...(input.cache_creation_input_tokens !== undefined
+        ? { cache_creation_input_tokens: input.cache_creation_input_tokens }
+        : {}),
+      ...(input.cache_read_input_tokens !== undefined
+        ? { cache_read_input_tokens: input.cache_read_input_tokens }
+        : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.scaffold_variant ? { scaffold_variant: input.scaffold_variant } : {}),
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),

@@ -12,7 +12,10 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LiteLLMClient } from '../../litellm';
 import type { LiteLLMMessage } from '../../litellm';
-import { recordProxyLlmUsage } from '../../telemetry/llm-usage-ledger';
+import {
+  recordProxyLlmUsage,
+  splitCachedPromptUsage,
+} from '../../telemetry/llm-usage-ledger';
 import type { LlmClient, LlmMessage } from '../ports/llm-client';
 
 function loadEnvFile(filePath: string): void {
@@ -98,7 +101,15 @@ export class LiteLLMClientAdapter implements LlmClient {
         : undefined,
     });
     await recordProxyLlmUsage({
-      input_tokens: response.usage?.prompt_tokens ?? 0,
+      ...splitCachedPromptUsage({
+        prompt_tokens: response.usage?.prompt_tokens ?? 0,
+        ...(response.usage?.cache_read_tokens !== undefined
+          ? { cache_read_tokens: response.usage.cache_read_tokens }
+          : {}),
+        ...(response.usage?.cache_write_tokens !== undefined
+          ? { cache_write_tokens: response.usage.cache_write_tokens }
+          : {}),
+      }),
       output_tokens: response.usage?.completion_tokens ?? 0,
       model: response.model || this.taskName,
       source: 'proxy',

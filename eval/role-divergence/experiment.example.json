@@ -1,0 +1,13 @@
+{
+  "experiment_id": "dask-role-divergence",
+  "model_label": "configured-by-environment",
+  "dataset_subset": "v0-dask-3-prctx",
+  "memory_ablation": "B2",
+  "expected_retrieval_policy": {
+    "recall_top_k": 20,
+    "min_embedding_similarity": 0.5,
+    "min_confidence": 0.2,
+    "max_memory_items": 5,
+    "min_tag_overlap": 1
+  }
+}

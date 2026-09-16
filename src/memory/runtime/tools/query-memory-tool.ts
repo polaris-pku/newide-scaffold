@@ -53,6 +53,14 @@ export class QueryMemoryTool implements Tool<QueryMemoryInput, QueryMemoryOutput
   constructor(
     private readonly memory: AgentMemoryScope,
     private readonly embedding?: EmbeddingProvider,
+    /**
+     * 本轮检索到的技能回调，带**全文**。
+     *
+     * 顶层 Agent 调 `invoke_driver` 时只能传字符串（`task.context.skills`），它会
+     * 把查到的技能转述成一句话——19k 字符的技能正文因此被压成几十字符到达 driver。
+     * 这个回调让宿主把原文直接带下去，绕开转述这一环。
+     */
+    private readonly onSkillsRetrieved?: (skills: QueryMemoryOutput['skills']) => void,
   ) {}
 
   async execute(input: QueryMemoryInput): Promise<QueryMemoryOutput> {
@@ -75,12 +83,17 @@ export class QueryMemoryTool implements Tool<QueryMemoryInput, QueryMemoryOutput
       },
     );
 
+    const skills = result.skills.map((s) => ({
+      id: s.id,
+      description: s.description,
+      content: s.content,
+    }));
+    if (skills.length > 0) {
+      this.onSkillsRetrieved?.(skills);
+    }
+
     return {
-      skills: result.skills.map((s) => ({
-        id: s.id,
-        description: s.description,
-        content: s.content,
-      })),
+      skills,
       experiences: result.experiences.map((e) => ({
         id: e.id,
         description: e.description,

@@ -142,6 +142,8 @@ export interface CompletionRequest {
     | undefined;
   /** Temperature (0-2) */
   temperature?: number;
+  /** Nucleus sampling cutoff (0-1). Omitted → provider default. */
+  topP?: number;
   /** Max tokens to generate */
   maxTokens?: number;
   /** Structured output JSON schema */
@@ -166,6 +168,17 @@ export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /**
+   * 命中提示词缓存而**按折扣计价**的输入 token（Anthropic 口径约 0.1x）。
+   *
+   * 与 `prompt_tokens` 是**包含关系**：`prompt_tokens` 是整个 prompt，
+   * `cache_read_tokens` 是其中走缓存的那部分。**不要相加**——把两者加总就是把同一批
+   * token 记两次。台账要的是「全价部分 + 缓存读 + 缓存写」三分量，全价部分 =
+   * `prompt_tokens - cache_read_tokens - cache_write_tokens`。
+   */
+  cache_read_tokens?: number;
+  /** 写入缓存、按溢价计价的输入 token（Anthropic 口径约 1.25x）。同上，是子集。 */
+  cache_write_tokens?: number;
 }
 
 // ──────────────────────────────────────────────────────────

@@ -37,8 +37,9 @@ export const ROLE_ROSTER: readonly RoleSeedSpec[] = [
       '只承接正确性维度任务：找 bug / 逻辑与行为推理 / 规格符合 / 测试充分性 / 并发正确性；其余质量维度（可维护性/性能/可靠性/安全）转交对应角色。',
     ],
     charter:
-      '负责正确性质量维度：对代码做行为推理与逻辑审查（含单文件轻入口）、整仓对抗式 bug 猎杀与自动修复（H-S-R 协议，可按议会拆为 Hunter/Skeptic/Referee）、单点 bug 真伪裁决、代码与规格符合性裁决、同源变体排查、测试覆盖缺口审计，以及并发/多线程/异步正确性专项（竞态、TOCTOU、死锁、锁序、原子性）。',
-    families_zh: '行为推理（agentic-code-reasoning）、猎杀家族（bugsweep 与 bug-hunter 议会三件套）、验证双轨（fp-check）、规格符合（spec-to-code-compliance）、同源变体、测试覆盖审计、并发专项',
+      '负责正确性质量维度：对代码做行为推理与逻辑审查（含单文件轻入口）、整仓对抗式 bug 猎杀与自动修复（H-S-R 协议，可按议会拆为 Hunter/Skeptic/Referee）、单点 bug 真伪裁决、代码与规格符合性裁决、同源变体排查，以及并发/多线程/异步正确性专项（竞态、TOCTOU、死锁、锁序、原子性）。',
+    families_zh:
+      '行为推理（agentic-code-reasoning）、猎杀家族（bugsweep 与 bug-hunter 议会三件套）、验证双轨（fp-check）、规格符合（spec-to-code-compliance）、同源变体、并发专项',
     boundary_zh:
       '并发专项（concurrency-correctness-review）可在 bugsweep 之后追加；仅谈可维护性转 maintainability、性能转 performance、攻击面/密钥/供应链转 security、故障模式/SLO 转 reliability。',
   },
@@ -79,8 +80,9 @@ export const ROLE_ROSTER: readonly RoleSeedSpec[] = [
       '只承接可靠性质量维度任务：SLO/故障模式/回滚/容灾/发布就绪/事件响应；其余质量维度转交对应角色。',
     ],
     charter:
-      '负责可靠性质量维度：SLO/可靠性策略设计、发布就绪门禁（ship-check）、回滚工作流、备份恢复与数据韧性演练、故障注入与混沌工程、可观测性设计（指标/日志/追踪埋点）、特性开关渐进放量、事件响应全流程（SEV 分诊/升级/取证），以及 Agent 自身运维与评测护栏（evals-ops）。',
-    families_zh: 'SRE 族（策略/门禁/回滚/备份/韧性）、演练族（故障注入/混沌）、可观测与放量（observability-designer/feature-flags-architect）、事件响应（incident-response）、Agent 运维（agent-ops/evals-ops-guardrails）',
+      '负责可靠性质量维度：SLO/可靠性策略设计、回滚工作流、备份恢复与数据韧性演练、故障注入与混沌工程、可观测性设计（指标/日志/追踪埋点）、特性开关渐进放量。',
+    families_zh:
+      'SRE 族（策略/回滚/备份/韧性）、演练族（故障注入/混沌）、可观测与放量（observability-designer/feature-flags-architect）',
     boundary_zh:
       '仅谈"上线会不会炸/坏了怎么恢复"在此；发布时的功能正确性仍走 correctness；数据安全/密钥走 security。',
   },
@@ -93,8 +95,9 @@ export const ROLE_ROSTER: readonly RoleSeedSpec[] = [
       '只承接安全质量维度任务：漏洞审计/威胁建模/攻击面/密钥与供应链/云与容器/移动端/Agent 安全；其余质量维度转交对应角色。',
     ],
     charter:
-      '负责安全质量维度：代码安全审计与变更门禁、OWASP 方法学与审计上下文构建、威胁建模、密钥/供应链/云 IaC/容器/移动端专项审查、密码学用法审计（非字符串扫描）、红队与对抗视角，以及 Agent 安全检测家族（间接注入/工具滥用/越权绕过/数据泄露/供应链/意外代码执行/Agent 间通信/级联故障/人机信任利用），含 owasp-asi 全链探测。',
-    families_zh: '审计族（code-security-audit/audit-context-building/security-audit-owasp/owasp-asi）、变更门与专项（auth/输入校验/密钥/供应链/云/容器/移动端/密码学/API）、威胁建模与红队、Agent 检测家族（Tencent 9 件套）',
+      '负责安全质量维度：代码安全审计与变更门禁、OWASP 方法学与审计上下文构建、威胁建模、密钥/供应链/云 IaC/移动端专项审查、密码学用法审计（非字符串扫描）、红队与对抗视角，以及 Agent 安全检测家族（间接注入/工具滥用/越权绕过/数据泄露/供应链/意外代码执行/Agent 间通信/级联故障/人机信任利用），含 owasp-asi 全链探测。',
+    families_zh:
+      '审计族（code-security-audit/audit-context-building/security-audit-owasp/owasp-asi）、变更门与专项（auth/输入校验/密钥/供应链/云/移动端/密码学/API）、威胁建模与红队、Agent 检测家族（Tencent 9 件套）',
     boundary_zh:
       '仅谈可利用性/攻击面/密钥/供应链在此；代码功能性 bug 转 correctness（variant-analysis 可被安全审计复用）。',
   },

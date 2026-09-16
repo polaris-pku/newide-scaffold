@@ -208,6 +208,36 @@ export function toRunTokenUsageSummary(
   };
 }
 
+/**
+ * 把「一个总 prompt + 缓存读写子集」拆成台账要的三个分量。
+ *
+ * 存在的理由：`prompt_tokens` 是**整个 prompt**，而 `cache_read_tokens` /
+ * `cache_write_tokens` 是它的**子集**。直接把三个数都写进台账会把同一批 token 记两次
+ * （缓存读会被算成全价 + 折扣价），虚报成本并让命中率失去意义。全价部分必须是
+ * `prompt - cache_read - cache_write`。
+ *
+ * 缓存量为 0 时返回显式的 0 而不是省略：0 是「确实没命中」这一有价值的事实，
+ * 省略会与「上游没上报」混为一谈。
+ */
+export function splitCachedPromptUsage(input: {
+  prompt_tokens: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+}): {
+  input_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+} {
+  const total = Math.max(0, Math.floor(input.prompt_tokens));
+  const read = Math.max(0, Math.floor(input.cache_read_tokens ?? 0));
+  const write = Math.max(0, Math.floor(input.cache_write_tokens ?? 0));
+  return {
+    input_tokens: Math.max(0, total - read - write),
+    cache_creation_input_tokens: write,
+    cache_read_input_tokens: read,
+  };
+}
+
 export async function recordProxyLlmUsage(input: {
   input_tokens: number;
   output_tokens: number;
@@ -262,6 +292,12 @@ export async function recordProxyLlmUsage(input: {
       case_id: caseId,
       input_tokens: entry.input_tokens,
       output_tokens: entry.output_tokens,
+      ...(entry.cache_creation_input_tokens !== undefined
+        ? { cache_creation_input_tokens: entry.cache_creation_input_tokens }
+        : {}),
+      ...(entry.cache_read_input_tokens !== undefined
+        ? { cache_read_input_tokens: entry.cache_read_input_tokens }
+        : {}),
       ...(entry.model ? { model: entry.model } : {}),
       ...(entry.temperature !== undefined ? { temperature: entry.temperature } : {}),
       ...(entry.seed !== undefined ? { seed: entry.seed } : {}),

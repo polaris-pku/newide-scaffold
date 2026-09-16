@@ -18,7 +18,7 @@ Input: a specification document + the codebase that should implement it (optiona
 
 ## When NOT to Use
 
-- Code with no documentation of intended behavior — there is nothing to check against, and a requirement inferred from the code is checked against itself. Build the system model first (e.g., with the sibling `audit-context-building` skill).
+- Code with no documentation of intended behavior — there is nothing to check against, and a requirement inferred from the code is checked against itself. Build the system model first.
 - General bug hunting. This finds one class only: where code and document disagree. A bug both artifacts are silent about is out of scope; a bug the document endorses is a finding against the document.
 - Writing or improving documentation — though the output is precisely the list of what needs fixing.
 
@@ -61,16 +61,16 @@ Adjacent-verdict discipline: `partial` is not `contradicted` when the requiremen
 
 ## Severity Rubric (consequence, not wording distance)
 
-- **Critical** — value or control moves in a way the document rules out, and someone outside the trust boundary can cause it: a missing bound that lets a caller withdraw more than they hold; an access check the document requires and the code omits on a path reachable by an untrusted actor; a formula divergence that accumulates against users every time it runs.
-- **High** — the same class of consequence, but gated: needs a privileged role, an unusual state, or a precondition the attacker does not directly control. Also: enforcement exists on the paths anyone would test and is missing on one path that is reachable.
+- **Critical** — value or control moves in a way the document rules out, and an ordinary caller can cause it: a missing bound that lets a caller withdraw more than they hold; a check the document requires and the code omits on a path any caller reaches; a formula divergence that accumulates against users every time it runs.
+- **High** — the same class of consequence, but gated: needs special state, an unusual sequence, or a precondition no ordinary call supplies. Also: enforcement exists on the paths anyone would test and is missing on one path that is reachable.
 - **Medium** — a real gap whose consequence depends on something not established: a missing error case currently unreachable but nothing prevents it from becoming reachable; an ambiguity in the document that has let two components diverge in how they read it.
 - **Low** — no behavioral consequence: the code is correct and the document describes it wrongly, or the code enforces more than the document asks. Say plainly that the fix belongs in the document.
 
 **The two directions of a gap:** decide which side is wrong before assigning severity. If the code's behavior is the intended one, the finding is that the document misdescribes it — still a finding, because the document is what the client publishes and what the next reader will believe. `stronger-than-spec` is the direction people skip: Low now, a regression later.
 
-**Raises severity:** untrusted actor can reach it; needs no unusual state; runs on every call rather than an edge case; the document names the requirement mandatory; other code depends on the requirement holding. **Lowers severity:** needs a role only the client holds; a second mechanism happens to enforce the same thing; the divergence is in a path that cannot currently be reached (state the reason it cannot). **Neither:** how emphatically the document states it — a MUST satisfied through a different mechanism is not a finding, and a quietly-worded sentence about accounting can describe the most serious gap in the system.
+**Raises severity:** an ordinary caller reaches it; needs no unusual state; runs on every call rather than an edge case; the document names the requirement mandatory; other code depends on the requirement holding. **Lowers severity:** needs a configuration or role only the deployment sets; a second mechanism happens to enforce the same thing; the divergence is in a path that cannot currently be reached (state the reason it cannot). **Neither:** how emphatically the document states it — a MUST satisfied through a different mechanism is not a finding, and a quietly-worded sentence about accounting can describe the most serious gap in the system.
 
-**Stating the consequence:** a divergence whose consequence is spelled out gets fixed; one stated as a mismatch gets discussed. Where you can show it, show who acts, in what order, and what they end up with. Where you cannot, say what would have to be true for it to matter — and leave it there. An invented attack sequence or made-up figure discredits the real finding underneath it.
+**Stating the consequence:** a divergence whose consequence is spelled out gets fixed; one stated as a mismatch gets discussed. Where you can show it, show who acts, in what order, and what they end up with. Where you cannot, say what would have to be true for it to matter — and leave it there. An invented scenario or made-up figure discredits the real finding underneath it.
 
 **Requirements that cannot be checked** are findings in their own right, filed against the document: a requirement too vague to check against any implementation, or one document stating a requirement another contradicts. The code may be fine — what is broken is that nobody can say whether it is.
 
@@ -122,29 +122,9 @@ Conventions: cite code as `File.ext:L45` / `L89-L135`; quote the document verbat
 
 Treat `notChecked`, `unverified`, and `unreadableDocuments` sections seriously before calling the report complete: requirements below the fan-out cut were never checked, and a divergence whose refutation agents both failed is unverified rather than confirmed.
 
-## Checklist
-
-- [ ] Document is authoritative (client-written / published / audited against)? If it is stale prose, say so.
-- [ ] Scope stated: documents in play, sections checked vs not checked, requirement count.
-- [ ] Requirement quoted verbatim with its section cited; restated concretely with named quantities.
-- [ ] Enforcement located and cited (`File.ext:L45`); traced into callees (modifiers, base contracts, middleware, wrappers, `#ifdef` builds, route tables, DB constraints, callers) — never concluded from a name.
-- [ ] Every path walked: enforcement on all reachable paths, or each missing path named.
-- [ ] Searched section recorded: vocabulary + synonyms + patterns with results, including misses.
-- [ ] Verdict chosen among the six with the adjacent-verdict reasoning stated.
-- [ ] Direction of gap determined (code wrong vs document misdescribes code) before severity.
-- [ ] Severity by consequence; raising/lowering factors considered; consequence stated concretely or the unestablished precondition named.
-- [ ] Arithmetic verified as arithmetic (fee numerators, unchecked blocks, integer width) — never by grep for the document's words.
-- [ ] Refutation performed by non-authors (code re-read + document re-read); both-knock-down drops the finding; both-fail marks it `unverified`.
-- [ ] Reverse direction checked: behavior the code has that no document mentions.
-- [ ] Every claim cites a line or sits in Open Questions; no "probably/seems to/should be" hedges; empty sections explicitly marked empty.
-
 ## Examples
 
-**`implemented` — arithmetic that satisfies a requirement it does not resemble.** Requirement: "The protocol charges a fixed 0.3% fee on the input amount for every swap." Code at Router.sol:L108-L111 computes `amountIn * 997` then `amountOut = (amountInWithFee * reserveOut) / (reserveIn * 1000 + amountInWithFee)`. Nothing contains `fee`, `0.3`, or `30`; searching the document's vocabulary stops at a comment. The verdict rests on the arithmetic: input scaled by 997 over a denominator scaled by 1000 ⇒ fee = 3/1000 = 0.3%. Deciding `implemented` over `partial` needs three facts: the fee is applied before output is computed (cannot be bypassed by the caller), it is a literal not a storage read (no admin path changes it), and there is no branch around it (every swap passes L108). Record the 997/1000 ↔ 0.3% equivalence so the next reader does not re-derive it. Mistake to avoid: calling this `undecidable`/`absent` because the fee is unnamed.
-
 **`absent` — the searches are the finding.** Requirement: "All swap operations MUST enforce a maximum slippage of 1% between expected and actual output." The `swap` signature carries no `minAmountOut` — suggestive, not conclusive (the bound could be computed internally from an oracle). What makes `absent` credible is the record: `slippage` → 0 hits; `minAmount`/`minOut`/`limitPrice`/`maxDelta` → 0 hits (synonyms checked because the code's word is not the document's); `require`/`revert` in `swap` → 2 hits, both on `amountIn > 0` and `tokenIn != tokenOut`; modifiers → `nonReentrant` only; oracle/TWAP reads → none; the one callee read in full (computes output, enforces nothing); callers → none in scope (it is an entrypoint). Six places it could have been, none holding it — that is an absence. Without the list it is a guess in citation format. Mistake to avoid: concluding `absent` after searching only the document's own vocabulary.
-
-**`partial` — enforcement on the path nobody tested.** Requirement: "The parser MUST reject any frame whose declared length exceeds the remaining buffer." `parse_frame(buf, len, out)` checks `if (len < HDR) return -1`, then `if (declared > len - HDR) return -1` at the non-continuation path — but a `FLAG_CONT` branch writes `out->len = declared` straight from attacker-controlled bytes with no comparison against `len`, returning success. Two paths, one enforcing and one not → `partial`, naming which path fails; `contradicted` would overstate (the requirement holds for the common case), `implemented` would miss the finding. Then check the callers: a caller validating before calling closes it; one trusting `out->len` after a zero return confirms it. Also check other build configurations (`#ifdef`-gated handling). Mistake to avoid: stopping at the first check that matches the requirement — it is usually the one on the path everyone tests.
 
 ## Provenance
 
@@ -153,3 +133,4 @@ Treat `notChecked`, `unverified`, and `unreadableDocuments` sections seriously b
 - License: unknown — see repo (no LICENSE bundled in the skill directory)
 - 蒸馏说明：原目录含 7 文件（SKILL.md + resources 下 4 篇：ANALYSIS_FORMAT / DIVERGENCE_RUBRIC / DOMAIN_NOTES / WORKED_EXAMPLE，另有 agents/openai.yaml 与 assets 图标，纯展示资产已省略）。SKILL.md 中关于 Claude Code 斜杠命令与插件工作流（按需求 fan-out、产出聚合报告 + 每需求一条记录）的机制性描述已改写为通用执行模型文字；四篇 resources 按语义内联进 Verdicts / Severity Rubric / Domain Map / Analysis Record Format / Examples 各节。判定规则（六种 verdict、severity 升降因子、各领域 enforcement 藏身处、Searched 记录要求）尽力逐字保留。未删除/新建任何文件。
 - Distillation note (EN): original had 7 files (4 resource docs inlined; openai.yaml/icon are content-free presentation assets). Claude Code slash-command/plugin routing details were rewritten as a generic execution model; judgment rules (six verdicts, severity rubric, domain-specific enforcement map, search-record discipline) are preserved at high fidelity. No files were deleted or created.
+- 维度收敛（2026-09-11）：本技能的方法（"文档要求 X，代码是否做到"）本身是维度中性的。仅 severity rubric 里的 attacker model 被剥离：Critical 由"trust boundary 之外的人能触发"改为"普通调用方即可触发"，High 由"需要特权角色 / attacker 不直接控制的先决条件"改为"需要特殊状态或非常规调用序列"，升降因子同步改写（untrusted actor → ordinary caller）。Domain Map 与各领域 enforcement 藏身处保留——那是"需求映射到代码"的方法，不是可利用性判断。

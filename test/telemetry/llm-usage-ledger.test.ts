@@ -9,6 +9,7 @@ import {
   runWithLlmUsageLedger,
   snapshotActiveLedgerUsage,
   snapshotRunLedgerUsage,
+  splitCachedPromptUsage,
   toRunTokenUsageSummary,
 } from '../../src/telemetry';
 
@@ -58,8 +59,7 @@ describe('llm-usage-ledger', () => {
     releaseRunLlmUsageLedger('run_1');
   });
 
-  it('merges proxy and claude summaries', () => {
-    const proxy = toRunTokenUsageSummary([
+  it('merges proxy and claude summaries', () => {    const proxy = toRunTokenUsageSummary([
       {
         input_tokens: 10,
         output_tokens: 5,
@@ -86,5 +86,36 @@ describe('llm-usage-ledger', () => {
     expect(merged.session_id).toBe('sess_1');
     expect(merged.by_source.proxy?.total_tokens).toBe(15);
     expect(merged.by_source.claude_session_jsonl?.total_tokens).toBe(34);
+  });
+});
+
+describe('splitCachedPromptUsage', () => {
+  it('把总 prompt 拆成不重不漏的三分量', () => {
+    const split = splitCachedPromptUsage({
+      prompt_tokens: 1000,
+      cache_read_tokens: 700,
+      cache_write_tokens: 100,
+    });
+    // 全价部分必须减去缓存读写：把 prompt_tokens 原样当全价，会和缓存读叠加成双计。
+    expect(split.input_tokens).toBe(200);
+    expect(split.cache_read_input_tokens).toBe(700);
+    expect(split.cache_creation_input_tokens).toBe(100);
+    expect(
+      split.input_tokens + split.cache_read_input_tokens + split.cache_creation_input_tokens,
+    ).toBe(1000);
+  });
+
+  it('未上报缓存时全价等于全部，且缓存量显式为 0', () => {
+    expect(splitCachedPromptUsage({ prompt_tokens: 500 })).toEqual({
+      input_tokens: 500,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    });
+  });
+
+  it('上游缓存量超过 prompt 时钳到 0，不产出负数', () => {
+    expect(
+      splitCachedPromptUsage({ prompt_tokens: 100, cache_read_tokens: 300 }).input_tokens,
+    ).toBe(0);
   });
 });

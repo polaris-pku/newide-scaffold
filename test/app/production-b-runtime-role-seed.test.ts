@@ -36,17 +36,15 @@ describe('production B runtime role seeding (NEWIDE_B_SEED_ROLES)', () => {
         expect(agentIds.has(spec.role_id), `role ${spec.role_id} must be seeded`).toBe(true);
       }
 
-      const activityByRole = new Map<string, number>();
+      const skillByRole = new Map<string, number>();
       for (const file of await scanCorpus(CORPUS_ROOT)) {
-        if (file.kind === 'activity') {
-          activityByRole.set(file.role, (activityByRole.get(file.role) ?? 0) + 1);
-        }
+        skillByRole.set(file.role, (skillByRole.get(file.role) ?? 0) + 1);
       }
 
       for (const spec of ROLE_ROSTER) {
         const skills = await repository.listSkills(spec.role_id);
         expect(skills.length, `${spec.role_id} skill count`).toBe(
-          activityByRole.get(spec.role) ?? 0,
+          skillByRole.get(spec.role) ?? 0,
         );
         const persona = await repository.getPersona(spec.role_id);
         expect(persona.summary).toBe(spec.charter);

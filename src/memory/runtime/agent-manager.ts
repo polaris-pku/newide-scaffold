@@ -172,7 +172,7 @@ export class AgentManager {
         const memory = createAgentMemoryScope(this.repository, this.bufferRepository, role_id);
         const tools = {
           ...this.options.tools,
-          tools: [new QueryMemoryTool(memory, this.options.embedding), ...this.options.tools.tools],
+          tools: [new QueryMemoryTool(memory, this.options.embedding, this.options.tools.onSkillsRetrieved), ...this.options.tools.tools],
         };
         const agent = new Agent(memory, tools);
         this.agents.set(role_id, agent);
@@ -235,7 +235,7 @@ export class AgentManager {
     // 自动注入 QueryMemoryTool（需要 AgentMemoryScope，只能在这里创建）
     const tools = {
       ...this.options.tools,
-      tools: [new QueryMemoryTool(memory, this.options.embedding), ...this.options.tools.tools],
+      tools: [new QueryMemoryTool(memory, this.options.embedding, this.options.tools.onSkillsRetrieved), ...this.options.tools.tools],
     };
 
     return new Agent(memory, tools);

@@ -5,16 +5,11 @@ description: Reviews concurrency constructs for races, TOCTOU, deadlocks, lock o
 
 # Concurrency Review Skill
 
-Review Java concurrent code for correctness, safety, and modern best practices.
+Review threaded, async, or parallel code for concurrency correctness and safety. The protocol below applies to any concurrent code (Java, Kotlin, Go, Rust, C++, JS/TS async, …); the code samples use Java and are illustrative, not a Java-only scope.
 
 ## Why This Matters
 
-> Nearly 60% of multithreaded applications encounter issues due to improper management of shared resources. - ACM Study
-
-Concurrency bugs are:
-- **Hard to reproduce** - timing-dependent
-- **Hard to test** - may only appear under load
-- **Hard to debug** - non-deterministic behavior
+> Concurrency bugs surface as intermittent, load-dependent failures rather than deterministic ones — which is what makes them expensive: they pass review, pass the test suite, and fail in production.
 
 This skill helps catch issues **before** they reach production.
 
@@ -22,73 +17,20 @@ This skill helps catch issues **before** they reach production.
 - Reviewing code with `synchronized`, `volatile`, `Lock`
 - Checking `@Async`, `CompletableFuture`, `ExecutorService`
 - Validating thread safety of shared state
-- Reviewing Virtual Threads / Structured Concurrency code
 - Any code accessed by multiple threads
 
 ---
 
-## Modern Java (21/25): Virtual Threads
+## Per-Finding Verdict Contract
 
-### When to Use Virtual Threads
+The deliverable is a **verdict per finding** — not a checklist of suspicions. For every concurrency issue you report, emit a finding block with all four fields:
 
-```java
-// ✅ Perfect for I/O-bound tasks (HTTP, DB, file I/O)
-try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-    for (Request request : requests) {
-        executor.submit(() -> callExternalApi(request));
-    }
-}
+- **Trigger window / timing** — the exact interleaving: what thread/callback A does between thread B's check and its act, which `await`/IO boundary opens the window, or which two writes race. If you cannot name a concrete window, it is not a finding.
+- **Reachability** — whether that window can actually occur here: which callers, under what load/schedule, and whether an existing lock, atomic, or confined dispatcher already closes it. Reachable → report; unreachable (single-threaded init, an already-synchronized context) → drop.
+- **Evidence** — `file:line` anchors for every step of the window: the read, the check, the write, the shared state, and the missing or insufficient guard.
+- **Verdict** — one of `REAL_RACE` / `REAL_DEADLOCK` / `REAL_VISIBILITY_BUG` / `NEEDS_REVIEW` (window plausible, reachability unconfirmed) / `NOT_A_BUG` (name the guard that closes it).
 
-// ❌ Not beneficial for CPU-bound tasks
-// Use platform threads / ForkJoinPool instead
-```
-
-**Rule of thumb**: If your app never has 10,000+ concurrent tasks, virtual threads may not provide significant benefit.
-
-### Java 25: Synchronized Pinning Fixed
-
-In Java 21-23, virtual threads became "pinned" when entering `synchronized` blocks with blocking operations. **Java 25 fixes this** (JEP 491).
-
-```java
-// In Java 21-23: ⚠️ Could cause pinning
-synchronized (lock) {
-    blockingIoCall();  // Virtual thread pinned to carrier
-}
-
-// In Java 25: ✅ No longer an issue
-// But consider ReentrantLock for explicit control anyway
-```
-
-### ScopedValue Over ThreadLocal
-
-```java
-// ❌ ThreadLocal problematic with virtual threads
-private static final ThreadLocal<User> currentUser = new ThreadLocal<>();
-
-// ✅ ScopedValue (Java 21+ preview, improved in 25)
-private static final ScopedValue<User> CURRENT_USER = ScopedValue.newInstance();
-
-ScopedValue.where(CURRENT_USER, user).run(() -> {
-    // CURRENT_USER.get() available here and in child virtual threads
-    processRequest();
-});
-```
-
-### Structured Concurrency (Java 25 Preview)
-
-```java
-// ✅ Structured concurrency - tasks tied to scope lifecycle
-try (StructuredTaskScope.ShutdownOnFailure scope = new StructuredTaskScope.ShutdownOnFailure()) {
-    Subtask<User> userTask = scope.fork(() -> fetchUser(id));
-    Subtask<Orders> ordersTask = scope.fork(() -> fetchOrders(id));
-
-    scope.join();            // Wait for all
-    scope.throwIfFailed();   // Propagate exceptions
-
-    return new Profile(userTask.get(), ordersTask.get());
-}
-// All subtasks automatically cancelled if scope exits
-```
+Verdicts are per finding (per root cause), not per file; two sightings of one root cause share a single finding and a single verdict.
 
 ---
 
@@ -154,45 +96,30 @@ public void processInBackground() { }
 
 ### 4. Default Executor Creates Thread Per Task
 
+Default `SimpleAsyncTaskExecutor` creates a new thread for every task with no bound. Under load it creates threads faster than they retire and can exhaust memory (OutOfMemoryError). Configure a bounded pool (`ThreadPoolTaskExecutor` with core/max/queue limits) instead.
+
+### 5. ThreadLocal-Bound Context Not Propagating
+
+Any context kept in a `ThreadLocal` — MDC/logging context, transaction or request context, a framework's security context — does not follow work handed to another thread. The async task reads either `null`, or worse on a pooled thread, a stale value left behind by a previous task.
+
 ```java
-// ❌ Default SimpleAsyncTaskExecutor - creates new thread each time!
-// Can cause OutOfMemoryError under load
-
-// ✅ Configure proper thread pool
-@Configuration
-@EnableAsync
-public class AsyncConfig {
-
-    @Bean
-    public Executor taskExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(10);
-        executor.setMaxPoolSize(50);
-        executor.setQueueCapacity(100);
-        executor.setThreadNamePrefix("async-");
-        executor.setRejectedExecutionHandler(new CallerRunsPolicy());
-        executor.initialize();
-        return executor;
-    }
+// ❌ The ThreadLocal is bound to the submitting thread, not the async one
+@Async
+public void recordAction() {
+    // MDC.get("requestId") / RequestContextHolder / SecurityContextHolder are NULL or stale here
+    String requestId = MDC.get("requestId");
+    auditLog.write(requestId, ...);   // writes null, or another request's id
 }
 ```
 
-### 5. SecurityContext Not Propagating
+Capture the value on the submitting thread and pass it as an argument, or wrap the executor so it re-binds the context for each task:
 
 ```java
-// ❌ SecurityContextHolder is ThreadLocal-bound
-@Async
-public void auditAction() {
-    // SecurityContextHolder.getContext() is NULL here!
-    String user = SecurityContextHolder.getContext().getAuthentication().getName();
-}
-
-// ✅ Use DelegatingSecurityContextAsyncTaskExecutor
 @Bean
 public Executor taskExecutor() {
     ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
     // ... configure ...
-    return new DelegatingSecurityContextAsyncTaskExecutor(executor);
+    return new DelegatingSecurityContextAsyncTaskExecutor(executor);  // same idea for MDC / request context
 }
 ```
 
@@ -225,17 +152,9 @@ CompletableFuture.supplyAsync(() -> riskyOperation())
     });
 ```
 
-### Timeout Handling (Java 9+)
+### Timeout Handling
 
-```java
-// ✅ Fail after timeout
-CompletableFuture.supplyAsync(() -> slowOperation())
-    .orTimeout(5, TimeUnit.SECONDS);  // Throws TimeoutException
-
-// ✅ Return default after timeout
-CompletableFuture.supplyAsync(() -> slowOperation())
-    .completeOnTimeout(defaultValue, 5, TimeUnit.SECONDS);
-```
+A future with no timeout hangs forever when the operation never completes. Set one (`orTimeout`, `completeOnTimeout`) on any asynchronous operation that can stall.
 
 ### Combining Futures
 
@@ -251,23 +170,6 @@ CompletableFuture.anyOf(future1, future2, future3)
 // ✅ Combine results
 future1.thenCombine(future2, (r1, r2) -> merge(r1, r2));
 ```
-
-### Use Appropriate Executor
-
-```java
-// ❌ CPU-bound task in ForkJoinPool.commonPool (default)
-CompletableFuture.supplyAsync(() -> cpuIntensiveWork());
-
-// ✅ Custom executor for blocking/I/O operations
-ExecutorService ioExecutor = Executors.newFixedThreadPool(20);
-CompletableFuture.supplyAsync(() -> blockingIoCall(), ioExecutor);
-
-// ✅ In Java 21+, virtual threads for I/O
-ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
-CompletableFuture.supplyAsync(() -> blockingIoCall(), virtualExecutor);
-```
-
----
 
 ## Classic Concurrency Issues
 
@@ -401,15 +303,6 @@ public void transfer(Account from, Account to, int amount) {
 ### ConcurrentHashMap Pitfalls
 
 ```java
-// ❌ Non-atomic compound operation
-if (!map.containsKey(key)) {
-    map.put(key, value);
-}
-
-// ✅ Atomic
-map.putIfAbsent(key, value);
-map.computeIfAbsent(key, k -> createValue());
-
 // ❌ Nested compute can deadlock
 map.compute(key1, (k, v) -> {
     return map.compute(key2, ...);  // Deadlock risk!
@@ -431,21 +324,11 @@ map.compute(key1, (k, v) -> {
 ### 🟡 Medium Severity (Potential Issues)
 - [ ] Thread pools properly sized and named
 - [ ] CompletableFuture exceptions handled (exceptionally/handle)
-- [ ] SecurityContext propagated to async tasks if needed
+- [ ] ThreadLocal-bound context (MDC / request context / security context) propagated to async tasks, or captured on the submitting thread and passed explicitly
 - [ ] `ExecutorService` properly shut down
 - [ ] `Lock.unlock()` in finally block
 - [ ] Thread-safe collections used for shared data
-
-### 🟢 Modern Patterns (Java 21/25)
-- [ ] Virtual threads used for I/O-bound concurrent tasks
-- [ ] ScopedValue considered over ThreadLocal
-- [ ] Structured concurrency for related subtasks
-- [ ] Timeouts on CompletableFuture operations
-
-### 📝 Documentation
-- [ ] Thread safety documented on shared classes
-- [ ] Locking order documented for nested locks
-- [ ] Each `volatile` usage justified
+- [ ] Asynchronous operations that can stall carry a timeout
 
 ---
 
@@ -467,7 +350,7 @@ grep -rn "Executors\.\|ThreadPoolExecutor\|ExecutorService" --include="*.java"
 # Find CompletableFuture without error handling
 grep -rn "CompletableFuture\." --include="*.java" | grep -v "exceptionally\|handle\|whenComplete"
 
-# Find ThreadLocal (consider ScopedValue in Java 21+)
+# Find ThreadLocal (context bound to one thread only)
 grep -rn "ThreadLocal" --include="*.java"
 ```
 
@@ -476,5 +359,7 @@ grep -rn "ThreadLocal" --include="*.java"
 - Source repo: https://github.com/decebals/claude-code-java
 - Original path: skills/concurrency-review/SKILL.md
 - License: unknown - see repo
-- 并入说明（2026-09-07）：下载并归一为单文件（frontmatter 仅 name/description）；原仓库配套技能/辅助文件未随附，需要时回上游取用。
-- Integration note (2026-09-07): fetched and normalized to single-file; sibling skills and auxiliary files of the source repo are not bundled - see upstream.
+- 并入说明（2026-09-07）：下载并归一为单文件（frontmatter 仅 name/description）；原仓库配套文件未随附，需要时回上游取用。
+- Integration note (2026-09-07): fetched and normalized to single-file; auxiliary files of the source repo are not bundled - see upstream.
+- 维度收敛（2026-09-11）：原 "SecurityContext Not Propagating" 改为 "ThreadLocal-Bound Context Not Propagating"——ThreadLocal 传播失败是行为缺陷（下游读到 null，或在线程池上读到上一个任务留下的值），Spring Security 只是典型实例，MDC/事务/请求上下文同理，故按本维度判据呈现并把通用修法（捕获后显式传递）放在框架包装器之前。另删去一处无出处的统计（"Nearly 60% of multithreaded applications … - ACM Study"，与 P0-3 同类缺陷），改写为不带引用的性质陈述。
+- 段落级判据收敛（2026-09-11）：删去 Java 21/25 特性采用指南（Virtual Threads 何时用、Java 25 pinning 修复说明、ScopedValue 迁移、Structured Concurrency API 教程、executor 调参、Modern Patterns 与 Documentation checklist）——这些是"怎么写好并发代码"的采用指南，不是"怎么发现并发缺陷"的审查协议，且其缺陷面已由别处覆盖。保留并缩到缺陷内核的两处：默认 `SimpleAsyncTaskExecutor` 无界建线程致 OOM、无 timeout 的 future 永久挂起。

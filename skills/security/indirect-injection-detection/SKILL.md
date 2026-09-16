@@ -65,7 +65,7 @@ Use a clear marker so success/failure is unambiguous:
 
 ## Output
 
-For each **confirmed** finding, emit one `<vuln>`. Use a short descriptive `risk_type` (e.g. Indirect Prompt Injection, Goal Hijack). Do not use ASI or other framework codes—the reviewer stage adds classification.
+For each **confirmed** finding, emit one `<vuln>`. Use a short descriptive `risk_type` (e.g. Indirect Prompt Injection, Goal Hijack). Do not use ASI or other framework codes.
 
 ```xml
 <vuln>

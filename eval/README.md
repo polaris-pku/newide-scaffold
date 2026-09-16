@@ -28,7 +28,7 @@
 - `v0-dev`：早期开发子集，用来在扩大规模前做稳定迭代。
 - `v0-repo-full`：整仓覆盖切片（conan 2 + dask 8 + requests 4 = 14）；入选 repo 全部 instance，无半截仓。
 - `v0-repo-full-prctx`：同上 14 题，但 `problem_statement` 为 release-note + 离线 PR/Issue body（论文 Appendix N.1）；先跑 `pnpm eval:build-pr-context -- --subset v0-repo-full`。
-- `v0-dask-3-prctx`：从 `v0-repo-full-prctx` 抽出的 3 道 dask 题（`2023.3.2_2023.4.0`、`2023.6.0_2023.6.1`、`2024.3.1_2024.4.0`），用于多修复簇 / 抗干扰 / 定位对照。
+- `v0-dask-3-prctx`：从 `v0-repo-full-prctx` 抽出的 3 道 dask 题（`2023.3.2_2023.4.0`、`2023.6.0_2023.6.1`、`2024.3.1_2024.4.0`），用于多修复簇 / 抗干扰 / 定位对照；角色分歧实验（`pnpm eval:role-divergence`）用它，且**只取 `problem_statement`**。
 - `verified-30`：RFC §4.1 打榜集（`frozen_adapted_v1`；flask 库存适配，见下方说明）。
 
 子集元数据在 `eval/datasets/` 下。每个文件记录来源版本、来源 JSONL、筛选规则、环境要求和固定的 instance id 列表。完整 SWE-EVO JSONL 路径由 `eval/manifest.json` 声明（`default_subset` → `subsets`）。

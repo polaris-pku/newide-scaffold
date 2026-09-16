@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { generateText, jsonSchema, type LanguageModel } from 'ai';
 import { LiteLLMClient } from '../../litellm';
 import type { Tool, ToolCall } from '../../litellm';
-import { recordProxyLlmUsage } from '../../telemetry/llm-usage-ledger';
+import { recordProxyLlmUsage, splitCachedPromptUsage } from '../../telemetry/llm-usage-ledger';
 import type {
   ToolCallingClient,
   ToolCallMessage,
@@ -162,6 +162,15 @@ function toToolCalls(resultToolCalls: unknown[]): ToolCall[] {
 export interface LiteLLMToolCallingClientOptions {
   /** LiteLLM 任务类型（默认 'memory-query'，对应 config/memory-query.yaml） */
   taskName?: string;
+  /**
+   * 输出 token 上限。只在 `model`（模型覆盖）生效时有意义——那条分支没有 YAML
+   * 任务可继承，默认写死 2000。
+   *
+   * 工具调用场景下 2000 往往不够：Agent 一旦把大段上下文塞进工具参数，流式输出会
+   * 在字符串中间被截断，得到非法 JSON，工具调用直接失败且报错难懂（"Unterminated
+   * string in JSON"）。需要长参数时把它调大。
+   */
+  maxTokens?: number;
   /** 是否加载环境变量（默认 true，设为 false 可跳过） */
   loadEnv?: boolean;
 
@@ -189,6 +198,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
   private readonly client: LiteLLMClient;
   private readonly taskName: string;
   private readonly modelOverride: string | undefined;
+  private readonly maxTokensOverride: number | undefined;
 
   constructor(options: LiteLLMToolCallingClientOptions = {}) {
     this.taskName = options.taskName ?? 'memory-query';
@@ -207,6 +217,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     }
 
     this.modelOverride = options.model?.trim() || process.env.DEEPSEEK_MODEL?.trim() || undefined;
+    this.maxTokensOverride = options.maxTokens;
 
     this.client = new LiteLLMClient();
     this.client.registerProvider('openai', async (modelId: string) => {
@@ -244,6 +255,9 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
         providerName = 'anthropic';
       }
     }
+
+    // 显式传入的上限优先于分支默认值与 YAML 任务配置
+    if (this.maxTokensOverride !== undefined) maxTokens = this.maxTokensOverride;
 
     // 2. 解析 provider 得到 AI SDK model 实例
     const model = await resolveProviderModel(providerName, modelId);
@@ -340,8 +354,20 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       generateParams.tools = tools;
     }
     const result = await generateText(generateParams as Parameters<typeof generateText>[0]);
+    // 缓存口径必须拆开发：AI SDK 的 `inputTokens` 是**整个 prompt**，其中
+    // `cacheReadTokens`/`cacheWriteTokens` 是子集。若把 inputTokens 原样当全价输入，
+    // 会和缓存读叠加成双计。拆分规则统一在 splitCachedPromptUsage 里，见其注释。
+    // 这也是这条链路上能看见缓存命中率的唯一位置。
     await recordProxyLlmUsage({
-      input_tokens: result.usage?.inputTokens ?? 0,
+      ...splitCachedPromptUsage({
+        prompt_tokens: result.usage?.inputTokens ?? 0,
+        ...(result.usage?.inputTokenDetails?.cacheReadTokens !== undefined
+          ? { cache_read_tokens: result.usage.inputTokenDetails.cacheReadTokens }
+          : {}),
+        ...(result.usage?.inputTokenDetails?.cacheWriteTokens !== undefined
+          ? { cache_write_tokens: result.usage.inputTokenDetails.cacheWriteTokens }
+          : {}),
+      }),
       output_tokens: result.usage?.outputTokens ?? 0,
       model: modelId,
       temperature,

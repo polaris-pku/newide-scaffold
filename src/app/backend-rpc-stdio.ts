@@ -248,11 +248,24 @@ export async function createProductionBackendService(
           autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
         },
       });
-    try {
-      await memoryMaintenance.replayPending();
-    } catch {
-      throw new Error('Production B Agent manager readiness check failed');
+    // 隔离训练/实验开关：关掉「运行后自动提取经验」与「启动时重放待处理 buffer」两条自动
+    // 路径，使 Agent 记忆在整轮运行中与种子保持一致（角色记忆在学习中漂移会让实验格子
+    // 不再独立）。显式的 memory 维护 RPC 不受影响。注意必须一并关掉重放：只关提取的话，
+    // 本格写入的 pending buffer 会在下一个后端启动时被 replayPending 补做。
+    const disableExtraction = env.NEWIDE_B_DISABLE_EXTRACTION === '1';
+    if (!disableExtraction) {
+      try {
+        await memoryMaintenance.replayPending();
+      } catch {
+        throw new Error('Production B Agent manager readiness check failed');
+      }
     }
+    // 隔离开关：跳过任务级预检索。默认关（生产行为不变）。开启后 driver 只拿到顶层 Agent
+    // 经 query_memory 自查并显式传入的记忆，与系统提示词 "Skills are NOT pre-loaded —
+    // you must query them when needed" 一致。见 eval/role-divergence/README.md。
+    const disablePreRetrieval = env.NEWIDE_B_DISABLE_PRE_RETRIEVAL === '1';
+    // 顶层 Agent 的 tool-calling 观测落点（实验用；不设则完全不写）
+    const agentTraceDir = env.NEWIDE_B_AGENT_TRACE_DIR?.trim();
     const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
     // 动态 Agent 目录：选人 / 议会 / 邮箱协作每次使用时查询当前注册 Agent，
     // 使 memory.createAgent 新增的 Agent 无需重启即可进入协作流程。
@@ -279,7 +292,9 @@ export async function createProductionBackendService(
         new ProductionAgentToolCallingClient(
           createProductionToolCallingClient(productionLlm, env),
         ),
-      memoryMaintenance: bCapabilities.maintenance,
+      ...(disableExtraction ? {} : { memoryMaintenance: bCapabilities.maintenance }),
+      ...(disablePreRetrieval ? { disablePreRetrieval: true } : {}),
+      ...(agentTraceDir ? { agentTraceDir } : {}),
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),
@@ -552,18 +567,33 @@ function createProductionToolCallingClient(
   runtime: ProductionLlmRuntime | undefined,
   env: NodeJS.ProcessEnv,
 ): LiteLLMToolCallingClient {
+  // 工具调用的输出上限：默认走 client 的 2000，可用 env 抬高。参数过长时 2000 会让
+  // 流式输出在字符串中间截断，得到非法 JSON 而工具调用直接失败。
+  const maxTokens = readOptionalPositiveInt(env.NEWIDE_AGENT_LLM_MAX_TOKENS, 'NEWIDE_AGENT_LLM_MAX_TOKENS');
   if (runtime) {
     return new LiteLLMToolCallingClient({
       model: runtime.model,
       apiKey: runtime.apiKey,
       baseUrl: runtime.baseUrl,
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
     });
   }
   return new LiteLLMToolCallingClient({
     ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
       ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
       : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
   });
+}
+
+/** 读可选的正整数 env；未设返回 undefined，非法值抛错（不静默吞掉配置错误） */
+function readOptionalPositiveInt(value: string | undefined, name: string): number | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
 }
 
 function firstNonBlank(...values: Array<string | undefined>): string | undefined {

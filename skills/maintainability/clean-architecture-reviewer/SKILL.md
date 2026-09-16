@@ -18,7 +18,6 @@ description: 'Reviews codebases and PRs for Clean Architecture violations: depen
 - Validating that a new feature follows the established layer boundaries.
 - Original metadata: domain `api-architecture`, role `specialist`, scope `review`, triggers `review`, `architecture review`, `dependency rule`, `layering`, `PR review`, `code audit`, `violations`.
 - Output is a categorized **report** (see Output Format).
-- Related skills in the same family (separate skills, not inlined here): `clean-architecture-dependency-inversion`, `clean-architecture-usecase-generator`, `clean-architecture-test-generator`.
 
 ## Core Principles
 

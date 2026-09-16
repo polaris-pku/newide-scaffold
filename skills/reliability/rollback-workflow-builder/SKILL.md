@@ -7,6 +7,8 @@ description: Creates safe rollback procedures for deployments with automated wor
 
 Build safe, fast rollback mechanisms for production deployments.
 
+> **Asset note.** The original skill referenced two helper scripts, `scripts/deploy.sh` and `scripts/health-check.sh`. Neither is **distributed with this corpus**; in the workflows below they appear as `./deploy` and `./health-check` placeholders — substitute your project's own deploy and health-check entrypoints. The criteria those helpers encoded (rollback triggers, health gates, post-rollback verification) are inlined in "Health-check gate" below.
+
 ## Manual Rollback Workflow
 
 ```yaml
@@ -71,13 +73,13 @@ jobs:
 
       - name: Deploy rollback
         run: |
-          scripts/deploy.sh ${{ github.event.inputs.environment }}
+          ./deploy ${{ github.event.inputs.environment }}   # your project's deploy entrypoint
         env:
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
 
       - name: Verify deployment
         run: |
-          scripts/health-check.sh ${{ github.event.inputs.environment }}
+          ./health-check ${{ github.event.inputs.environment }}
 
       - name: Create incident issue
         uses: actions/github-script@v7
@@ -114,27 +116,27 @@ deploy:
   steps:
     - name: Deploy
       id: deploy
-      run: scripts/deploy.sh production
+      run: ./deploy production
       continue-on-error: true
 
     - name: Verify deployment
       id: verify
       if: steps.deploy.outcome == 'success'
-      run: scripts/health-check.sh production
+      run: ./health-check production
       continue-on-error: true
 
     - name: Auto-rollback on failure
       if: steps.deploy.outcome == 'failure' || steps.verify.outcome == 'failure'
       run: |
-        echo "⚠️ Deployment failed, initiating automatic rollback"
+        echo "Deployment failed, initiating automatic rollback"
         PREVIOUS_VERSION=$(git describe --tags --abbrev=0 HEAD^)
-        scripts/deploy.sh production $PREVIOUS_VERSION
+        ./deploy production "$PREVIOUS_VERSION"
 
         # Verify rollback
-        if scripts/health-check.sh production; then
-          echo "✅ Rollback successful"
+        if ./health-check production; then
+          echo "Rollback successful"
         else
-          echo "❌ Rollback failed - manual intervention required"
+          echo "Rollback failed - manual intervention required"
           exit 1
         fi
 ```
@@ -150,7 +152,9 @@ rollback-k8s:
 
     - name: Configure kubectl
       run: |
+        # ephemeral, permission-restricted, and cleaned up below — never left on the runner
         echo "${{ secrets.KUBECONFIG }}" > kubeconfig
+        chmod 600 kubeconfig
         export KUBECONFIG=kubeconfig
 
     - name: Rollback deployment
@@ -168,8 +172,14 @@ rollback-k8s:
 ```yaml
 - name: Rollback to previous image
   run: |
-    # Get previous image tag
-    PREVIOUS_TAG=$(docker inspect myapp:latest | jq -r '.[0].ContainerConfig.Labels.previous_tag')
+    # Resolve the previous tag from the registry or the deploy record — do NOT read it out
+    # of `docker inspect`. Modern `docker inspect` output has no `ContainerConfig` key
+    # (it is `.Config`), and stock Docker never writes a `previous_tag` label, so the
+    # classic one-liner is both syntactically and logically wrong.
+    # Either query the registry / deployment record for the tag that was live before this
+    # release, or have the deploy pipeline write an explicit `previous_tag` label at build
+    # time — in which case it can be read back with `.[0].Config.Labels.previous_tag`.
+    PREVIOUS_TAG=$(<resolve from registry or deploy record>)
 
     # Retag previous as latest
     docker pull myapp:$PREVIOUS_TAG
@@ -204,6 +214,8 @@ rollback-k8s:
 ```
 
 ## Rollback Runbook
+
+The trigger thresholds below are illustrative starting points — set each from your own service's normal range, not from these numbers.
 
 ````markdown
 # Production Rollback Runbook
@@ -272,14 +284,6 @@ docker logs myapp -f
 5. **Create incident ticket**
 6. **Schedule postmortem**
 
-## Rollback Verification
-
-- [ ] Health check returns 200
-- [ ] Error rate <1%
-- [ ] Response time p95 <500ms
-- [ ] Key features working (login, checkout, etc.)
-- [ ] Database connectivity OK
-
 ## Communication Template
 
 ```
@@ -312,43 +316,16 @@ Updates: #incidents
 **Symptom:** Users still see new version
 **Fix:** Clear CDN cache, check load balancer config
 
-````
+## Health-check gate
 
-## Health Check Script
+The health check is the gate that separates "rolled back and verified" from "still broken". It runs against the target environment's base URL and must pass every layer before the rollback is called successful:
 
-```bash
-#!/bin/bash
-# scripts/health-check.sh
+1. **Application health** — the service's own health endpoint returns 2xx (e.g. `/api/health`).
+2. **Dependency health** — the database and critical downstream dependencies report healthy (e.g. `/api/health/db`).
+3. **Key user journeys** — a small set of representative endpoints (login, catalog, checkout) returns 2xx; a passing health endpoint with failing journeys is a false green.
+4. **Signal confirmation** — error rate <1% and p95 latency <500 ms over a short window; health endpoints alone do not prove recovery.
 
-ENVIRONMENT=$1
-BASE_URL="https://${ENVIRONMENT}.myapp.com"
-
-echo "Running health checks for $ENVIRONMENT..."
-
-# API health
-if ! curl -f "$BASE_URL/api/health" > /dev/null 2>&1; then
-  echo "❌ API health check failed"
-  exit 1
-fi
-
-# Database connection
-if ! curl -f "$BASE_URL/api/health/db" > /dev/null 2>&1; then
-  echo "❌ Database health check failed"
-  exit 1
-fi
-
-# Key endpoints
-ENDPOINTS=("/api/users" "/api/products" "/api/orders")
-for endpoint in "${ENDPOINTS[@]}"; do
-  if ! curl -f "$BASE_URL$endpoint" > /dev/null 2>&1; then
-    echo "❌ Endpoint $endpoint health check failed"
-    exit 1
-  fi
-done
-
-echo "✅ All health checks passed"
-exit 0
-````
+Fail closed: if any layer fails, the rollback is *not* complete and an operator must intervene. The original `scripts/health-check.sh` is not distributed with this corpus.
 
 ## Best Practices
 
@@ -359,14 +336,3 @@ exit 0
 5. **Tested**: Practice rollbacks regularly
 6. **Monitored**: Alert on failures
 7. **Communicated**: Notify stakeholders
-
-## Output Checklist
-
-- [ ] Manual rollback workflow
-- [ ] Automated rollback on failure
-- [ ] Platform-specific rollback (K8s/Docker)
-- [ ] Database rollback procedure
-- [ ] Rollback runbook documented
-- [ ] Health check scripts
-- [ ] Communication templates
-- [ ] Incident issue automation

@@ -7,9 +7,6 @@ description: 'Guides naming as an evolutionary process in two modes: audit (broa
 
 # evolutionary-naming
 
-> 蒸馏自 kawasima/evolutionary-naming（skills/evolutionary-naming）。原为 4 文件（SKILL.md + reference.md + audit-mode.md + improve-mode.md），已内联合并为单文件。
-> Distilled from kawasima/evolutionary-naming (skills/evolutionary-naming); originally 4 files (SKILL.md + shared reference.md + audit-mode.md + improve-mode.md), now inlined as text.
-
 ## When to Use
 
 - Use when refactoring code with poor names, when asked to improve naming, or when a user struggles to name a class/method/variable.
@@ -26,7 +23,7 @@ description: 'Guides naming as an evolutionary process in two modes: audit (broa
 
 | Phase | Steps | Nature |
 |---|---|---|
-| **Phase 1: Insight → Name** | Missing → Nonsense → Honest → Honest and Complete | Universal. Pure naming. No structural change. Safe to walk continuously. |
+| **Phase 1: Insight → Name** | Missing → Nonsense → Honest → Honest and Complete | Universal. Pure naming, no structural change. Safe to walk continuously — **except** a rename of an exported/public symbol, route path, DB column, config key, or event name: those are contracts, so sweep the call sites and propose a deprecation path rather than a silent rename. |
 | **Phase 2: Name → Structure** | Honest and Complete → Does the Right Thing | Codebase-specific. Requires structural refactoring. **Ask permission.** |
 | **Phase 3: Combine for Design** | Does the Right Thing → Intent → Domain Abstraction | Requires reading call sites and domain context. **Ask permission.** |
 
@@ -64,24 +61,12 @@ Purpose: scan provided code and produce a **structured report** of all naming im
 - Audit the broader codebase silently — stay within the user-provided scope; if unsure, ask.
 - Group by file or by kind instead of by phase — phase grouping reflects required permission level, which is what the user needs to plan work.
 
-### Diagnosis Shortcuts (full criteria in the 7-Step Reference)
-| Sign | Step |
-|---|---|
-| 1-letter name (`d`, `r`, `s`) | Missing |
-| Abbreviation (`cnt`, `ts`, `val`) | Missing/Nonsense |
-| `-Manager`, `-Handler`, `-Util`, `-er` | Misleading → Nonsense candidate |
-| Generic verb (`process`, `handle`, `do`) | Misleading |
-| Type as name (`String string`) | Missing |
-| Map keys as untyped strings | Missing (each key is its own identifier) |
-| Long name with `And` | Honest and Complete (Phase 2 candidate) |
-| Domain term, single-purpose | Intent or Domain Abstraction |
-
 ### Handoff to Improve Mode
 When the user picks one identifier from the audit ("X だけ直して", "Improve OrderManager"): switch to improve-mode for that single target; do NOT re-audit — the diagnosis is already in your output; carry forward the current-step classification you assigned.
 
 ## Mode: Improve — Interactive Single-Target Improvement
 
-Purpose: take ONE identifier and walk it through the naming process, one transition at a time, *proposing* each move. Pause at phase boundaries so the user can decide whether to invest in structural changes. Advisory: you propose renames and suggest commit messages; you do not edit files or run git.
+Purpose: take ONE identifier and walk it through the naming process, one transition at a time, *proposing* each move. Pause at phase boundaries so the user can decide whether to invest in structural changes.
 
 ### Workflow
 1. **Confirm the target.** Restate which identifier you're improving. If the user named multiple, ask which one to start with.
@@ -210,21 +195,11 @@ storeFlightToDatabaseAndLocalCache() → beginTrackingFlight()
 | Name a class without reading its full body | You can't be Honest about what you haven't read. |
 | Skip `probably_` / `_AndStuff` because it looks unprofessional | Misleading "professional" names cause bugs; honest uncertainty is better. |
 | Rename to a shorter name at Honest and Complete | Long names are correct here; shortening comes at Intent level. |
-| Skip applesauce because the name "already says something" | `-Manager`, `-Handler`, `process()` say nothing useful — misleading, not Honest. |
-| Naming by when it's called (`onInit`, `preLoad`) | Name by what it does or why it exists. |
 | Variable named same as type (`GridSquare gridSquare`) | Name by what distinguishes this instance. |
 | Using CS terms (`Transformer`, `Processor`, `Handler`) at Intent level | Use domain terms the business understands. |
 
 ### Why a Commit per Step
 Each naming improvement makes the code strictly better. A commit locks in that gain, so if the next step fails the user rolls back to a better state than before. Propose one commit per step, never a batch — the naming process IS the commit history. Suggest the message; the user runs the commit.
-
-```
-rename process to applesauce
-rename applesauce to parseXmlAndStuff (honest)
-expand name to parseXmlAndSaveToDatabaseAndCache (complete)
-extract parseItemsFromXml (single responsibility)
-rename to importEntries (intent)
-```
 
 ## Output Format — Audit Report
 

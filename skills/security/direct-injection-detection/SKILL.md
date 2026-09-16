@@ -5,9 +5,6 @@ description: Detect direct prompt injection or instruction override via user mes
 
 # Direct Injection Detection
 
-> 边界标注（2026-09-07）：Agent 安全探测（直接提示注入）；发现后的加固/门禁见 reliability/evals-ops-guardrails，归类用 security/owasp-asi。
-> Boundary (2026-09-07): agent-security probing (direct prompt injection); hardening/governance after findings lives in reliability evals-ops-guardrails, classification in owasp-asi.
-
 Detect **direct prompt injection** where the **user message itself** tries to override system or developer instructions. This is different from indirect injection (no external documents/RAG/web content).
 
 > **Stop rule**: once one confirmed finding of a given type is obtained, stop all probes for that type.

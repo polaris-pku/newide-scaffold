@@ -13,7 +13,7 @@ description: Audits Terraform infrastructure for security - IAM, network, storag
 - When auditing existing Terraform state files to identify deployed misconfigurations
 - When enforcing organizational security standards across multiple Terraform projects
 
-**Do not use** for runtime security monitoring (use CSPM tools), for application security testing (use SAST/DAST tools), or for cloud configuration drift detection (use AWS Config or Azure Policy after deployment).
+**Do not use** for runtime security monitoring, for application security testing, or for cloud configuration drift detection.
 
 ## Prerequisites
 
@@ -273,15 +273,6 @@ done
 ### Scenario: Adding Security Gates to an Existing Terraform CI/CD Pipeline
 
 **Context**: A DevOps team deploys infrastructure via Terraform in GitHub Actions but has no security scanning. Recent audit findings show multiple S3 buckets without encryption and security groups allowing SSH from the internet.
-
-**Approach**:
-1. Add Checkov as the first security gate in the GitHub Actions workflow
-2. Run `checkov -d ./terraform/` to establish the current baseline of findings
-3. Triage existing findings: fix CRITICAL issues, create tickets for HIGH, suppress accepted risks
-4. Add tfsec as a secondary scanner for Terraform-specific checks
-5. Write custom OPA policies for organization standards (required tags, naming conventions)
-6. Configure the pipeline to block PRs with CRITICAL or HIGH findings
-7. Generate SARIF reports for GitHub Security tab integration
 
 **Pitfalls**: Adding security scanning to an existing project will initially produce hundreds of findings. Implement gradually by starting with CRITICAL-only blocking, then expanding to HIGH. Use inline suppression comments (`#checkov:skip=CKV_AWS_18:Public bucket for static website`) for intentional exceptions with documented justification.
 

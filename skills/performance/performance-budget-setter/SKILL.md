@@ -9,6 +9,8 @@ Set and enforce performance budgets to maintain fast user experiences.
 
 ## Performance Budget Template
 
+Every number below illustrates the *shape* of a budget, not a recommended value — derive yours from your own baseline and business constraints.
+
 ```markdown
 # Performance Budget: E-Commerce Website
 
@@ -42,11 +44,13 @@ Set and enforce performance budgets to maintain fast user experiences.
 
 ## Core Web Vitals
 
-| Metric                         | Good   | Poor   | Target |
-| ------------------------------ | ------ | ------ | ------ |
-| LCP (Largest Contentful Paint) | <2.5s  | >4.0s  | <2.0s  |
-| FID (First Input Delay)        | <100ms | >300ms | <50ms  |
-| CLS (Cumulative Layout Shift)  | <0.1   | >0.25  | <0.05  |
+The **Good** and **Poor** columns are Google's published thresholds (keep them as-is); **Target** is your own tighter goal — set it, don't copy the illustration.
+
+| Metric                          | Good   | Poor   | Target |
+| ------------------------------- | ------ | ------ | ------ |
+| LCP (Largest Contentful Paint)  | <2.5s  | >4.0s  | <2.0s  |
+| INP (Interaction to Next Paint) | <200ms | >500ms | <200ms |
+| CLS (Cumulative Layout Shift)   | <0.1   | >0.25  | <0.05  |
 
 ## Page-Specific Budgets
 
@@ -92,14 +96,14 @@ jobs:
   budget-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Build production bundle
         run: npm run build
 
       - name: Check bundle size
         run: |
-          npx bundlesize
+          npx size-limit
 
       - name: Lighthouse CI
         run: |
@@ -154,8 +158,9 @@ module.exports = {
 ### Real User Monitoring (RUM)
 
 ```typescript
-// Track Core Web Vitals
-import { getCLS, getFID, getFCP, getLCP, getTTFB } from "web-vitals";
+// Track Core Web Vitals (web-vitals v4+ API: FID was replaced by INP and the
+// getXXX() helpers were removed in favor of onXXX() callbacks)
+import { onCLS, onFCP, onINP, onLCP, onTTFB } from "web-vitals";
 
 function sendToAnalytics(metric) {
   const body = JSON.stringify(metric);
@@ -167,9 +172,9 @@ function sendToAnalytics(metric) {
   }
 }
 
-getCLS(sendToAnalytics);
-getFID(sendToAnalytics);
-getLCP(sendToAnalytics);
+onCLS(sendToAnalytics);
+onINP(sendToAnalytics);
+onLCP(sendToAnalytics);
 ```
 
 ### Synthetic Monitoring
@@ -192,7 +197,7 @@ curl "https://www.webpagetest.org/runtest.php?url=https://example.com&k=API_KEY"
 - Core Web Vitals scores
 - Page load times
 
-**Alerts:**
+**Alerts** (the percentages below are illustration — set each from the noise floor of your own metric):
 
 - Bundle size exceeds budget by 10%
 - LCP >2.5s for >5% of users
@@ -228,11 +233,13 @@ const [user, orders] = await Promise.all([fetchUser(id), fetchOrders(id)]);
 const cachedData = await redis.get(key);
 if (cachedData) return cachedData;
 
-// Pagination
+// Pagination: prefer keyset (cursor) pagination over deep offset
 const products = await db.products
-  .find()
-  .limit(20)
-  .skip((page - 1) * 20);
+  .find({ id: { $gt: lastSeenId } })
+  .sort({ id: 1 })
+  .limit(20);
+// Avoid .limit(20).skip((page - 1) * 20) for deep pages - the database still
+// scans and discards every skipped row, so cost grows with the page number.
 ```
 
 ### Optimize Database Queries

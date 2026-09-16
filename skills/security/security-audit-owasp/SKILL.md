@@ -5,9 +5,6 @@ description: Audits code and deployments for security vulnerabilities and drives
 
 # security-audit-owasp
 
-> 边界标注（2026-09-07）：本技能主打"安全变更模式 + 部署门 + OWASP Top10 清单"；纯 diff 全量审计走 security/code-security-audit，避免双份全量清单。正文葡语示例为溯源保真保留。
-> Boundary (2026-09-07): this skill owns the secure-change workflow, deployment gate and OWASP Top-10 checklist; plain full-diff audits go to code-security-audit (do not duplicate). Portuguese examples are kept for provenance fidelity.
-
 > 蒸馏自 Prismas33/security-audit（仓库内路径 `.`）。原为 4 文件（SKILL.md + README.md + references/attack-patterns.md + references/secure-change-gates.md）；两篇附属参考文档已内联为正文章节，frontmatter 的 author/version 移入 Provenance。
 > Distilled from Prismas33/security-audit (repo path `.`); originally 4 files (SKILL.md, README.md, and two reference documents now inlined as body sections).
 
@@ -38,7 +35,7 @@ Think like an attacker:
 Then think like the operator who must safely ship the fix:
 5. **Contract mapping** — Which browser, proxy/CDN, frontend, API, mobile APK, and legacy clients depend on this behavior?
 6. **Regression proof** — What small test would prove the change works without breaking those clients?
-7. **Deployment proof** — What production header, health check, or flow proves the backend/frontend rollout is compatible?
+7. **Security evidence** — What production header, preflight response, or auth flow proves the security fix behaves as intended?
 
 ## Security Change Mode
 
@@ -62,7 +59,6 @@ For a cross-layer change, map this contract before editing:
 | API | request parsing, auth middleware, response/cookie headers, logout |
 | CORS/proxy/CDN | exact allowed origin, credentials header, `Vary: Origin`, HTTPS |
 | Native/APK/legacy | Bearer/API compatibility, WebView cookie behavior, update constraints |
-| Deployment | backend-first ordering, restart method, rollback path, health check |
 
 ### 2. Mandatory Rules
 
@@ -72,7 +68,7 @@ For a cross-layer change, map this contract before editing:
 - Do not log raw request bodies, authorization headers, cookies, provider errors, or unredacted exception objects.
 - Do not use `Access-Control-Allow-Origin: *` with credentials. Use explicit origins and `Access-Control-Allow-Credentials: true`.
 - Preserve an explicit compatibility path for native/legacy clients before replacing Bearer authentication.
-- Deploy the backend/API compatibility change before frontend code that requires it.
+- Release readiness, deployment ordering, rollback and health checks are out of scope here.
 - Do not claim a security fix is complete until its focused production validation has passed.
 
 ### 3. Cookie Session Checklist
@@ -90,25 +86,21 @@ When migrating web auth from Bearer/JWT in browser storage to cookies, verify ev
 - [ ] State-changing cookie-authenticated endpoints have CSRF protection appropriate to the site architecture.
 - [ ] Native/APK/CLI Bearer support is retained or a tested migration path exists.
 
-### 4. Security Deployment Gate
+### 4. Pre-Deploy Security Checks
 
-Before deploy:
+Before deploy — security-specific checks only:
 
-- [ ] Focused build/typecheck and relevant tests pass.
-- [ ] A rollback command/version is known.
-- [ ] API/backend deploy happens before the frontend if the frontend contract changed.
+- [ ] Every new or changed endpoint has authentication and authorization applied.
+- [ ] No secrets, tokens, or credentials were introduced into source, config files, or the built bundle.
+- [ ] New dependencies introduce no known vulnerabilities (npm audit / pip-audit).
 - [ ] Production CORS origins match the real panel origin exactly.
 
-After deploy:
+After deploy — security verification:
 
-- [ ] Health endpoint succeeds.
 - [ ] Browser preflight `OPTIONS` confirms expected origin, methods, headers, and credentials policy.
-- [ ] Login succeeds in a real browser.
 - [ ] URL bar, browser storage, and console are checked for sensitive data.
-- [ ] Logout and session expiry are checked.
+- [ ] Logout and session expiry invalidate the session server-side.
 - [ ] A supported native/APK flow is smoke-tested when auth behavior changed.
-
-If a frontend deploy is already live and its API counterpart is not, prioritize restoring compatibility immediately: deploy the API fix or roll back the frontend.
 
 ### Expected Output
 
@@ -278,14 +270,6 @@ query = "SELECT * FROM users WHERE id = " + user_input
 query = "SELECT * FROM users WHERE id = %s" % user_input
 ```
 
-**Como Atacar:**
-```
-# Input malicioso
-' OR '1'='1
-'; DROP TABLE users; --
-' UNION SELECT username, password FROM users --
-```
-
 **Remediação:**
 ```python
 # Queries parametrizadas
@@ -314,14 +298,6 @@ document.write(userInput);
 eval(userInput);
 ```
 
-**Payloads de Teste:**
-```html
-<script>alert('XSS')</script>
-<img src=x onerror=alert('XSS')>
-<svg onload=alert('XSS')>
-javascript:alert('XSS')
-```
-
 **Remediação:**
 ```javascript
 // Usar textContent em vez de innerHTML
@@ -345,14 +321,6 @@ GET /api/orders/456/invoice
 
 # Verificar se mudar o ID mostra dados de outros users
 GET /api/users/124/profile  # Deveria dar 403, não 200
-```
-
-**Como Atacar:**
-```bash
-# Enumerar IDs
-for i in {1..1000}; do
-  curl "https://api.com/users/$i/profile"
-done
 ```
 
 **Remediação:**
@@ -384,17 +352,6 @@ def get_profile(user_id: int, current_user: User):
 - Cookie sem HttpOnly/Secure
 ```
 
-**Testes:**
-```bash
-# JWT com alg:none
-echo '{"alg":"none","typ":"JWT"}' | base64
-echo '{"user":"admin"}' | base64
-# Token: base64header.base64payload.
-
-# Brute force
-hydra -l admin -P wordlist.txt target http-post-form
-```
-
 ### 5. SSRF (Server-Side Request Forgery)
 
 **Como Identificar:**
@@ -404,17 +361,6 @@ hydra -l admin -P wordlist.txt target http-post-form
 def fetch_url(url: str):
     response = requests.get(url)  # SSRF!
     return response.text
-```
-
-**Como Atacar:**
-```
-# Aceder a serviços internos
-?url=http://localhost/admin
-?url=http://169.254.169.254/metadata  # AWS metadata
-?url=http://internal-api:8080/secrets
-
-# File access
-?url=file:///etc/passwd
 ```
 
 **Remediação:**
@@ -461,13 +407,6 @@ def get_file(filename: str):
     return open(f"/uploads/{filename}").read()
 ```
 
-**Como Atacar:**
-```
-GET /files/../../../etc/passwd
-GET /files/....//....//etc/passwd
-GET /files/%2e%2e%2f%2e%2e%2fetc/passwd
-```
-
 **Remediação:**
 ```python
 import os
@@ -493,15 +432,6 @@ os.system(f"ping {user_input}")
 subprocess.call(f"convert {filename}", shell=True)
 ```
 
-**Como Atacar:**
-```
-# Input malicioso
-; cat /etc/passwd
-| cat /etc/passwd
-`cat /etc/passwd`
-$(cat /etc/passwd)
-```
-
 **Remediação:**
 ```python
 # Usar lista de argumentos, não shell=True
@@ -522,16 +452,6 @@ if not re.match(r'^[\d.]+$', user_input):
 def create_user(data: dict):
     user = User(**data)  # Pode incluir is_admin=True!
     db.add(user)
-```
-
-**Como Atacar:**
-```json
-{
-  "username": "hacker",
-  "email": "hacker@evil.com",
-  "is_admin": true,
-  "role": "superuser"
-}
 ```
 
 **Remediação:**
@@ -578,11 +498,11 @@ X-Originating-IP: different-ip
 # Normalizar paths antes de rate limiting
 ```
 
-## Secure Change Gates (cross-layer auth & deployment reference)
+## Secure Change Gates (cross-layer auth reference)
 
 > 内联自原 references/secure-change-gates.md。Inlined from the original references/secure-change-gates.md.
 
-Use this whenever a security finding changes an authentication, browser, API, proxy, or deployment contract.
+Use this whenever a security finding changes an authentication, browser, API, or proxy contract.
 
 ### Change Record
 
@@ -593,42 +513,16 @@ Risk: CRITICAL/HIGH/MEDIUM/LOW
 Root cause:
 Affected layers: browser | frontend | API | proxy/CDN | native/APK | database
 Compatibility decision:
-Rollback:
-
-### Pre-deploy proof
-- [ ] Focused build/test:
-- [ ] Static sensitive-data scan:
-- [ ] CORS/preflight check:
-- [ ] Native/APK compatibility decision:
-
-### Post-deploy proof
-- [ ] API health:
-- [ ] Browser login:
-- [ ] URL/storage/console inspection:
-- [ ] Logout/session expiry:
-- [ ] Native/APK smoke test:
 ```
-
-### Auth Migration Matrix
-
-| Scenario | Required proof |
-|---|---|
-| Browser login | `Set-Cookie` has `HttpOnly`, `Secure` in production, and deliberate `SameSite`; no JWT is persisted in browser storage. |
-| Browser request | Fetch includes credentials and preflight returns exact `Access-Control-Allow-Origin` plus `Access-Control-Allow-Credentials: true`. |
-| Logout | Cookie is cleared with matching path/domain/SameSite attributes and protected API requests return 401 afterward. |
-| API errors | Logs contain sanitized error metadata, never raw request/auth/cookie/token/provider data. |
-| Native APK | Existing Bearer flow remains functional or a versioned replacement and rollout plan exists. |
-| Frontend release | Backend supports the new contract before the browser bundle reaches production. |
 
 ### Stop Conditions
 
-Stop deployment and repair or roll back when any condition is true:
+Stop deployment and repair when any condition is true:
 
 - Login depends on an API CORS header that is not already live.
 - The frontend/API origins are unknown or a wildcard origin is being combined with credentials.
 - A JWT/password/token still appears in a URL, browser storage, console, or generated log.
 - A fix removes Bearer auth without an explicit APK/native compatibility decision.
-- There is no command or version to roll back a production auth change.
 
 ## Analysis Commands
 
@@ -683,7 +577,7 @@ For a suspected credential/session exposure:
 2. **Assess:** identify browser history, screenshots, logs, CDN/proxy, analytics, git, chat, backups, and client storage that may contain the secret.
 3. **Rotate:** change exposed passwords, signing secrets, API keys, and provider secrets as applicable.
 4. **Remediate:** fix the root cause across frontend, API, and infrastructure.
-5. **Verify:** run the deployment gate and document evidence, remaining risk, and rollback.
+5. **Verify:** re-run the pre-deploy security checks and document evidence and remaining risk.
 
 Never place real credentials, tokens, or copied sensitive URLs in the incident report.
 

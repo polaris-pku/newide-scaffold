@@ -5,9 +5,6 @@ description: Classifies security findings against the OWASP Top 10 for Agentic A
 
 # OWASP ASI Classification Framework
 
-> 边界标注（2026-09-07）：只做 ASI 分类；上游 10 个 detection 技能本语料仅收录 direct-injection-detection 一个——先用探测/审计技能产出发现，再用本框架归类。
-> Boundary (2026-09-07): classification only; of the 10 upstream detection skills only direct-injection-detection is in this corpus — detect first, then classify here.
-
 **OWASP Top 10 for Agentic Applications 2026** - Standardized risk classification for AI agent security.
 
 ## Risk Categories
@@ -24,22 +21,6 @@ description: Classifies security findings against the OWASP Top 10 for Agentic A
 | **ASI08** | Cascading Failures | Error propagation, chain reaction vulnerabilities |
 | **ASI09** | Human-Agent Trust Exploit | Social engineering, deceptive responses |
 | **ASI10** | Rogue Agents | Malicious agent behavior, unauthorized actions |
-
-## Detection Source → ASI Mapping
-
-| Detection Source | Type | Primary ASI | Secondary ASI |
-|:-----------------|:-----|:------------|:--------------|
-| `data-leakage-detection` | Skill | ASI06, ASI07 | ASI01, ASI03 |
-| `tool-abuse-detection` | Skill | ASI02, ASI05, ASI07 | ASI03 |
-| `indirect-injection-detection` | Skill | ASI01 | ASI06 |
-| `authorization-bypass-detection` | Skill | ASI03 | ASI09 |
-| `agentic-supply-chain-detection` | Skill | ASI04 | ASI10 |
-| `unexpected-code-execution-detection` | Skill | ASI05 | ASI04 |
-| `inter-agent-comm-security-detection` | Skill | ASI07 | ASI06 |
-| `cascading-failure-detection` | Skill | ASI08 | ASI10 |
-| `human-agent-trust-exploit-detection` | Skill | ASI09 | ASI01 |
-| Prompt Injection tests | Dialogue | ASI01, ASI06 | ASI09 |
-| Code Audit | Agent | ASI04, ASI05 | ASI10 |
 
 ## Finding → ASI Mapping
 
@@ -61,15 +42,11 @@ description: Classifies security findings against the OWASP Top 10 for Agentic A
 - Remote code execution confirmed
 - Full agent takeover possible
 
-**Action**: Immediate remediation (within 24 hours)
-
 ### High ⚠️
 - API keys with limited scope
 - Authentication tokens
 - System prompt disclosure
 - Partial credential exposure
-
-**Action**: Urgent remediation (within 1 week)
 
 ### Medium 💡
 - Configuration details
@@ -77,21 +54,14 @@ description: Classifies security findings against the OWASP Top 10 for Agentic A
 - Metadata leakage
 - Conditional exploitation paths
 
-**Action**: Address within 2-4 weeks
-
 ### Low ℹ️
 - Generic system information
 - Non-sensitive configurations
 - Indirect hints
 
-**Action**: Review as time permits
+> 本框架只做严重级归类；不设整改时限，也不设发布门禁，不设 SLA。
+> This framework classifies severity only; it does not set remediation deadlines, release gates, or SLAs.
 
 ## Usage
 
-Load this skill when performing OWASP ASI classification:
-
-```python
-load_skill(name="owasp-asi")
-```
-
-Then apply the mapping rules to classify findings.
+Load this skill when performing OWASP ASI classification, then apply the mapping rules above to classify agent-security findings.

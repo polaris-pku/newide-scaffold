@@ -128,7 +128,7 @@ export default async function Page() {
 
 ### Direct imports, not barrels
 
-Barrel `index.ts` files force the bundler to walk the entire module graph even when tree-shaking removes most of it. Direct imports save 200-800ms of first-load JS in many real-world apps.
+Barrel `index.ts` files force the bundler to walk the entire module graph even when tree-shaking removes most of it. Direct imports keep the shipped bundle to what is actually used.
 
 ```ts
 // INCORRECT
@@ -182,22 +182,11 @@ Trigger `<link rel="preload">` or `import()` on hover so the bundle is in cache 
 
 ## 3. Server-Side Performance (HIGH)
 
-### Authenticate Server Actions like API routes
+### Server Action authorization — out of scope
 
-Every `"use server"` function is a public endpoint. Authenticate AND authorize inside the action — never rely on the calling Client Component's gating.
-
-```ts
-"use server";
-export async function deleteUser(formData: FormData) {
-  const session = await getSession();
-  if (!session?.user) throw new Error("Unauthorized");
-  const targetId = String(formData.get("id"));
-  if (session.user.role !== "admin" && session.user.id !== targetId) {
-    throw new Error("Forbidden");
-  }
-  await db.user.delete({ where: { id: targetId } });
-}
-```
+Authenticating and authorizing `"use server"` endpoints is an authn/authz concern, not a
+rendering-performance one. The only performance ask is that per-request work inside
+actions be deduplicated — see `React.cache()` below.
 
 ### `React.cache()` for per-request deduplication
 
@@ -232,7 +221,7 @@ export async function Page() {
 
 ### No mutable module-level state in RSC/SSR
 
-Module state on the server is shared across all requests — a race condition between users. Use request-scoped storage (`headers()`, `cookies()`, async context) instead.
+Module state on the server is shared across every request, which defeats the per-request caching and deduplication the rest of this section relies on. Use request-scoped storage (`headers()`, `cookies()`, async context). (A module value that *varies per user* is also an output-correctness bug — that reading is out of scope here.)
 
 ### Minimize data passed to Client Components
 
@@ -465,15 +454,9 @@ Use ONLY for known-divergent leaf nodes — never on a tree containing other chi
 
 React 19 `<Activity mode="visible|hidden">` keeps tree state and effects mounted but hides — cheaper than unmount/remount for tabs and accordions.
 
-### Ternary over `&&` for conditional render
+### Conditional-render footguns — out of scope
 
-```tsx
-// INCORRECT — `0` renders as text node
-{count && <Badge>{count}</Badge>}
-
-// CORRECT
-{count > 0 ? <Badge>{count}</Badge> : null}
-```
+A conditional render that emits a falsy value as text (`{count && <Badge/>}` renders `0`) is an output-correctness defect, not a rendering-performance one.
 
 ### `useTransition` for loading states
 
@@ -495,7 +478,7 @@ preconnect("https://api.example.com");
 
 - **Batch DOM/CSS changes** — apply via class swap or `cssText`, not property-by-property
 - **`Map` for repeated lookups** — `O(1)` vs `O(n)` linear scan
-- **Cache property access in loops** — `const len = arr.length`
+- **Profile before micro-optimizing loop internals** — modern V8 hoists/inlines `.length` and property access, so a manual `const len = arr.length` is usually a no-op; measure first
 - **Memoize pure functions** — module-level `Map<key, result>`
 - **Cache `localStorage` reads** — sync API; one read per render
 - **Combine `filter().map()` into one pass** — `flatMap` or single `for`
@@ -505,7 +488,6 @@ preconnect("https://api.example.com");
 - **Loop for min/max** instead of `sort()` — `O(n)` vs `O(n log n)`
 - **`Set`/`Map` for membership** — `O(1)` vs `Array.includes` `O(n)`
 - **`toSorted()` over mutation** when immutability matters
-- **`flatMap` to map and filter in one pass**
 - **`requestIdleCallback`** for non-critical work
 
 ## 8. Advanced Patterns (LOW)
@@ -557,25 +539,10 @@ When the project ships React Compiler, demote `rerender-*` manual memoization ru
 | **INP** (Interaction to Next Paint) | Re-render, Rendering, JavaScript |
 | **CLS** (Cumulative Layout Shift) | Rendering (Suspense placement, image dimensions) |
 | **TBT** (Total Blocking Time) | Bundle Size, JavaScript, Defer Third-Party |
-| **FID** (legacy) | Bundle Size, Hydration |
-
-## Related
-
-- Skills: react-patterns, react-testing, frontend-patterns, accessibility, nextjs-turbopack
-- Rules: rules/react/
-- Agents: `react-reviewer` enforces these rules in code review; `react-build-resolver` handles related build failures
-- Commands: `/react-review`, `/react-build`, `/react-test`
-
-## Attribution
-
-Adapted from Vercel Labs `react-best-practices` skill (MIT License, copyright Vercel Engineering, v1.0.0 January 2026). Source: [https://github.com/vercel-labs/agent-skills/tree/main/skills/react-best-practices](https://github.com/vercel-labs/agent-skills/tree/main/skills/react-best-practices).
-
-This skill restructures and adapts the original 70-rule catalog into a single navigable reference. For the full original ruleset with extended examples, see the upstream repository.
 
 ## Provenance
 
 - Source repo: https://github.com/affaan-m/everything-claude-code
 - Original path: skills/react-performance/SKILL.md
 - License: unknown - see repo
-- 并入说明（2026-09-07）：下载并归一为单文件（frontmatter 仅 name/description）；原仓库配套技能/辅助文件未随附，需要时回上游取用。
 - Integration note (2026-09-07): fetched and normalized to single-file; sibling skills and auxiliary files of the source repo are not bundled - see upstream.

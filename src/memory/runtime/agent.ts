@@ -31,6 +31,81 @@ import { buildAgentSystemPrompt } from '../prompts/agent-system-prompt';
 // ──────────────────────────────────────────────
 
 /**
+ * 顶层 Agent 的单次工具调用记录。
+ *
+ * 宿主用它把「Agent 到底调没调 query_memory、查到几条」落成凭据。没有这条记录时，
+ * 注入为空只能靠猜——运行时完全没有 Agent 侧的观测。
+ */
+export interface AgentToolEvent {
+  /** 工具名（query_memory / invoke_driver / …） */
+  name: string;
+  /** 是否成功执行；工具不存在或抛错为 false */
+  ok: boolean;
+  /** 第几轮 tool-calling */
+  round: number;
+  /** 入参摘要（截断） */
+  args_preview: string;
+  /** 结果概要：query_memory 记条数与体量，其余截断 */
+  summary: string;
+  /** 结构化计数（仅 query_memory）：供机器消费，免去解析 summary */
+  result_counts?: ToolResultCounts;
+  error?: string;
+}
+
+/** 工具结果的结构化计数 */
+export interface ToolResultCounts {
+  skills: number;
+  experiences: number;
+  content_chars: number;
+}
+
+/** 人读概要 + 可机器消费的计数 */
+export interface ToolResultSummary {
+  text: string;
+  counts?: ToolResultCounts;
+}
+
+const TOOL_PREVIEW_CHARS = 400;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function clip(text: string): string {
+  return text.length > TOOL_PREVIEW_CHARS
+    ? `${text.slice(0, TOOL_PREVIEW_CHARS)}…(+${String(text.length - TOOL_PREVIEW_CHARS)})`
+    : text;
+}
+
+/**
+ * 工具结果的紧凑概要。
+ *
+ * `query_memory` 的结果带着技能**全文**（单条可达 5 万字符），直接 JSON 化会把日志
+ * 撑爆且看不出重点；这里只记条数与字符数——那正是判断"检索有没有命中"所需的量。
+ */
+export function summarizeToolResult(name: string, result: unknown): ToolResultSummary {
+  if (name === 'query_memory' && isPlainRecord(result)) {
+    const skills = Array.isArray(result.skills) ? result.skills : [];
+    const experiences = Array.isArray(result.experiences) ? result.experiences : [];
+    const contentChars = skills.reduce(
+      (sum, skill) =>
+        sum + (isPlainRecord(skill) && typeof skill.content === 'string' ? skill.content.length : 0),
+      0,
+    );
+    const counts: ToolResultCounts = {
+      skills: skills.length,
+      experiences: experiences.length,
+      content_chars: contentChars,
+    };
+    return {
+      text: `skills=${String(counts.skills)} (${String(counts.content_chars)} chars), experiences=${String(counts.experiences)}`,
+      counts,
+    };
+  }
+  return { text: clip(typeof result === 'string' ? result : JSON.stringify(result ?? null)) };
+}
+
+/**
  * Agent 的 tool-calling 模式配置。
  * 提供此配置时，Agent 将使用 LLM tool-calling 替代固定 pipeline。
  */
@@ -41,6 +116,21 @@ export interface AgentToolConfig {
   tools: Tool[];
   /** 顶层 Agent 的系统提示词 */
   systemPrompt?: string;
+  /**
+   * 顶层 Agent 的每次工具调用回调（观测用，宿主落盘）。
+   *
+   * 与 `onSkillsRetrieved` 的分工：那个搬运正文，这个只记「发生了什么」。实验需要它
+   * 来判断注入为空究竟是 Agent 没去查、还是查了没命中。
+   */
+  onToolEvent?: (event: AgentToolEvent) => void;
+  /**
+   * 顶层 Agent 经 `query_memory` 检到的技能（**全文**）回调。
+   *
+   * 宿主用它把原文直接交给下游：Agent 调 `invoke_driver` 只能传字符串，会把技能
+   * 转述成一句话，正文在转述里蒸发。回调让「Agent 决定查什么」与「查到的原文
+   * 完整送达」两件事并存。
+   */
+  onSkillsRetrieved?: (skills: Array<{ id: string; description: string; content: string }>) => void;
   /** 单次任务最大 tool-calling 轮次（防死循环，默认 20） */
   maxToolCalls?: number;
 }
@@ -213,6 +303,14 @@ export class Agent {
       for (const toolCall of response.tool_calls) {
         const tool = this.toolRegistry.get(toolCall.function.name);
         if (!tool) {
+          this.toolConfig.onToolEvent?.({
+            name: toolCall.function.name,
+            ok: false,
+            round: this.loopRound,
+            args_preview: clip(toolCall.function.arguments),
+            summary: '',
+            error: 'unknown tool',
+          });
           this.loopMessages.push({
             role: 'tool',
             content: `Error: unknown tool "${toolCall.function.name}"`,
@@ -225,10 +323,19 @@ export class Agent {
           const args = JSON.parse(toolCall.function.arguments);
           const result = await tool.execute(args);
 
-          // 记录最后一次 invoke_driver 的返回
           if (tool.name === 'invoke_driver') {
             this.lastDriverReturn = result as DriverReturn;
           }
+
+          const summary = summarizeToolResult(tool.name, result);
+          this.toolConfig.onToolEvent?.({
+            name: tool.name,
+            ok: true,
+            round: this.loopRound,
+            args_preview: clip(toolCall.function.arguments),
+            summary: summary.text,
+            ...(summary.counts ? { result_counts: summary.counts } : {}),
+          });
 
           const content =
             typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
@@ -239,9 +346,18 @@ export class Agent {
             tool_call_id: toolCall.id,
           });
         } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          this.toolConfig.onToolEvent?.({
+            name: tool.name,
+            ok: false,
+            round: this.loopRound,
+            args_preview: clip(toolCall.function.arguments),
+            summary: '',
+            error: errorMessage,
+          });
           this.loopMessages.push({
             role: 'tool',
-            content: `Error executing ${tool.name}: ${error instanceof Error ? error.message : String(error)}`,
+            content: `Error executing ${tool.name}: ${errorMessage}`,
             tool_call_id: toolCall.id,
           });
         }

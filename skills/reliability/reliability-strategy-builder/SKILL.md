@@ -235,6 +235,8 @@ Error Budget: 0.1% = 43.2 minutes/month downtime allowed
 
 ### Severity Levels
 
+The response times below are illustrative defaults for the template — set them from your team's actual on-call capacity and commitments.
+
 ```
 SEV1 (Critical): Complete service outage, data loss
   - Response time: <15 minutes

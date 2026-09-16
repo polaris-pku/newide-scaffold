@@ -7,7 +7,7 @@
 ## 权威溯源位置（三处一致，以此为准）
 
 1. **顶层 `README.md`**（同步自语料主源）：`授权说明` 段 + 「角色与数量」表 + 下载/蒸馏说明。
-2. **各角色 `README.md` 的来源映射表**：目录 ↔ 来源仓库 ↔ 源路径 ↔ 状态（活动/指针/宿主）↔ LICENSE 说明。
+2. **各角色 `README.md` 的来源映射表**：目录 ↔ 来源仓库 ↔ 源路径 ↔ 状态（独立技能 / 专项 / 新增等）↔ LICENSE 说明。
 3. **各 `SKILL.md` 文件内**：`## Provenance` 段或 `> Provenance:` 行（Source repo / Original path / License / 并入说明）。
 
 ## License 概况（2026-09-07 终态）
@@ -19,4 +19,4 @@
 ## 本目录内的本地文件
 
 - `THIRD-PARTY-NOTICES.md`（本文件）：**仅存在于 scaffold 侧**，sync-skills 镜像同步时保留、不覆盖不删除。
-- `skill-manifest.baseline.json`：导入快照基线（66 个活动技能 slug/id/sha256），由 `pnpm seed:roles:baseline` 重写——内容哈希与语料副本联动，非第三方内容。
+- `skill-manifest.baseline.json`：导入快照基线（60 个技能 slug/id/sha256），由 `pnpm seed:roles:baseline` 重写——内容哈希与语料副本联动，非第三方内容。

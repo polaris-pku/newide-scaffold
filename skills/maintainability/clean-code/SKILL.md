@@ -7,11 +7,6 @@ description: 'Applies Clean Code principles to code written or modified: descrip
 
 # clean-code
 
-> 蒸馏自 Teqqles/cleanerCodeAISkills（skills/clean-code）。原为 6 文件（SKILL.md + 5 份语言示例参考），已内联合并为单文件。
-> Distilled from Teqqles/cleanerCodeAISkills (skills/clean-code); originally 6 files (SKILL.md + 5 per-language example references), now inlined as text.
-> 整合说明（2026-09-07）：本技能已收编 maintainability/anti-patterns（同源 cleanerCodeAISkills），其 10 类反模式目录并入文末 Smell Catalog；anti-patterns 目录保留为指针。
-> Integration 2026-09-07: anti-patterns smell catalog folded in; its directory is now a pointer.
-
 ## When to Use
 
 - Apply these principles **by default to all code output**: writing, reviewing, or modifying any code — regardless of language or framework.
@@ -46,7 +41,7 @@ A function does one thing at one level of abstraction.
 Each nesting level adds cognitive load. Flatten wherever possible.
 - Guard clauses first: validate preconditions and return (or throw) early.
 - Avoid if/else chains in favour of early returns.
-- Target: no more than 2–3 levels of nesting in any function.
+- Flatten until every remaining level carries meaning: a level that only wraps a single statement is noise.
 
 ```javascript
 // Nested                                          // Flat
@@ -66,7 +61,7 @@ function process(order) {                          function process(order) {
 
 ### Remove Duplication Through Meaningful Abstraction
 When logic appears in two places, extract it: but only when the boundary is clear.
-- Wait until you see the pattern a second time before abstracting.
+- Wait until you see the pattern a second time before extracting *within a module*. Promoting it to a shared cross-module utility is a larger commitment — it needs a third sighting and an obvious home before it earns one.
 - The extracted name adds meaning; it does not just wrap the implementation.
 - A bad abstraction is worse than duplication: name it after *why* it exists, not *what* it does.
 
@@ -93,16 +88,6 @@ Before committing any block, verify:
 - [ ] **Testable:** it can be verified in isolation without complex setup.
 - [ ] **Changeable:** modifying one part does not force changes in unrelated parts.
 
-Per block also verify:
-- [ ] Chose the obvious, readable solution over the clever one; no one-liners that obscure intent.
-- [ ] Names reveal intent at the call site; booleans read as assertions; no cryptic abbreviations or single letters outside loop counters/math.
-- [ ] Each function does one thing at one level of abstraction; no multi-job functions (validate+save+email → split).
-- [ ] Nesting ≤ 2–3 levels; preconditions are guard clauses returning early (Scala: `Option` + `match`, `Either` for errors).
-- [ ] Logic appearing twice is extracted only behind a meaningful boundary and a name that says *why*.
-- [ ] Modules grouped by domain concept with tests colocated; no `/utils`-style dumping grounds.
-- [ ] Comments only state *why*; nothing narrates *what* the code does (legal headers / public API docs excepted).
-- [ ] No match/switch construct that hides cyclomatic complexity or business rules behind tuple gymnastics.
-
 ## Smell Catalog — Anti-Patterns and Fixes (folded in from cleanerCodeAISkills/anti-patterns)
 
 ### God Class / Blob
@@ -117,7 +102,7 @@ A method that uses more data from another class than from its own.
 
 ### Shotgun Surgery
 A single logical change requires editing many classes in many places.
-- Symptom: adding a field means touching 5+ files; related logic is scattered rather than grouped.
+- Symptom: adding a field means touching many files; related logic is scattered rather than grouped.
 - Fix: consolidate the scattered logic into a single module or class. The opposite of God Class, but equally painful.
 
 ### Primitive Obsession
@@ -127,7 +112,7 @@ Using primitive types (strings, ints, booleans) where a domain type would commun
 
 ### Long Parameter Lists
 A function that takes many arguments signals it is doing too much or its dependencies are poorly structured.
-- Symptoms: 5+ parameters, especially of the same type; callers constantly pass `null` or default values for parameters they do not use.
+- Symptoms: many parameters, especially of the same type; callers constantly pass `null` or default values for parameters they do not use.
 - Fix: group related parameters into a value object; split the function into smaller ones that each need fewer arguments.
 
 ### Flag Arguments
@@ -154,7 +139,7 @@ Code that must be called in a specific sequence but does not enforce or communic
 
 ### Data Clumps
 Groups of data that always appear together but are not captured in a named structure.
-- Symptoms: the same 3–4 parameters travel together across many function signatures; parallel arrays or maps that represent one conceptual entity.
+- Symptoms: the same few parameters travel together across many function signatures; parallel arrays or maps that represent one conceptual entity.
 - Fix: extract a class or record that names the concept.
 
 ### Language-Specific Fix Idioms
@@ -171,8 +156,6 @@ The five language references illustrate the same catalog; the fixing shapes are 
 | Data Clumps | **Java:** `record Coordinate(double latitude, double longitude)`. **TS:** `interface Coordinate`. **JS:** a plain named object literal. **Python:** frozen `@dataclass Coordinate`. **Scala:** `case class Coordinate`. Then signatures take `Coordinate`, not `lat1, lon1, lat2, lon2`. |
 | Inappropriate Intimacy | JS: replace shared mutable module globals with explicit dependency passing (`placeOrder(cart, apiBase, currentUser)`). Others: expose a minimal public interface / intermediary. |
 | Speculative Generality | Scala: drop a single-instance type class and call the concrete method until a second implementation exists. All languages: delete unused abstractions (YAGNI). |
-
-> Provenance: 并入自 Teqqles/cleanerCodeAISkills（repo: https://github.com/Teqqles/cleanerCodeAISkills，path: skills/anti-patterns）。
 
 ## Provenance
 

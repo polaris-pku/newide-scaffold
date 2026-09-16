@@ -7,7 +7,6 @@ description: 'Designs, generates, modifies, and reviews Swift and iOS code with 
 
 # swift-performance-engineering
 
-> 蒸馏自 codeanurag/swift-performance-engineering-Skill（仓库根目录 `.`）。原为多文件（含附属文档、官方来源索引与 agent 元数据），已合并为单文件。
 > Distilled from codeanurag/swift-performance-engineering-Skill (repo root `.`); originally multi-file with auxiliary docs and metadata, now inlined as text.
 
 ## When to Use
@@ -91,13 +90,6 @@ Inspect these areas whenever relevant:
 ## Checklist
 
 Use both when generating/modifying Swift/iOS code and when reviewing existing code. Build mode: prevent bottlenecks from landing. Review mode: explain and prioritize issues already present.
-
-### Build-First Expectations
-
-- [ ] Hot path designed before the first implementation is written
-- [ ] Main-thread, allocation, and lifecycle costs explicit in architecture decisions
-- [ ] Simple code kept where the path is not performance-sensitive; disciplined code where the path is launch-, render-, scroll-, or interaction-critical
-- [ ] Measurement hooks, performance tests, or profiling notes added when a change could affect startup, rendering, memory, or concurrency
 
 ### Object Creation Discipline
 
@@ -184,8 +176,6 @@ When **generating or modifying** code, also explain:
 
 ## Evidence Expectations
 
-- Prefer official Apple Developer and Swift documentation when justifying platform-specific advice.
-- If a recommendation depends on a moving platform detail, verify against current official docs at review time.
 - When profiling is missing, say what should be measured before approving a risky refactor.
 - Do not promise wins you cannot explain mechanically.
 
@@ -239,4 +229,3 @@ Ground platform-specific advice in current official Apple and Swift pages. Prefe
 - Source repo: https://github.com/codeanurag/swift-performance-engineering-Skill
 - Original path: `.` (repo root)
 - License: MIT (in-repo LICENSE; created by Anurag Pandit)
-- 蒸馏说明：原含 6 文件（SKILL.md + README.md + 附属清单 review-checklist.md + 官方来源索引 official-performance-sources.md + agent 元数据 openai.yaml + LICENSE）。评审清单已完整内联为 Checklist 章节；官方来源索引已保留为 Official Sources（直接链接压缩为域名+路径形式，完整可点击 URL 见原仓库，正文按要求不留本地相对链接）；agent 元数据（display name / default prompt）并入 When to Use。description 原为 400+ 字符超长单行，已压缩至 246 字符。

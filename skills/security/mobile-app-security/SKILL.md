@@ -19,25 +19,17 @@ This skill performs static code analysis for mobile application security vulnera
 
 ## When NOT to Use
 
-- When the user is asking about server-side/backend security (use `security-review` or `bandit-sast`)
-- When the user wants runtime dynamic analysis of a running mobile app (use a DAST tool)
+- When the user is asking about server-side/backend security
+- When the user wants runtime dynamic analysis of a running mobile app
 - When reviewing general web application code unrelated to mobile platforms
-- When the `crypto-audit` skill already covers the request at a cryptographic level
-- When auditing container security or infrastructure (use `docker-scout-scanner` or `iac-scanner`)
-- When the user asks about **server-side API security, REST endpoints, or backend code** — you **MUST** decline and recommend `api-security-tester` or `security-review`
-- When the user asks about **OWASP Web Top 10 issues** (SQL injection, XSS, CSRF) — you **MUST** decline, explain that this skill covers OWASP Mobile Top 10:2024 only, and recommend `security-review`
+- When the request is purely about cryptographic algorithms rather than mobile platform code
+- When auditing container security or infrastructure
+- When the user asks about **server-side API security, REST endpoints, or backend code** — you **MUST** decline; this skill covers mobile platforms only
+- When the user asks about **OWASP Web Top 10 issues** (SQL injection, XSS, CSRF) — you **MUST** decline, and explain that this skill covers OWASP Mobile Top 10:2024 only
 
 ## Prerequisites
 
-### Tool Installed (Preferred)
-
-No external tool required. This skill uses code analysis only.
-
-All checks are performed through pattern matching and code inspection -- no CLI tool needs to be installed, configured, or invoked.
-
-### Tool Not Installed (Fallback)
-
-This skill is always available as a pure analysis skill. There is no fallback mode because there is no external tool dependency. All checks run directly through code analysis.
+No external tool required. This skill uses code analysis only -- all checks run through pattern matching and code inspection, with no CLI tool to install, configure, or invoke and no fallback mode.
 
 ## Workflow
 
@@ -530,7 +522,7 @@ func trackUserActivity(user: User) {
 
 **CWE-693** (Protection Mechanism Failure) | **M7** - Insufficient Binary Protections | Severity: **Medium**
 
-**WHY:** Mobile binaries are distributed to end users who can reverse-engineer, modify, and redistribute them. Without code obfuscation, root/jailbreak detection, tamper detection, and debugger detection, attackers can analyze business logic, bypass license checks, extract secrets, and create modified versions of the app.
+**WHY:** Without code obfuscation, root/jailbreak detection, tamper detection, and debugger detection, attackers can reverse-engineer, modify, and redistribute the app to analyze business logic, bypass license checks, and extract secrets.
 
 **UNSAFE:**
 
@@ -970,45 +962,6 @@ Each finding should include:
 | 8 | Exported components / debug mode in prod | CWE-276 | M8 - Security Misconfiguration | High |
 | 9 | Plaintext storage of tokens/credentials | CWE-312 | M9 - Insecure Data Storage | Critical |
 | 10 | Weak/broken crypto algorithms | CWE-327 | M10 - Insufficient Cryptography | High |
-| 11 | SQL injection in local databases | CWE-89 | M4 - Insufficient Input/Output Validation | High |
-| 12 | Insecure random number generation | CWE-330 | M10 - Insufficient Cryptography | High |
-| 13 | Disabled certificate validation | CWE-295 | M5 - Insecure Communication | Critical |
-| 14 | Cleartext HTTP communication | CWE-319 | M5 - Insecure Communication | High |
-| 15 | Sensitive data in clipboard/pasteboard | CWE-200 | M9 - Insecure Data Storage | Medium |
-
-### OWASP Mobile Top 10:2024 Quick Reference
-
-| Category | Description | Related Checks |
-|----------|-------------|----------------|
-| M1 | Improper Credential Usage | Check 1 |
-| M2 | Inadequate Supply Chain Security | Check 2 |
-| M3 | Insecure Authentication/Authorization | Check 3 |
-| M4 | Insufficient Input/Output Validation | Checks 4, 11 |
-| M5 | Insecure Communication | Checks 5, 13, 14 |
-| M6 | Inadequate Privacy Controls | Check 6 |
-| M7 | Insufficient Binary Protections | Check 7 |
-| M8 | Security Misconfiguration | Check 8 |
-| M9 | Insecure Data Storage | Checks 9, 15 |
-| M10 | Insufficient Cryptography | Checks 10, 12 |
-
-### CWE Reference
-
-| CWE ID | Name | MITRE URL |
-|--------|------|-----------|
-| CWE-79 | Improper Neutralization of Input During Web Page Generation | https://cwe.mitre.org/data/definitions/79.html |
-| CWE-89 | Improper Neutralization of Special Elements used in an SQL Command | https://cwe.mitre.org/data/definitions/89.html |
-| CWE-200 | Exposure of Sensitive Information to an Unauthorized Actor | https://cwe.mitre.org/data/definitions/200.html |
-| CWE-276 | Incorrect Default Permissions | https://cwe.mitre.org/data/definitions/276.html |
-| CWE-287 | Improper Authentication | https://cwe.mitre.org/data/definitions/287.html |
-| CWE-295 | Improper Certificate Validation | https://cwe.mitre.org/data/definitions/295.html |
-| CWE-312 | Cleartext Storage of Sensitive Information | https://cwe.mitre.org/data/definitions/312.html |
-| CWE-319 | Cleartext Transmission of Sensitive Information | https://cwe.mitre.org/data/definitions/319.html |
-| CWE-327 | Use of a Broken or Risky Cryptographic Algorithm | https://cwe.mitre.org/data/definitions/327.html |
-| CWE-330 | Use of Insufficiently Random Values | https://cwe.mitre.org/data/definitions/330.html |
-| CWE-359 | Exposure of Private Personal Information | https://cwe.mitre.org/data/definitions/359.html |
-| CWE-693 | Protection Mechanism Failure | https://cwe.mitre.org/data/definitions/693.html |
-| CWE-798 | Use of Hard-coded Credentials | https://cwe.mitre.org/data/definitions/798.html |
-| CWE-829 | Inclusion of Functionality from Untrusted Control Sphere | https://cwe.mitre.org/data/definitions/829.html |
 
 ## Example Usage
 

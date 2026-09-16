@@ -9,282 +9,72 @@ Create reliable disaster recovery procedures for your databases.
 
 ## Backup Strategy
 
-````markdown
-# Database Backup Strategy
+Design the strategy first; it is the contract the runbook enforces. Inline concrete numbers for the target database — no placeholders in the final runbook.
 
-## Backup Types
+### Backup types and retention
 
-### 1. Full Backup (Daily)
+| Type                          | Cadence                              | Retention | Restores to      |
+| ----------------------------- | ------------------------------------ | --------- | ---------------- |
+| Full                          | Daily (e.g. 02:00 UTC; ~50 GB, ~45m) | 30 days   | Backup time      |
+| Incremental                   | Hourly (~500 MB, ~5m)                | 7 days    | Last incremental |
+| Transaction log / WAL         | Every 15 min                         | 3 days    | Any point (PITR) |
 
-- **When**: 2:00 AM UTC
-- **Retention**: 30 days
-- **Storage**: S3 `s3://backups/full/`
-- **Size**: ~50 GB
-- **Duration**: ~45 minutes
+Rules:
 
-### 2. Incremental Backup (Hourly)
+- **Off-host, multi-location**: object storage (e.g. `s3://backups/`) plus a cross-region/account copy. Local disk is staging, never the system of record.
+- **Retention ≥ the longest committed recovery scenario** — a 30-day full retention cannot recover 40-day-old corruption; the published RTO/RPO must be reachable from the oldest retained artifact.
+- **Encrypt at rest**; backups are production data.
+- **RPO is set by the highest-frequency capture**: with 15-minute log shipping, worst-case data loss is 15 minutes.
 
-- **When**: Every hour
-- **Retention**: 7 days
-- **Storage**: S3 `s3://backups/incremental/`
-- **Size**: ~500 MB
-- **Duration**: ~5 minutes
+## Backup Execution
 
-### 3. Transaction Log Backup (Every 15 min)
+Take the backup with the native tool, then verify before declaring success:
 
-- **When**: Every 15 minutes
-- **Retention**: 3 days
-- **Storage**: S3 `s3://backups/wal/`
-- **Point-in-time recovery capability**
-
-## Backup Automation
-
-### PostgreSQL
-
-```bash
-#!/bin/bash
-# scripts/backup-postgres.sh
-
-set -e
-
-# Configuration
-DB_NAME="production"
-DB_USER="postgres"
-DB_HOST="postgres.example.com"
-BACKUP_DIR="/var/backups/postgres"
-S3_BUCKET="s3://my-backups/postgres"
-DATE=$(date +%Y%m%d_%H%M%S)
-FILENAME="${DB_NAME}_${DATE}.sql.gz"
-
-# Create backup directory
-mkdir -p $BACKUP_DIR
-
-echo "🔄 Starting backup: $FILENAME"
-
-# Full backup with pg_dump
-pg_dump \
-  --host=$DB_HOST \
-  --username=$DB_USER \
-  --dbname=$DB_NAME \
-  --format=custom \
-  --compress=9 \
-  --file=$BACKUP_DIR/$FILENAME \
-  --verbose
-
-# Verify backup
-if [ -f "$BACKUP_DIR/$FILENAME" ]; then
-  SIZE=$(du -h "$BACKUP_DIR/$FILENAME" | cut -f1)
-  echo "✅ Backup created: $SIZE"
-else
-  echo "❌ Backup failed"
-  exit 1
-fi
-
-# Upload to S3
-echo "📤 Uploading to S3..."
-aws s3 cp $BACKUP_DIR/$FILENAME $S3_BUCKET/ \
-  --storage-class STANDARD_IA
-
-# Verify upload
-if aws s3 ls $S3_BUCKET/$FILENAME; then
-  echo "✅ Uploaded to S3"
-else
-  echo "❌ S3 upload failed"
-  exit 1
-fi
-
-# Cleanup old local backups (keep last 7 days)
-find $BACKUP_DIR -type f -name "*.sql.gz" -mtime +7 -delete
-echo "🗑️  Cleaned up old local backups"
-
-# Send notification
-curl -X POST $SLACK_WEBHOOK \
-  -H 'Content-Type: application/json' \
-  -d "{\"text\": \"✅ Database backup complete: $FILENAME ($SIZE)\"}"
-
-echo "✅ Backup complete!"
-```
-````
-
-### MySQL
-
-```bash
-#!/bin/bash
-# scripts/backup-mysql.sh
-
-set -e
-
-DB_NAME="production"
-DB_USER="root"
-DB_PASSWORD=$MYSQL_PASSWORD
-DATE=$(date +%Y%m%d_%H%M%S)
-FILENAME="${DB_NAME}_${DATE}.sql.gz"
-
-echo "🔄 Starting MySQL backup..."
-
-# Backup with mysqldump
-mysqldump \
-  --user=$DB_USER \
-  --password=$DB_PASSWORD \
-  --single-transaction \
-  --quick \
-  --lock-tables=false \
-  --databases $DB_NAME \
-  | gzip > /var/backups/mysql/$FILENAME
-
-# Upload to S3
-aws s3 cp /var/backups/mysql/$FILENAME s3://my-backups/mysql/
-
-echo "✅ Backup complete!"
-```
+- **PostgreSQL** — a full logical backup with `pg_dump --format=custom --compress=9` (custom format is what `pg_restore` needs), or a physical base backup with `pg_basebackup` for a PITR chain. Read host/user/db from config; never hard-code credentials.
+- **MySQL** — a consistent logical backup with `mysqldump --single-transaction --quick --lock-tables=false` so InnoDB writes are not blocked; stream through `gzip` to the staging path.
+- **Verify, then ship**: assert the artifact exists and its size is plausible *before* uploading; after upload, confirm the object is listed in the bucket. A backup that silently failed is worse than no backup.
+- **Retention enforcement**: prune local staging (e.g. keep 7 days) only after a verified upload — never prune the remote copy on the local schedule.
+- **Notify on completion** (Slack/webhook) with filename and size, so a missing notification is itself a signal.
 
 ## Restore Procedures
 
-### Full Restore
+### Full restore
 
-```bash
-#!/bin/bash
-# scripts/restore-postgres.sh
+Sequence (each step gated on the previous):
 
-set -e
+1. **Fetch** the chosen artifact from object storage into a scratch path.
+2. **Create a fresh, empty database** (e.g. `production_restored`) — never restore over the live database; cutover happens later.
+3. **Restore** with `pg_restore` (custom-format dumps) against the new database.
+4. **Verify before cutover**: table count, row counts of critical tables, constraints, indexes (see Validation Checks). A restore is not "done" until validated.
 
-BACKUP_FILE=$1
-RESTORE_DB="production_restored"
+### Point-in-time recovery (PITR)
 
-if [ -z "$BACKUP_FILE" ]; then
-  echo "Usage: restore-postgres.sh <backup-file>"
-  exit 1
-fi
+PITR needs a **base backup** plus a **continuous WAL archive**. Watch the common conflation:
 
-echo "🔄 Starting restore from: $BACKUP_FILE"
-
-# 1. Download from S3
-echo "📥 Downloading backup..."
-aws s3 cp s3://my-backups/postgres/$BACKUP_FILE /tmp/
-
-# 2. Create new database
-echo "🗄️  Creating database..."
-psql -h $DB_HOST -U postgres -c "CREATE DATABASE $RESTORE_DB;"
-
-# 3. Restore backup
-echo "🔄 Restoring data..."
-pg_restore \
-  --host=$DB_HOST \
-  --username=postgres \
-  --dbname=$RESTORE_DB \
-  --verbose \
-  /tmp/$BACKUP_FILE
-
-# 4. Verify restore
-echo "✅ Verifying restore..."
-TABLE_COUNT=$(psql -h $DB_HOST -U postgres -d $RESTORE_DB -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';")
-echo "  Tables restored: $TABLE_COUNT"
-
-ROW_COUNT=$(psql -h $DB_HOST -U postgres -d $RESTORE_DB -t -c "SELECT COUNT(*) FROM users;")
-echo "  User rows: $ROW_COUNT"
-
-echo "✅ Restore complete!"
-echo "  Database: $RESTORE_DB"
-echo "  To use: UPDATE application config to point to $RESTORE_DB"
-```
-
-### Point-in-Time Recovery (PITR)
-
-```bash
-#!/bin/bash
-# scripts/pitr-restore.sh
-
-TARGET_TIME=$1  # Format: 2024-01-15 14:30:00
-
-echo "🔄 Point-in-Time Restore to: $TARGET_TIME"
-
-# 1. Restore base backup
-echo "📦 Restoring base backup..."
-pg_basebackup -D /var/lib/postgresql/data -X stream
-
-# 2. Configure recovery
-cat > /var/lib/postgresql/data/recovery.conf << EOF
-restore_command = 'aws s3 cp s3://my-backups/wal/%f %p'
-recovery_target_time = '$TARGET_TIME'
-recovery_target_action = 'promote'
-EOF
-
-# 3. Start PostgreSQL
-echo "🚀 Starting PostgreSQL in recovery mode..."
-systemctl start postgresql
-
-# 4. Wait for recovery
-while ! pg_isready; do
-  echo "  Waiting for recovery..."
-  sleep 5
-done
-
-echo "✅ PITR complete!"
-```
+- `pg_basebackup` **takes** a base backup; it is not itself a recovery action. Recovery replays WAL on top of an already-restored base backup.
+- **`recovery.conf` no longer exists — it was removed in PostgreSQL 12.** On PG 12+ recovery is configured by:
+  - placing an **empty `recovery.signal`** file in the data directory, and
+  - setting parameters in `postgresql.conf`: `restore_command` (e.g. `aws s3 cp s3://my-backups/wal/%f %p`), `recovery_target_time = '<timestamp>'`, and `recovery_target_action = 'promote'` (promote = accept writes once the target is reached).
+- **PostgreSQL ≤ 11 only**: the old flow still applies — write those same parameters to `recovery.conf` instead of using `recovery.signal` + `postgresql.conf`.
+- Start the server; it enters recovery, replays WAL to the target, then promotes. Wait on readiness (`pg_isready`) before declaring success, and confirm the promoted node accepts writes.
 
 ## Validation Checks
 
-```bash
-#!/bin/bash
-# scripts/validate-restore.sh
+A restore is only proven by validation. Check, in order:
 
-DB=$1
-
-echo "🔍 Validating restore..."
-
-# 1. Check table count
-TABLES=$(psql -d $DB -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';")
-echo "Tables: $TABLES"
-
-if [ "$TABLES" -lt 10 ]; then
-  echo "❌ Too few tables restored"
-  exit 1
-fi
-
-# 2. Check row counts
-for table in users products orders; do
-  ROWS=$(psql -d $DB -t -c "SELECT COUNT(*) FROM $table;")
-  echo "  $table: $ROWS rows"
-
-  if [ "$ROWS" -lt 1 ]; then
-    echo "❌ Table $table is empty"
-    exit 1
-  fi
-done
-
-# 3. Check constraints
-CONSTRAINTS=$(psql -d $DB -t -c "SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_type='FOREIGN KEY';")
-echo "Foreign keys: $CONSTRAINTS"
-
-# 4. Check indexes
-INDEXES=$(psql -d $DB -t -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname='public';")
-echo "Indexes: $INDEXES"
-
-# 5. Test query performance
-START=$(date +%s%N)
-psql -d $DB -c "SELECT COUNT(*) FROM users WHERE email LIKE '%@example.com%';" > /dev/null
-END=$(date +%s%N)
-DURATION=$(( (END - START) / 1000000 ))
-echo "Query performance: ${DURATION}ms"
-
-if [ "$DURATION" -gt 1000 ]; then
-  echo "⚠️  Slow query - missing indexes?"
-fi
-
-echo "✅ Validation complete!"
-```
+1. **Schema completeness** — table count in `public` meets the expected minimum (e.g. ≥10); a near-empty schema means a silent failure.
+2. **Row presence** — critical tables (e.g. `users`, `products`, `orders`) are non-empty; assert a threshold, not just "exists".
+3. **Constraints** — foreign-key count matches expectations (partial restores often drop FKs).
+4. **Indexes** — index count in the restored schema matches the source.
+5. **Query performance** — time a representative query (e.g. a filtered `COUNT(*)`); if it exceeds ~1s where it should be sub-second, indexes were likely lost.
+6. **Application-level** — the app can connect and read through the restored database before cutover.
 
 ## Disaster Recovery Runbook
 
-````markdown
-# Disaster Recovery Runbook
-
-## Incident Response
-
-### 1. Assess Situation (5 minutes)
+### 1. Assess situation (5 minutes)
 
 - [ ] Identify incident severity (P0/P1/P2)
-- [ ] Determine data loss window
+- [ ] Determine the data-loss window
 - [ ] Notify stakeholders
 
 **Contacts:**
@@ -293,21 +83,20 @@ echo "✅ Validation complete!"
 - Engineering Lead: [phone]
 - CTO: [phone]
 
-### 2. Stop the Bleeding (10 minutes)
+### 2. Stop the bleeding (10 minutes)
 
 - [ ] Enable maintenance mode
-- [ ] Stop writes to corrupted database
+- [ ] Stop writes to the corrupted database
 - [ ] Preserve evidence (logs, backups)
 
 ```bash
 # Enable maintenance mode
 kubectl scale deployment/api --replicas=0
 ```
-````
 
-### 3. Identify Recovery Point (15 minutes)
+### 3. Identify the recovery point (15 minutes)
 
-- [ ] Determine last good backup
+- [ ] Determine the last good backup
 - [ ] Check backup integrity
 - [ ] Calculate data loss
 
@@ -319,14 +108,14 @@ aws s3 ls s3://my-backups/postgres/ | tail -20
 aws s3 ls s3://my-backups/postgres/production_20240115_020000.sql.gz --human-readable
 ```
 
-### 4. Prepare Recovery Environment (30 minutes)
+### 4. Prepare the recovery environment (30 minutes)
 
-- [ ] Spin up new database instance
+- [ ] Spin up a new database instance
 - [ ] Configure networking
 - [ ] Test connectivity
 
 ```bash
-# Create RDS instance
+# Create a recovery instance
 aws rds create-db-instance \
   --db-instance-identifier production-recovery \
   --db-instance-class db.r6g.xlarge \
@@ -335,24 +124,16 @@ aws rds create-db-instance \
   --master-user-password [secure-password]
 ```
 
-### 5. Execute Restore (1-2 hours)
+### 5. Execute the restore (1-2 hours)
 
-- [ ] Download backup from S3
-- [ ] Run restore script
+- [ ] Download the backup from object storage
+- [ ] Run the full-restore (or PITR) procedure above
 - [ ] Apply transaction logs (if PITR)
 - [ ] Verify data integrity
 
-```bash
-# Run restore
-scripts/restore-postgres.sh production_20240115_020000.sql.gz
+### 6. Validate and test (30 minutes)
 
-# Validate
-scripts/validate-restore.sh production_restored
-```
-
-### 6. Validate and Test (30 minutes)
-
-- [ ] Run validation scripts
+- [ ] Run the validation checks above
 - [ ] Test critical queries
 - [ ] Verify row counts
 - [ ] Check data consistency
@@ -360,7 +141,7 @@ scripts/validate-restore.sh production_restored
 ### 7. Cutover (15 minutes)
 
 - [ ] Update application config
-- [ ] Point DNS to new database
+- [ ] Point DNS to the new database
 - [ ] Disable maintenance mode
 - [ ] Monitor for errors
 
@@ -372,12 +153,12 @@ kubectl set env deployment/api DATABASE_URL=postgresql://...
 kubectl scale deployment/api --replicas=3
 ```
 
-### 8. Post-Recovery (1 hour)
+### 8. Post-recovery (1 hour)
 
 - [ ] Monitor system health
 - [ ] Verify user reports
-- [ ] Document incident
-- [ ] Schedule postmortem
+- [ ] Document the incident
+- [ ] Schedule a postmortem
 
 ## Recovery Time Objective (RTO)
 
@@ -395,61 +176,18 @@ kubectl scale deployment/api --replicas=3
 | Incremental      | 1 hour           |
 | Transaction logs | 15 minutes       |
 
-````
+**Derivation.** Derive RTO from the sum of the restore steps — fetch + provision + restore + validate + cutover — not from a wish. Derive RPO from the capture frequency of the newest artifact you actually retain. Publish either only after it has been demonstrated in a drill; mark estimated values as estimates.
 
-## Automated Backup Monitoring
+## Backup Monitoring
 
-```typescript
-// scripts/monitor-backups.ts
-import { S3Client, ListObjectsV2Command } from '@aws-sdk/client-s3';
+Backups fail silently, so monitor the *absence* of backups, not only their errors:
 
-const s3 = new S3Client({ region: 'us-east-1' });
-
-async function checkBackupHealth() {
-  const bucket = 'my-backups';
-  const prefix = 'postgres/';
-
-  // List recent backups
-  const command = new ListObjectsV2Command({
-    Bucket: bucket,
-    Prefix: prefix,
-    MaxKeys: 10,
-  });
-
-  const response = await s3.send(command);
-  const backups = response.Contents || [];
-
-  // Check last backup age
-  const latestBackup = backups[0];
-  const age = Date.now() - new Date(latestBackup.LastModified!).getTime();
-  const ageHours = age / (1000 * 60 * 60);
-
-  if (ageHours > 25) {
-    console.error('❌ No backup in last 24 hours!');
-    // Send alert
-    await sendSlackAlert('No recent database backup!');
-    process.exit(1);
-  }
-
-  // Check backup size
-  const size = latestBackup.Size! / (1024 * 1024 * 1024); // GB
-  if (size < 10) {
-    console.error('⚠️  Backup size suspiciously small');
-  }
-
-  console.log('✅ Backup health check passed');
-  console.log(`  Latest: ${latestBackup.Key}`);
-  console.log(`  Age: ${ageHours.toFixed(1)} hours`);
-  console.log(`  Size: ${size.toFixed(2)} GB`);
-}
-
-checkBackupHealth();
-````
+- **Freshness gate** — alert if no new backup appeared in the last N hours (e.g. > 25 h for a daily full). This catches the "scheduler died" case.
+- **Size sanity** — alert if the latest artifact is implausibly small (e.g. < 10 GB when ~50 GB is typical); a truncated dump looks like success.
+- **Restore proof** — the strongest signal is a recent *successful restore drill*, not a recent backup file.
+- **Routing** — page the on-call DBA on a freshness violation; run the check on a schedule independent of the backup job.
 
 ## Role Assignments
-
-```markdown
-## DR Team Roles
 
 ### Database Administrator (Primary)
 
@@ -475,31 +213,19 @@ checkBackupHealth();
 - Prioritize recovery
 - Customer communication
 
-## Escalation Path
+### Escalation Path
 
 1. DBA on-call →
 2. Engineering Lead →
 3. CTO →
 4. CEO (P0 incidents only)
-```
 
 ## Best Practices
 
-1. **Test restores regularly**: Quarterly DR drills
-2. **Automate backups**: Never rely on manual processes
-3. **Multiple locations**: Cross-region backup storage
-4. **Monitor backup health**: Alert on failures
-5. **Document procedures**: Keep runbook updated
-6. **Encrypt backups**: Protect sensitive data
-7. **Version control**: Track backup script changes
-
-## Output Checklist
-
-- [ ] Backup automation scripts
-- [ ] Restore procedures documented
-- [ ] Validation checks defined
-- [ ] PITR procedure (if applicable)
-- [ ] DR runbook created
-- [ ] Role assignments documented
-- [ ] RTO/RPO defined
-- [ ] Backup monitoring configured
+1. **Test restores regularly**: quarterly DR drills — at least one full restore per quarter
+2. **Automate backups**: never rely on manual processes
+3. **Multiple locations**: cross-region backup storage
+4. **Monitor backup health**: alert on failures and on silence
+5. **Document procedures**: keep the runbook updated
+6. **Encrypt backups**: protect sensitive data
+7. **Version control**: track backup/restore procedure changes

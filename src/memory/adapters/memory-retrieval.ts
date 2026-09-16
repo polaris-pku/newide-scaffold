@@ -42,6 +42,21 @@ const DEFAULT_MIN_TAG_OVERLAP = 1;
 const DEFAULT_MIN_EMBEDDING_SIMILARITY = 0.5;
 
 /**
+ * 默认检索策略（唯一事实来源）。
+ * 导出以便调用方断言这些控制变量未被改动——实验/回归依赖「检索策略固定」时，
+ * 漂移必须当场可见而不是静默改变召回集合。
+ */
+export const DEFAULT_MEMORY_RELEVANCE_POLICY: Readonly<MemoryRelevancePolicy> = {
+  include_skills: true,
+  include_recent_experience: true,
+  recall_top_k: DEFAULT_RECALL_TOP_K,
+  min_embedding_similarity: DEFAULT_MIN_EMBEDDING_SIMILARITY,
+  min_confidence: DEFAULT_MIN_CONFIDENCE,
+  max_memory_items: DEFAULT_MAX_MEMORY_ITEMS,
+  min_tag_overlap: DEFAULT_MIN_TAG_OVERLAP,
+};
+
+/**
  * retrieveMemoriesForTask 的输入。
  * task_query 通常来自 task.spec，用于生成 task embedding 及 tag 匹配。
  */
@@ -142,15 +157,17 @@ async function loadMemorySources(scope: AgentMemoryScope): Promise<MemorySources
 
 function resolveRelevancePolicy(options?: MemoryRetrievalOptions): MemoryRelevancePolicy {
   const overrides = options?.selection;
+  const defaults = DEFAULT_MEMORY_RELEVANCE_POLICY;
   return {
-    include_skills: overrides?.include_skills ?? true,
-    include_recent_experience: overrides?.include_recent_experience ?? true,
-    recall_top_k: overrides?.recall_top_k ?? DEFAULT_RECALL_TOP_K,
+    include_skills: overrides?.include_skills ?? defaults.include_skills,
+    include_recent_experience:
+      overrides?.include_recent_experience ?? defaults.include_recent_experience,
+    recall_top_k: overrides?.recall_top_k ?? defaults.recall_top_k,
     min_embedding_similarity:
-      overrides?.min_embedding_similarity ?? DEFAULT_MIN_EMBEDDING_SIMILARITY,
-    min_confidence: overrides?.min_confidence ?? DEFAULT_MIN_CONFIDENCE,
-    max_memory_items: overrides?.max_memory_items ?? DEFAULT_MAX_MEMORY_ITEMS,
-    min_tag_overlap: overrides?.min_tag_overlap ?? DEFAULT_MIN_TAG_OVERLAP,
+      overrides?.min_embedding_similarity ?? defaults.min_embedding_similarity,
+    min_confidence: overrides?.min_confidence ?? defaults.min_confidence,
+    max_memory_items: overrides?.max_memory_items ?? defaults.max_memory_items,
+    min_tag_overlap: overrides?.min_tag_overlap ?? defaults.min_tag_overlap,
   };
 }
 

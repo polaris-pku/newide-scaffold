@@ -3,8 +3,8 @@
  *
  * 复用生产 composition（createProductionBRuntime：NEWIDE_B_DATABASE_URL →
  * 外部 PostgreSQL，否则嵌入式 PGlite），把 scaffold `skills/` 语料导入同一
- * 存储：5 个 role agent（role_correctness … role_security）各持有本维度活动
- * 技能（10/9/11/12/24），写入 PersonaDef v1；幂等可重复执行。
+ * 存储：5 个 role agent（role_correctness … role_security）各持有本维度
+ * 技能（10/9/10/8/23），写入 PersonaDef v1；幂等可重复执行。
  *
  * 用法（scaffold 根目录）：
  *   pnpm seed:roles                 # 真跑（资产存在→离线资产模式；否则 hash/litellm 现场向量）
@@ -98,7 +98,6 @@ async function main(): Promise<void> {
           repo_root: repoRoot,
           skills_dir: skillsDir,
           activity_total: report.activity_total,
-          pointer_total: report.pointer_total,
           created_role_ids: report.created_role_ids,
           per_role: report.per_role,
           embedding_asset: report.embedding_asset,
@@ -119,9 +118,7 @@ async function main(): Promise<void> {
       for (const spec of ROLE_ROSTER) {
         const expectedIds = new Set(
           corpusFiles
-            .filter(
-              (file) => file.role === spec.role && file.kind === 'activity',
-            )
+            .filter((file) => file.role === spec.role)
             .map((file) => slugToSkillId(file.slug)),
         );
         const actualIds = new Set(

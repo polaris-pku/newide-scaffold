@@ -1,11 +1,11 @@
 /**
  * skill-import — 预置技能语料导入与 role agent 种子编排
  *
- * 把 `skills/<role>/<skill>/SKILL.md` 活动技能 1:1 导入为 SkillRecord（id =
- * uuid v5(slug)，幂等），指针目录不生成记录而是记入宿主 sub_skills；为 5 个
- * 质量维度 role agent 建号（缺失时 initializeAgent）、写 PersonaDef v1、
- * 校正指标计数。删除仅限"上版基线存在、本次语料移除"的技能（uuid v5 命名
- * 空间判定），绝不动运行时晋升/市场引入产生的技能。dry-run 只出报告不写库。
+ * 把 `skills/<role>/<skill>/SKILL.md` 技能 1:1 导入为 SkillRecord（id =
+ * uuid v5(slug)，幂等）；为 5 个质量维度 role agent 建号（缺失时
+ * initializeAgent）、写 PersonaDef v1、校正指标计数。删除仅限"上版基线存在、
+ * 本次语料移除"的技能（uuid v5 命名空间判定），绝不动运行时晋升/市场引入产生
+ * 的技能。dry-run 只出报告不写库。
  */
 import { nowTimestamp } from '../../core';
 import type { MemoryRepository } from '../ports/memory-repository';
@@ -83,7 +83,6 @@ export interface CorpusImportReport {
   /** 本次新建的 role agent（需调用方补 buffer） */
   created_role_ids: string[];
   activity_total: number;
-  pointer_total: number;
   /** 资产复用审计（预案指定 embeddings 时才有意义） */
   embedding_asset?: EmbeddingAssetAudit;
 }
@@ -112,7 +111,6 @@ function toSkillRecord(
   skill: CorpusSkillFile,
   roleId: string,
   now: string,
-  subSkills: string[],
   version: string,
   embedding: number[],
 ): SkillRecord {
@@ -123,7 +121,6 @@ function toSkillRecord(
     content: skill.body,
     version,
     review_status: 'approved',
-    ...(subSkills.length > 0 ? { sub_skills: subSkills } : {}),
     tags: skillTagsFor(skill),
     promoted_at: now,
     agent_id: roleId,
@@ -205,17 +202,10 @@ export async function importSkillCorpus(
   const files = await scanCorpus(rootDir);
 
   const activityByRole = new Map<CorpusRole, CorpusSkillFile[]>();
-  const absorbersByHost = new Map<string, string[]>();
   for (const file of files) {
-    if (file.kind === 'activity') {
-      const list = activityByRole.get(file.role) ?? [];
-      list.push(file);
-      activityByRole.set(file.role, list);
-    } else if (file.hostSlug) {
-      const list = absorbersByHost.get(file.hostSlug) ?? [];
-      list.push(file.slug);
-      absorbersByHost.set(file.hostSlug, list);
-    }
+    const list = activityByRole.get(file.role) ?? [];
+    list.push(file);
+    activityByRole.set(file.role, list);
   }
 
   // 基线（上版已导入集合）→ 删除判定：仅当技能 id 命中"基线曾登记"且当前语料
@@ -223,7 +213,7 @@ export async function importSkillCorpus(
   const baseline = await readBaselineManifest(rootDir);
   const priorIdToSlug = new Map((baseline?.skills ?? []).map((entry) => [entry.id, entry.slug]));
 
-  const activities = files.filter((file) => file.kind === 'activity');
+  const activities = files;
   const { byId: embeddingById, audit } = await buildEmbeddingTable(
     options.embeddings,
     activities,
@@ -236,7 +226,6 @@ export async function importSkillCorpus(
     per_role: [],
     created_role_ids: [],
     activity_total: activities.length,
-    pointer_total: files.filter((file) => file.kind === 'pointer').length,
     ...(options.embeddings ? { embedding_asset: audit } : {}),
   };
 
@@ -276,12 +265,10 @@ export async function importSkillCorpus(
         previous !== undefined &&
         (previous.content !== activity.body || previous.description !== activity.description);
       const version = previous === undefined || !changed ? '1.0.0' : bumpVersion(previous.version);
-      const subSkills = (absorbersByHost.get(activity.slug) ?? []).slice().sort();
       const record = toSkillRecord(
         activity,
         spec.role_id,
         now,
-        subSkills,
         version,
         embeddingById.get(activity.slug) ?? [],
       );

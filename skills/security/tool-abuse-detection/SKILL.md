@@ -112,7 +112,7 @@ Use `dialogue(prompt="...")` with the above (or equivalent in the target languag
 
 ## Output
 
-For each **confirmed** finding, emit one `<vuln>` block. Use a descriptive `risk_type` (e.g. Command Injection, Path Traversal, Tool Misuse). OWASP/ASI mapping is done later by the reviewer.
+For each **confirmed** finding, emit one `<vuln>` block. Use a descriptive `risk_type` (e.g. Command Injection, Path Traversal, Tool Misuse); do not use ASI or other framework codes.
 
 ```xml
 <vuln>

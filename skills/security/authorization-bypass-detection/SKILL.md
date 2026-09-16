@@ -55,7 +55,7 @@ Use `dialogue(prompt="...")` with the above (or equivalent in the target languag
 
 ## Output
 
-For each **confirmed** finding, emit one `<vuln>`. Use a short descriptive `risk_type` (e.g. Unauthorized Access, Privilege Escalation). Do not use ASI or other framework codes—the reviewer stage adds classification.
+For each **confirmed** finding, emit one `<vuln>`. Use a short descriptive `risk_type` (e.g. Unauthorized Access, Privilege Escalation). Do not use ASI or other framework codes.
 
 ```xml
 <vuln>

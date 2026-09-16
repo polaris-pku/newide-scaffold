@@ -8,7 +8,9 @@
     "Requires eval/data/sweevo-v0-repo-full-prctx.jsonl (pnpm eval:build-pr-context -- --subset v0-repo-full).",
     "Use with NEWIDE_SWE_EVO_BLOCK_INTERNET=1.",
     "F2P counts are inflated by test-collection imports on 2023.4.0 and 2023.6.1; score by independent fix clusters.",
-    "2024.3.1_2024.4.0 F2P is GroupBy.value_counts all-NA partitions only; changelog highlights for query planner / GPU dashboard are out-of-repo."
+    "2024.3.1_2024.4.0 F2P is GroupBy.value_counts all-NA partitions only; changelog highlights for query planner / GPU dashboard are out-of-repo.",
+    "角色分歧实验（pnpm eval:role-divergence）只读 problem_statement：不 checkout 仓库、不打补丁、不跑测试。",
+    "规范 jsonl 缺席时，eval/role-divergence/recover-dataset.ts 可从本地运行归档重建这 3 条问题陈述，用 --jsonl 指过去即可。"
   ],
   "instance_ids": [
     "dask__dask_2023.3.2_2023.4.0",

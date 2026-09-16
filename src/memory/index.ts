@@ -159,6 +159,7 @@ export { createAgentMemoryScope } from './adapters/agent-memory-scope';
 export { writePendingBuffer } from './services/buffer-writer';
 export { prepareTaskContext, type MemoryQueryStrategy } from './services/memory-query';
 export {
+  DEFAULT_MEMORY_RELEVANCE_POLICY,
   retrieveMemoriesForTask,
   type MemoryRetrievalOptions,
   type MemoryRelevancePolicy,
@@ -394,7 +395,7 @@ export type {
 // ════════════════════════════════════════════════════════
 
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
-export type { AgentToolConfig } from './runtime/agent';
+export type { AgentToolConfig, AgentToolEvent } from './runtime/agent';
 export type {
   AgentArchiveRecord,
   AgentHandle,
@@ -424,7 +425,6 @@ export {
   BASELINE_FILE_NAME,
   CORPUS_ROLES,
   COUNCIL_TRIO_SLUGS,
-  POINTER_TARGETS,
   ROLE_AGENT_IDS,
   buildBaselineManifest,
   readBaselineManifest,

@@ -5,25 +5,7 @@ description: Guides authorized API security testing across REST, gRPC, and WebSo
 
 # Offensive API Security Testing
 
-> 边界标注（2026-09-07）：红队进攻手册，仅在明确授权的渗透/红队演练中使用；日常防御性代码审计请用 code-security-audit。
-> Boundary (2026-09-07): red-team offensive manual — authorized penetration testing only; day-to-day defensive audits use code-security-audit.
-
 You are conducting authorized security assessments against API-driven applications. This skill covers REST, gRPC, and WebSocket attack surfaces with emphasis on the OWASP API Security Top 10 2023. Every technique assumes you have written authorization and a defined scope. Your goal is to identify vulnerabilities that allow unauthorized data access, privilege escalation, or service disruption through API-layer attacks.
-
-## Quick Workflow
-
-1. Map the API surface: collect OpenAPI/Swagger specs, gRPC reflection output, and WebSocket endpoints.
-2. Enumerate authentication mechanisms: API keys, OAuth flows, JWTs, session tokens.
-3. Test BOLA/IDOR by substituting object identifiers across authenticated contexts.
-4. Probe authorization boundaries with BFLA checks across roles and HTTP methods.
-5. Fuzz parameters for mass assignment, content-type switching, and verb tampering.
-6. Assess rate limiting and resource consumption controls.
-7. Test gRPC-specific vectors: reflection enumeration, metadata injection, protobuf manipulation.
-8. Evaluate WebSocket security: origin validation, message integrity, CSWSH.
-9. Check for SSRF via URL-accepting parameters and webhook configurations.
-10. Document findings with reproduction steps and severity ratings.
-
----
 
 ## OWASP API Top 10 2023 -- BOLA and IDOR
 
@@ -469,28 +451,6 @@ When you run these tests, you leave artifacts that defenders and monitoring syst
 - **SSRF payloads** containing internal IPs or metadata URLs are flagged by WAFs. Outbound connections to unexpected destinations trigger network monitoring alerts.
 
 - **Version probing** creates 404 bursts across multiple path prefixes from a single source IP.
-
----
-
-## Engagement Cheatsheet
-
-| Phase | Action | Tool |
-|-------|--------|------|
-| Reconnaissance | Collect API specs | Burp crawler, Swagger endpoints |
-| Reconnaissance | gRPC service enumeration | grpcurl with reflection |
-| Reconnaissance | WebSocket endpoint discovery | Burp Suite, DevTools |
-| Authentication | Token lifecycle testing | curl, Burp Repeater |
-| Authorization | BOLA/IDOR across objects | curl loops, Burp Intruder |
-| Authorization | BFLA across roles | curl with multiple tokens |
-| Input handling | Mass assignment | curl, Postman |
-| Input handling | Content-type switching | curl with varied headers |
-| Protocol | gRPC metadata injection | grpcurl |
-| Protocol | gRPC protobuf interception | mitmproxy with addon |
-| Protocol | WebSocket injection | websocat, Python websockets |
-| Protocol | CSWSH verification | Custom HTML test page |
-| Infrastructure | SSRF via URL parameters | curl, Burp Collaborator |
-| Infrastructure | API versioning bypass | curl version enumeration |
-| Infrastructure | Misconfiguration scan | curl, Burp scanner |
 
 ---
 

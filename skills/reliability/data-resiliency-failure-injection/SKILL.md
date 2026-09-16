@@ -47,6 +47,8 @@ Do not treat resilience testing as random breakage. The point is to validate rec
    - synthetic or masked test data
    - bounded windows and rollback-ready test scope
 
+   This non-production-first default is for drills whose first concern is protecting real data. It is the *entry* rung of the environment ladder: production drilling is the mature rung, reached once abort criteria, a bounded blast radius, and on-call coverage exist.
+
 4. Inject one failure mode at a time.
    Use controlled exercises such as:
    - killing a task or worker
@@ -66,13 +68,6 @@ Do not treat resilience testing as random breakage. The point is to validate rec
 
 6. Record guardrails and automate the highest-value drills.
    The best resilience test is one the team can rerun after changes, not a one-time exercise that gets forgotten.
-
-7. Load companion skills by failure mode. (These are sibling skills/docs in the same source repo, https://github.com/vaquarkhan/data-engineering-agent-skills.)
-   - replay or backfill drills: `safe-backfill-and-replay-orchestration`
-   - Kafka lag, DLQ, or schema drift: `kafka-resilience-and-schema-evolution`
-   - serverless Spark checkpoint recovery: `spark-serverless-reliability-and-state-management`
-   - live diagnosis before drills: `mcp-data-observability-integration`
-   - drill patterns: companion doc shipped with this skill in the source repo (https://github.com/vaquarkhan/data-engineering-agent-skills)
 
 ## Common Rationalizations
 

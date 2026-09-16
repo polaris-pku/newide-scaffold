@@ -5,11 +5,9 @@ description: Runs a Measure-Diagnose-Fix-Verify audit of Jetpack Compose Android
 
 # Auditing Compose Performance — the Measure → Diagnose → Fix → Verify orchestrator
 
-This is the highest-level entry point in the `compose-performance-skills` library. When the developer's symptom is broad — "the app feels sluggish", "scroll is rough everywhere", "we're starting a perf sprint", "where do we even start?" — Claude enters here. The orchestrator does **NOT** replace the 25 focused skills; it sequences them through a four-phase loop and produces a written audit report at the end.
+This is the highest-level entry point for a broad Compose performance audit. When the developer's symptom is broad — "the app feels sluggish", "scroll is rough everywhere", "we're starting a perf sprint", "where do we even start?" — start here. It runs the four-phase loop below and produces a written audit report at the end.
 
-The phases are **Measure → Diagnose → Fix → Verify**, run in order, never skipped. Phase 1 establishes baseline numbers from a release + R8 build on a real device, because anything else is fiction. Phase 2 turns symptoms into named causes from the Compose Compiler reports, Layout Inspector, and runtime tracing. Phase 3 applies one targeted fix at a time, re-measuring between fixes so the delta of each change is provable. Phase 4 regenerates the Baseline Profile, locks in a CI stability gate, and commits the baseline files so regressions cannot slip back.
-
-Perf work without measurement is guessing. Skydoves hot take #1 applies throughout: **DO NOT** chase 100% skippability — that is a diagnostic on a compiler report, not the goal. The goal is `FrameTimingMetric` and `StartupTimingMetric` improvement on a real device.
+Perf work without measurement is guessing. The goal is `FrameTimingMetric` and `StartupTimingMetric` improvement on a real device — never a number read off the compiler report.
 
 ## When to use this skill
 
@@ -22,15 +20,15 @@ Perf work without measurement is guessing. Skydoves hot take #1 applies througho
 
 ## When NOT to use this skill
 
-- A specific symptom is already named (scroll jank in `LazyColumn`, `derivedStateOf` not firing, custom modifier recomposing). Go straight to the focused skill. See (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) for the symptom→skill map.
-- The developer only wants to fix one issue and does not want a written report. Pick the focused skill from (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
+- A specific symptom is already named (scroll jank in `LazyColumn`, `derivedStateOf` not firing, custom modifier recomposing) — fix that surface directly instead of running the full audit.
+- The developer only wants to fix one issue and does not want a written report — this audit always produces one, so do the targeted fix without it.
 - No release build is possible (e.g. broken signing config). Resolve that first; this audit MUST measure release.
 
 ## Prerequisites
 
 - Project builds the release variant successfully (`./gradlew assembleRelease`).
 - At least one physical Android device for measurement. Emulator numbers are not representative.
-- A Macrobenchmark module is present, or willingness to add one (see (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled)).
+- A Macrobenchmark module is present, or willingness to add one.
 - Willingness to commit Baseline Profile and stability baseline files to the repo.
 - Compose Compiler 1.5.5+ for `stabilityConfigurationFile`. Kotlin 2.0.20+ for Strong Skipping default. AGP 8.2+ for the Baseline Profile Generator template.
 - Optional but recommended: a feature branch to land each fix as its own PR.
@@ -41,9 +39,9 @@ Run all four phases in order. **DO NOT** skip ahead. After each Phase 3 fix, ret
 
 ### Phase 1 — Measure (establish baseline numbers BEFORE changing any code)
 
-- [ ] Confirm the release variant builds and is the measurement target. Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Confirm R8 is enabled correctly (full mode, `proguard-android-optimize.txt`, resource shrinking on). Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Generate or refresh the Baseline Profile via the Baseline Profile Generator module. Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
+- [ ] Confirm the release variant builds and is the measurement target.
+- [ ] Confirm R8 is enabled correctly (full mode, `proguard-android-optimize.txt`, resource shrinking on).
+- [ ] Generate or refresh the Baseline Profile via the Baseline Profile Generator module.
 - [ ] Capture **cold startup** numbers with `MacrobenchmarkRule` + `StartupTimingMetric` under `CompilationMode.Partial(BaselineProfileMode.Require)`. Run ≥10 iterations.
 - [ ] Capture **scroll** numbers for the suspect surface with `FrameTimingMetric` (P50, P90, P99). Run ≥5 iterations on the same device.
 - [ ] Record every number in the audit report's "Baseline (Phase 1)" section. **MUST** be done before any code change.
@@ -64,36 +62,36 @@ Run all four phases in order. **DO NOT** skip ahead. After each Phase 3 fix, ret
 
 ### Phase 2 — Diagnose (turn symptoms into named causes)
 
-- [ ] Enable Compose Compiler reports for the **release** variant. Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
+- [ ] Enable Compose Compiler reports for the **release** variant.
 - [ ] Read `<module>-composables.txt`. List every restartable-but-not-skippable composable and the unstable parameter that blocks skipping.
 - [ ] Read `<module>-classes.txt`. List every unstable class with the offending field (a `var`, an unstable field type, an interface, etc.).
-- [ ] For surprising verdicts (`runtime`, `unknown`, "this looks stable but the compiler disagrees"), run (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) to walk the 12-phase algorithm.
-- [ ] Layout Inspector pass on the suspect surfaces: enable recomposition counts and skip counts. Identify hotspots with high counts and low skips. Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] For release-grade tracing (Layout Inspector cannot reach release builds), instrument the top hotspots with `@TraceRecomposition`. Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
+- [ ] For surprising verdicts (`runtime`, `unknown`, "this looks stable but the compiler disagrees"), re-inspect the field types and mutability by hand before trusting the report.
+- [ ] Layout Inspector pass on the suspect surfaces: enable recomposition counts and skip counts. Identify hotspots with high counts and low skips.
+- [ ] For release-grade tracing (Layout Inspector cannot reach release builds), instrument the top hotspots with `@TraceRecomposition`.
 - [ ] Triage: rank issues by **frequency × cost**. A recomposition in a hot `LazyColumn` row beats a 10× recomposition on a one-off settings screen. **DO NOT** rank by compiler-report severity alone.
 - [ ] Write the Diagnosis section of the audit report: top-5 hotspots, count of restartable-not-skippable composables, count of unstable classes, count of phase-misplaced reads.
 
 ### Phase 3 — Fix (apply targeted, minimal-diff changes — one cause per PR)
 
-For each ranked issue, pick the matching focused skill and apply the fix. **PREFERRED:** one PR per skill, so the diff is reviewable and bisectable. After **each** fix, re-run Phase 1 (measure) and Phase 2 (diagnose) to confirm the change moved the right needle and did not regress another.
+For each ranked issue, apply the targeted fix. **PREFERRED:** one PR per fix cause, so the diff is reviewable and bisectable. After **each** fix, re-run Phase 1 (measure) and Phase 2 (diagnose) to confirm the change moved the right needle and did not regress another.
 
-- [ ] Stability fixes (unstable `data class`, `List`/`Set`/`Map` parameter, `java.time.LocalDateTime`) → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Strong Skipping audit (verify mode is on, find lambda capture sites that need `@DontMemoize` or `@NonSkippableComposable`) → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Phase-deferral fixes for animations and scroll (`Modifier.offset { }`, `Modifier.graphicsLayer { }`, `Modifier.drawBehind { }`) → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] `derivedStateOf` misuse (missing `remember`, captured non-state vars, used where input frequency does not exceed output frequency) → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Lazy layout `key` and `contentType` for `LazyColumn`/`LazyRow`/`LazyVerticalGrid`, hoisting modifier chains out of the `items` lambda → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Lazy prefetch tuning **only** if Compose Foundation 1.10+ defaults still drop frames at high scroll velocity → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Custom modifier migrations from `Modifier.composed { }` to `Modifier.Node` + `ModifierNodeElement` → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Modifier order bugs (background painted in wrong region, click area extends past visible button, `clip` after `background`) → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Flow collection safety (`collectAsState` → `collectAsStateWithLifecycle`, hoist `Flow<T>` parameters out of composables, add `.conflate()` / `.distinctUntilChanged()`) → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-- [ ] Effect API audit (`LaunchedEffect` vs `RememberedEffect` vs `DisposableEffect` vs `SideEffect`, stale callbacks via `rememberUpdatedState`) → (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
+- [ ] Stability fixes (unstable `data class`, `List`/`Set`/`Map` parameter, `java.time.LocalDateTime`).
+- [ ] Strong Skipping audit (verify mode is on, find lambda capture sites that need `@DontMemoize` or `@NonSkippableComposable`).
+- [ ] Phase-deferral fixes for animations and scroll (`Modifier.offset { }`, `Modifier.graphicsLayer { }`, `Modifier.drawBehind { }`).
+- [ ] `derivedStateOf` misuse (missing `remember`, captured non-state vars, used where input frequency does not exceed output frequency).
+- [ ] Lazy layout `key` and `contentType` for `LazyColumn`/`LazyRow`/`LazyVerticalGrid`, hoisting modifier chains out of the `items` lambda.
+- [ ] Lazy prefetch tuning **only** if Compose Foundation 1.10+ defaults still drop frames at high scroll velocity.
+- [ ] Custom modifier migrations from `Modifier.composed { }` to `Modifier.Node` + `ModifierNodeElement`.
+- [ ] Modifier order bugs (background painted in wrong region, click area extends past visible button, `clip` after `background`).
+- [ ] Flow collection safety (`collectAsState` → `collectAsStateWithLifecycle`, hoist `Flow<T>` parameters out of composables, add `.conflate()` / `.distinctUntilChanged()`).
+- [ ] Effect API audit (`LaunchedEffect` vs `RememberedEffect` vs `DisposableEffect` vs `SideEffect`, stale callbacks via `rememberUpdatedState`).
 - [ ] After each fix: re-run Phase 1 + Phase 2 and record the Macrobenchmark delta in the audit report's Phase 3 table.
 
 ### Phase 4 — Verify (lock it in)
 
-- [ ] Re-generate the Baseline Profile so the now-faster code paths are captured. Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
+- [ ] Re-generate the Baseline Profile so the now-faster code paths are captured.
 - [ ] Compare Macrobenchmark numbers vs the Phase 1 baseline. Record P50/P90/P99 deltas in the "Verification (Phase 4)" section.
-- [ ] Set up the CI stability gate so regressions fail the build (`stabilityDump` once, then `stabilityCheck` on every PR). Cross-link (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
+- [ ] Set up the CI stability gate so regressions fail the build (`stabilityDump` once, then `stabilityCheck` on every PR).
 - [ ] Commit `app/src/main/generated/baselineProfiles/baseline-prof.txt` (or wherever the consumer module placed it).
 - [ ] Commit `app/stability/*.stability` baseline files generated by `:stabilityDump`.
 - [ ] Document the audit report (template below) and circulate. **MUST NOT** declare the audit complete without the written report.
@@ -124,10 +122,10 @@ Claude **MUST** produce this file at the end of the audit. Save it under `docs/p
 - Phase-misplaced reads: <count>
 
 ## Fixes applied (Phase 3)
-| Skill | Change | Files | Macrobench delta |
-| ----- | ------ | ----- | ---------------- |
-| stability/stabilizing-compose-types | wrap List<Snack> with ImmutableList | feed/SnackList.kt | scroll P90 18ms → 12ms |
-| recomposition/deferring-state-reads | offset(x.dp) → offset { } | hero/Hero.kt | scroll P99 33ms → 19ms |
+| Fix | Change | Files | Macrobench delta |
+| --- | ------ | ----- | ---------------- |
+| Stabilize list types | wrap List<Snack> with ImmutableList | feed/SnackList.kt | scroll P90 18ms → 12ms |
+| Defer state reads | offset(x.dp) → offset { } | hero/Hero.kt | scroll P99 33ms → 19ms |
 | ... | ... | ... | ... |
 
 ## Verification (Phase 4)
@@ -140,55 +138,13 @@ Claude **MUST** produce this file at the end of the audit. Save it under `docs/p
 - <list>
 ```
 
-## Patterns
+## Anti-patterns in your own output
 
-### Pattern: Measure before you touch a single line
+Three smells this protocol exists to prevent — each restates a rule above, kept here as a recognizable failure mode during an audit:
 
-```kotlin
-// WRONG
-// "Scroll feels rough — let me wrap this List in ImmutableList and add @Immutable everywhere."
-// WRONG because: no baseline number exists, so any later claim of improvement is unfalsifiable.
-```
-
-```kotlin
-// RIGHT
-// 1. Run MacrobenchmarkRule on the suspect surface. Record P50/P90/P99 in the report.
-// 2. Read the Compose Compiler report for the same surface. Identify the named cause.
-// 3. Apply ONE targeted fix from a sibling skill.
-// 4. Re-run the same Macrobenchmark. Compute the delta. Record it.
-```
-
-### Pattern: One cause per PR
-
-```text
-WRONG: a single PR titled "perf improvements" that
-  - converts 4 data classes to ImmutableList parameters
-  - migrates 2 custom modifiers to Modifier.Node
-  - moves 3 graphicsLayer reads down a phase
-  - adds a Baseline Profile module
-WRONG because: if the Macrobench delta is mixed (startup faster, scroll slower), the
-audit cannot attribute the regression to a specific change. Bisect impossible.
-```
-
-```text
-RIGHT: four PRs, each scoped to a single skill, each with its own Before/After
-Macrobench number in the description. The audit report links to each PR in the
-Phase 3 table.
-```
-
-### Pattern: Skippability is a diagnostic, not a KPI
-
-```text
-WRONG: "We got composables.txt skip rate from 71% to 100%. Audit complete."
-WRONG because: skippability is a means. The end is FrameTimingMetric and
-StartupTimingMetric improvement on a real device. A 100% skippable app can still
-drop frames if the work happens in Layout or Draw.
-```
-
-```text
-RIGHT: "Scroll P90 dropped from 18ms to 11ms. Cold startup median dropped from
-820ms to 610ms. Skip rate improved as a side effect; we did not target it directly."
-```
+- **Fixing before measuring.** "Scroll feels rough — let me wrap this `List` in `ImmutableList` and add `@Immutable` everywhere." With no baseline number recorded first, any later claim of improvement is unfalsifiable.
+- **One mega-PR across several causes.** A PR that converts four data classes, migrates two modifiers, moves three reads down a phase, and adds a Baseline Profile module produces a mixed delta (startup faster, scroll slower) that cannot be attributed to any one change — bisect impossible. Scope each PR to one cause and give it its own before/after Macrobenchmark number.
+- **Chasing 100% skippability.** "We got `composables.txt` skip rate from 71% to 100%. Audit complete." Skippability is a means, not the end; a 100% skippable app still drops frames when the work lands in Layout or Draw. Report `FrameTimingMetric` / `StartupTimingMetric` movement on a real device instead.
 
 ## Compose version requirements appendix
 
@@ -212,62 +168,17 @@ RIGHT: "Scroll P90 dropped from 18ms to 11ms. Cold startup median dropped from
 - **MUST** measure on release + R8 + a real physical device. Debug numbers and emulator numbers are not representative.
 - **MUST NOT** declare the audit complete without producing the written report from the template above.
 - **MUST NOT** chase 100% skippability (skydoves hot take #1) — the goal is `FrameTimingMetric` and `StartupTimingMetric` improvement, not a metric on the compiler report.
-- **MUST NOT** apply a fix from a focused skill without first reading that skill's prerequisites and verification checklist.
-- **PREFERRED:** one PR per fix skill — small diffs are reviewable and bisectable.
+- **MUST NOT** apply a fix for a named cause without first checking that cause's prerequisites and verification approach.
+- **PREFERRED:** one PR per fix cause — small diffs are reviewable and bisectable.
 - **PREFERRED:** rank Phase 2 hotspots by frequency × cost, not by compiler-report severity.
 
 ## Verification
 
-- [ ] Phase 1 numbers (cold startup median; scroll FrameTimingMetric P50/P90/P99) are recorded in the report before any code changed.
-- [ ] Phase 2 diagnosis is written: restartable-not-skippable count, unstable class count, top-5 hotspots ranked.
-- [ ] Each Phase 3 fix has its own row in the report with the specific skill applied, the files touched, and a measurable Macrobenchmark delta.
-- [ ] Phase 4: Baseline Profile regenerated and committed; `app/stability/*.stability` files committed; CI `stabilityCheck` gate is active.
-- [ ] Audit report saved (e.g. `docs/perf-audit-<date>-<module>.md`) and circulated.
-- [ ] Cold startup median and scroll P90 are both improved or held steady; if either regressed, the report's "Open items" section names the cause and the next action.
+The Phase 1–4 checklists in the workflow are the verification protocol — every box in every phase must be ticked before the audit may be called complete. The single pass/fail gate they do not imply:
 
-## References
+- [ ] Cold startup median and scroll P90 are both improved or held steady. If either regressed, the report's "Open items" section names the cause and the next action.
 
-### Sibling skills (the 25 focused skills this orchestrator sequences)
-
-Phase 1 — Measure:
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — debug builds lie; measure release + R8.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — Baseline Profile Generator + Macrobenchmark end-to-end.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — full mode, optimize ProGuard file, trust consumer rules.
-
-Phase 2 — Diagnose:
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — enable and read the Compose Compiler reports.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — 12-phase algorithm, `$stable` field, generic bitmasks.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — IDE plugin for inline stability inspection.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — visualize how unstable parameters propagate through the composable tree.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — Layout Inspector counts and Argument Change Reasons.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — `@TraceRecomposition` for release-grade tracing.
-
-Phase 3 — Fix:
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — three-tier waterfall: rewrite, annotate, configure.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — verify mode, audit lambda capture sites, escape hatches.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — push reads down to Layout/Draw via lambda modifiers.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — only when input frequency exceeds output frequency.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — recognize when `SubcomposeLayout` / `BoxWithConstraints` cost outweighs benefit.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — `key`, `contentType`, `Modifier.animateItem()`, hoisting.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — `LazyLayoutCacheWindow`, pausable prefetch, `NestedPrefetchScope`.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — `Modifier.Node` + `ModifierNodeElement` over `composed { }`.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — wrap-the-next-modifier mental model.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — `collectAsStateWithLifecycle`, hoist `Flow<T>` parameters.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — pick the cheapest correct effect API.
-
-Phase 4 — Verify:
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — `stabilityDump` baseline + `stabilityCheck` CI gate.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — regenerate after fixes; commit `baseline-prof.txt`.
-
-Hot-reload (developer-loop velocity, optional but recommended):
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — install and configure HotSwan for sub-second iteration.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — keep `remember`/`rememberSaveable` state through a reload.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — what reloads cleanly vs what forces a full rebuild.
-- (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled) — pair HotSwan with an MCP-aware AI tool for tight loops.
-
-Symptom and API lookup: (companion skill in https://github.com/skydoves/compose-performance-skills, not bundled).
-
-### External references
+## External references
 
 - Android Developers — Performance overview: https://developer.android.com/develop/ui/compose/performance
 - Android Developers — Stability overview: https://developer.android.com/develop/ui/compose/performance/stability
@@ -286,3 +197,4 @@ Symptom and API lookup: (companion skill in https://github.com/skydoves/compose-
 - License: Apache-2.0
 - 并入说明（2026-09-07）：下载并归一为单文件（frontmatter 仅 name/description）；原仓库配套技能/辅助文件未随附，需要时回上游取用。
 - Integration note (2026-09-07): fetched and normalized to single-file; sibling skills and auxiliary files of the source repo are not bundled - see upstream.
+- 体量收敛（2026-09-11）：删除 39 行无信息量的 "companion skill …" 兄弟技能清单（归一化时技能名已丢失，只剩 URL 样板）、正文内 23 处同句内联引用、以及复述已述规则的 Patterns 代码块与 Verification 清单；intro 段中逐阶段复述 Workflow 的部分删除。5,556 → 3,900 token。

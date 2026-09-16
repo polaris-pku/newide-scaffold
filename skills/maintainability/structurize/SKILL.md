@@ -7,7 +7,7 @@ description: Finds hidden repetition in an area (Type-3/4 clones, co-change, sho
 
 Scope: the area the user names (directory, feature, data flow), or with none named whatever the current prompt is about, plus one hop out along imports.
 
-**Leave as is** is a real verdict: occurrences that change for *different* reasons were never one thing, and a module needing more knobs than the occurrences have lines is worse than the occurrences. (`simplify-code` deletes visible duplication in a diff; this asks what repetition should *become*.)
+**Leave as is** is a real verdict: occurrences that change for *different* reasons were never one thing, and a module needing more knobs than the occurrences have lines is worse than the occurrences. (Deleting visible duplication in a diff is a different question; this asks what repetition should *become*.)
 
 ## 1 · Hunt: the real ones are hidden
 

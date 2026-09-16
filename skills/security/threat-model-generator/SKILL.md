@@ -5,9 +5,6 @@ description: Creates comprehensive threat models using STRIDE methodology with a
 
 # Threat Model Generator
 
-> 边界标注（2026-09-07）：设计阶段的 STRIDE 威胁建模；"先建模、后审计"——审计/找 bug 前的代码库上下文构建用 security/audit-context-building。
-> Boundary (2026-09-07): STRIDE threat modeling at design time; model first, then audit — pre-audit codebase context building is audit-context-building's job.
-
 Systematically identify and mitigate security threats.
 
 ## STRIDE Methodology
@@ -362,13 +359,20 @@ const patterns: CodePattern[] = [
     severity: "high",
   },
   {
-    pattern: /process\.env\./,
-    threat: "Hardcoded environment variable",
-    severity: "medium",
+    // Hardcoded secret literal: a secret-like name assigned a quoted value that
+    // matches a known key prefix or a long high-entropy blob.
+    // Reads such as `process.env.X` or `os.environ["X"]` are correct external
+    // configuration, not hardcoding — the required quoted literal excludes them.
+    pattern:
+      /(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)\s*[:=]\s*["'`](?:sk-|sk_live_|AKIA|ASIA|ghp_|xox[baprs]-|-----BEGIN|AIza|[A-Za-z0-9+/]{40,}={0,2})/i,
+    threat: "Hardcoded secret literal in source",
+    severity: "critical",
   },
   {
-    pattern: /password|secret|key/i,
-    threat: "Potential secret in code",
+    // Secret-like name assigned an opaque quoted literal (no known prefix).
+    pattern:
+      /(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)\s*[:=]\s*["'`][^"'`\s]{12,}["'`]/i,
+    threat: "Possible hardcoded secret in source",
     severity: "high",
   },
 ];
@@ -382,16 +386,3 @@ const patterns: CodePattern[] = [
 4. **Test mitigations**: Verify controls work
 5. **Monitor residual risks**: Track over time
 6. **Automate where possible**: Integrate into CI/CD
-
-## Output Checklist
-
-- [ ] Assets identified and classified
-- [ ] Threats enumerated using STRIDE
-- [ ] Attack vectors documented
-- [ ] Mitigations defined for each threat
-- [ ] Residual risk calculated
-- [ ] Risk acceptance documented
-- [ ] Monitoring plan created
-- [ ] Threat model document generated
-- [ ] Stakeholder approval obtained
-- [ ] Review schedule set

@@ -310,6 +310,7 @@ export class LiteLLMClient {
       model,
       messages,
       temperature: request.temperature ?? resolved.temperature,
+      ...(request.topP !== undefined ? { topP: request.topP } : {}),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -328,6 +329,7 @@ export class LiteLLMClient {
         prompt_tokens: result.usage?.inputTokens ?? 0,
         completion_tokens: result.usage?.outputTokens ?? 0,
         total_tokens: result.usage?.totalTokens ?? 0,
+        ...toCacheUsage(result.usage),
       },
       finishReason: result.finishReason,
     };
@@ -354,6 +356,7 @@ export class LiteLLMClient {
       messages,
       tools: toAiTools(schemas, handlers),
       temperature: request.temperature ?? resolved.temperature,
+      ...(request.topP !== undefined ? { topP: request.topP } : {}),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
       maxSteps: maxRounds,
     };
@@ -373,6 +376,7 @@ export class LiteLLMClient {
         prompt_tokens: result.usage?.inputTokens ?? 0,
         completion_tokens: result.usage?.outputTokens ?? 0,
         total_tokens: result.usage?.totalTokens ?? 0,
+        ...toCacheUsage(result.usage),
       },
       finishReason: result.finishReason,
     };
@@ -387,6 +391,7 @@ export class LiteLLMClient {
       model,
       messages,
       temperature: request.temperature ?? resolved.temperature,
+      ...(request.topP !== undefined ? { topP: request.topP } : {}),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -416,6 +421,7 @@ export class LiteLLMClient {
       schema: jsonSchema(schema.schema as Record<string, unknown>),
       messages,
       temperature: request.temperature ?? resolved.temperature,
+      ...(request.topP !== undefined ? { topP: request.topP } : {}),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -496,4 +502,25 @@ export class LiteLLMClient {
       tools: this.tools.getAllHandlers(),
     };
   }
+}
+
+/**
+ * 抽出提示词缓存的读写量。
+ *
+ * 这是全链路唯一能看见「缓存命中率」的收口点：AI SDK 把缓存拆在
+ * `usage.inputTokenDetails` 上（`noCacheTokens` / `cacheReadTokens` / `cacheWriteTokens`），
+ * 而 `usage.inputTokens` 是三者之和。不回传它，下游台账就只能看见一个笼统的
+ * prompt_tokens，缓存有没有生效永远不可知——实测第一次跑出 238 次推理、缓存读写全 0，
+ * 全靠这个字段才看得出来。
+ */
+function toCacheUsage(usage: unknown): { cache_read_tokens?: number; cache_write_tokens?: number } {
+  const details = (usage as { inputTokenDetails?: Record<string, unknown> } | undefined)
+    ?.inputTokenDetails;
+  if (!details) return {};
+  const read = Number(details.cacheReadTokens ?? 0);
+  const write = Number(details.cacheWriteTokens ?? 0);
+  return {
+    ...(Number.isFinite(read) && read > 0 ? { cache_read_tokens: read } : {}),
+    ...(Number.isFinite(write) && write > 0 ? { cache_write_tokens: write } : {}),
+  };
 }

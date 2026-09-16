@@ -5,9 +5,6 @@ description: Reviews authentication and authorization code for session, CSRF, co
 
 # Auth Security Reviewer
 
-> 边界标注（2026-09-07）：领域特化 = 全量审计（code-security-audit / security-audit-owasp）的认证授权章节专项版；仅当请求明确是 auth/session/JWT/CSRF/密码/MFA 时单独使用。
-> Boundary (2026-09-07): domain specialist = the auth/authorization part of a full audit; use standalone only when the ask is explicitly auth, sessions, JWT, CSRF, passwords, MFA.
-
 Comprehensive security review of authentication systems.
 
 ## Session Security Checklist
@@ -416,16 +413,3 @@ describe("Auth Security", () => {
 5. **Secure cookies**: HttpOnly, Secure, SameSite
 6. **MFA**: For sensitive operations
 7. **Audit logs**: Track authentication events
-
-## Output Checklist
-
-- [ ] Session configuration reviewed
-- [ ] JWT implementation secured
-- [ ] CSRF protection enabled
-- [ ] Password hashing with bcrypt
-- [ ] MFA implementation (if required)
-- [ ] Authorization checks on all endpoints
-- [ ] Session fixation prevention
-- [ ] Rate limiting on auth endpoints
-- [ ] Security tests written
-- [ ] Audit logging configured

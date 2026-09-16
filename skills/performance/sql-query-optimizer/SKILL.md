@@ -38,16 +38,20 @@ Planning Time: 0.234 ms
 Execution Time: 245.234 ms
 */
 
--- Issues identified:
--- 1. Seq Scan on orders (no index on user_id)
--- 2. Seq Scan on users (no index on created_at)
--- 3. Full table scans expensive
+-- Observations to verify against row counts, selectivity, and plan shape:
+-- 1. Seq Scan on orders: an index on user_id helps ONLY if the scan is selective
+--    (returns a small fraction of rows). On a small table, or as the build side
+--    of a hash join, a Seq Scan is often the cheaper plan.
+-- 2. Seq Scan on users: same caveat - compare rows returned vs rows scanned.
+-- 3. "Expensive" is a property of measured time and rows, not of the scan type.
+--    Confirm with EXPLAIN ANALYZE actual times before changing anything.
 ```
 
 ## Index Recommendations
 
 ```sql
--- Problem: Sequential scans
+-- Candidate: a selective equality filter (99950 of 100000 rows removed) doing
+-- a full scan - this is the shape where an index actually pays off.
 EXPLAIN ANALYZE
 SELECT * FROM orders WHERE user_id = 123;
 /*
@@ -65,7 +69,9 @@ Index Scan using idx_orders_user_id on orders  (cost=0.29..45.32 rows=50 width=1
   Index Cond: (user_id = 123)
 */
 
--- Performance: 89ms → 0.09ms (990x faster!)
+-- Verify the improvement yourself with a before/after EXPLAIN ANALYZE on your own
+-- data. The speedup depends on selectivity and table size - do not assume a fixed
+-- multiplier.
 ```
 
 ## Query Rewrites
@@ -79,24 +85,27 @@ SELECT * FROM users WHERE id = 123;
 -- ✅ Good: Fetch only needed columns
 SELECT id, email, name FROM users WHERE id = 123;
 
--- Performance: 50% faster, less network transfer
+-- Benefit: narrower rows and less data over the wire. How much this helps varies
+-- with column count and payload size - measure it rather than quoting a fixed %.
 ```
 
-### 2. Use EXISTS Instead of IN
+### 2. `IN` vs `EXISTS`: usually equivalent
+
+Modern planners typically rewrite `IN (subquery)` and `EXISTS` into the same
+semi-join, so neither form is reliably faster. Choose the more readable one and
+verify the plan - the real lever is the supporting index, not the syntax.
 
 ```sql
--- ❌ Slow: Subquery executed fully
+-- These two normally plan identically; confirm with EXPLAIN ANALYZE.
 SELECT * FROM users
 WHERE id IN (SELECT user_id FROM orders WHERE total > 100);
 
--- ✅ Fast: Short-circuits on first match
 SELECT * FROM users u
 WHERE EXISTS (
   SELECT 1 FROM orders o
   WHERE o.user_id = u.id AND o.total > 100
 );
-
--- Performance: 3x faster on large datasets
+-- Make sure orders(user_id) and orders(total) are indexed so the semi-join is cheap.
 ```
 
 ### 3. Avoid Functions on Indexed Columns
@@ -124,20 +133,20 @@ CREATE INDEX idx_users_email_covering ON users(email) INCLUDE (id, name);
 -- Result: Index-only scan (no table access needed)
 ```
 
-### 5. Optimize JOIN Order
+### 5. Inner-join order is the planner's decision
+
+The textual order of inner joins does not set execution order - the planner
+reorders joins by statistics and cost. Hand-ordering tables is not an
+optimization; make the join keys indexed and the filtered columns selective.
 
 ```sql
--- ❌ Bad: Large table first
-SELECT * FROM orders o
-JOIN users u ON u.id = o.user_id
-WHERE u.email = 'john@example.com';
-
--- ✅ Good: Filter first, join second
+-- Swapping the FROM/JOIN order normally produces the same plan.
 SELECT * FROM users u
 JOIN orders o ON o.user_id = u.id
 WHERE u.email = 'john@example.com';
 
--- Or use CTE for clarity:
+-- A CTE can aid readability, but many planners inline it - check the plan before
+-- assuming it materializes as a barrier.
 WITH filtered_users AS (
   SELECT id FROM users WHERE email = 'john@example.com'
 )
@@ -208,19 +217,25 @@ async function compareQueries() {
       FROM users u
       LEFT JOIN orders o ON o.user_id = u.id
       GROUP BY u.id
+      ORDER BY u.id            -- fixed order: the two queries must return the SAME rows
       LIMIT 10
     `;
   });
 
-  // Query 2: Optimized
+  // Query 2: optimized — restrict to the 10 users first, then count per user,
+  // instead of grouping the whole users x orders join and truncating afterwards.
   const result2 = await benchmarkQuery("Optimized Query", async () => {
     return prisma.$queryRaw`
       SELECT u.id, u.email, u.name,
              (SELECT COUNT(*) FROM orders WHERE user_id = u.id) as order_count
       FROM users u
+      ORDER BY u.id            -- same fixed order as Query 1
       LIMIT 10
     `;
   });
+
+  // Comparison — the number is meaningful only because both queries are ordered
+  // identically and return identical result sets; assert that before trusting it.
 
   // Comparison
   const improvement = (
@@ -240,35 +255,25 @@ interface QueryOptimization {
   query: string;
   issues: string[];
   recommendations: string[];
-  estimatedImprovement: string;
+  verification: string;
 }
 
 const optimizations: QueryOptimization[] = [
   {
-    query: "SELECT * FROM orders WHERE user_id = $1",
-    issues: [
-      "Missing index on user_id",
-      "SELECT * fetches unnecessary columns",
-    ],
-    recommendations: [
-      "CREATE INDEX idx_orders_user_id ON orders(user_id)",
-      "SELECT id, total, status instead of *",
-    ],
-    estimatedImprovement: "90% faster",
-  },
-  {
     query: "SELECT COUNT(*) FROM orders",
-    issues: ["Full table scan", "No WHERE clause filtering"],
+    issues: ["Unbounded COUNT(*) scans the whole table by design"],
     recommendations: [
-      "Add WHERE clause to filter rows",
-      "Consider approximate count for large tables",
+      "Use an approximate count (pg_class.reltuples) when exactness is not required",
+      "Add a WHERE clause and index it if only a filtered count is needed",
     ],
-    estimatedImprovement: "70% faster",
+    verification: "Compare actual block reads and time before/after",
   },
 ];
 ```
 
 ## Automated Slow Query Detection
+
+The `100` values below are an example starting point — set the threshold from this database's own latency distribution, not from a universal constant.
 
 ```typescript
 // scripts/detect-slow-queries.ts
@@ -305,20 +310,9 @@ async function detectSlowQueries() {
 ## Best Practices
 
 1. **Always use EXPLAIN**: Understand query plans
-2. **Index foreign keys**: Essential for joins
+2. **Index for what the plan needs**: a foreign-key column is auto-indexed in InnoDB (a manual index on it is redundant) but **not** in PostgreSQL; either way an index helps a join only when it is selective — check the plan before adding one.
 3. **Avoid SELECT \***: Fetch only needed columns
 4. **Use composite indexes**: Multi-column queries
 5. **Consider covering indexes**: Eliminate table access
 6. **Batch operations**: Reduce round trips
 7. **Monitor regularly**: Track slow queries
-
-## Output Checklist
-
-- [ ] EXPLAIN plan analyzed
-- [ ] Missing indexes identified
-- [ ] Query rewrite suggestions
-- [ ] Performance benchmarks
-- [ ] Before/after metrics
-- [ ] Index creation scripts
-- [ ] Slow query monitoring
-- [ ] Optimization priority list

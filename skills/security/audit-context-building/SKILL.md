@@ -5,9 +5,6 @@ description: Understands a codebase before hunting for bugs, capturing what each
 
 # audit-context-building
 
-> 边界标注（2026-09-07）：审计/威胁建模/找 bug 前理解代码库的前置工具；correctness 的 bugsweep 猎杀与 security 审计均可复用本技能做 preflight。
-> Boundary (2026-09-07): pre-work for audits, threat models and bug hunts — reusable as preflight by correctness bugsweep and by security audits.
-
 > 蒸馏自 trailofbits/skills（仓库内路径 plugins/audit-context-building/skills/audit-context-building）。原为 6 文件（SKILL.md + 3 篇 resources + agents/openai.yaml + 品牌 svg）；resources 已全文内联，openai.yaml/svg 仅为界面配置已省略。
 > Distilled from trailofbits/skills (`plugins/audit-context-building/skills/audit-context-building`); originally 6 files with three resource documents now inlined.
 
@@ -99,7 +96,6 @@ One document per function, sections in this order, separated by `---`:
 ### Before you finish
 
 - Check that every claim either cites a line or sits in Open Questions.
-- Check that you followed every path through each function called, not just the one that succeeds.
 - If something you wrote earlier turns out to be wrong, fix it where it stands and say what changed.
 - Cut the hedges: "Probably", "seems to", and "should be" each become either a claim with a line number or an open question.
 - Finishing with open questions is a complete analysis. Finishing with open questions you never wrote down is not.
@@ -239,47 +235,6 @@ The `SESSION_CLOSING` observation and the unlocked-caller observation are both i
 Both are recorded as unenforced assumptions with the line that should have enforced them. Neither is called a use-after-free or a race condition, neither gets a severity, and no fix is proposed — the hunting phase makes those calls with the whole system model in front of it.
 
 Note also what the record does *not* do: there is no invariant invented to reach a count, and blocks that do one thing get one line each.
-
-### The same shape in Solidity
-
-The format does not change between domains; the same callee trap appears in a different dialect:
-
-```solidity
-// L61
-function withdraw(uint256 amount) external {
-    require(_debit(msg.sender, amount), "insufficient");   // L62
-    (bool ok, ) = msg.sender.call{value: amount}("");      // L63
-    require(ok, "transfer failed");                        // L64
-    totalDeposits -= amount;                               // L65
-}
-```
-
-**Inputs & Assumptions:**
-- `amount` (uint256): user-specified. Trust: **untrusted**.
-- Implicit: `msg.sender`, `balanceOf[msg.sender]` (L12), `hasCreditLine[msg.sender]` (L13).
-- Precondition: the caller's balance covers `amount`. **Established by `_debit`, and only on one of its two paths** — see below.
-
-**Outputs & Effects:**
-- Storage writes: `balanceOf[msg.sender]` inside `_debit` (L48, L52); `totalDeposits` at L65.
-- External interaction: `msg.sender.call{value: amount}` (L63) — value transfer to an arbitrary address.
-- No event emitted on withdrawal. Off-chain accounting cannot observe this path.
-
-**Block-by-Block (L62-L65):**
-- **What:** debits the balance, sends the ether, then decrements the running total.
-- **Why here:** the debit precedes the transfer, which reads as checks-effects-interactions.
-- **Assumes:** `_debit` returning true means the balance covered the amount.
-- **Establishes:** nothing the later lines can rely on — `totalDeposits` at L65 lands *after* the external call at L63, so it is not in effect during re-entry.
-
-**Cross-Function Dependencies:**
-- **Callee `_debit` (internal, L44-L54):** read in full. Two paths, and they do not agree.
-  - Default path (L50-L52): `if (balanceOf[account] < amount) return false;` then subtracts. The bound holds.
-  - Credit-line path (L46-L49): when `hasCreditLine[account]` is set, it subtracts inside an `unchecked` block and returns true **without comparing balance to amount**. For those accounts the caller's precondition is established by nothing, and the subtraction wraps instead of reverting.
-- **Invariant coupling:** `sum(balanceOf) == totalDeposits` is the contract's central invariant. It is maintained on the default path and not on the credit-line path.
-
-**Open Questions:**
-- unclear; need to inspect who can set `hasCreditLine` and whether it is ever cleared (`L13` declares it; no setter appears in this file).
-
-Note what the record does *not* say: it does not call L63 a reentrancy vulnerability or the `unchecked` block an integer underflow, and it proposes no fix. It says where each precondition is established, and names the one that is established nowhere. The hunting phase takes it from there.
 
 ## Provenance
 

@@ -5,9 +5,6 @@ description: Identifies and fixes XSS, SQL injection, and command injection vuln
 
 # Input Validation & Sanitization Auditor
 
-> 边界标注（2026-09-07）：= 全量审计的注入类（XSS/SQLi/命令注入）修复专项；全量审计请用 code-security-audit。
-> Boundary (2026-09-07): injection (XSS/SQLi/command) remediation specialist of a full audit; full audits use code-security-audit.
-
 Prevent injection attacks through proper input handling.
 
 ## XSS Prevention

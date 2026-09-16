@@ -10,15 +10,15 @@ description: Audits code changes, diffs, or PRs to find high-confidence exploita
 
 AI-powered security audit for code changes with false positive filtering. Engine upstream of [anthropics/claude-code-security-review](https://github.com/anthropics/claude-code-security-review); this fork packages the audit as an agent skill plus a GitHub Action CI runner.
 
-> 整合说明（2026-09-07）：本技能已收编 anthropic-claude-code-security-review（anthropics 官方适配件，同源同输出契约）；anthropic 目录保留为指针。差异内容并入文末 Official Lineage 章节。
-> Integration 2026-09-07: the official Anthropic security-review adaptation (anthropics/claude-code-security-review) was folded in; its directory is now a pointer.
+> 整合说明（2026-09-07）：官方 Anthropic security-review 适配件（同源同输出契约）已并入本技能。
+> Integration 2026-09-07: the official Anthropic security-review adaptation (same source, same output contract) was folded into this skill.
 
 ## When to Use
 
 - When asked to "audit security", "review for vulnerabilities", "security scan", "check for security issues", "audit this PR", "review these changes for security", or "find vulnerabilities in diff".
 - Input: a code change set — a branch diff against `origin/main`, staged changes, last N commits, or a GitHub PR.
 - Output: a set of HIGH/MEDIUM findings only, each with file, line, severity, category, confidence, description, exploit scenario, and recommendation.
-- Distinct from secure-coding-pattern skills (checklists/templates): this skill actively audits a concrete diff and filters to high-confidence, exploitable issues.
+- This skill actively audits a concrete diff (not a checklist or template scan) and filters to high-confidence, exploitable issues.
 
 ## Core Principles
 
@@ -147,55 +147,10 @@ When the bundled engine runs (CI or CLI), these steps replace/augment the manual
 3. **Assemble the audit prompt** — inject repo/PR context, the changed-file list, and the diff (or, if the prompt would exceed ~1MB / hits "Prompt is too long", omit the diff and instruct the reviewer to explore the changed files with file tools instead); append any custom scan categories. The prompt body embeds the objective, exclusions, category list, three-phase methodology, severity/confidence guidance, and the exact JSON output schema shown above.
 4. **Run the reviewer** — invoke the model/CLI (`claude` CLI with `--output-format json`, default model `claude-opus-4-1-20250805` overridable via `CLAUDE_MODEL`, `Bash(ps:*)` disallowed, prompt fed on stdin, ~20-minute subprocess timeout). Up to 3 attempts with short sleeps; retry on `error_during_execution`, on unparseable output (once), and re-run without the diff on `PROMPT_TOO_LONG`. Claude Code is pre-validated (`claude --version` + `ANTHROPIC_API_KEY`).
 5. **Parse the JSON** — parse stdout with fallbacks: direct `json.loads` → fenced ```json code block → first balanced-brace object in the text. Accept only a Claude wrapper object carrying `result`, whose `result` text parses to JSON containing a `findings` key.
-6. **Filter stage 1 — hard rules:** the engine applies regex families for: DoS/resource-exhaustion, rate-limiting recommendations, resource-management findings, open redirects, regex injection/DoS, memory-safety terms **only excluded when the file is not C/C++** (`.c/.cc/.cpp/.h` eligible), and SSRF findings when the file is `.html`; `.md` findings are excluded outright. Each removed finding records the matched rule family (exclusion breakdown is kept).
-7. **Filter stage 2 — per-finding model filter** (enabled by `ENABLE_CLAUDE_FILTERING=true` with an API key): each surviving finding is analyzed individually by the API with PR context, the source file content, and the filtering instructions (default: 16 hard-exclusion categories, signal-quality criteria, and the framework precedents, plus any custom FP rules). The model must answer JSON `{original_severity, confidence_score (1–10), keep_finding, exclusion_reason, justification}`. A `keep_finding: false` verdict excludes the finding with its reason; kept findings carry the confidence and justification as metadata. If the API call fails the finding is kept with a warning at default confidence 10. If stage 2 is disabled, everything surviving stage 1 is kept at default confidence 10.
+6. **Filter stage 1 — hard rules:** the engine applies the Hard Exclusions above to each finding via regex families; each removed finding records the matched rule family (the exclusion breakdown is kept as metadata).
+7. **Filter stage 2 — per-finding model filter** (enabled by `ENABLE_CLAUDE_FILTERING=true` with an API key): each surviving finding is re-analyzed individually against the Signal Quality Criteria and Precedents above (plus any custom FP rules), with PR context and the source file content. The model answers JSON `{original_severity, confidence_score (1–10), keep_finding, exclusion_reason, justification}`; `keep_finding: false` excludes the finding with its reason, and kept findings carry the confidence and justification as metadata. A failed API call keeps the finding with a warning at default confidence 10. If stage 2 is disabled, everything surviving stage 1 is kept at default confidence 10.
 8. **Filter stage 3 — final directory exclusion** — drop kept findings whose `file` path falls under an excluded directory.
 9. **Emit & exit** — print one JSON document to stdout: `{pr_number, repo, findings (kept), analysis_summary, filtering_summary}` where `filtering_summary` holds `total_original_findings`, `excluded_findings` count and full details, `kept_findings`, and per-stage `filter_analysis` (incl. hard/claude/directory exclusion counts and average confidence). Exit code: **0** when no HIGH finding remains, **1** if any kept finding is HIGH (so CI can fail the build), **2** on configuration errors (missing `GITHUB_TOKEN`/`GITHUB_REPOSITORY`/`PR_NUMBER` or invalid init).
-
-## GitHub Action CI Integration
-
-Runs automated audits on PRs as a composite GitHub Action: installs `gh`, sets up Python 3.x and Node 18, caches a per-PR marker (`.claudecode-marker`) so ClaudeCode normally runs **once per PR** to avoid duplicate false-positive noise; `run-every-commit: true` forces a run on every commit. `ANTHROPIC_API_KEY` is mandatory. Only runs on `pull_request` events.
-
-Required/optional inputs:
-
-| Input | Required | Purpose |
-|----------|----------|---------|
-| `claude-api-key` | Yes | Anthropic API key (enabled for Claude API + Claude Code) |
-| `comment-pr` | No (default `true`) | Post findings as PR review comments |
-| `upload-results` | No (default `true`) | Upload `findings.json`, `claudecode-results.json`, error log as artifacts (7-day retention) |
-| `exclude-directories` | No | Comma-separated dirs to skip |
-| `claudecode-timeout` | No (default `20`) | Analysis timeout in minutes |
-| `claude-model` | No | Model override (default Opus 4.1) |
-| `run-every-commit` | No (default `false`) | Skip the once-per-PR cache check |
-| `false-positive-filtering-instructions` | No | Path to a custom FP-rules text file |
-| `custom-security-scan-instructions` | No | Path to custom scan categories to append to the audit prompt |
-
-Outputs: `findings-count` and `results-file` (`claudecode-results.json`). Workflow permissions needed: `pull-requests: write`, `contents: read`.
-
-Example workflow:
-
-```yaml
-name: Security Review
-permissions:
-  pull-requests: write
-  contents: read
-on:
-  pull_request:
-jobs:
-  security:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 2
-      - uses: anthropics/claude-code-security-review@main
-        with:
-          comment-pr: true
-          claude-api-key: ${{ secrets.CLAUDE_API_KEY }}
-```
-
-PR commenting (the bundled Node commenter, run when `comment-pr=true`): reads `findings.json` from cwd, maps each finding to the PR diff (`GITHUB_REPOSITORY` + `GITHUB_EVENT_PATH`), and posts one review with inline comments (`🤖 **Security Issue: …**`, severity, category, exploit scenario, recommendation) at `side: RIGHT`; skips files not in the diff; skips entirely when earlier bot comments already exist (duplicate avoidance); falls back to individual line comments (with +1/−1 reactions) when the bulk review call fails; respects `SILENCE_CLAUDECODE_COMMENTS`.
 
 ## Customization
 
@@ -217,29 +172,6 @@ A project may replace the default FP rules with its own profile, e.g.: all DoS/r
 ## Evaluation Framework
 
 Validate the audit against any public PR whose vulnerabilities are known by invoking the bundled eval CLI with `ANTHROPIC_API_KEY` set and a `owner/repo#PR` argument (verbose output optional; results JSON is written under an eval-results directory and the process exits 0 on success). The bundled eval scenarios score the manual workflow against crafted vulnerable diffs (each 100 points across criteria like "SQL injection identified", "plaintext password storage flagged", "missing auth on admin endpoint", "correct output format used", "no false positives reported") — including a compliance scenario where the agent must detect PCI DSS card-data logging/retention violations and IDOR/refund-auth issues and apply the financial-services custom categories. Repo-wide, evals compare detection against SAST baselines on real PRs.
-
-## Official Lineage — anthropics/claude-code-security-review (folded in)
-
-> 血缘（2026-09-07 并入）：本技能与 anthropics 官方 Claude Code `security-review` 命令同源同契。官方命令（`.claude/commands/security-review.md`）被工程化衍生为 LeonMelamud fork（即本技能蒸馏源，含 GitHub Action CI 运行器），而本目录旧条目正是该官方命令的 SKILL 适配件。两系输出契约一致：逐条 `# Vuln N: 类别: file:line`，字段 severity/category/description/exploit scenario/recommendation；误报过滤（hard exclusions / precedents / signal quality）同源同构。
-> Lineage: same origin and same output contract as the official Anthropic `security-review` command; false-positive filtering rules share the same source.
-
-**逐条比对结论（被并入 171 行 vs 宿主全部规则）：**
-
-- **Hard Exclusions：** 被并入文件 18 条编号排除规则全部可在宿主 20 条中找到语义对应（宿主为超集），无缺失条目需逐条并入。对应：官方 1→宿主 1、2→11、3→2、4→1/3（memory/CPU 消耗）、5→13（"非安全关键字段缺输入校验"为宿主 #13 Missing Hardening 的特例）、6→宿主 Precedents 5、7→13、8→14、9→15、10→6、11→9、12→12、13→8、14→17、15→5、16→5、17→10、18→宿主 Precedents 10。
-- **Precedents：** 被并入 12 条逐条对应宿主 12 条（1→1、2→2、3→3、4→宿主硬排除 3、5→9、6→4、7→5、8→6、9→11、10→7、11→1、12→8），无缺失。
-- **Signal Quality Criteria：** 被并入 4 条与宿主 `## Signal Quality Criteria` 逐字相同。
-- **综上：排除/判定类规则内容与宿主全量重复，无增量规则需并入宿主正文。**
-
-**被并入文件中宿主没有、仅记录于此的过程/措辞差异：**
-
-1. 变更采集命令集：含 `git status`（工作树状态）、`git log --no-decorate origin/HEAD...`（分支提交列表）、`git diff --merge-base origin/HEAD`（完整 diff，以 `origin/HEAD` 为合并基）；宿主手动流程以 `origin/main` 为基线，且未含 status/log 采集步骤。
-2. 显式子任务委派法：识别漏洞用子任务（审查指令整体放入其提示）→ 对每个候选并行开过滤子任务（种子为 False Positive Filtering 指令）→ 过滤置信度 <8 即丢弃；宿主手工程序未要求委派。
-3. 分析约束原文："Do not run commands to reproduce a vulnerability — read the code to determine whether it is real. Do not write to any files during analysis."（宿主无此显式约束）。
-4. 严重级定义补充 LOW = defense-in-depth / 低影响、不报告（宿主只给出 HIGH/MEDIUM 定义）。
-5. 输出示例为完整可读的工作示例（`# Vuln 1: XSS: `foo.py:42``，含 username 参数反射型 XSS 攻击路径与 Flask `escape()` / Jinja2 auto-escaping 修复建议）；宿主示例为占位符模板 `# Vuln N: [Category]: file:line`。
-6. 已核对无差异项：安全类别清单、三阶段方法论、0–1 置信度分档（0.9–1.0 / 0.8–0.9 / 0.7–0.8 / <0.7）均与宿主逐项一致。
-
-- Provenance: 并入自 anthropics/claude-code-security-review（repo: https://github.com/anthropics/claude-code-security-review，path: .claude/commands/security-review.md；适配件改编说明见原文件）。
 
 ## Provenance
 

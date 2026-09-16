@@ -25,6 +25,7 @@ import {
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
   type AgentTaskRequest,
+  type AgentToolEvent,
   type AgentHandle,
   type BufferRepository,
   type CollectCompetitionClaimsOptions,
@@ -89,6 +90,22 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   embedding?: EmbeddingProvider;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
+  /**
+   * 隔离开关：跳过任务级预检索（默认 false，生产行为不变）。
+   *
+   * 开启后 `driver_context` 里只剩顶层 Agent 经 `query_memory` 自查并显式传入的
+   * 技能/经验，与系统提示词 "Skills are NOT pre-loaded — you must query them when
+   * needed" 一致；用于隔离「预检索注入」与「Agent 自查注入」两条路径的实验。
+   */
+  disablePreRetrieval?: boolean;
+  /**
+   * 顶层 Agent 的 tool-calling 观测落点（默认关闭，生产行为不变）。
+   *
+   * 配了之后，每次工具调用追加一行到 `<agentTraceDir>/<run_id>.jsonl`。作用是让
+   * 「Agent 到底调没调 query_memory、查到几条」可查——否则注入为空时只能猜。
+   * 实验用（`NEWIDE_B_AGENT_TRACE_DIR`），与 `disablePreRetrieval` 同一族开关。
+   */
+  agentTraceDir?: string;
   mailbox?: {
     service: PersistentMailboxService;
     /** 协作名册：静态数组或动态提供者（每次使用时查询，支持运行时新增 Agent） */
@@ -112,6 +129,14 @@ interface InvocationContext {
   onDriverEvent?: AgentExecutionOptions['onDriverEvent'];
   execution?: DriverRunResult;
   retrieval: MemoryRetrievalResult;
+  /**
+   * 顶层 Agent 本轮经 `query_memory` 检到的技能（**全文**，由工具回调累积）。
+   *
+   * 与 `retrieval`（facade 的预检索，可被 `disablePreRetrieval` 关掉）是两条不同的
+   * 来源：这条是「Agent 自己判断需要什么 → 去查 → 原文随 invoke_driver 下去」。
+   * 不记这个的话，Agent 只能靠转述，正文会在转述里蒸发。
+   */
+  agent_retrieved_skills: Array<{ id: string; description: string; content: string }>;
   driver_invocation_context?: DriverRuntimeInvokerInput['driver_context'];
   agent_system_prompt_sha256?: string;
   inbound_mailbox?: PersistedMailboxEnvelope;
@@ -139,6 +164,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly executionQueues = new Map<string, Promise<void>>();
   private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
+  /** per-run 串行队列，保证工具调用按发生顺序落盘 */
+  private readonly agentTraceQueues = new Map<string, Promise<void>>();
   private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
 
   constructor(private readonly options: DriverRuntimeAgentExecutionFacadeOptions) {
@@ -151,24 +178,63 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   }
 
   private createManager(): Promise<AgentManager> {
-    const tools = [
-      new InvokeDriverTool((task) => this.invokeDriver(task)),
-      ...(this.options.mailbox
-        ? [new MailboxSendTool((input) => this.sendMailbox(input))]
-        : []),
-    ];
-    return AgentManager.create(this.options.repository, this.options.bufferRepository, {
-      tools: {
-        llm: {
-          completeWithTools: (input) => this.completeWithTools(input),
+      const tools = [
+        new InvokeDriverTool((task) => this.invokeDriver(task)),
+        ...(this.options.mailbox
+          ? [new MailboxSendTool((input) => this.sendMailbox(input))]
+          : []),
+      ];
+      return AgentManager.create(this.options.repository, this.options.bufferRepository, {
+        tools: {
+          llm: {
+            completeWithTools: (input) => this.completeWithTools(input),
+          },
+          tools,
+          maxToolCalls: this.options.mailbox ? 6 : 4,
+          // 把 Agent 自查到的技能**原文**攒到当前 invocation 上：Agent 无法把这
+          // 些正文原样塞进 invoke_driver 的字符串参数，只能转述，转述会把 19k 字符
+          // 的技能压成一句话。见 InvocationContext.agent_retrieved_skills。
+          onSkillsRetrieved: (skills) => {
+            const invocation = this.invocationContext.getStore();
+            if (invocation) invocation.agent_retrieved_skills.push(...skills);
+          },
+          // 观测：把每次工具调用落成 per-run JSONL，供实验判断注入为空的成因
+          // （Agent 没去查 vs 查了没命中）。
+          onToolEvent: (event) => {
+            this.appendAgentToolTrace(event);
+          },
         },
-        tools,
-        maxToolCalls: this.options.mailbox ? 6 : 4,
-      },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
       retirementEvaluator: createToolRetirementEvaluator(this.options.llm),
     });
+  }
+
+  /**
+   * 把一次工具调用追加到 `<agentTraceDir>/<run_id>.jsonl`。未配置落点则什么都不做。
+   *
+   * 观测用，不进执行路径：写失败被吞掉，绝不影响运行。per-run 队列保证顺序。
+   */
+  private appendAgentToolTrace(event: AgentToolEvent): void {
+    const directory = this.options.agentTraceDir;
+    if (!directory) return;
+    const invocation = this.invocationContext.getStore();
+    const runId = invocation?.run_id ?? 'unknown';
+    const target = path.join(directory, `${runId}.jsonl`);
+    const line = `${JSON.stringify({
+      run_id: runId,
+      role_id: invocation?.role_id,
+      task_id: invocation?.task_id,
+      at: nowTimestamp(),
+      ...event,
+    })}\n`;
+
+    const previous = this.agentTraceQueues.get(runId) ?? Promise.resolve();
+    const next = previous
+      .then(() => fs.mkdir(directory, { recursive: true }))
+      .then(() => fs.appendFile(target, line, 'utf8'))
+      .catch(() => undefined);
+    this.agentTraceQueues.set(runId, next);
   }
 
   async ensureAgent(agentId: string): Promise<void> {
@@ -401,25 +467,27 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             )
         : [];
     return runWithMemoryAblationPolicy(ablationPolicy, async () => {
-      const retrieval = await withAbort(
-        repositoryRetrieveMemoryForTask(
-          createAgentMemoryScope(
-            this.options.repository,
-            this.options.bufferRepository,
-            runtimeRoleId,
-          ),
-          task,
-          input.task_id,
-          {
-            ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
-            selection: {
-              include_skills: ablationPolicy.include_skills,
-              include_recent_experience: ablationPolicy.include_recent_experience,
-            },
-          },
-        ),
-        options?.signal,
-      );
+      const retrieval: MemoryRetrievalResult = this.options.disablePreRetrieval
+        ? { skills: [], experiences: [] }
+        : await withAbort(
+            repositoryRetrieveMemoryForTask(
+              createAgentMemoryScope(
+                this.options.repository,
+                this.options.bufferRepository,
+                runtimeRoleId,
+              ),
+              task,
+              input.task_id,
+              {
+                ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
+                selection: {
+                  include_skills: ablationPolicy.include_skills,
+                  include_recent_experience: ablationPolicy.include_recent_experience,
+                },
+              },
+            ),
+            options?.signal,
+          );
       throwIfAborted(options?.signal);
       const invocation: InvocationContext = {
         task_id: input.task_id,
@@ -432,6 +500,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
+        agent_retrieved_skills: [],
         ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
         notice_mailboxes: noticeMailboxes,
         mailbox_outcomes: [],
@@ -857,6 +926,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
         task_instruction: invocation.driver_instruction,
         skills: deduplicateMemoryItems([
+          ...toDriverMemoryItems(invocation.agent_retrieved_skills),
           ...toDriverMemoryItems(invocation.retrieval.skills),
           ...toMemoryItems('skill', task.context?.skills),
         ]),

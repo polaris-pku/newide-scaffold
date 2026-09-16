@@ -2,9 +2,9 @@
  * skill-corpus — 预置技能语料（skills/ 目录）扫描与映射
  *
  * 只读 side：扫描 `skills/<role>/<skill>/SKILL.md`，解析 frontmatter（仅
- * {name, description}，键集校验与语料规范一致）、区分活动技能 / 路由指针、
- * 解析指针指向的宿主，并提供确定性 ID（uuid v5(slug)）与内容哈希——
- * 供 import 脚本、CLI 与快照测试共用，保证 ID/版本判定跨运行一致。
+ * {name, description}，键集校验与语料规范一致），并提供确定性 ID
+ * （uuid v5(slug)）与内容哈希——供 import 脚本、CLI 与快照测试共用，
+ * 保证 ID/版本判定跨运行一致。
  */
 import { createHash } from 'node:crypto';
 import { promises as fs, type Dirent } from 'node:fs';
@@ -31,23 +31,7 @@ export const ROLE_AGENT_IDS: Readonly<Record<CorpusRole, string>> = {
   security: 'role_security',
 };
 
-/**
- * 路由指针 → 宿主技能映射（9 个指针目录，重构期并入 7 个宿主）。
- * 指针目录不生成独立 SkillRecord，其 slug 记入宿主记录的 sub_skills。
- */
-export const POINTER_TARGETS: Readonly<Record<string, string>> = {
-  'logic-review': 'agentic-code-reasoning',
-  'harden-code': 'bugsweep',
-  'anti-patterns': 'clean-code',
-  'cyclomatic-complexity-refactor': 'refactoring',
-  'simplify-code': 'simplify-swarm',
-  cleanup: 'simplify-swarm',
-  'code-humanizer': 'simplify-swarm',
-  'backend-latency-profiler-helper': 'backend-performance-review',
-  'anthropic-claude-code-security-review': 'code-security-audit',
-};
-
-/** 议会部署形态（bugsweep 的 H-S-R 三件套）：活动技能但标记部署形态，不并入宿主 */
+/** 议会部署形态（H-S-R 三件套）：独立技能，仅标记部署形态 */
 export const COUNCIL_TRIO_SLUGS: ReadonlySet<string> = new Set([
   'bug-hunter-hunter',
   'bug-hunter-skeptic',
@@ -68,13 +52,10 @@ export interface CorpusSkillFile {
   /** 目录名（= frontmatter name） */
   slug: string;
   role: CorpusRole;
-  kind: 'activity' | 'pointer';
   name: string;
   description: string;
   /** frontmatter 之后的正文（含 Provenance 段），trim 后 */
   body: string;
-  /** kind=pointer 时的宿主 slug（POINTER_TARGETS[slug]） */
-  hostSlug?: string;
   /** SKILL.md 绝对路径（校验报错用） */
   filePath: string;
 }
@@ -90,7 +71,7 @@ export interface CorpusSkillBaselineEntry {
 
 export interface CorpusBaselineManifest {
   schema: 'newide-skill-baseline/v1';
-  /** 仅活动技能（指针不入库） */
+  /** 全部活动技能 */
   skills: CorpusSkillBaselineEntry[];
 }
 
@@ -124,7 +105,7 @@ export interface SkillEmbeddingsManifest {
   created_at: string;
   /** 向量化对象 */
   embed_input: 'description';
-  /** 仅活动技能（指针不入资产不入库） */
+  /** 全部技能（每目录一技能，与语料目录 1:1） */
   skills: SkillEmbeddingAssetEntry[];
 }
 
@@ -200,8 +181,7 @@ export async function parseSkillFile(filePath: string): Promise<{
 }
 
 /**
- * 扫描语料根目录（skills/），返回全部技能文件并做结构校验：
- * slug 全局唯一、指针均指向同角色活动宿主。
+ * 扫描语料根目录（skills/），返回全部技能文件并做结构校验：slug 全局唯一。
  */
 export async function scanCorpus(rootDir: string): Promise<CorpusSkillFile[]> {
   const files: CorpusSkillFile[] = [];
@@ -221,17 +201,12 @@ export async function scanCorpus(rootDir: string): Promise<CorpusSkillFile[]> {
         const skillDir = path.join(roleDir, entry.name);
         const filePath = path.join(skillDir, SKILL_FILE_NAME);
         const parsed = await parseSkillFile(filePath);
-        const kind: CorpusSkillFile['kind'] = parsed.description.startsWith('Routes ')
-          ? 'pointer'
-          : 'activity';
         files.push({
           slug: parsed.slug,
           role,
-          kind,
           name: parsed.name,
           description: parsed.description,
           body: parsed.body,
-          ...(kind === 'pointer' ? { hostSlug: POINTER_TARGETS[parsed.slug] } : {}),
           filePath,
         });
       } else if (entry.name !== ROLE_README_FILE_NAME) {
@@ -242,41 +217,21 @@ export async function scanCorpus(rootDir: string): Promise<CorpusSkillFile[]> {
     }
   }
 
-  // slug 全局唯一性 + 指针宿主存在性校验
+  // slug 全局唯一性校验
   const seen = new Set<string>();
-  const activityByRole = new Map<CorpusRole, Set<string>>();
   for (const file of files) {
     if (seen.has(file.slug)) {
       throw new Error(`Corpus violation: duplicate skill slug across roles: ${file.slug}`);
     }
     seen.add(file.slug);
-    if (file.kind === 'activity') {
-      const set = activityByRole.get(file.role) ?? new Set<string>();
-      set.add(file.slug);
-      activityByRole.set(file.role, set);
-    }
-  }
-  for (const file of files) {
-    if (file.kind === 'pointer') {
-      const host = file.hostSlug;
-      if (!host || !POINTER_TARGETS[file.slug]) {
-        throw new Error(`Corpus violation: pointer ${file.slug} has no POINTER_TARGETS entry`);
-      }
-      if (!activityByRole.get(file.role)?.has(host)) {
-        throw new Error(
-          `Corpus violation: pointer ${file.slug} -> ${host} is not an activity skill of role ${file.role}`,
-        );
-      }
-    }
   }
   return files;
 }
 
-/** 生成快照基线清单（仅活动技能，排序稳定） */
+/** 生成快照基线清单（排序稳定） */
 export async function buildBaselineManifest(rootDir: string): Promise<CorpusBaselineManifest> {
   const files = await scanCorpus(rootDir);
   const entries: CorpusSkillBaselineEntry[] = files
-    .filter((file) => file.kind === 'activity')
     .map((file) => ({
       slug: file.slug,
       role: file.role,
