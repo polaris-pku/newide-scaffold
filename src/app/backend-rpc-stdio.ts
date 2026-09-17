@@ -64,6 +64,7 @@ import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
+import { createRunLatency } from '../telemetry';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -436,6 +437,7 @@ export async function createProductionBackendService(
     const taskExecutionLoop = new TaskExecutionLoop({
       processor: taskProcessor,
       evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
+      create_latency_recorder: createRunLatency({ root: runsRoot }).createRecorder,
       executors: createProductionStageExecutors({
         selectAgentHandler,
         agentExecutionFacade,
