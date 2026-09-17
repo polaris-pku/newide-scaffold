@@ -72,6 +72,7 @@ import {
   createDriverRuntimeInvoker,
   type DriverRuntimeInvokerInput,
 } from '../driver/driver-runtime-invoker';
+import { runWithLlmUsageAttribution } from '../telemetry';
 import type {
   AgentContextPackEvidence,
   AgentExecutionEvidenceStore,
@@ -343,7 +344,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         }
         let result: AgentExecutionResult;
         try {
-          result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+          // role 归属在这里一处收敛：execute_agent、council 各席位、plan_first 重试都
+          // 从这个入口进，调用方不必各自记得叠一层。归属必须包在 enqueue 回调内部——
+          // 队列可能延后执行，包在外面时回调不保证继承到这个 ALS 作用域。
+          result = await runWithLlmUsageAttribution({ role_id: runtimeRoleId }, () =>
+            this.execute(manager, scopedInput, runtimeRoleId, options),
+          );
         } catch (error) {
           await this.recoverRole(runtimeRoleId);
           throw error;

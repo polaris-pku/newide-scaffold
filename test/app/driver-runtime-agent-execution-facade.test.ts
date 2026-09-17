@@ -31,6 +31,7 @@ import {
   type MailboxToolOutcome,
 } from '../../src/mailbox';
 import { SqliteCoordinationStore } from '../../src/persistence';
+import { getLlmUsageAttribution } from '../../src/telemetry';
 import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
@@ -534,6 +535,27 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(events).toEqual([
       expect.objectContaining({ event_type: 'agent_message_chunk', role_id: 'reviewer' }),
     ]);
+  });
+
+  it('binds LLM calls during an agent run to the executing role', async () => {
+    const inner = invokeDriverLlm();
+    const observedRoles: Array<string | undefined> = [];
+    const { facade } = createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      {
+        async completeWithTools(input) {
+          observedRoles.push(getLlmUsageAttribution()?.role_id);
+          return inner.completeWithTools(input);
+        },
+      },
+    );
+
+    await facade.runAgent(request('task_role_attribution', 'reviewer'));
+
+    expect(observedRoles.length).toBeGreaterThan(0);
+    // 漏包一层时这里会混进 undefined；不检查轮数，只要求每一轮都归属同一角色。
+    expect(observedRoles.every((role) => role === 'reviewer')).toBe(true);
   });
 
   it('resolves a relative workspace before crossing the B to A process boundary', async () => {

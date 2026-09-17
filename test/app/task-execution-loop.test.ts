@@ -5,7 +5,17 @@ import {
   type TaskExecutionLoopExecutors,
 } from '../../src/coordination';
 import { TaskProcessor } from '../../src/coordination';
-import { createRunLatency, type RunLatencySpan } from '../../src/telemetry';
+import {
+  createRunLatency,
+  getLlmUsageAttribution,
+  getRunLlmUsageLedger,
+  groupLlmUsageEntriesBy,
+  InMemoryTelemetrySink,
+  recordProxyLlmUsage,
+  releaseRunLlmUsageLedger,
+  runWithLlmUsageLedger,
+  type RunLatencySpan,
+} from '../../src/telemetry';
 import {
   SqliteCoordinationStore,
   type CoordinationStateCommit,
@@ -373,6 +383,53 @@ describe('TaskExecutionLoop', () => {
     ).resolves.toMatchObject({ task: { status: 'completed' } });
     expect(fixture.latencySpans).toEqual([]);
   });
+
+  it('binds every stage executor to its own stage cursor', async () => {
+    const fixture = createFixture({ requestCouncil: true });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(fixture.observedAttributions).toEqual([
+      { cursor: 'select_agent', stage_cursor: 'select_agent' },
+      { cursor: 'execute_agent', stage_cursor: 'execute_agent' },
+      { cursor: 'council', stage_cursor: 'council' },
+      { cursor: 'gate', stage_cursor: 'gate' },
+      { cursor: 'deliver', stage_cursor: 'deliver' },
+    ]);
+  });
+
+  it('records each stage LLM usage under the stage that produced it', async () => {
+    const sink = new InMemoryTelemetrySink();
+    const fixture = createFixture({
+      requestCouncil: true,
+      llmUsageAt: ['execute_agent', 'council'],
+    });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    try {
+      // 与生产同构：用量不带 sink / case_id，全部由外层账本作用域补全。
+      await runWithLlmUsageLedger(
+        { case_id: 'task_loop', run_id: 'run_loop', task_id: 'task_loop', sink },
+        () => fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' }),
+      );
+
+      const emitted = sink
+        .list()
+        .filter((record) => record.event_type === 'proxy.llm_usage_recorded');
+      expect(emitted.map((record) => record.payload.stage_cursor)).toEqual([
+        'execute_agent',
+        'council',
+      ]);
+      const entries = getRunLlmUsageLedger('run_loop')?.entries ?? [];
+      expect(groupLlmUsageEntriesBy(entries, 'stage_cursor')).toMatchObject({
+        execute_agent: { input_tokens: 100, output_tokens: 10, call_count: 1 },
+        council: { input_tokens: 100, output_tokens: 10, call_count: 1 },
+      });
+    } finally {
+      releaseRunLlmUsageLedger('run_loop');
+    }
+  });
 });
 
 interface FixtureOptions {
@@ -387,6 +444,11 @@ interface FixtureOptions {
   invalidFinalOutput?: boolean;
   /** 传入数组即开启墙钟埋点，span 会被写进这个数组。 */
   latencySpans?: RunLatencySpan[];
+  /**
+   * 这些 stage 的执行器在运行中各记一笔 LLM 用量。刻意不传 sink / case_id——生产里
+   * 它们由外层账本作用域提供，测试也照此走 `runWithLlmUsageLedger`。
+   */
+  llmUsageAt?: ReadonlyArray<TaskCursorInput['cursor']>;
 }
 
 function createFixture(options: FixtureOptions = {}): {
@@ -398,6 +460,11 @@ function createFixture(options: FixtureOptions = {}): {
   inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>>;
   memoryAblations: Array<string | undefined>;
   latencySpans: RunLatencySpan[];
+  /** 每个 stage 执行器运行期间观察到的 token 归属阶段，与 calls 同序。 */
+  observedAttributions: Array<{
+    cursor: TaskCursorInput['cursor'];
+    stage_cursor: string | undefined;
+  }>;
 } {
   const store = new SqliteCoordinationStore(':memory:');
   let conflictInjected = false;
@@ -415,6 +482,10 @@ function createFixture(options: FixtureOptions = {}): {
   const calls: string[] = [];
   const inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>> = {};
   const memoryAblations: Array<string | undefined> = [];
+  const observedAttributions: Array<{
+    cursor: TaskCursorInput['cursor'];
+    stage_cursor: string | undefined;
+  }> = [];
   const execute = <TInput extends TaskCursorInput, TResult>(
     cursor: TInput['cursor'],
     result: TResult,
@@ -425,8 +496,12 @@ function createFixture(options: FixtureOptions = {}): {
         memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
       }): Promise<TResult> => {
       calls.push(cursor);
+      observedAttributions.push({ cursor, stage_cursor: getLlmUsageAttribution()?.stage_cursor });
       inputs[cursor] = context.cursor_input;
       memoryAblations.push(context.memory_ablation);
+      if (options.llmUsageAt?.includes(cursor)) {
+        await recordProxyLlmUsage({ input_tokens: 100, output_tokens: 10, model: 'fake-model' });
+      }
       if (cursor === 'execute_agent' && options.overrideDuringExecute) {
         processor.setCouncilOverride('run_loop');
       }
@@ -488,6 +563,10 @@ function createFixture(options: FixtureOptions = {}): {
     deliver: {
       execute: vi.fn(async (context) => {
         calls.push('deliver');
+        observedAttributions.push({
+          cursor: 'deliver',
+          stage_cursor: getLlmUsageAttribution()?.stage_cursor,
+        });
         inputs.deliver = context.cursor_input;
         memoryAblations.push(context.memory_ablation);
         return {
@@ -526,6 +605,7 @@ function createFixture(options: FixtureOptions = {}): {
     inputs,
     memoryAblations,
     latencySpans,
+    observedAttributions,
   };
 }
 
