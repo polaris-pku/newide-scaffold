@@ -13,6 +13,7 @@
  *   9. hasPendingTask 状态报告
  *   10. AgentManager.dispatchTask 异步派单
  *   11. executeTask 失败后释放 currentTask，避免后续 B_BLOCKED
+ *   12. agent.llm_round / agent.tool.<name> span 与 LLM 调用、工具执行一一对应
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect } from 'vitest';
@@ -24,6 +25,13 @@ import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { InMemoryBufferRepository } from '../adapters/in-memory-buffer-repository';
 import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import type { AgentTaskRequest } from '../agent-types';
+import type { DriverReturn } from '../schemas';
+import {
+  RunLatencyRecorder,
+  runWithRunLatencyRecorder,
+  type RunLatencySpan,
+  type RunLatencyTraceSink,
+} from '../../telemetry';
 
 // ──────────────────────────────────────────────
 // Mock ToolCallingClient
@@ -274,6 +282,201 @@ describe('Agent self-loop (executeTask)', () => {
       expect(agent.getState()).toBe('sleeping');
       expect(agent.hasPendingTask()).toBe(false);
     });
+  });
+});
+
+// ──────────────────────────────────────────────
+// 轮次与工具调用 span
+// ──────────────────────────────────────────────
+
+class CollectingLatencySink implements RunLatencyTraceSink {
+  readonly spans: RunLatencySpan[] = [];
+
+  append(span: RunLatencySpan): void {
+    this.spans.push(span);
+  }
+}
+
+function createLatencyRecorder(sink: RunLatencyTraceSink): RunLatencyRecorder {
+  return new RunLatencyRecorder({
+    run_id: 'run_agent_loop',
+    task_id: 'task_loop_001',
+    sink,
+  });
+}
+
+/** 包一层计数器，用来对照 span 条数与被调用的 LLM 次数。 */
+function countingClient(inner: ToolCallingClient): {
+  client: ToolCallingClient;
+  calls: () => number;
+} {
+  let calls = 0;
+  return {
+    client: {
+      completeWithTools: async (input) => {
+        calls += 1;
+        return inner.completeWithTools(input);
+      },
+    },
+    calls: () => calls,
+  };
+}
+
+function createNamedTool(
+  name: string,
+  onExecute: () => void,
+  output: unknown = { result: `${name} output` },
+): Tool {
+  return {
+    name,
+    description: `${name} tool`,
+    inputSchema: { type: 'object', properties: {} },
+    execute: async () => {
+      onExecute();
+      return output;
+    },
+  };
+}
+
+/**
+ * `invoke_driver` 的返回值会被 Agent 当作 DriverReturn 写进 buffer，形状必须合法，
+ * 否则 finalizeLoop 里的 schema 校验会失败——那是测试夹具的问题，不是被测代码的。
+ */
+const DRIVER_RETURN_STUB: DriverReturn = {
+  artifacts: [],
+  summary: 'stub driver return',
+  decisions: [],
+  blockers: [],
+  referenced_experiences: [],
+  assumptions: [],
+};
+
+function toolCallRound(...names: string[]): ToolCallResult {
+  return {
+    content: null,
+    tool_calls: names.map((name, index) => ({
+      id: `call_${name}_${index}`,
+      type: 'function',
+      function: { name, arguments: '{}' },
+    })),
+  };
+}
+
+describe('Agent 轮次与工具调用 span', () => {
+  it('agent.llm_round 条数与 LLM 调用次数一致，且轮号从 0 递增', async () => {
+    const { memory } = await createTestInfra('role_round_spans');
+    const counted = countingClient(
+      createMockToolClient([textResponse('Step 1: analyzing...'), textResponse('Task completed.')]),
+    );
+    const agent = new Agent(memory, createToolConfig(counted.client));
+    const sink = new CollectingLatencySink();
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () =>
+      agent.executeTask(createTestTask()),
+    );
+
+    const rounds = sink.spans.filter((span) => span.name === 'agent.llm_round');
+    expect(counted.calls()).toBe(2);
+    expect(rounds.length).toBe(counted.calls());
+    expect(rounds.map((span) => span.round)).toEqual([0, 1]);
+    expect(rounds.every((span) => span.layer === 'agent' && span.ok)).toBe(true);
+    // 没有 role_id 就没法把 council 各席位的耗时分开，也对不上账本里按角色的 token。
+    expect(rounds.every((span) => span.role_id === 'role_round_spans')).toBe(true);
+  });
+
+  it('达到 maxToolCalls 的那一轮不产生 span——没有 LLM 调用就没有轮次', async () => {
+    const { memory } = await createTestInfra('role_round_cap_spans');
+    const counted = countingClient(
+      createMockToolClient(Array.from({ length: 5 }, () => textResponse('Still thinking...'))),
+    );
+    const config: AgentToolConfig = { llm: counted.client, tools: [], maxToolCalls: 3 };
+    const agent = new Agent(memory, config);
+    const sink = new CollectingLatencySink();
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () =>
+      agent.executeTask(createTestTask()),
+    );
+
+    // 循环被调用 4 次（第 4 次撞上限直接退出），但只有前 3 次真的调了 LLM。
+    expect(counted.calls()).toBe(3);
+    expect(sink.spans.filter((span) => span.name === 'agent.llm_round').length).toBe(3);
+  });
+
+  it('agent.tool.<name> 覆盖每个被调用的工具，并与同轮 LLM span 共用轮号', async () => {
+    const { memory } = await createTestInfra('role_tool_spans');
+    const executed: string[] = [];
+    const agent = new Agent(
+      memory,
+      createToolConfig(
+        createMockToolClient([
+          toolCallRound('query_memory', 'invoke_driver', 'mailbox_send'),
+          textResponse('Task completed.'),
+        ]),
+        [
+          createNamedTool('query_memory', () => executed.push('query_memory')),
+          createNamedTool('invoke_driver', () => executed.push('invoke_driver'), DRIVER_RETURN_STUB),
+          createNamedTool('mailbox_send', () => executed.push('mailbox_send')),
+        ],
+      ),
+    );
+    const sink = new CollectingLatencySink();
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () =>
+      agent.executeTask(createTestTask()),
+    );
+
+    expect(executed).toEqual(['query_memory', 'invoke_driver', 'mailbox_send']);
+    const toolSpans = sink.spans.filter((span) => span.name.startsWith('agent.tool.'));
+    expect(toolSpans.map((span) => span.name)).toEqual([
+      'agent.tool.query_memory',
+      'agent.tool.invoke_driver',
+      'agent.tool.mailbox_send',
+    ]);
+    expect(toolSpans.every((span) => span.layer === 'agent' && span.round === 0)).toBe(true);
+    expect(toolSpans.every((span) => span.role_id === 'role_tool_spans')).toBe(true);
+  });
+
+  it('工具抛错时照样记 span，并标出 ok=false 与错误信息', async () => {
+    const { memory } = await createTestInfra('role_tool_span_error');
+    const failingTool: Tool = {
+      name: 'boom',
+      description: 'always fails',
+      inputSchema: { type: 'object', properties: {} },
+      execute: async () => {
+        throw new Error('tool exploded');
+      },
+    };
+    const agent = new Agent(
+      memory,
+      createToolConfig(
+        createMockToolClient([toolCallRound('boom'), textResponse('Task completed.')]),
+        [failingTool],
+      ),
+    );
+    const sink = new CollectingLatencySink();
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () =>
+      agent.executeTask(createTestTask()),
+    );
+
+    const [span] = sink.spans.filter((entry) => entry.name === 'agent.tool.boom');
+    expect(span?.ok).toBe(false);
+    expect(span?.error).toContain('tool exploded');
+  });
+
+  it('没有 recorder 时循环照常跑完，不产生任何 span 副作用', async () => {
+    const { memory } = await createTestInfra('role_no_recorder');
+    const agent = new Agent(
+      memory,
+      createToolConfig(
+        createMockToolClient([toolCallRound('query_memory'), textResponse('Task completed.')]),
+        [createNamedTool('query_memory', () => undefined)],
+      ),
+    );
+
+    const result = await agent.executeTask(createTestTask());
+    expect(result.agent_id).toBe('role_no_recorder');
+    expect(agent.getState()).toBe('sleeping');
   });
 });
 
