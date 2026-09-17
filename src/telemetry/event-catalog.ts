@@ -33,6 +33,13 @@ export const TELEMETRY_EVENT_CATALOG = [
     description: 'LLM token usage proxy signal used by token_per_fix.',
   },
   {
+    event_type: 'llm.usage_dropped',
+    owner: 'F',
+    level: 'L2_EVENT',
+    source: 'proxy',
+    description: 'An LLM usage record could not reach the ledger or the sink; carries the reason.',
+  },
+  {
     event_type: 'eval.agent_crash',
     owner: 'F',
     level: 'L2_EVENT',
