@@ -12,14 +12,19 @@
  * - **观测绝不能反过来让生产 run 失败**：payload 序列化失败、sink 抛错都只吞掉这一条，
  *   计数本身永不抛出。
  * - **汇总只在 run 结束时发一次**，不逐事件发。逐事件发等于用事件流去测量事件流：
- *   被测对象会被观测者放大，而且这些信号最终会写进 audit.jsonl，把「用行数对账」
- *   这件事本身搞脏。
+ *   被测对象会被观测者放大。
+ * - **汇总信号落自己的文件，不进 run 的权威事件流**。`audit.jsonl` 与 `run.subscribe`
+ *   里的事件是消费方会断言形状的契约；把观测信号混进去，既不属于任何 stage、也不属于
+ *   run 生命周期，会直接破坏「最后一条事件是 run.completed」这类断言。生产用
+ *   `FileRunEventConsumptionSink`，测试可注入内存 sink。
  * - **计数不含阶段语义之外的东西**：`handler.*`、`task.created`、`run.started` 等
  *   生命周期事件不过 `emit()`，因此不在计数内。与 audit.jsonl 对账时这部分是已知差集。
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { emitTelemetry, type TelemetrySink } from './telemetry-sink';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { emitTelemetry, type TelemetryRecord, type TelemetrySink } from './telemetry-sink';
 
 /** 按 event_type 分组的计数与体积。 */
 export interface RunEventConsumptionEntry {
@@ -141,8 +146,43 @@ export class RunEventConsumptionRecorder {
   }
 }
 
-const recorderStorage = new AsyncLocalStorage<RunEventConsumptionRecorder>();
+/**
+ * 追加写 `<root>/<run_id>/event-consumption.jsonl`。
+ *
+ * 与 `FileRunLatencyTraceSink` 同一个理由、同一套目录约定：观测信号落自己的文件，
+ * **不进 run 的权威事件流**。走 registry 那条路（`appendTelemetry`）会让汇总信号出现在
+ * `audit.jsonl` 与 `run.subscribe` 的流里，而它既不属于任何 stage、也不属于 run 生命
+ * 周期——对「最后一条事件是 run.completed」这类消费方断言就是破坏。目录「已建过」按
+ * run 记忆，避免每写一条都 mkdir。
+ */
+export class FileRunEventConsumptionSink implements TelemetrySink {
+  private readonly readyRuns = new Set<string>();
+  private readonly failedRuns = new Set<string>();
 
+  constructor(private readonly root: string) {}
+
+  emit(record: TelemetryRecord): void {
+    const runId = record.run_id;
+    if (!runId || this.failedRuns.has(runId)) return;
+    try {
+      const runDir = path.join(this.root, runId);
+      if (!this.readyRuns.has(runId)) {
+        mkdirSync(runDir, { recursive: true });
+        this.readyRuns.add(runId);
+      }
+      appendFileSync(
+        path.join(runDir, 'event-consumption.jsonl'),
+        `${JSON.stringify(record)}\n`,
+        'utf-8',
+      );
+    } catch {
+      // 同一个 run 连续失败就不再重试：观测写不进去不该拖慢被测的 run。
+      this.failedRuns.add(runId);
+    }
+  }
+}
+
+const recorderStorage = new AsyncLocalStorage<RunEventConsumptionRecorder>();
 /** 在当前异步上下文内绑定计数器。 */
 export function runWithRunEventConsumption<T>(
   recorder: RunEventConsumptionRecorder,

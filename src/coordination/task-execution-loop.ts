@@ -19,6 +19,7 @@ import {
 } from './task-processor';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
 import {
+  recordRunEventCommittedBatch,
   runWithLlmUsageAttribution,
   runWithRunLatencyRecorder,
   stageSpan,
@@ -259,7 +260,7 @@ export class TaskExecutionLoop {
       expected_cursor: cursorInput.cursor,
       invocation_id: invocationId,
     });
-    controls.on_committed_events?.(started.committed_events);
+    this.notifyCommittedEvents(controls, started.committed_events);
 
     try {
       switch (cursorInput.cursor) {
@@ -328,7 +329,7 @@ export class TaskExecutionLoop {
                 : {}),
             },
           );
-          controls.on_committed_events?.(committed.committed_events);
+          this.notifyCommittedEvents(controls, committed.committed_events);
           return committed;
         }
         case 'council': {
@@ -374,7 +375,7 @@ export class TaskExecutionLoop {
                 },
               ...(result.artifact_refs ? { artifact_refs: result.artifact_refs } : {}),
             });
-            controls.on_committed_events?.(committed.committed_events);
+            this.notifyCommittedEvents(controls, committed.committed_events);
             return committed;
           }
           const committed = this.advanceWithEvidence(
@@ -389,7 +390,7 @@ export class TaskExecutionLoop {
             },
             result,
           );
-          controls.on_committed_events?.(committed.committed_events);
+          this.notifyCommittedEvents(controls, committed.committed_events);
           return committed;
         }
         case 'deliver': {
@@ -409,7 +410,7 @@ export class TaskExecutionLoop {
               ...(result.warnings ? { warnings: result.warnings } : {}),
             },
           );
-          controls.on_committed_events?.(committed.committed_events);
+          this.notifyCommittedEvents(controls, committed.committed_events);
           return committed;
         }
       }
@@ -435,9 +436,26 @@ export class TaskExecutionLoop {
         ...(failureEvidence ? { evidence_ref: failureEvidence } : {}),
         ...(resultEvidence ? { artifact_refs: [resultEvidence.uri] } : {}),
       });
-      controls.on_committed_events?.(committed.committed_events);
+      this.notifyCommittedEvents(controls, committed.committed_events);
       return committed;
     }
+  }
+
+  /**
+   * 提交批次的通知与计数必须同源。
+   *
+   * 分两处写迟早会漂移——漂移的后果不是报错，而是报告里的「提交了 N 批」跟回调真正
+   * 被叫的次数对不上。收敛成一个方法后，漏记与漏调在结构上不可能发生。
+   *
+   * 与 `emit()` 那处不同，这里**不**因为没人监听就跳过计数：提交在 processor 里已经
+   * 发生了，没有监听者不改变「提交了这么多」这个事实。
+   */
+  private notifyCommittedEvents(
+    controls: Pick<RunTaskExecutionInput, 'on_committed_events'>,
+    events: readonly PersistedCoordinationEvent[],
+  ): void {
+    recordRunEventCommittedBatch(events.length);
+    controls.on_committed_events?.(events);
   }
 
   private async persistAndAdvance(
@@ -457,7 +475,7 @@ export class TaskExecutionLoop {
       nextInput,
       result,
     );
-    controls.on_committed_events?.(committed.committed_events);
+    this.notifyCommittedEvents(controls, committed.committed_events);
     return committed;
   }
 
