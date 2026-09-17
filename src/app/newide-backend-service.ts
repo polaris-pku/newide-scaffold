@@ -24,7 +24,12 @@ import {
   type ResumePackage,
   type RestoreFileAnchorResult,
 } from '../checkpoint';
-import type { TelemetryRecord, TelemetrySink } from '../telemetry/telemetry-sink';
+import {
+  releaseRunLlmUsageLedger,
+  runWithLlmUsageLedger,
+  type TelemetryRecord,
+  type TelemetrySink,
+} from '../telemetry';
 import {
   InMemoryRunRegistry,
   type AppRunEvent,
@@ -868,6 +873,39 @@ export class NewideBackendService {
   }
 
   private async executeTaskAuthorityRun(input: {
+    identity: { run_id: string; task_id: string };
+    loop: TaskExecutionLoop;
+    controller: AbortController;
+    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+    session_id?: string;
+  }): Promise<void> {
+    const { run_id: runId, task_id: taskId } = input.identity;
+    // 新主路径此前完全没有账本：adapter 照常调用 recordProxyLlmUsage，但没有作用域承接，
+    // token 静默消失（`dropped_no_ledger`）。作用域覆盖整轮——run 身份在 beginRun 之前
+    // 就已定死。sink 复用 appendTelemetry，用量事件因此进入 run 事件流，进而落
+    // audit.jsonl 与 timeline.json（终态 summary.token_usage 从后者读出）。
+    const sink: TelemetrySink = {
+      emit: (record) => this.appendTelemetry(input.identity, record),
+    };
+    try {
+      await runWithLlmUsageLedger(
+        {
+          case_id: taskId,
+          run_id: runId,
+          task_id: taskId,
+          sink,
+          scaffold_variant: 'full_system',
+        },
+        () => this.runAuthorityLoop(input),
+      );
+    } finally {
+      // 挂在 run 终态而不是别处：B 记忆维护在循环内部读同一个 run 的账本，提前释放会让
+      // 它读到空账，进而用偏小的部分值覆盖 summary.token_usage。
+      releaseRunLlmUsageLedger(runId);
+    }
+  }
+
+  private async runAuthorityLoop(input: {
     identity: { run_id: string; task_id: string };
     loop: TaskExecutionLoop;
     controller: AbortController;

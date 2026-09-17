@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { CoordinatorRunRequest } from '../../src/coordinator/coordinator-runner';
@@ -12,6 +12,23 @@ import {
 } from '../../src/app/newide-backend-service';
 import { InMemoryRunRegistry, type AppRunEvent } from '../../src/app/run-registry';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
+import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
+import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
+import {
+  TaskExecutionLoop,
+  TaskProcessor,
+  type TaskExecutionLoopExecutors,
+} from '../../src/coordination';
+import {
+  FileRunEvidenceStore,
+  SqliteCoordinationStore,
+  type TaskCursorInput,
+} from '../../src/persistence';
+import {
+  recordProxyLlmUsage,
+  resetLlmUsageDropCounters,
+  snapshotLlmUsageDropCounters,
+} from '../../src/telemetry';
 
 describe('NewideBackendService Task-first view', () => {
   it('creates a durable task and immediately exposes the same running snapshot', async () => {
@@ -219,7 +236,155 @@ describe('NewideBackendService Task-first view', () => {
       await rm(runsRoot, { recursive: true, force: true });
     }
   });
+  it('attributes task-loop LLM usage to stages and lands it in the run summary', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-usage-'));
+    const store = new SqliteCoordinationStore(':memory:');
+    const processor = new TaskProcessor(store);
+    const stages: string[] = [];
+    const loop = new TaskExecutionLoop({
+      processor,
+      evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
+      executors: taskLoopExecutors((cursor) => {
+        stages.push(cursor);
+      }),
+    });
+    const service = new NewideBackendService(
+      undefined,
+      new InMemoryRunRegistry(),
+      new FileRunAuditWriter(runsRoot),
+      new FileRunTerminalOutputWriter(runsRoot),
+      new FileRunRequestStore(runsRoot),
+      processor,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      loop,
+    );
+
+    resetLlmUsageDropCounters();
+    try {
+      const created = await service.createTask({
+        spec: 'Attribute token usage',
+        role_id: 'role_backend_engineer',
+        completion_criteria: ['Usage is visible per stage'],
+        workspace_path: process.cwd(),
+        mode: 'single_agent',
+      });
+      const runId = created.current_run?.run_id ?? '';
+      await waitForTerminalTask(service, created.task.task_id);
+      // 终态事件早于 finalize 落盘，读盘前必须等 terminalRuns 全部落定。
+      await service.close();
+
+      expect(stages).toEqual(['select_agent', 'execute_agent', 'gate', 'deliver']);
+      // 接线之前这三处全是静默丢弃；不再增长才算真正接上了账本。
+      expect(snapshotLlmUsageDropCounters()).toMatchObject({
+        dropped_no_ledger: 0,
+        dropped_no_case_id: 0,
+      });
+
+      const audit = await readFile(path.join(runsRoot, runId, 'audit.jsonl'), 'utf8');
+      const usageEvents = audit
+        .split('\n')
+        .filter((line) => line.includes('proxy.llm_usage_recorded'))
+        .map((line) => JSON.parse(line) as { payload: { stage_cursor?: string } });
+      expect(usageEvents.map((event) => event.payload.stage_cursor)).toEqual([
+        'execute_agent',
+        'gate',
+      ]);
+
+      // summary 的 token 口径来自 timeline 上的用量事件，接线之后它自己就亮了。
+      const summary = JSON.parse(
+        await readFile(path.join(runsRoot, runId, 'summary.json'), 'utf8'),
+      ) as { token_usage?: { total_tokens?: number; call_count?: number } };
+      expect(summary.token_usage).toMatchObject({ total_tokens: 220, call_count: 2 });
+    } finally {
+      await rm(runsRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
 });
+
+function taskLoopExecutors(
+  onStage: (cursor: TaskCursorInput['cursor']) => void,
+): TaskExecutionLoopExecutors {
+  return {
+    select_agent: {
+      execute: async () => {
+        onStage('select_agent');
+        return { winner_agent_id: 'agent_a', evidence: { winner_agent_id: 'agent_a' } };
+      },
+    },
+    execute_agent: {
+      execute: async () => {
+        onStage('execute_agent');
+        await recordFakeUsage();
+        return {
+          changeset_ref: 'artifact_primary_changeset',
+          expected_sha256: 'd'.repeat(64),
+          agent_id: 'agent_a',
+          session_id: 'session_primary',
+          evidence: { response: 'implementation complete' },
+        };
+      },
+    },
+    council: {
+      execute: async () => {
+        throw new Error('single_agent run must not reach the Council stage');
+      },
+    },
+    gate: {
+      execute: async () => {
+        onStage('gate');
+        await recordFakeUsage();
+        return { evidence: { status: 'skipped' } };
+      },
+    },
+    deliver: {
+      execute: async (context) => {
+        onStage('deliver');
+        return {
+          final_output: {
+            artifact_ref: context.cursor_input.changeset_ref,
+            sha256: context.cursor_input.expected_sha256,
+            workspace_path: '/workspace/result.ts',
+          },
+          evidence: { files_written: ['result.ts'] },
+        };
+      },
+    },
+  };
+}
+
+/**
+ * 刻意不带 sink / case_id：生产里这两样由 executeTaskAuthorityRun 的账本作用域补全，
+ * 所以测试断言的是「新主路径确实有作用域」，不是「测试自己传了参数」。
+ */
+function recordFakeUsage(): Promise<void> {
+  return recordProxyLlmUsage({ input_tokens: 100, output_tokens: 10, model: 'fake-model' });
+}
+
+/**
+ * 等到 run 走到终态。
+ *
+ * `subscribeTask` 先注册监听器再读快照，两者之间没有窗口：完成事件要么进回调，要么
+ * 已经反映在返回的快照里。所以这里既不轮询也不赌时序。
+ */
+async function waitForTerminalTask(
+  service: NewideBackendService,
+  taskId: string,
+): Promise<void> {
+  let resolveTerminal!: () => void;
+  const terminal = new Promise<void>((resolve) => {
+    resolveTerminal = resolve;
+  });
+  const subscription = await service.subscribeTask(taskId, (event) => {
+    if (event.type === 'run.completed' || event.type === 'run.failed') resolveTerminal();
+  });
+  if (subscription.snapshot.task.status !== 'running') resolveTerminal();
+  await terminal;
+  subscription.unsubscribe();
+}
 
 function serviceWith(
   requestStore: FileRunRequestStore,

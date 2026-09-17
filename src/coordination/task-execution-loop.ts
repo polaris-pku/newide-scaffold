@@ -19,6 +19,7 @@ import {
 } from './task-processor';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
 import {
+  runWithLlmUsageAttribution,
   runWithRunLatencyRecorder,
   stageSpan,
   withRunLatencySpan,
@@ -26,6 +27,25 @@ import {
 } from '../telemetry';
 
 type CursorInput<TCursor extends TaskResumeCursor> = Extract<TaskCursorInput, { cursor: TCursor }>;
+
+/** `executeStage` 能真正执行的游标——`done` / `mailbox_wait` 是循环退出条件，不是阶段。 */
+type ExecutableStageCursor = Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>['cursor'];
+
+/**
+ * 阶段边界的两条归因必须同源。
+ *
+ * 耗时 span 名与 token 归属的 stage 游标都按同一个游标生成，分开写就会漂移——漂移的
+ * 后果不是报错，而是报告里 token 与耗时的 stage 名对不上。收敛成一个包裹点后，
+ * 「漏包一层归属」或「包错游标」在结构上不可能发生。
+ */
+function runStageWithAttribution<T>(
+  cursor: ExecutableStageCursor,
+  execute: () => Promise<T>,
+): Promise<T> {
+  return runWithLlmUsageAttribution({ stage_cursor: cursor }, () =>
+    withRunLatencySpan(stageSpan(cursor), {}, execute),
+  );
+}
 
 export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   task_id: string;
@@ -244,7 +264,7 @@ export class TaskExecutionLoop {
     try {
       switch (cursorInput.cursor) {
         case 'select_agent': {
-          const result = await withRunLatencySpan(stageSpan('select_agent'), {}, () =>
+          const result = await runStageWithAttribution('select_agent', () =>
             this.executors.select_agent.execute(stageContext(state, cursorInput, controls)),
           );
           return await this.persistAndAdvance(
@@ -260,7 +280,7 @@ export class TaskExecutionLoop {
           );
         }
         case 'execute_agent': {
-          const result = await withRunLatencySpan(stageSpan('execute_agent'), {}, () =>
+          const result = await runStageWithAttribution('execute_agent', () =>
             this.executors.execute_agent.execute(stageContext(state, cursorInput, controls)),
           );
           if (!result.mailbox_wait) assertChangesetResult(result, 'Primary Agent');
@@ -312,7 +332,7 @@ export class TaskExecutionLoop {
           return committed;
         }
         case 'council': {
-          const result = await withRunLatencySpan(stageSpan('council'), {}, () =>
+          const result = await runStageWithAttribution('council', () =>
             this.executors.council.execute(stageContext(state, cursorInput, controls)),
           );
           assertChangesetResult(result, 'Council');
@@ -332,7 +352,7 @@ export class TaskExecutionLoop {
           );
         }
         case 'gate': {
-          const result = await withRunLatencySpan(stageSpan('gate'), {}, () =>
+          const result = await runStageWithAttribution('gate', () =>
             this.executors.gate.execute(stageContext(state, cursorInput, controls)),
           );
           assertGateResultIdentity(result, cursorInput);
@@ -373,7 +393,7 @@ export class TaskExecutionLoop {
           return committed;
         }
         case 'deliver': {
-          const result = await withRunLatencySpan(stageSpan('deliver'), {}, () =>
+          const result = await runStageWithAttribution('deliver', () =>
             this.executors.deliver.execute(stageContext(state, cursorInput, controls)),
           );
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
