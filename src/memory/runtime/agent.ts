@@ -23,6 +23,7 @@ import type { AgentCompetitionClaim } from '../competition-types';
 import { createMockCompetitionClaimEvaluator } from '../adapters/mock-competition-claim-evaluator';
 import { ToolRegistry, type Tool, type ToolCallMessage, type ToolCallingClient } from './tool';
 import { createId, nowTimestamp } from '../../core';
+import { agentToolSpan, withRunLatencySpan } from '../../telemetry';
 import { writePendingBuffer } from '../services/buffer-writer';
 import { buildAgentSystemPrompt } from '../prompts/agent-system-prompt';
 
@@ -192,12 +193,26 @@ export class Agent {
       return true;
     }
 
-    // 单步：一次 LLM 调用
-    const response = await this.toolConfig.llm.completeWithTools({
-      messages: this.loopMessages,
-      tools: this.toolRegistry.toToolDefinitions(),
-      tool_choice: 'auto',
-    });
+    // 单步：一次 LLM 调用。
+    //
+    // 只包这一次调用、不包整轮：工具耗时由 `agent.tool.*` 各自记录，把它也算进来会让
+    // 两类 span 相加时重复计时。因为每轮恰好一次 LLM 调用，`agent.llm_round` 的条数
+    // 就等于 LLM 调用次数。闭包内 TS 不再保留上面的窄化，先把引用取到局部。
+    const toolConfig = this.toolConfig;
+    const toolRegistry = this.toolRegistry;
+    const loopMessages = this.loopMessages;
+    // 自增前取值，于是 LLM span 与随后的工具 span 记的是同一轮号（0 起）。
+    const round = this.loopRound;
+    // 不带 role_id 的话，council 一次跑的多个席位在耗时流水里就分不出谁是谁，也就
+    // 对不上账本里按角色的 token。Agent 自己就知道角色，这里随手记上。
+    const role_id = this.memory.role_id;
+    const response = await withRunLatencySpan('agent.llm_round', { role_id, round }, () =>
+      toolConfig.llm.completeWithTools({
+        messages: loopMessages,
+        tools: toolRegistry.toToolDefinitions(),
+        tool_choice: 'auto',
+      }),
+    );
 
     this.loopRound++;
 
@@ -223,7 +238,13 @@ export class Agent {
 
         try {
           const args = JSON.parse(toolCall.function.arguments);
-          const result = await tool.execute(args);
+          // 只包工具本身，不含参数解析：解析失败时并没有工具在跑，记一条耗时只会
+          // 往「工具慢」的方向误导。抛错也照记，失败往往正是耗时异常的原因。
+          const result = await withRunLatencySpan(
+            agentToolSpan(tool.name),
+            { role_id, round },
+            () => tool.execute(args),
+          );
 
           // 记录最后一次 invoke_driver 的返回
           if (tool.name === 'invoke_driver') {

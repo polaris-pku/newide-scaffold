@@ -31,7 +31,13 @@ import {
   type MailboxToolOutcome,
 } from '../../src/mailbox';
 import { SqliteCoordinationStore } from '../../src/persistence';
-import { getLlmUsageAttribution } from '../../src/telemetry';
+import {
+  RunLatencyRecorder,
+  getLlmUsageAttribution,
+  runWithRunLatencyRecorder,
+  type RunLatencySpan,
+  type RunLatencyTraceSink,
+} from '../../src/telemetry';
 import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
@@ -556,6 +562,25 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(observedRoles.length).toBeGreaterThan(0);
     // 漏包一层时这里会混进 undefined；不检查轮数，只要求每一轮都归属同一角色。
     expect(observedRoles.every((role) => role === 'reviewer')).toBe(true);
+  });
+
+  it('把 agent 轮次与工具调用 span 记进驱动这次调用的那个 run', async () => {
+    const { facade } = createFacade(new CapturingDriver('succeeded'));
+    const sink = new CollectingLatencySink();
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () =>
+      facade.runAgent(request('task_agent_spans', 'reviewer')),
+    );
+
+    // 一条 invoke_driver 工具调用 + 一次收尾文本，共两轮 LLM。
+    const names = sink.spans.map((span) => span.name);
+    expect(names.filter((name) => name === 'agent.llm_round').length).toBe(2);
+    expect(names).toContain('agent.tool.invoke_driver');
+    // 这里 span 能出现本身就是结论：没有 recorder 时 withRunLatencySpan 是空转的，
+    // 而 recorder 要穿过 facade 的 enqueue 队列才够得着 Agent 循环。
+    expect(sink.spans.every((span) => span.run_id === 'run_agent_spans')).toBe(true);
+    // 角色一路从请求传到 span，才能和账本里的 token 按同一把钥匙对齐。
+    expect(sink.spans.every((span) => span.role_id === 'reviewer')).toBe(true);
   });
 
   it('resolves a relative workspace before crossing the B to A process boundary', async () => {
@@ -1286,6 +1311,19 @@ class BlockingOnceRetrievalRepository extends InMemoryRepository {
     }
     return super.searchSkills(...args);
   }
+}
+
+/** 收集 span 的耗时 sink，用来断言 Agent 循环产生的 span 落进了当前 run。 */
+class CollectingLatencySink implements RunLatencyTraceSink {
+  readonly spans: RunLatencySpan[] = [];
+
+  append(span: RunLatencySpan): void {
+    this.spans.push(span);
+  }
+}
+
+function createLatencyRecorder(sink: RunLatencyTraceSink): RunLatencyRecorder {
+  return new RunLatencyRecorder({ run_id: 'run_agent_spans', task_id: 'task_agent_spans', sink });
 }
 
 function invokeDriverLlm(): ToolCallingClient {
