@@ -6,15 +6,21 @@
  * 测试用内存 sink）。
  *
  * 核心设计：
+ * - 用 AsyncLocalStorage 携带 run 级 recorder。这样 facade、stage executor、
+ *   council 席位、driver 重试都能零签名改动地记 span，且自动归属同一个 run，
+ *   不必逐层传参。
  * - 每条 span 同时记墙钟 `started_at` / `completed_at` 与单调钟差值 `duration_ms`。
  *   墙钟用于跨进程、跨文件对齐时间轴，单调钟用于抗系统时间调整；两者不可互替。
  *   单调钟倒退时如实退回墙钟口径，而不是把负数压成 0 谎报「瞬间完成」。
  * - 异常路径同样落 span：失败往往正是耗时异常的原因，只记成功路径会让「为什么
  *   这次特别慢」变成盲区。
  * - 观测绝不能反过来让生产 run 失败：写 sink 统一走 `appendRunLatencySpan`，
- *   任何 sink 实现抛错都只丢这一条 span。
+ *   任何 sink 实现抛错都只丢这一条 span；文件 sink 自己也不再重试失败的 run。
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
 import { nowTimestamp } from '../core';
 import {
   resolveRunLatencySpan,
@@ -120,6 +126,35 @@ export function appendRunLatencySpan(sink: RunLatencyTraceSink, span: RunLatency
 export class NoopRunLatencyTraceSink implements RunLatencyTraceSink {
   append(_span: RunLatencySpan): void {
     return undefined;
+  }
+}
+
+/**
+ * 追加写 `<root>/<run_id>/latency.jsonl`。
+ *
+ * 与 FileRunAuditWriter 保持同样的目录约定，便于把 audit.jsonl /
+ * driver-stream.jsonl / latency.jsonl / telemetry.jsonl 放在同一层对时间轴。
+ * 目录「已建过」按 run 记忆，避免每写一条都 mkdir。
+ */
+export class FileRunLatencyTraceSink implements RunLatencyTraceSink {
+  private readonly readyRuns = new Set<string>();
+  private readonly failedRuns = new Set<string>();
+
+  constructor(private readonly root: string) {}
+
+  append(span: RunLatencySpan): void {
+    if (this.failedRuns.has(span.run_id)) return;
+    try {
+      const runDir = path.join(this.root, span.run_id);
+      if (!this.readyRuns.has(span.run_id)) {
+        mkdirSync(runDir, { recursive: true });
+        this.readyRuns.add(span.run_id);
+      }
+      appendFileSync(path.join(runDir, 'latency.jsonl'), `${JSON.stringify(span)}\n`, 'utf-8');
+    } catch {
+      // 同一个 run 连续失败就不再重试，否则每条 span 都再吃一次失败路径的开销。
+      this.failedRuns.add(span.run_id);
+    }
   }
 }
 
@@ -240,6 +275,54 @@ export class RunLatencyRecorder {
       ...metaFields(options.meta, derived),
     });
   }
+}
+
+const recorderStorage = new AsyncLocalStorage<RunLatencyRecorder>();
+
+/**
+ * 在当前异步上下文内绑定 recorder。
+ *
+ * 这是埋点能「零签名改动」覆盖深层调用的关键：facade、stage executor、council
+ * 席位、driver 重试都跑在这个上下文里，于是自动归属同一个 run，不必逐层传参。
+ */
+export function runWithRunLatencyRecorder<T>(
+  recorder: RunLatencyRecorder,
+  run: () => Promise<T>,
+): Promise<T> {
+  return recorderStorage.run(recorder, run);
+}
+
+export function getRunLatencyRecorder(): RunLatencyRecorder | undefined {
+  return recorderStorage.getStore();
+}
+
+/**
+ * 计时包裹一个调用，span 归属当前 run。
+ *
+ * 没有 recorder 时（单测、example、非 RPC 路径）直接执行 `run`：不产生任何副作用，
+ * 也不改变异常语义。第一个参数接受登记名（拼错即编译错误）或动态族 ref。
+ */
+export function withRunLatencySpan<T>(
+  nameOrRef: RunLatencySpanName | RunLatencySpanRef,
+  options: RunLatencySpanOptions<T>,
+  run: () => Promise<T>,
+): Promise<T> {
+  const recorder = recorderStorage.getStore();
+  if (!recorder) return run();
+  return recorder.span(nameOrRef, options, run);
+}
+
+/**
+ * 记录一条外部测得的 span。
+ *
+ * 供不便接收 recorder 实例的边界使用（例如 driver transport 的里程碑回调）：
+ * 它只需要一个普通函数引用，就能把数据写进当前 run 的流水。
+ */
+export function recordRunLatencySpan(
+  nameOrRef: RunLatencySpanName | RunLatencySpanRef,
+  input: RunLatencySpanRecordInput,
+): void {
+  recorderStorage.getStore()?.record(nameOrRef, input);
 }
 
 function wallClockElapsedMs(startedAt: string, completedAt: string): number {
