@@ -5,6 +5,7 @@ import {
   type TaskExecutionLoopExecutors,
 } from '../../src/coordination';
 import { TaskProcessor } from '../../src/coordination';
+import { createRunLatency, type RunLatencySpan } from '../../src/telemetry';
 import {
   SqliteCoordinationStore,
   type CoordinationStateCommit,
@@ -322,6 +323,56 @@ describe('TaskExecutionLoop', () => {
 
     expect(fixture.calls).toEqual(['gate', 'deliver']);
   });
+
+  it('records one wall-clock span per stage plus a run root span', async () => {
+    const fixture = createFixture({ latencySpans: [] });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    const spans = fixture.latencySpans.map((span) => span.name);
+    expect(spans).toEqual([
+      'stage.select_agent',
+      'stage.execute_agent',
+      'stage.gate',
+      'stage.deliver',
+      'run.loop_total',
+    ]);
+    // 根 span 必须覆盖整轮：它最后结束。
+    expect(fixture.latencySpans.at(-1)).toMatchObject({
+      name: 'run.loop_total',
+      layer: 'loop',
+      run_id: 'run_loop',
+      ok: true,
+      meta: { status: 'completed' },
+    });
+    for (const span of fixture.latencySpans) {
+      expect(span.run_id).toBe('run_loop');
+      expect(span.duration_ms).toBeGreaterThanOrEqual(0);
+      expect(span.duration_source).toBe('monotonic');
+    }
+  });
+
+  it('records a failed stage span and still ends the run root span', async () => {
+    const fixture = createFixture({ failAt: 'gate', latencySpans: [] });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    const gate = fixture.latencySpans.find((span) => span.name === 'stage.gate');
+    expect(gate).toMatchObject({ ok: false, error: 'gate failed' });
+    expect(fixture.latencySpans.at(-1)).toMatchObject({ name: 'run.loop_total', ok: true });
+  });
+
+  it('leaves telemetry untouched when no latency recorder is injected', async () => {
+    const fixture = createFixture();
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    await expect(
+      fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' }),
+    ).resolves.toMatchObject({ task: { status: 'completed' } });
+    expect(fixture.latencySpans).toEqual([]);
+  });
 });
 
 interface FixtureOptions {
@@ -334,6 +385,8 @@ interface FixtureOptions {
   overrideDuringExecuteCommit?: boolean;
   coordinationFailureAt?: TaskCursorInput['cursor'];
   invalidFinalOutput?: boolean;
+  /** 传入数组即开启墙钟埋点，span 会被写进这个数组。 */
+  latencySpans?: RunLatencySpan[];
 }
 
 function createFixture(options: FixtureOptions = {}): {
@@ -344,6 +397,7 @@ function createFixture(options: FixtureOptions = {}): {
   calls: string[];
   inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>>;
   memoryAblations: Array<string | undefined>;
+  latencySpans: RunLatencySpan[];
 } {
   const store = new SqliteCoordinationStore(':memory:');
   let conflictInjected = false;
@@ -448,6 +502,7 @@ function createFixture(options: FixtureOptions = {}): {
     },
   };
   const evidenceStore = new MemoryEvidenceStore(options.evidenceFailureAt);
+  const latencySpans = options.latencySpans ?? [];
   return {
     store,
     processor,
@@ -457,10 +512,20 @@ function createFixture(options: FixtureOptions = {}): {
       evidence_store: evidenceStore,
       executors,
       create_invocation_id: (cursor) => `invocation_${cursor}`,
+      ...(options.latencySpans
+        ? {
+            create_latency_recorder: createRunLatency({
+              root: '.newide/ignored',
+              persist: false,
+              extraSinks: [{ append: (span) => latencySpans.push(span) }],
+            }).createRecorder,
+          }
+        : {}),
     }),
     calls,
     inputs,
     memoryAblations,
+    latencySpans,
   };
 }
 

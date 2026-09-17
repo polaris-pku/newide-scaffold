@@ -18,6 +18,12 @@ import {
   type TaskStageCommitResult,
 } from './task-processor';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
+import {
+  runWithRunLatencyRecorder,
+  stageSpan,
+  withRunLatencySpan,
+  type RunLatencyRecorder,
+} from '../telemetry';
 
 type CursorInput<TCursor extends TaskResumeCursor> = Extract<TaskCursorInput, { cursor: TCursor }>;
 
@@ -139,6 +145,11 @@ export interface TaskExecutionLoopOptions {
   evidence_store: RunEvidenceStore;
   executors: TaskExecutionLoopExecutors;
   create_invocation_id?: (cursor: TaskResumeCursor) => string;
+  /**
+   * 墙钟归因。按 run 建一个 recorder，loop 内部据此给根 span 与每个 stage 记耗时。
+   * 不注入时全部埋点自动退化为空操作，单测与 example 无需改动。
+   */
+  create_latency_recorder?: (input: { run_id: string; task_id: string }) => RunLatencyRecorder;
 }
 
 export interface RunTaskExecutionInput {
@@ -158,6 +169,9 @@ export class TaskExecutionLoop {
   private readonly evidenceStore: RunEvidenceStore;
   private readonly executors: TaskExecutionLoopExecutors;
   private readonly createInvocationId: (cursor: TaskResumeCursor) => string;
+  private readonly createLatencyRecorder:
+    | ((input: { run_id: string; task_id: string }) => RunLatencyRecorder)
+    | undefined;
 
   constructor(options: TaskExecutionLoopOptions) {
     this.processor = options.processor;
@@ -165,6 +179,7 @@ export class TaskExecutionLoop {
     this.executors = options.executors;
     this.createInvocationId =
       options.create_invocation_id ?? ((cursor) => createId(`invocation_${cursor}`));
+    this.createLatencyRecorder = options.create_latency_recorder;
   }
 
   async run(input: RunTaskExecutionInput): Promise<TaskSnapshot> {
@@ -173,6 +188,24 @@ export class TaskExecutionLoop {
     if (input.council_override === true) {
       this.processor.setCouncilOverride(input.run_id);
     }
+    const recorder = this.createLatencyRecorder?.({
+      run_id: input.run_id,
+      task_id: input.task_id,
+    });
+    if (!recorder) return this.runStages(input);
+
+    // 根 span 覆盖整轮执行；recorder 同时通过 ALS 绑定，让 loop 内部与更深层调用
+    // （facade / stage executor / council 席位）的 span 自动归属同一个 run。
+    return runWithRunLatencyRecorder(recorder, () =>
+      withRunLatencySpan(
+        'run.loop_total',
+        { metaFrom: (snapshot: TaskSnapshot) => ({ status: snapshot.task.status }) },
+        () => this.runStages(input),
+      ),
+    );
+  }
+
+  private async runStages(input: RunTaskExecutionInput): Promise<TaskSnapshot> {
     for (;;) {
       input.signal?.throwIfAborted();
       const state = this.processor.getRunExecutionState(input.run_id);
@@ -211,8 +244,8 @@ export class TaskExecutionLoop {
     try {
       switch (cursorInput.cursor) {
         case 'select_agent': {
-          const result = await this.executors.select_agent.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await withRunLatencySpan(stageSpan('select_agent'), {}, () =>
+            this.executors.select_agent.execute(stageContext(state, cursorInput, controls)),
           );
           return await this.persistAndAdvance(
             state,
@@ -227,8 +260,8 @@ export class TaskExecutionLoop {
           );
         }
         case 'execute_agent': {
-          const result = await this.executors.execute_agent.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await withRunLatencySpan(stageSpan('execute_agent'), {}, () =>
+            this.executors.execute_agent.execute(stageContext(state, cursorInput, controls)),
           );
           if (!result.mailbox_wait) assertChangesetResult(result, 'Primary Agent');
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
@@ -279,8 +312,8 @@ export class TaskExecutionLoop {
           return committed;
         }
         case 'council': {
-          const result = await this.executors.council.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await withRunLatencySpan(stageSpan('council'), {}, () =>
+            this.executors.council.execute(stageContext(state, cursorInput, controls)),
           );
           assertChangesetResult(result, 'Council');
           return await this.persistAndAdvance(
@@ -299,8 +332,8 @@ export class TaskExecutionLoop {
           );
         }
         case 'gate': {
-          const result = await this.executors.gate.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await withRunLatencySpan(stageSpan('gate'), {}, () =>
+            this.executors.gate.execute(stageContext(state, cursorInput, controls)),
           );
           assertGateResultIdentity(result, cursorInput);
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
@@ -340,8 +373,8 @@ export class TaskExecutionLoop {
           return committed;
         }
         case 'deliver': {
-          const result = await this.executors.deliver.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await withRunLatencySpan(stageSpan('deliver'), {}, () =>
+            this.executors.deliver.execute(stageContext(state, cursorInput, controls)),
           );
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
           const committed = this.advanceWithEvidence(

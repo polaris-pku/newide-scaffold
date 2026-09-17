@@ -160,6 +160,51 @@ export class FileRunLatencyTraceSink implements RunLatencyTraceSink {
 
 export type MonotonicNow = () => number;
 
+/**
+ * span 流水的一份聚合快照。
+ *
+ * 逐条 span 适合离线做瀑布图，但「这次 run 每层各花了多少」是更常被问的问题。
+ * 快照按 span 名与 layer 分组合计，让调用点不必自己去解析 JSONL。
+ */
+export interface RunLatencyTotals {
+  run_id: string;
+  task_id?: string;
+  span_count: number;
+  /** 按 span 名分组的合计（含次数），用于回答「每层各花了多少」。 */
+  by_name: Record<string, { count: number; total_duration_ms: number; max_duration_ms: number }>;
+  /** 按 layer 分组的合计，用于粗粒度归因。 */
+  by_layer: Record<string, { count: number; total_duration_ms: number }>;
+}
+
+/** 从 span 序列算聚合快照；不排序、不改写输入。 */
+export function summarizeRunLatency(
+  runId: string,
+  spans: readonly RunLatencySpan[],
+  taskId?: string,
+): RunLatencyTotals {
+  const byName: RunLatencyTotals['by_name'] = {};
+  const byLayer: RunLatencyTotals['by_layer'] = {};
+  for (const span of spans) {
+    const nameBucket = byName[span.name] ?? { count: 0, total_duration_ms: 0, max_duration_ms: 0 };
+    nameBucket.count += 1;
+    nameBucket.total_duration_ms += span.duration_ms;
+    nameBucket.max_duration_ms = Math.max(nameBucket.max_duration_ms, span.duration_ms);
+    byName[span.name] = nameBucket;
+
+    const layerBucket = byLayer[span.layer] ?? { count: 0, total_duration_ms: 0 };
+    layerBucket.count += 1;
+    layerBucket.total_duration_ms += span.duration_ms;
+    byLayer[span.layer] = layerBucket;
+  }
+  return {
+    run_id: runId,
+    ...(taskId ? { task_id: taskId } : {}),
+    span_count: spans.length,
+    by_name: byName,
+    by_layer: byLayer,
+  };
+}
+
 function defaultMonotonicNow(): number {
   return typeof performance !== 'undefined' && typeof performance.now === 'function'
     ? performance.now()
