@@ -354,8 +354,11 @@ describe('SynthesisAgentCouncilProvider', () => {
             run_id: input.run_id,
             session_id: 'session_active_proposer',
           });
-          for (let index = 0; index < 5; index += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 3));
+          // 事件间隔要比 roleInactivityTimeoutMs 小一个数量级，才能在 CI 的调度抖动下
+          // 仍满足「一直有事件就不算不活跃」；总时长又要明显超过该阈值，否则断言退化成
+          // 「什么都没发生」。原来的 3ms 间隔 / 5ms 阈值只差 2ms，抖动一压就反了。
+          for (let index = 0; index < 20; index += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
             options?.onDriverEvent?.({
               schema_version: 'driver-event.v1',
               event_type: 'agent_thought_chunk',
@@ -369,7 +372,7 @@ describe('SynthesisAgentCouncilProvider', () => {
     };
     const provider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
-      roleInactivityTimeoutMs: 5,
+      roleInactivityTimeoutMs: 100,
     });
 
     const result = await provider.runCouncilRound(baseInput());
