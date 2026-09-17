@@ -10,3 +10,4 @@ export * from './llm-usage-ledger';
 export * from './collect-claude-session-usage';
 export * from './run-latency-trace';
 export * from './run-latency-factory';
+export * from './run-event-consumption';

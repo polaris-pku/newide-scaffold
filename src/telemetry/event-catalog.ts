@@ -40,6 +40,20 @@ export const TELEMETRY_EVENT_CATALOG = [
     description: 'An LLM usage record could not reach the ledger or the sink; carries the reason.',
   },
   {
+    event_type: 'run.event_consumed',
+    owner: 'F',
+    level: 'L2_EVENT',
+    source: 'harness',
+    description: 'Per-run stage event totals: counts, payload bytes and the breakdown by type.',
+  },
+  {
+    event_type: 'run.event_committed_batch',
+    owner: 'F',
+    level: 'L2_EVENT',
+    source: 'harness',
+    description: 'Per-run count of coordination commit batches and the events they carried.',
+  },
+  {
     event_type: 'eval.agent_crash',
     owner: 'F',
     level: 'L2_EVENT',
