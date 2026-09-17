@@ -50,10 +50,12 @@ describe('Council end-to-end coordinator slice', () => {
     });
 
     expect(result.summary.status).toBe('completed');
-    expect(requests.map((request) => request.role_id)).toEqual([
-      'role_ts_engineer',
-      'role_backend_proposer',
-      'role_frontend_proposer',
+    expect(requests[0]?.role_id).toBe('role_ts_engineer');
+    // Proposers are dispatched concurrently, so their invocation order is unspecified.
+    expect(new Set(requests.slice(1, 3).map((request) => request.role_id))).toEqual(
+      new Set(['role_backend_proposer', 'role_frontend_proposer']),
+    );
+    expect(requests.slice(3).map((request) => request.role_id)).toEqual([
       'role_security_reviewer',
       'role_release_synthesizer',
     ]);
