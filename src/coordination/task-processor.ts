@@ -35,6 +35,18 @@ import type { ParticipantSessionRegistry } from './participant-session-registry'
 
 export interface TaskProcessorOptions {
   now?: () => string;
+  /**
+   * 进程内单调时钟，返回当前毫秒偏移。默认 `performance.now()`。
+   *
+   * stage 耗时必须用它而非墙钟：墙钟会被 NTP 校正、夏令时、手动改系统时间推移，
+   * 算出来的「耗时」可能为负或凭空多出几小时。单调钟只保证单调递增，正是计时的语义。
+   * 测试通过注入该函数即可精确控制耗时断言。
+   *
+   * 默认值不能退回 `Date.now`：那样 `duration_source` 会恒报 `monotonic` 而实际是墙钟，
+   * 恰好把该字段用来表达的可信度标反。跨进程失效的判据也依赖真实单调钟——新进程的
+   * 原点必然小于旧读数，相减为负才会走到退化分支。
+   */
+  monotonicNow?: () => number;
   createEventId?: () => string;
   runsRoot?: string;
   participantSessions?: ParticipantSessionRegistry;
@@ -97,6 +109,37 @@ export interface TaskStageCommitResult {
   snapshot: TaskSnapshot;
   committed_events: PersistedCoordinationEvent[];
 }
+
+/**
+ * 单个 stage 的耗时记录。
+ *
+ * `started_at`/`completed_at` 是墙钟 ISO 串（来自 `now()`），用于人读与跨重启对齐；
+ * `duration_ms` 取单调钟差值，仅当该差值不可用（单调基准属于上一个进程，相减为负）
+ * 时退化为两个墙钟串相减。判据与两种口径的选择见 `settleStageTiming`。
+ *
+ * `duration_source` 显式标出口径：退化口径可能因系统时间被调整而失真，
+ * 聚合时不区分就会把两种可信度不同的数字混在一起。
+ */
+export interface StageTiming {
+  cursor: TaskResumeCursor;
+  invocation_id: string;
+  started_at?: string;
+  completed_at: string;
+  duration_ms: number;
+  duration_source: 'monotonic' | 'wall_clock';
+}
+
+/** 单个 run 内按 cursor 累积的 stage 耗时表。 */
+type StageTimingTable = Partial<Record<TaskResumeCursor, StageTiming>>;
+
+/**
+ * diagnostics 里的 stage 耗时表，按 run_id 分桶。
+ *
+ * 必须按 run 分开：`runtime_state` 是 task 级的，若只按 cursor 平铺，后一个 run 重跑同一
+ * cursor 时会覆盖前一个 run 的数字，而 projectAggregate 会把这张表读给 run_history 里
+ * 每一个 run，于是历史 run 会显示出后一个 run 的耗时——看似合理但完全错误的数。
+ */
+type StageTimingTables = Partial<Record<string, StageTimingTable>>;
 
 export interface TaskRunExecutionState {
   task_id: string;
@@ -186,6 +229,7 @@ export class TaskProcessorStageCommitError extends Error {
 
 export class TaskProcessor {
   private readonly now: () => string;
+  private readonly monotonicNow: () => number;
   private readonly createEventId: () => string;
   private readonly runsRoot: string;
   private readonly mailboxStore?:
@@ -202,6 +246,7 @@ export class TaskProcessor {
     } = {},
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.monotonicNow = options.monotonicNow ?? defaultMonotonicNow;
     this.createEventId = options.createEventId ?? (() => createId('event'));
     this.runsRoot = options.runsRoot ?? '.newide/runs';
     if (options.participantSessions) this.participantSessions = options.participantSessions;
@@ -235,6 +280,9 @@ export class TaskProcessor {
     );
 
     const timestamp = this.now();
+    // runtime_state 是 task 级的，下面整体重建它。已结束 run 的耗时表要先接过来，
+    // 否则新 run 一开始就把它们抹掉，历史 run 的耗时就再也读不出来了。
+    const carriedStageTimings = readStageTimings(existing?.runtime_state.diagnostics ?? {});
     const task: PersistedTaskState = existing
       ? (() => {
           const {
@@ -321,6 +369,9 @@ export class TaskProcessor {
         diagnostics: {
           mode: input.mode,
           run_intent: runIntent.type,
+          ...(Object.keys(carriedStageTimings).length > 0
+            ? { stage_timings: carriedStageTimings }
+            : {}),
           ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
           ...(runIntent.type === 'checkpoint_resume'
             ? { resume_strategy: runIntent.strategy }
@@ -377,6 +428,9 @@ export class TaskProcessor {
             invocation_id: input.invocation_id,
             started_at: timestamp,
             started_event_id: event.event_id,
+            // 单调起点，供本进程内精确计算 stage 耗时；跨重启后该字段仍在，
+            // 但进程的单调基准已换，故只在 stage 边界读一次、不跨进程比较。
+            monotonic_started_at: this.monotonicNow(),
           },
         },
         updated_at: timestamp,
@@ -427,6 +481,11 @@ export class TaskProcessor {
     if (completing) assertFinalOutputEvidence(input.final_output!);
 
     const timestamp = input.event?.created_at ?? this.now();
+    // 耗时必须在覆盖 active_stage 之前读出来：下面写 runtime_state 时会把 active_stage 整个删掉。
+    const active = readActiveStage(aggregate.runtime_state.diagnostics);
+    const stageTiming = active
+      ? settleStageTiming(active, timestamp, this.monotonicNow())
+      : undefined;
     const event =
       input.event ??
       this.createEvent('handler.completed', input.run_id, aggregate.task.task_id, input.run_id, {
@@ -435,6 +494,7 @@ export class TaskProcessor {
         next_cursor: nextInput.cursor,
         evidence_ref: input.evidence_ref.uri,
         evidence_sha256: input.evidence_ref.sha256,
+        ...(stageTiming ? { timing: stageTiming } : {}),
       });
     assertStageEvent(event, 'handler.completed', aggregate.task.task_id, input.run_id);
     if (aggregate.events.some((candidate) => candidate.event_id === event.event_id)) {
@@ -492,6 +552,15 @@ export class TaskProcessor {
           ...stageEvidence,
           [input.expected_cursor]: { ...input.evidence_ref },
         },
+        ...(stageTiming
+          ? {
+              stage_timings: foldStageTiming(
+                diagnosticsWithoutActiveStage,
+                input.run_id,
+                stageTiming,
+              ),
+            }
+          : {}),
         last_completed_stage: input.expected_cursor,
         last_completed_invocation_id: input.invocation_id,
       },
@@ -535,6 +604,11 @@ export class TaskProcessor {
     assertTaskStatusTransition(aggregate.task.status, 'failed');
 
     const timestamp = input.event?.created_at ?? this.now();
+    // 失败路径同样记耗时：卡住 6 分钟后超时失败，与立刻失败，是完全不同的故障。
+    const active = readActiveStage(aggregate.runtime_state.diagnostics);
+    const stageTiming = active
+      ? settleStageTiming(active, timestamp, this.monotonicNow())
+      : undefined;
     const event =
       input.event ??
       this.createEvent('handler.failed', input.run_id, aggregate.task.task_id, input.run_id, {
@@ -542,6 +616,7 @@ export class TaskProcessor {
         invocation_id: input.invocation_id,
         code: input.error.code,
         message: input.error.message,
+        ...(stageTiming ? { timing: stageTiming } : {}),
       });
     assertStageEvent(event, 'handler.failed', aggregate.task.task_id, input.run_id);
     const terminalEvent = this.createEvent(
@@ -585,6 +660,17 @@ export class TaskProcessor {
         artifact_refs: artifactRefs,
         diagnostics: {
           ...diagnosticsWithoutActiveStage,
+          // 失败路径同样折进耗时表。原先只写在 handler.failed 事件上，快照里读不到——
+          // 而「卡住几分钟后失败」恰恰是最需要看耗时的那种故障。
+          ...(stageTiming
+            ? {
+                stage_timings: foldStageTiming(
+                  diagnosticsWithoutActiveStage,
+                  input.run_id,
+                  stageTiming,
+                ),
+              }
+            : {}),
           failed_stage: input.expected_cursor,
           failed_invocation_id: input.invocation_id,
           ...(input.evidence_ref ? { failed_stage_evidence: { ...input.evidence_ref } } : {}),
@@ -1379,7 +1465,13 @@ function projectAggregate(aggregate: PersistedTaskAggregate, runsRoot: string): 
     },
     created_at: aggregate.task.created_at,
     runs: aggregate.runs.map((run) =>
-      toRunFact(run, run.snapshot ?? projectPersistedRunSnapshot(aggregate, run.run_id, runsRoot)),
+      toRunFact(
+        run,
+        run.snapshot ?? projectPersistedRunSnapshot(aggregate, run.run_id, runsRoot),
+        // 按 run_id 取本 run 自己的那一桶。task 级表里同时躺着历史 run 的记录，
+        // 整表读给每个 run 会让历史 run 显示出后一个 run 的耗时。
+        readRunStageTimings(aggregate.runtime_state.diagnostics, run.run_id),
+      ),
     ),
   });
   const waitingReason = readWaitingReason(aggregate);
@@ -1411,7 +1503,12 @@ function projectAggregate(aggregate: PersistedTaskAggregate, runsRoot: string): 
   });
 }
 
-function toRunFact(run: PersistedRunState, snapshot = run.snapshot): TaskRunFact {
+function toRunFact(
+  run: PersistedRunState,
+  snapshot = run.snapshot,
+  stageTimings?: StageTimingTable,
+): TaskRunFact {
+  const timings = stageTimings && Object.keys(stageTimings).length > 0 ? stageTimings : undefined;
   return {
     run_id: run.run_id,
     task_id: run.task_id,
@@ -1421,6 +1518,7 @@ function toRunFact(run: PersistedRunState, snapshot = run.snapshot): TaskRunFact
     ...(run.session_id ? { session_id: run.session_id } : {}),
     ...(run.started_at ? { started_at: run.started_at } : {}),
     ...(run.completed_at ? { completed_at: run.completed_at } : {}),
+    ...(timings ? { stage_timings: timings } : {}),
     ...(run.error ? { error: { ...run.error } } : {}),
     revision: run.revision,
     ...(snapshot ? { snapshot } : {}),
@@ -1741,9 +1839,14 @@ function assertInvocation(
   }
 }
 
-function readActiveStage(
-  diagnostics: Record<string, unknown>,
-): { cursor: TaskResumeCursor; invocation_id: string } | undefined {
+function readActiveStage(diagnostics: Record<string, unknown>):
+  | {
+      cursor: TaskResumeCursor;
+      invocation_id: string;
+      started_at?: string;
+      monotonic_started_at?: number;
+    }
+  | undefined {
   const value = diagnostics.active_stage;
   if (!value || typeof value !== 'object') return undefined;
   const cursor = Reflect.get(value, 'cursor');
@@ -1751,7 +1854,127 @@ function readActiveStage(
   if (!isTaskResumeCursor(cursor) || typeof invocationId !== 'string' || !invocationId) {
     throw new Error('Persisted active_stage diagnostics are invalid');
   }
-  return { cursor, invocation_id: invocationId };
+  // `started_at` 是可选字段：早期版本写入的 diagnostics 可能没有它，缺失时不能抛错，
+  // 否则历史 run 一旦被 resume 就会直接崩在读取阶段。
+  const startedAt = Reflect.get(value, 'started_at');
+  const monotonicStartedAt = Reflect.get(value, 'monotonic_started_at');
+  return {
+    cursor,
+    invocation_id: invocationId,
+    ...(typeof startedAt === 'string' && startedAt ? { started_at: startedAt } : {}),
+    ...(typeof monotonicStartedAt === 'number' && Number.isFinite(monotonicStartedAt)
+      ? { monotonic_started_at: monotonicStartedAt }
+      : {}),
+  };
+}
+
+/**
+ * 结算一个 stage 的耗时。
+ *
+ * 单调钟是首选：它不受系统时间校正影响，也不会被夏令时跳变影响。但单调读数只在
+ * **记录它的那个进程内**有意义——`active_stage.monotonic_started_at` 是上一个进程写下的，
+ * 而新进程的单调钟从自己的原点重新开始，两边相减会得到无意义的结果（通常为负）。
+ * 历史数据里该字段也可能整个缺失。
+ *
+ * 因此判据不是「有没有单调读数」，而是「相减是否得到一个非负值」：为负说明基准已经
+ * 对不上，必须退回墙钟。这里刻意不把负值夹到 0 —— 那会谎报「该阶段瞬间完成」，
+ * 比没有数据更糟。`duration_source` 如实标出实际使用的口径。
+ *
+ * 两种口径都取不到值时返回 undefined，该 stage 就不落表也不写事件：观测数据宁可缺一条，
+ * 也不能凭空填一个 0 冒充测量结果。
+ */
+function settleStageTiming(
+  active: {
+    cursor: TaskResumeCursor;
+    invocation_id: string;
+    started_at?: string;
+    monotonic_started_at?: number;
+  },
+  completedAt: string,
+  monotonicNow: number,
+): StageTiming | undefined {
+  const monotonicStart = active.monotonic_started_at;
+  const monotonicElapsed =
+    monotonicStart !== undefined && Number.isFinite(monotonicStart)
+      ? monotonicNow - monotonicStart
+      : undefined;
+  const useMonotonic =
+    monotonicElapsed !== undefined && Number.isFinite(monotonicElapsed) && monotonicElapsed >= 0;
+  const duration = useMonotonic
+    ? monotonicElapsed
+    : elapsedWallClockMs(active.started_at, completedAt);
+  if (duration === undefined) return undefined;
+  return {
+    cursor: active.cursor,
+    invocation_id: active.invocation_id,
+    ...(active.started_at ? { started_at: active.started_at } : {}),
+    completed_at: completedAt,
+    duration_ms: duration,
+    duration_source: useMonotonic ? 'monotonic' : 'wall_clock',
+  };
+}
+
+/**
+ * 两个 ISO 时间戳之间的毫秒差；任一不可解析、或结果为负（说明墙钟被向后校正过）时
+ * 返回 undefined，由调用方决定「没有数据」而不是把它当成 0。
+ */
+function elapsedWallClockMs(startedAt: string | undefined, completedAt: string): number | undefined {
+  if (!startedAt) return undefined;
+  const start = Date.parse(startedAt);
+  const end = Date.parse(completedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return undefined;
+  return end - start >= 0 ? end - start : undefined;
+}
+
+/**
+ * 默认单调时钟。
+ *
+ * 用 `performance.now()` 而不是 `Date.now()`：后者是墙钟，会被 NTP 校正推移，而
+ * `duration_source` 会据此标成 `monotonic`——把一个实际不可信的读数标成可信的，
+ * 比标错更糟。运行环境没有 `performance` 时（极少数嵌入式/受限宿主）退回 `Date.now`，
+ * 此时跨进程退化判据仍可能失效，但至少不会静默产生负值。
+ */
+function defaultMonotonicNow(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+/**
+ * 把一个 stage 的耗时折进按 run 分桶的表，返回新表。
+ *
+ * 桶键取入参 `runId` 而不是 `runtime_state.current_run_id`：终态提交会在写 runtime_state
+ * 之前把 current_run_id 摘掉，而失败路径正是在那一步之前落表，依赖该字段会漏记。
+ */
+function foldStageTiming(
+  diagnostics: Record<string, unknown>,
+  runId: string,
+  timing: StageTiming,
+): StageTimingTables {
+  const tables = readStageTimings(diagnostics);
+  return { ...tables, [runId]: { ...tables[runId], [timing.cursor]: timing } };
+}
+
+/** 单个 run 的耗时表；该 run 没有记录时返回 undefined。 */
+function readRunStageTimings(
+  diagnostics: Record<string, unknown>,
+  runId: string,
+): StageTimingTable | undefined {
+  const table = readStageTimings(diagnostics)[runId];
+  return table && Object.keys(table).length > 0 ? table : undefined;
+}
+
+/**
+ * 读取已累积的 stage 耗时表（按 run_id 分桶）。
+ *
+ * 整个 diagnostics 是自由格式的 JSON 列，历史数据里 `stage_timings` 可能是任何形状，
+ * 因此这里只做「是不是对象」的最低限度判断并保留原始条目——观测数据不该让任务失败，
+ * 但读回时也不能把非对象当成表来展开。
+ */
+function readStageTimings(diagnostics: Record<string, unknown>): StageTimingTables {
+  const value = diagnostics.stage_timings;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return value as StageTimingTables;
 }
 
 function readStageEvidence(

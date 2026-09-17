@@ -4,6 +4,21 @@ import { councilOutcomeEvidenceSchema } from './run-snapshot';
 
 const recordSchema = z.record(z.string(), z.unknown());
 
+/**
+ * 单个 stage 的耗时。字段与 coordination 侧的 StageTiming 对齐，取值放宽为最小约束：
+ * 这是观测数据，历史 run 可能缺字段或用不同口径，快照必须能读出来而不是解析失败。
+ */
+const stageTimingSchema = z
+  .object({
+    cursor: z.string().min(1),
+    invocation_id: z.string().min(1),
+    started_at: z.string().min(1).optional(),
+    completed_at: z.string().min(1),
+    duration_ms: z.number().nonnegative(),
+    duration_source: z.enum(['monotonic', 'wall_clock']),
+  })
+  .strict();
+
 export const taskRunSummarySchema = z
   .object({
     run_id: z.string().min(1),
@@ -14,6 +29,11 @@ export const taskRunSummarySchema = z
     session_id: z.string().min(1).optional(),
     started_at: z.string().min(1).optional(),
     completed_at: z.string().min(1).optional(),
+    /**
+     * 按 stage 的耗时表。哪个阶段吃掉了墙钟时间，看这里而不是靠猜——在它出现之前，
+     * 全链路只有 gate 命令有真实计时，端到端延迟无处可查。
+     */
+    stage_timings: z.record(z.string(), stageTimingSchema).optional(),
     error: z
       .object({
         code: z.string().min(1),

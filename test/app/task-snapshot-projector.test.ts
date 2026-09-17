@@ -49,6 +49,45 @@ describe('projectTaskSnapshot', () => {
     });
   });
 
+  it('preserves per-stage timings on the run summary', () => {
+    const snapshot = projectTaskSnapshot({
+      task_id: 'task_1',
+      task_request: {
+        spec: 'Locate where the wall clock goes',
+        role_id: 'role_performance_engineer',
+        risk_level: 'low',
+        affected_paths: [],
+        completion_criteria: ['stage timings are observable'],
+      },
+      created_at: '2026-07-19T01:00:00.000Z',
+      runs: [
+        fact({
+          run_id: 'run_timed',
+          status: 'completed',
+          restartable: true,
+          revision: 9,
+          stage_timings: {
+            execute_agent: {
+              cursor: 'execute_agent',
+              invocation_id: 'invocation_execute',
+              started_at: '2026-07-19T01:00:05.000Z',
+              completed_at: '2026-07-19T01:05:05.000Z',
+              duration_ms: 300000,
+              duration_source: 'monotonic',
+            },
+          },
+        }),
+      ],
+    });
+
+    expect(taskSnapshotSchema.parse(snapshot)).toEqual(snapshot);
+    expect(snapshot.run_history[0]?.stage_timings?.execute_agent).toMatchObject({
+      cursor: 'execute_agent',
+      duration_ms: 300000,
+      duration_source: 'monotonic',
+    });
+  });
+
   it('projects market, autonomous Council and final output from terminal evidence', () => {
     const result = {
       quality: 'best_effort' as const,

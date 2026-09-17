@@ -7,6 +7,7 @@ import { TaskProcessor } from '../../src/coordination';
 import { PersistentMailboxService } from '../../src/mailbox';
 import { SqliteCoordinationStore, type TaskCursorInput } from '../../src/persistence';
 import type { RunSnapshot } from '../../src/protocol/run-snapshot';
+import { taskSnapshotSchema } from '../../src/protocol/task-snapshot';
 
 const temporaryDirectories: string[] = [];
 
@@ -980,6 +981,301 @@ describe('TaskProcessor', () => {
     expect(store.getTaskAggregate('task_processor')?.task.revision).toBe(revision);
     store.close();
   });
+
+  describe('stage timing instrumentation', () => {
+    it('records a monotonic stage duration on handler.completed', () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-processor-'));
+      temporaryDirectories.push(directory);
+      const clock = stageTimingClock();
+      const store = new SqliteCoordinationStore(path.join(directory, 'coordination.sqlite'));
+      const processor = new TaskProcessor(store, clock);
+
+      processor.beginRun({
+        task_id: 'task_processor',
+        run_id: 'run_processor',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'single_agent',
+      });
+      processor.startStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_timed',
+      });
+      clock.advance(2500);
+      const advanced = processor.advanceStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_timed',
+        evidence_ref: evidenceRef('timed'),
+        next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+      });
+
+      const completed = advanced.committed_events.find(
+        (candidate) => candidate.event_type === 'handler.completed',
+      );
+      expect(completed?.payload.timing).toEqual({
+        cursor: 'select_agent',
+        invocation_id: 'invocation_timed',
+        started_at: expect.any(String),
+        completed_at: expect.any(String),
+        duration_ms: 2500,
+        duration_source: 'monotonic',
+      });
+
+      // 累积表按 run 分桶落在 runtime_state.diagnostics 上，供快照按 run 读取。
+      expect(store.getTaskAggregate('task_processor')?.runtime_state.diagnostics).toMatchObject({
+        stage_timings: { run_processor: { select_agent: { duration_ms: 2500 } } },
+      });
+      store.close();
+    });
+
+    it('surfaces accumulated stage timings on the run summary', () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-processor-'));
+      temporaryDirectories.push(directory);
+      const clock = stageTimingClock();
+      const store = new SqliteCoordinationStore(path.join(directory, 'coordination.sqlite'));
+      const processor = new TaskProcessor(store, clock);
+
+      processor.beginRun({
+        task_id: 'task_processor',
+        run_id: 'run_processor',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'single_agent',
+      });
+      processor.startStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_surface',
+      });
+      clock.advance(1200);
+      processor.advanceStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_surface',
+        evidence_ref: evidenceRef('surface'),
+        next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+      });
+
+      const snapshot = processor.getTaskSnapshot('task_processor');
+      expect(snapshot.current_run?.stage_timings).toMatchObject({
+        select_agent: { duration_ms: 1200, duration_source: 'monotonic' },
+      });
+      // 快照必须自洽：加上耗时字段后仍能通过协议校验。
+      expect(taskSnapshotSchema.parse(snapshot)).toEqual(snapshot);
+      store.close();
+    });
+
+    it('falls back to wall clock when the monotonic baseline is from another process', () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-processor-'));
+      temporaryDirectories.push(directory);
+      const store = new SqliteCoordinationStore(path.join(directory, 'coordination.sqlite'));
+      // 模拟进程重启：墙钟连续推进（03:00:00 → 03:00:07，真实间隔 7 秒），但单调钟
+      // 基准归零（新进程的计时原点）。若实现拿新基准去减旧读数，会算出 1.7e12 ms 量级的
+      // 天文数字；只有正确退回墙钟差才会得到 7000。
+      let wallClock = '2026-07-19T03:00:00.000Z';
+      let monotonic = 1000;
+      let sequence = 0;
+      const processor = new TaskProcessor(store, {
+        now: () => wallClock,
+        createEventId: () => `processor_event_${String(++sequence)}`,
+        monotonicNow: () => monotonic,
+      });
+
+      processor.beginRun({
+        task_id: 'task_processor',
+        run_id: 'run_processor',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'single_agent',
+      });
+      processor.startStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_restored',
+      });
+
+      wallClock = '2026-07-19T03:00:07.000Z';
+      monotonic = 1; // 新进程的单调钟从零附近重新开始
+
+      const advanced = processor.advanceStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_restored',
+        evidence_ref: evidenceRef('restored'),
+        next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+      });
+      const completed = advanced.committed_events.find(
+        (candidate) => candidate.event_type === 'handler.completed',
+      );
+      expect(completed?.payload.timing).toMatchObject({
+        duration_ms: 7000,
+        duration_source: 'wall_clock',
+      });
+      store.close();
+    });
+
+    it('records a stage duration on handler.failed', () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-processor-'));
+      temporaryDirectories.push(directory);
+      const clock = stageTimingClock();
+      const store = new SqliteCoordinationStore(path.join(directory, 'coordination.sqlite'));
+      const processor = new TaskProcessor(store, clock);
+
+      processor.beginRun({
+        task_id: 'task_processor',
+        run_id: 'run_processor',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'single_agent',
+      });
+      processor.startStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_fail',
+      });
+      clock.advance(4000);
+      const failed = processor.failStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_fail',
+        error: { code: 'STAGE_FAILED', message: 'market auction crashed' },
+      });
+
+      const failedEvent = failed.committed_events.find(
+        (candidate) => candidate.event_type === 'handler.failed',
+      );
+      // 卡住 4 秒后失败与立即失败是两种故障，失败路径同样要能看见耗时。
+      expect(failedEvent?.payload.timing).toMatchObject({
+        duration_ms: 4000,
+        duration_source: 'monotonic',
+      });
+      // 光写在事件上不够：快照是主读面。原先失败路径不折进耗时表，快照里只剩之前成功的
+      // stage，恰恰看不到「卡了几分钟才失败」的那一次。
+      expect(failed.snapshot.run_history[0]?.stage_timings).toMatchObject({
+        select_agent: { duration_ms: 4000, duration_source: 'monotonic' },
+      });
+      store.close();
+    });
+
+    it('keeps each run on its own stage timings when a Task runs twice', () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-processor-'));
+      temporaryDirectories.push(directory);
+      const clock = stageTimingClock();
+      const store = new SqliteCoordinationStore(path.join(directory, 'coordination.sqlite'));
+      const processor = new TaskProcessor(store, clock);
+
+      processor.beginRun({
+        task_id: 'task_processor',
+        run_id: 'run_first',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'single_agent',
+        cursor_input: selectInput,
+      });
+      processor.startStage({
+        run_id: 'run_first',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_first',
+      });
+      clock.advance(2500);
+      processor.advanceStage({
+        run_id: 'run_first',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_first',
+        evidence_ref: evidenceRef('first'),
+        next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+      });
+      processor.finishRun({
+        run_id: 'run_first',
+        status: 'completed',
+        final_output: {
+          artifact_ref: 'artifact_first',
+          sha256: 'c'.repeat(64),
+          workspace_path: '/workspace/result.ts',
+        },
+      });
+
+      // Council 复审是同一 Task 上的第二个 run，并且会重跑同一个 cursor。
+      processor.beginRun({
+        task_id: 'task_processor',
+        run_id: 'run_second',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'council',
+        run_intent: { type: 'council_refinement' },
+        cursor_input: selectInput,
+      });
+      processor.startStage({
+        run_id: 'run_second',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_second',
+      });
+      clock.advance(9000);
+      const snapshot = processor.advanceStage({
+        run_id: 'run_second',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_second',
+        evidence_ref: evidenceRef('second'),
+        next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+      }).snapshot;
+
+      expect(snapshot.current_run?.stage_timings).toMatchObject({
+        select_agent: { duration_ms: 9000 },
+      });
+      // 历史 run 必须还读到自己那次的 2500，而不是被后一个 run 的同名 cursor 顶掉。
+      expect(snapshot.run_history[0]?.stage_timings).toMatchObject({
+        select_agent: { duration_ms: 2500 },
+      });
+      store.close();
+    });
+
+    it('records nothing rather than 0ms when neither clock can measure the stage', () => {
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-processor-'));
+      temporaryDirectories.push(directory);
+      const store = new SqliteCoordinationStore(path.join(directory, 'coordination.sqlite'));
+      // 单调钟基准属于上一个进程（相减为负），墙钟又被向后校正过：两种口径都不可用。
+      let wall = '2026-07-19T03:00:10.000Z';
+      let monotonic = 5000;
+      let sequence = 0;
+      const processor = new TaskProcessor(store, {
+        now: () => wall,
+        createEventId: () => `processor_event_${String(++sequence)}`,
+        monotonicNow: () => monotonic,
+      });
+
+      processor.beginRun({
+        task_id: 'task_processor',
+        run_id: 'run_processor',
+        task_request: taskRequest,
+        workspace_path: '/workspace',
+        mode: 'single_agent',
+      });
+      processor.startStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_unmeasurable',
+      });
+      wall = '2026-07-19T03:00:01.000Z';
+      monotonic = 1;
+      const advanced = processor.advanceStage({
+        run_id: 'run_processor',
+        expected_cursor: 'select_agent',
+        invocation_id: 'invocation_unmeasurable',
+        evidence_ref: evidenceRef('unmeasurable'),
+        next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+      });
+
+      const completed = advanced.committed_events.find(
+        (candidate) => candidate.event_type === 'handler.completed',
+      );
+      // 没有数据就不写字段，而不是填 0 冒充「该阶段瞬间完成」。
+      expect(completed?.payload).not.toHaveProperty('timing');
+      expect(advanced.snapshot.current_run?.stage_timings).toBeUndefined();
+      store.close();
+    });
+  });
 });
 
 const taskRequest: TaskCreateRequest = {
@@ -1015,11 +1311,37 @@ function createProcessor(): {
 function deterministicClock(): {
   now: () => string;
   createEventId: () => string;
+  monotonicNow: () => number;
 } {
   let sequence = 0;
   return {
     now: () => `2026-07-19T03:00:${String(sequence).padStart(2, '0')}.000Z`,
     createEventId: () => `processor_event_${String(++sequence)}`,
+    // 单调钟固定在 0：本文件的断言关心的是阶段流转与事件形状，不是真实耗时。
+    // 需要精确断言耗时的用例自己注入可控时钟（见 stageTimingClock）。
+    monotonicNow: () => 0,
+  };
+}
+
+/**
+ * 可控单调时钟。`advance(ms)` 显式推进读数，使 stage 耗时断言与真实执行速度无关——
+ * 用真实时钟写这类断言必然是不稳定的。
+ */
+function stageTimingClock(): {
+  now: () => string;
+  createEventId: () => string;
+  monotonicNow: () => number;
+  advance: (ms: number) => void;
+} {
+  let sequence = 0;
+  let monotonic = 1000;
+  return {
+    now: () => `2026-07-19T03:00:${String(sequence).padStart(2, '0')}.000Z`,
+    createEventId: () => `processor_event_${String(++sequence)}`,
+    monotonicNow: () => monotonic,
+    advance: (ms: number) => {
+      monotonic += ms;
+    },
   };
 }
 
