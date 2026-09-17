@@ -27,10 +27,22 @@ export interface ProxyUsageTelemetryInput {
   case_id: string;
   input_tokens: number;
   output_tokens: number;
+  /**
+   * cache token 是 Claude 计费的实打实一部分，但早期只留在 ledger entry 上、
+   * 没进 emission，于是按 telemetry 流算总量的人会系统性偏小。
+   */
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
   model?: string;
   scaffold_variant?: 'air_emulator' | 'zcode_router' | 'full_system' | string;
   temperature?: number;
   seed?: number;
+  /** 归属维度，取值见 llm-usage-attribution。 */
+  stage_cursor?: string;
+  role_id?: string;
+  agent_id?: string;
+  tool_name?: string;
+  round?: number;
   task_id?: TaskId;
   run_id?: RunId;
 }
@@ -131,10 +143,21 @@ export function buildProxyUsageTelemetry(input: ProxyUsageTelemetryInput): Telem
       case_id: input.case_id,
       input_tokens: input.input_tokens,
       output_tokens: input.output_tokens,
+      ...(input.cache_creation_input_tokens !== undefined
+        ? { cache_creation_input_tokens: input.cache_creation_input_tokens }
+        : {}),
+      ...(input.cache_read_input_tokens !== undefined
+        ? { cache_read_input_tokens: input.cache_read_input_tokens }
+        : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.scaffold_variant ? { scaffold_variant: input.scaffold_variant } : {}),
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.seed !== undefined ? { seed: input.seed } : {}),
+      ...(input.stage_cursor ? { stage_cursor: input.stage_cursor } : {}),
+      ...(input.role_id ? { role_id: input.role_id } : {}),
+      ...(input.agent_id ? { agent_id: input.agent_id } : {}),
+      ...(input.tool_name ? { tool_name: input.tool_name } : {}),
+      ...(input.round !== undefined ? { round: input.round } : {}),
     },
     source: { kind: 'proxy', object_type: 'LLM call' },
   };
