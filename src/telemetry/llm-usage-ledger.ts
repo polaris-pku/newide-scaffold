@@ -5,11 +5,17 @@
  * Integration flow finalizes the ledger into summary.token_usage and
  * emits proxy.llm_usage_recorded onto the active TelemetrySink.
  *
- * 每条 entry 带归属维度（stage / role / agent / tool / round）：token 记在哪个环节
- * 名下由 `llm-usage-attribution` 的作用域决定，调用点不必逐层传参。
+ * 记账（ledger entry）与上报（sink emission）是两件独立的事，会各自失败：
+ * 没有 ledger 时 entry 无处可放，缺 sink / 缺 case_id 时事件发不出去。两种失败都
+ * 不报错——只是汇总数字变小，看报告的人无从察觉——所以每次失败都进丢弃计数器
+ * （`snapshotLlmUsageDropCounters`），能上报时再补一条 `llm.usage_dropped`。
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { buildProxyUsageTelemetry } from './event-builders';
+import {
+  buildLlmUsageDroppedTelemetry,
+  buildProxyUsageTelemetry,
+  type LlmUsageDropReason,
+} from './event-builders';
 import { getLlmUsageAttribution, type LlmUsageAttribution } from './llm-usage-attribution';
 import { emitTelemetry, type TelemetrySink } from './telemetry-sink';
 
@@ -124,6 +130,41 @@ export function snapshotRunLedgerUsage(runId: string): RunTokenUsageSummary {
 
 export function releaseRunLlmUsageLedger(runId: string): void {
   runLedgers.delete(runId);
+}
+
+/**
+ * 每条流失原因各发生多少次。
+ *
+ * 同一次调用可以同时命中多个原因——既没有 ledger 也没有 sink 时，entry 无处可放、
+ * 事件也发不出去，两件事都真的发生了。所以这里的数字回答的是「这个原因发生了几次」，
+ * 不是「丢了几条记录」，两者不可相加后当记录数读。
+ */
+export type LlmUsageDropCounters = Record<LlmUsageDropReason, number>;
+
+const dropCounters: LlmUsageDropCounters = {
+  dropped_no_ledger: 0,
+  dropped_no_sink: 0,
+  dropped_no_case_id: 0,
+};
+
+/**
+ * 计数器是「没有 sink 时」唯一的观测面：那条用量丢失的原因本身就是没有出口，
+ * 无从上报，只能留在进程内。长驻进程可定期读它并与 sink 侧的 `llm.usage_dropped`
+ * 对账。
+ */
+export function snapshotLlmUsageDropCounters(): LlmUsageDropCounters {
+  return { ...dropCounters };
+}
+
+/** 把计数器归零。长驻进程取基线、测试之间隔离用。 */
+export function resetLlmUsageDropCounters(): void {
+  dropCounters.dropped_no_ledger = 0;
+  dropCounters.dropped_no_sink = 0;
+  dropCounters.dropped_no_case_id = 0;
+}
+
+function countLlmUsageDrop(reason: LlmUsageDropReason): void {
+  dropCounters[reason] += 1;
 }
 
 export function summarizeLlmUsageEntries(entries: readonly LlmUsageEntry[]): LlmUsageTotals {
@@ -276,6 +317,11 @@ export async function recordProxyLlmUsage(
 ): Promise<void> {
   const ledger = storage.getStore();
   const source = input.source ?? 'proxy';
+  const sink = input.sink ?? ledger?.sink;
+  const caseId = input.case_id ?? ledger?.case_id;
+  const runId = input.run_id ?? ledger?.run_id;
+  const taskId = input.task_id ?? ledger?.task_id;
+
   const entry: LlmUsageEntry = {
     input_tokens: Math.max(0, Math.floor(input.input_tokens)),
     output_tokens: Math.max(0, Math.floor(input.output_tokens)),
@@ -297,17 +343,27 @@ export async function recordProxyLlmUsage(
     recorded_at: new Date().toISOString(),
     ...resolveUsageAttribution(input),
   };
-  ledger?.entries.push(entry);
 
-  const sink = input.sink ?? ledger?.sink;
-  if (!sink) return;
+  if (ledger) {
+    ledger.entries.push(entry);
+  } else {
+    // 记账失败不改变上报：显式传了 sink 的调用点仍应把用量事件发出去。所以这里
+    // 不 return，只是如实记下「这批 token 进不了 run 级汇总」。
+    await reportLlmUsageDrop('dropped_no_ledger', sink, entry, caseId, runId, taskId);
+  }
 
-  const caseId = input.case_id ?? ledger?.case_id;
-  if (!caseId) return;
+  if (!sink) {
+    // 没有出口就无从上报，这条丢失只留在计数器里。
+    countLlmUsageDrop('dropped_no_sink');
+    return;
+  }
+
+  if (!caseId) {
+    await reportLlmUsageDrop('dropped_no_case_id', sink, entry, undefined, runId, taskId);
+    return;
+  }
 
   const scaffoldVariant = input.scaffold_variant ?? ledger?.scaffold_variant;
-  const runId = input.run_id ?? ledger?.run_id;
-  const taskId = input.task_id ?? ledger?.task_id;
   await emitTelemetry(
     sink,
     buildProxyUsageTelemetry({
@@ -350,6 +406,45 @@ function resolveUsageAttribution(input: LlmUsageAttribution): LlmUsageAttributio
   const round = input.round ?? scoped?.round;
   if (round !== undefined) resolved.round = round;
   return resolved;
+}
+
+/**
+ * 记一次流失，并在有出口时补一条 `llm.usage_dropped`。
+ *
+ * 上报是 best-effort：上报丢弃这件事本身再失败，就只剩计数器这一条观测面。不能让
+ * 「记不上账」升级成「调用失败」——观测反过来弄挂生产正是本模块要避免的事。
+ */
+async function reportLlmUsageDrop(
+  reason: LlmUsageDropReason,
+  sink: TelemetrySink | undefined,
+  entry: LlmUsageEntry,
+  caseId: string | undefined,
+  runId: string | undefined,
+  taskId: string | undefined,
+): Promise<void> {
+  countLlmUsageDrop(reason);
+  if (!sink) return;
+  try {
+    await emitTelemetry(
+      sink,
+      buildLlmUsageDroppedTelemetry({
+        reason,
+        ...(caseId ? { case_id: caseId } : {}),
+        input_tokens: entry.input_tokens,
+        output_tokens: entry.output_tokens,
+        ...(entry.model ? { model: entry.model } : {}),
+        ...(entry.stage_cursor ? { stage_cursor: entry.stage_cursor } : {}),
+        ...(entry.role_id ? { role_id: entry.role_id } : {}),
+        ...(entry.agent_id ? { agent_id: entry.agent_id } : {}),
+        ...(entry.tool_name ? { tool_name: entry.tool_name } : {}),
+        ...(entry.round !== undefined ? { round: entry.round } : {}),
+        ...(runId ? { run_id: runId } : {}),
+        ...(taskId ? { task_id: taskId } : {}),
+      }),
+    );
+  } catch {
+    // 吞掉：计数器已经记过了。
+  }
 }
 
 export function activeLedgerTokenCostTotal(): number {

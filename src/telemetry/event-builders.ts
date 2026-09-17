@@ -47,6 +47,29 @@ export interface ProxyUsageTelemetryInput {
   run_id?: RunId;
 }
 
+/**
+ * 一条用量没能进流水的原因。
+ *
+ * 名字即 payload 里的字面量，是外部契约：消费方按这个字符串分类计数。
+ */
+export type LlmUsageDropReason = 'dropped_no_ledger' | 'dropped_no_sink' | 'dropped_no_case_id';
+
+export interface LlmUsageDroppedTelemetryInput {
+  reason: LlmUsageDropReason;
+  /** 缺 case_id 时没有稳定主体可挂，用占位而不是把这条信号吞掉。 */
+  case_id?: string;
+  input_tokens: number;
+  output_tokens: number;
+  model?: string;
+  stage_cursor?: string;
+  role_id?: string;
+  agent_id?: string;
+  tool_name?: string;
+  round?: number;
+  task_id?: TaskId;
+  run_id?: RunId;
+}
+
 export interface SweBenchVerifiedEvaluationTelemetryInput {
   case_id: string;
   exit_code: number;
@@ -153,6 +176,41 @@ export function buildProxyUsageTelemetry(input: ProxyUsageTelemetryInput): Telem
       ...(input.scaffold_variant ? { scaffold_variant: input.scaffold_variant } : {}),
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.seed !== undefined ? { seed: input.seed } : {}),
+      ...(input.stage_cursor ? { stage_cursor: input.stage_cursor } : {}),
+      ...(input.role_id ? { role_id: input.role_id } : {}),
+      ...(input.agent_id ? { agent_id: input.agent_id } : {}),
+      ...(input.tool_name ? { tool_name: input.tool_name } : {}),
+      ...(input.round !== undefined ? { round: input.round } : {}),
+    },
+    source: { kind: 'proxy', object_type: 'LLM call' },
+  };
+}
+
+/**
+ * 「这条用量没能进流水」的上报。
+ *
+ * 丢弃本身就是要被看见的信号：token 记账失败不报错，只是汇总数字变小，看报告的人
+ * 无从知道少了。每次丢弃带原因上报一条，就能从 telemetry 流里数出「有多少用量没记
+ * 上账、卡在哪一步」，而不是只能怀疑汇总偏小。
+ *
+ * 没有 sink 时无从上报——那种情况只剩计数器可看，见 llm-usage-ledger。
+ */
+export function buildLlmUsageDroppedTelemetry(
+  input: LlmUsageDroppedTelemetryInput,
+): TelemetryEmission {
+  return {
+    event_type: 'llm.usage_dropped',
+    // 缺 case_id 正是被丢弃的原因之一，此时主体未知，如实写成 unattributed。
+    subject_id: input.case_id ?? 'unattributed',
+    subject_type: 'llm_call',
+    ...(input.run_id ? { run_id: input.run_id } : {}),
+    ...(input.task_id ? { task_id: input.task_id } : {}),
+    payload: {
+      reason: input.reason,
+      ...(input.case_id ? { case_id: input.case_id } : {}),
+      input_tokens: input.input_tokens,
+      output_tokens: input.output_tokens,
+      ...(input.model ? { model: input.model } : {}),
       ...(input.stage_cursor ? { stage_cursor: input.stage_cursor } : {}),
       ...(input.role_id ? { role_id: input.role_id } : {}),
       ...(input.agent_id ? { agent_id: input.agent_id } : {}),

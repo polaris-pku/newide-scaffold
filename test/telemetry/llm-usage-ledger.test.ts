@@ -9,9 +9,11 @@ import {
   mergeTokenUsageSummaries,
   recordProxyLlmUsage,
   releaseRunLlmUsageLedger,
+  resetLlmUsageDropCounters,
   runWithLlmUsageAttribution,
   runWithLlmUsageLedger,
   snapshotActiveLedgerUsage,
+  snapshotLlmUsageDropCounters,
   snapshotRunLedgerUsage,
   toRunTokenUsageSummary,
 } from '../../src/telemetry';
@@ -93,6 +95,7 @@ describe('llm-usage-ledger', () => {
   });
 
   it('attributes usage from the ambient scope and groups it by stage and role', async () => {
+    resetLlmUsageDropCounters();
     const sink = new InMemoryTelemetrySink();
     await runWithLlmUsageLedger({ case_id: 'case_attr', run_id: 'run_attr', sink }, async () => {
       await runWithLlmUsageAttribution({ stage_cursor: 'execute_agent', role_id: 'impl' }, () =>
@@ -120,6 +123,11 @@ describe('llm-usage-ledger', () => {
     expect(byRole.impl?.total_tokens).toBe(11);
     expect(byRole.critic?.total_tokens).toBe(22);
 
+    expect(snapshotLlmUsageDropCounters()).toEqual({
+      dropped_no_ledger: 0,
+      dropped_no_sink: 0,
+      dropped_no_case_id: 0,
+    });
     releaseRunLlmUsageLedger('run_attr');
   });
 
@@ -145,6 +153,7 @@ describe('llm-usage-ledger', () => {
   });
 
   it('carries cache tokens and attribution into the emitted usage payload', async () => {
+    resetLlmUsageDropCounters();
     const sink = new InMemoryTelemetrySink();
     await runWithLlmUsageLedger({ case_id: 'case_cache', sink }, () =>
       runWithLlmUsageAttribution({ stage_cursor: 'extract', role_id: 'promoter' }, () =>
@@ -169,6 +178,66 @@ describe('llm-usage-ledger', () => {
       stage_cursor: 'extract',
       role_id: 'promoter',
     });
+  });
+
+  it('counts a usage record with no active ledger as a drop and still reports it', async () => {
+    resetLlmUsageDropCounters();
+    const sink = new InMemoryTelemetrySink();
+    await recordProxyLlmUsage({
+      input_tokens: 7,
+      output_tokens: 3,
+      case_id: 'case_orphan',
+      sink,
+    });
+
+    // 没有 ledger 的调用点拿不到 run 级汇总，这批 token 会从 token_usage 里消失；
+    // 但显式传了 sink 的上报路径照常，所以用量事件本身仍然发得出去。
+    expect(snapshotLlmUsageDropCounters()).toMatchObject({
+      dropped_no_ledger: 1,
+      dropped_no_sink: 0,
+      dropped_no_case_id: 0,
+    });
+    expect(sink.list().map((record) => record.event_type)).toEqual([
+      'llm.usage_dropped',
+      'proxy.llm_usage_recorded',
+    ]);
+    expect(sink.list()[0]?.payload).toMatchObject({
+      reason: 'dropped_no_ledger',
+      case_id: 'case_orphan',
+      input_tokens: 7,
+      output_tokens: 3,
+    });
+    expect(sink.list()[0]?.subject_id).toBe('case_orphan');
+  });
+
+  it('counts a drop when neither a ledger nor a sink can receive the record', async () => {
+    resetLlmUsageDropCounters();
+    await recordProxyLlmUsage({ input_tokens: 5, output_tokens: 1 });
+
+    // 两个原因各发生一次：entry 无处可放，事件也无处可发。没有 sink 就没有出口，
+    // 这种丢失只能靠计数器看见。
+    expect(snapshotLlmUsageDropCounters()).toMatchObject({
+      dropped_no_ledger: 1,
+      dropped_no_sink: 1,
+      dropped_no_case_id: 0,
+    });
+  });
+
+  it('counts a drop when the ledger has a sink but no case id', async () => {
+    resetLlmUsageDropCounters();
+    const sink = new InMemoryTelemetrySink();
+    await runWithLlmUsageLedger({ case_id: '', sink }, () =>
+      recordProxyLlmUsage({ input_tokens: 4, output_tokens: 2 }),
+    );
+
+    expect(snapshotLlmUsageDropCounters()).toMatchObject({
+      dropped_no_ledger: 0,
+      dropped_no_sink: 0,
+      dropped_no_case_id: 1,
+    });
+    // case_id 正是丢失的原因，主体只能如实写成未归属，而不是编一个出来。
+    expect(sink.list().map((record) => record.event_type)).toEqual(['llm.usage_dropped']);
+    expect(sink.list()[0]?.subject_id).toBe('unattributed');
   });
 
   it('detaches the run ledger on release so it does not outlive the run', async () => {
