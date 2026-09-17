@@ -41,6 +41,7 @@ import {
 import type { GateResult } from '../gate';
 import type { TaskResumeCursor } from '../persistence';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../protocol/agent-execution';
+import { recordRunEventConsumed } from '../telemetry';
 import type {
   CouncilStageExecutor,
   DeliverStageExecutor,
@@ -1201,6 +1202,9 @@ function emit<TCursor extends TaskResumeCursor>(
     created_at: nowTimestamp(),
     schema_version: SCHEMA_VERSION,
   };
+  // 只在这一处计数：这是全部阶段事件的唯一出口，计数因此不可能漏掉某个调用点。
+  // 放在 on_event 之前——事件此时已经产生，消费方随后抛错不该让它从计数里消失。
+  recordRunEventConsumed(eventType, payload);
   context.on_event(event);
 }
 

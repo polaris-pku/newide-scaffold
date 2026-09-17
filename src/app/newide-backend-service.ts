@@ -25,8 +25,11 @@ import {
   type RestoreFileAnchorResult,
 } from '../checkpoint';
 import {
+  NoopTelemetrySink,
   releaseRunLlmUsageLedger,
   runWithLlmUsageLedger,
+  runWithRunEventConsumption,
+  RunEventConsumptionRecorder,
   type TelemetryRecord,
   type TelemetrySink,
 } from '../telemetry';
@@ -259,6 +262,8 @@ export class NewideBackendService {
     private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
     private readonly participantSessionProvisioner?: ParticipantSessionProvisioner,
     private readonly artifactContentReader?: RunArtifactContentReader,
+    /** 事件消耗汇总的去处，生产注入按 run 落文件的 sink；不注入则整体空转。 */
+    private readonly runEventConsumptionSink: TelemetrySink = new NoopTelemetrySink(),
   ) {}
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
@@ -887,6 +892,16 @@ export class NewideBackendService {
     const sink: TelemetrySink = {
       emit: (record) => this.appendTelemetry(input.identity, record),
     };
+    // 事件计数与账本共用这个 run 作用域：计数器的 ALS 必须在 loop 外层建立，因为
+    // 阶段事件的出口（stage executor 的 emit）与提交回调都在 loop 内部。
+    // 落点刻意**不是**上面那个 registry sink：汇总信号若进 run 的事件流，就会排在
+    // run.completed 之后，破坏「最后一条事件是终态」的消费方断言。观测信号走自己的
+    // 文件（`event-consumption.jsonl`），与 latency.jsonl 同一套约定。
+    const consumption = new RunEventConsumptionRecorder({
+      run_id: runId,
+      task_id: taskId,
+      sink: this.runEventConsumptionSink,
+    });
     try {
       await runWithLlmUsageLedger(
         {
@@ -896,12 +911,15 @@ export class NewideBackendService {
           sink,
           scaffold_variant: 'full_system',
         },
-        () => this.runAuthorityLoop(input),
+        () => runWithRunEventConsumption(consumption, () => this.runAuthorityLoop(input)),
       );
     } finally {
       // 挂在 run 终态而不是别处：B 记忆维护在循环内部读同一个 run 的账本，提前释放会让
       // 它读到空账，进而用偏小的部分值覆盖 summary.token_usage。
       releaseRunLlmUsageLedger(runId);
+      // 与上面同理放 finally：失败的 run 往往才是事件堆得最多的一类，只在成功路径
+      // 发信号会正好把它漏掉。finish() 自身不抛错，不改变原来的异常语义。
+      await consumption.finish();
     }
   }
 

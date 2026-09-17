@@ -145,6 +145,26 @@ export class SqliteCoordinationStore
       .map((row) => readEvent(row));
   }
 
+  /**
+   * 按 run 统计事件条数与分布，供埋点对账使用。
+   *
+   * 只读，且刻意不解析 payload：对账只需要条数，把整份事件流读出来反序列化一遍纯属浪费。
+   * 走 `events(run_id, sequence)` 索引，不需要新的 schema。
+   */
+  countEvents(runId: string): { total: number; by_type: Record<string, number> } {
+    const rows = this.database
+      .prepare('SELECT event_type, COUNT(*) AS count FROM events WHERE run_id = ? GROUP BY event_type')
+      .all(runId);
+    const byType: Record<string, number> = {};
+    let total = 0;
+    for (const row of rows) {
+      const count = readNumber(row, 'count');
+      byType[readString(row, 'event_type')] = count;
+      total += count;
+    }
+    return { total, by_type: byType };
+  }
+
   getLatestCheckpoint(taskId: string): PersistedFullCheckpoint | undefined {
     const row = this.database
       .prepare(

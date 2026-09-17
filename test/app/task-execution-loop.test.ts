@@ -13,7 +13,9 @@ import {
   InMemoryTelemetrySink,
   recordProxyLlmUsage,
   releaseRunLlmUsageLedger,
+  RunEventConsumptionRecorder,
   runWithLlmUsageLedger,
+  runWithRunEventConsumption,
   type RunLatencySpan,
 } from '../../src/telemetry';
 import {
@@ -53,6 +55,44 @@ describe('TaskExecutionLoop', () => {
     expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state).not.toHaveProperty(
       'current_run_id',
     );
+  });
+
+  it('把提交批次记到 run 上，且条数与 events 表里的真值相等', async () => {
+    const fixture = createFixture();
+    begin(fixture.processor, selectInput, 'single_agent');
+    const sink = new InMemoryTelemetrySink();
+    const consumption = new RunEventConsumptionRecorder({
+      run_id: 'run_loop',
+      task_id: 'task_loop',
+      sink,
+    });
+
+    const seen: string[] = [];
+    await runWithRunEventConsumption(consumption, () =>
+      fixture.loop.run({
+        task_id: 'task_loop',
+        run_id: 'run_loop',
+        on_committed_events: (events) => {
+          for (const event of events) seen.push(event.event_type);
+        },
+      }),
+    );
+    const totals = await consumption.finish();
+
+    // 对账用集合关系而不是等式：events 表里的行为什么比提交回调报出来的多，是有具体
+    // 原因的——有几类生命周期事件不经提交回调写入。等式在这里恒假，写成「差集恰好
+    // 等于这几个类型」才是真的，而且能反过来抓住「某条提交路径漏记」。
+    const persisted = fixture.store.countEvents('run_loop');
+    const NOT_VIA_COMMIT = ['checkpoint.saved', 'run.created', 'run.started', 'task.created'];
+    const uncounted = NOT_VIA_COMMIT.reduce((sum, type) => sum + (persisted.by_type[type] ?? 0), 0);
+
+    expect(totals.committed_batches).toBeGreaterThan(0);
+    expect(totals.committed_events).toBe(seen.length);
+    expect(persisted.total - uncounted).toBe(totals.committed_events);
+    expect(Object.values(persisted.by_type).reduce((sum, count) => sum + count, 0)).toBe(
+      persisted.total,
+    );
+    expect(sink.list().map((record) => record.event_type)).toContain('run.event_committed_batch');
   });
 
   it('propagates memory ablation to every production stage context', async () => {

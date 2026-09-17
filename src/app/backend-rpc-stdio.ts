@@ -64,7 +64,7 @@ import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
-import { createRunLatency } from '../telemetry';
+import { createRunLatency, FileRunEventConsumptionSink } from '../telemetry';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -498,6 +498,7 @@ export async function createProductionBackendService(
       ),
       (input) => agentExecutionFacade.provisionParticipantSession(input),
       new FileRunArtifactContentReader(runsRoot),
+      new FileRunEventConsumptionSink(runsRoot),
     );
     await service.recoverMailboxWaits();
     return service;
