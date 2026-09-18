@@ -2,10 +2,10 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   CompositeTelemetrySink,
+  InMemoryTelemetrySink,
   JsonlTelemetrySink,
-} from '../../src/telemetry/jsonl-telemetry-sink';
-import { createFHarnessTelemetryPort } from '../../src/telemetry/harness-port';
-import { InMemoryTelemetrySink } from '../../src/telemetry/telemetry-sink';
+  createFHarnessTelemetryPort,
+} from '../../src/telemetry';
 import { writeJson } from '../run-summary';
 import { assertCaseExists, parseCooperBenchCaseId, parseCooperBenchSetting } from './cases';
 import {

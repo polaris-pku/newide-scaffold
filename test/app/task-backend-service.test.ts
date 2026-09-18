@@ -25,6 +25,8 @@ import {
   type TaskCursorInput,
 } from '../../src/persistence';
 import {
+  FileRunEventConsumptionSink,
+  FileRunTelemetryJsonlSink,
   recordProxyLlmUsage,
   resetLlmUsageDropCounters,
   snapshotLlmUsageDropCounters,
@@ -255,12 +257,18 @@ describe('NewideBackendService Task-first view', () => {
       new FileRunTerminalOutputWriter(runsRoot),
       new FileRunRequestStore(runsRoot),
       processor,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+      undefined, // mailboxService
+      undefined, // mailboxRecovery
+      undefined, // closeRuntime
+      undefined, // bMemoryService
+      undefined, // driverStreamAuditWriter
       loop,
+      undefined, // systemStatusService
+      undefined, // mailboxDeliveryWorker
+      undefined, // participantSessionProvisioner
+      undefined, // artifactContentReader
+      new FileRunEventConsumptionSink(runsRoot),
+      new FileRunTelemetryJsonlSink(runsRoot),
     );
 
     resetLlmUsageDropCounters();
@@ -299,6 +307,21 @@ describe('NewideBackendService Task-first view', () => {
         await readFile(path.join(runsRoot, runId, 'summary.json'), 'utf8'),
       ) as { token_usage?: { total_tokens?: number; call_count?: number } };
       expect(summary.token_usage).toMatchObject({ total_tokens: 220, call_count: 2 });
+
+      // 同一批记录还要按 run 落观测文件：telemetry.jsonl 记的是「这个 run 收到了哪些
+      // telemetry 记录」，与事件流是两条腿，落点不同（见 FileRunTelemetryJsonlSink）。
+      const telemetryRecords = (
+        await readFile(path.join(runsRoot, runId, 'telemetry.jsonl'), 'utf8')
+      )
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { event_type: string; run_id?: string });
+      expect(telemetryRecords.map((record) => record.event_type)).toEqual([
+        'proxy.llm_usage_recorded',
+        'proxy.llm_usage_recorded',
+      ]);
+      // 落盘按 run 分目录，行里缺 run_id 就是坏行，所以漏斗负责补齐。
+      expect(telemetryRecords.every((record) => record.run_id === runId)).toBe(true);
     } finally {
       await rm(runsRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }

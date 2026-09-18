@@ -1,8 +1,11 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CompositeTelemetrySink, JsonlTelemetrySink } from '../src/telemetry/jsonl-telemetry-sink';
-import { createFHarnessTelemetryPort } from '../src/telemetry/harness-port';
-import { InMemoryTelemetrySink } from '../src/telemetry/telemetry-sink';
+import {
+  CompositeTelemetrySink,
+  InMemoryTelemetrySink,
+  JsonlTelemetrySink,
+  createFHarnessTelemetryPort,
+} from '../src/telemetry';
 import { getInstanceOrThrow, indexDatasetById, loadDataset } from './load-dataset';
 import { loadDatasetSubset, loadManifest, resolveDatasetJsonl, resolveRunDir } from './paths';
 import { buildPrediction, writePredictionsJsonl } from './prediction-writer';

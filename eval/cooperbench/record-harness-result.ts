@@ -3,10 +3,10 @@ import { copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   CompositeTelemetrySink,
+  InMemoryTelemetrySink,
   JsonlTelemetrySink,
-} from '../../src/telemetry/jsonl-telemetry-sink';
-import { createFHarnessTelemetryPort } from '../../src/telemetry/harness-port';
-import { InMemoryTelemetrySink } from '../../src/telemetry/telemetry-sink';
+  createFHarnessTelemetryPort,
+} from '../../src/telemetry';
 import { readFlag } from '../cli-args';
 import { writeJson } from '../run-summary';
 import { parseCooperBenchSetting } from './cases';

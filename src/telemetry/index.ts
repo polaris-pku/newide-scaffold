@@ -1,5 +1,6 @@
 export * from './event-catalog';
 export * from './telemetry-sink';
+export * from './jsonl-telemetry-sink';
 export * from './event-builders';
 export * from './emit';
 export * from './memory-cycle-observer';
