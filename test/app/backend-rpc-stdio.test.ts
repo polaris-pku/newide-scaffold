@@ -15,6 +15,7 @@ import {
   readAuctionEnabled,
   readCouncilAuctionEnabled,
   readCouncilProposerCount,
+  readTelemetryJsonlEnabled,
   resolveProductionLlmRuntime,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
@@ -52,6 +53,24 @@ describe('readAuctionEnabled', () => {
 
   it('rejects invalid values', () => {
     expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
+
+describe('readTelemetryJsonlEnabled', () => {
+  it('defaults to on', () => {
+    expect(readTelemetryJsonlEnabled(undefined)).toBe(true);
+    expect(readTelemetryJsonlEnabled('')).toBe(true);
+  });
+
+  it('parses the off switch', () => {
+    expect(readTelemetryJsonlEnabled('0')).toBe(false);
+    expect(readTelemetryJsonlEnabled('false')).toBe(false);
+    expect(readTelemetryJsonlEnabled('FALSE')).toBe(false);
+    expect(readTelemetryJsonlEnabled('1')).toBe(true);
+  });
+
+  it('rejects invalid values', () => {
+    expect(() => readTelemetryJsonlEnabled('maybe')).toThrow('NEWIDE_TELEMETRY_JSONL');
   });
 });
 

@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import { copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { CompositeTelemetrySink, JsonlTelemetrySink } from '../src/telemetry/jsonl-telemetry-sink';
-import { createFHarnessTelemetryPort } from '../src/telemetry/harness-port';
-import { InMemoryTelemetrySink } from '../src/telemetry/telemetry-sink';
+import {
+  CompositeTelemetrySink,
+  InMemoryTelemetrySink,
+  JsonlTelemetrySink,
+  createFHarnessTelemetryPort,
+} from '../src/telemetry';
 import { getInstanceReport, hasP2pRegression, readHarnessReport } from './harness-report';
 import { resolveRunDir } from './paths';
 import { buildEvalSummary, writeJson } from './run-summary';

@@ -64,7 +64,13 @@ import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
-import { createRunLatency, FileRunEventConsumptionSink } from '../telemetry';
+import {
+  createRunLatency,
+  FileRunEventConsumptionSink,
+  FileRunTelemetryJsonlSink,
+  NoopTelemetrySink,
+  type TelemetrySink,
+} from '../telemetry';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -477,6 +483,13 @@ export async function createProductionBackendService(
         readiness: 'host_managed',
       },
     });
+    // 一次 run 一份 telemetry.jsonl（该 run 收到的全部 telemetry 记录）。关掉开关时换成
+    // 空转 sink，生产行为与接线前逐位一致：不建文件、不写盘，其余路径一行未改。
+    const runTelemetryJsonlSink: TelemetrySink = readTelemetryJsonlEnabled(
+      env.NEWIDE_TELEMETRY_JSONL,
+    )
+      ? new FileRunTelemetryJsonlSink(runsRoot)
+      : new NoopTelemetrySink();
     const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
@@ -499,6 +512,7 @@ export async function createProductionBackendService(
       (input) => agentExecutionFacade.provisionParticipantSession(input),
       new FileRunArtifactContentReader(runsRoot),
       new FileRunEventConsumptionSink(runsRoot),
+      runTelemetryJsonlSink,
     );
     await service.recoverMailboxWaits();
     return service;
@@ -919,6 +933,20 @@ export function readAuctionEnabled(value: string | undefined): boolean {
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
   throw new Error(`Invalid NEWIDE_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
+}
+
+/**
+ * NEWIDE_TELEMETRY_JSONL 解析：默认 true；"0"/"false" 关闭。
+ *
+ * 关掉是「怀疑埋点本身在干扰生产」时的对照手段，所以关闭路径必须干净：换空转 sink，
+ * 不建文件、不写盘。
+ */
+export function readTelemetryJsonlEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_TELEMETRY_JSONL: ${value}. Expected 0/1/true/false.`);
 }
 
 export function readCouncilAuctionEnabled(value: string | undefined): boolean {

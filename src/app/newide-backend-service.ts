@@ -264,6 +264,12 @@ export class NewideBackendService {
     private readonly artifactContentReader?: RunArtifactContentReader,
     /** 事件消耗汇总的去处，生产注入按 run 落文件的 sink；不注入则整体空转。 */
     private readonly runEventConsumptionSink: TelemetrySink = new NoopTelemetrySink(),
+    /**
+     * 该 run 收到的 telemetry 记录的去处——与进入事件流的那批同源同过滤，生产注入
+     * 按 run 落文件的 sink。与 `runEventConsumptionSink` 同为文件 sink 但收集面不同，
+     * 别接反。
+     */
+    private readonly runTelemetryJsonlSink: TelemetrySink = new NoopTelemetrySink(),
   ) {}
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
@@ -1611,6 +1617,35 @@ export class NewideBackendService {
     if (record.run_id && record.run_id !== identity.run_id) return;
     if (record.task_id && record.task_id !== identity.task_id) return;
     this.registry.appendEvent(identity.run_id, record.event_type, record.payload);
+    this.writeRunTelemetryRecord(identity, record);
+  }
+
+  /**
+   * 追加一条该 run 的 telemetry 记录到观测文件。
+   *
+   * 挂在 `appendTelemetry` 而不是构造 sink 的地方：这里是 telemetry 记录归属到某个
+   * run 的唯一漏斗，legacy 路径在拿到 identity 之前缓冲的记录也要从这里过一次
+   * （`startLegacyRun` 的 pendingTelemetry），挂在别处要么漏掉它们、要么在 run 还没
+   * 定身份时无处安放。
+   *
+   * `run_id` / `task_id` 按 identity 补齐：文件本就按 run 分目录，一行缺 run_id 在
+   * 这个文件里就是坏行；registry 那边也是按 identity 归属的，两边口径因此一致。
+   */
+  private writeRunTelemetryRecord(
+    identity: { run_id: string; task_id: string },
+    record: TelemetryRecord,
+  ): void {
+    try {
+      void Promise.resolve(
+        this.runTelemetryJsonlSink.emit({
+          ...record,
+          run_id: identity.run_id,
+          task_id: record.task_id ?? identity.task_id,
+        }),
+      ).catch(() => undefined);
+    } catch {
+      // 落盘是观测：同步抛出也只丢这一条信号，不影响 run。
+    }
   }
 
   private appendDomainEvent(identity: { run_id: string; task_id: string }, event: Event): void {
