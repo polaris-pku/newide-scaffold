@@ -440,10 +440,13 @@ export async function createProductionBackendService(
       participantSessions,
     });
     taskProcessor.recoverInterruptedTasks();
+    // 工厂必须活到 run 结束：`snapshot(runId)` 要拿内存缓冲算聚合，写进 summary 的
+    // consumption 块。以前这里直接取 `.createRecorder` 把工厂丢掉，聚合因此不可达。
+    const runLatency = createRunLatency({ root: runsRoot });
     const taskExecutionLoop = new TaskExecutionLoop({
       processor: taskProcessor,
       evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
-      create_latency_recorder: createRunLatency({ root: runsRoot }).createRecorder,
+      create_latency_recorder: runLatency.createRecorder,
       executors: createProductionStageExecutors({
         selectAgentHandler,
         agentExecutionFacade,
@@ -494,7 +497,7 @@ export async function createProductionBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
-      new FileRunTerminalOutputWriter(runsRoot),
+      new FileRunTerminalOutputWriter(runsRoot, runLatency),
       new FileRunRequestStore(runsRoot),
       taskProcessor,
       mailboxService,

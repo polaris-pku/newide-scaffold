@@ -3,8 +3,12 @@ import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
+import {
+  FileRunTerminalOutputWriter,
+  summarizeRunConsumption,
+} from '../../src/app/run-terminal-output-writer';
 import type { AppRunSnapshot } from '../../src/app/run-registry';
+import { createRunLatency } from '../../src/telemetry';
 
 const tempDirs: string[] = [];
 
@@ -96,6 +100,99 @@ describe('FileRunTerminalOutputWriter', () => {
         call_count: 2,
       },
     });
+  });
+
+  it('summarizes per-stage events, tokens and latency into summary.consumption', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runLatency = createRunLatency({ root: runsRoot, persist: false });
+    await runLatency
+      .createRecorder({ run_id: 'run_failed', task_id: 'task_failed' })
+      .span('stage.execute_agent', {}, async () => undefined);
+    const snapshot = failedSnapshot();
+    snapshot.events = [
+      {
+        event_id: 'run_event_stage',
+        sequence: 2,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'handler.started',
+        source: 'coordinator',
+        created_at: '2026-07-11T08:00:01.000Z',
+        payload: { cursor: 'execute_agent' },
+        schema_version: 'v0',
+      },
+      {
+        event_id: 'run_event_usage',
+        sequence: 3,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'proxy.llm_usage_recorded',
+        source: 'proxy',
+        created_at: '2026-07-11T08:00:02.000Z',
+        payload: {
+          stage_cursor: 'execute_agent',
+          input_tokens: 120,
+          output_tokens: 30,
+          cache_read_input_tokens: 8,
+        },
+        schema_version: 'v0',
+      },
+      {
+        event_id: 'run_event_stage_done',
+        sequence: 4,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'handler.completed',
+        source: 'coordinator',
+        created_at: '2026-07-11T08:00:03.000Z',
+        payload: { cursor: 'execute_agent', next_cursor: 'gate' },
+        schema_version: 'v0',
+      },
+      ...snapshot.events,
+    ];
+
+    await new FileRunTerminalOutputWriter(runsRoot, runLatency).finalize(snapshot);
+
+    const summary = (await readJson(path.join(runsRoot, 'run_failed', 'summary.json'))) as {
+      consumption: {
+        totals: Record<string, number>;
+        by_stage: Record<string, { events: number; llm_calls: number; duration_ms: number }>;
+        latency_by_name: Record<string, { count: number }>;
+      };
+    };
+    // total_tokens 走账本口径：含 cache，所以不等于 input + output。
+    expect(summary.consumption.totals).toMatchObject({
+      events: 4,
+      llm_calls: 1,
+      input_tokens: 120,
+      output_tokens: 30,
+      cache_read_input_tokens: 8,
+      total_tokens: 158,
+    });
+    // started / usage / completed 三条都算在它们界定的那个 stage 名下。
+    expect(summary.consumption.by_stage.execute_agent).toMatchObject({ events: 3, llm_calls: 1 });
+    // run.failed 在窗口关闭之后，落在 unattributed 桶。
+    expect(summary.consumption.by_stage.unattributed).toMatchObject({ events: 1 });
+    expect(summary.consumption.by_stage.execute_agent?.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(summary.consumption.latency_by_name['stage.execute_agent']).toMatchObject({ count: 1 });
+  });
+
+  it('degrades to event counts when the run has neither spans nor usage records', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
+
+    const summary = (await readJson(path.join(runsRoot, 'run_failed', 'summary.json'))) as {
+      consumption: Record<string, unknown>;
+    };
+    expect(summary.consumption).toMatchObject({
+      schema_version: 'newide.run_consumption.v1',
+      totals: { events: 1, llm_calls: 0, total_tokens: 0, duration_ms: 0 },
+      by_stage: { unattributed: { events: 1 } },
+    });
+    expect(summary.consumption).not.toHaveProperty('latency_by_name');
   });
 
   it('writes memory_ablation from agent.execution_requested when context_pack is missing', async () => {
@@ -230,6 +327,11 @@ describe('FileRunTerminalOutputWriter', () => {
         context_tokens_used: 321,
         sessions: [{ session_id: 'session_usage', role_id: 'role_usage' }],
       },
+      // summary.json 已先存在时首写是空操作（wx），consumption 只能靠收尾那次并入。
+      consumption: {
+        schema_version: 'newide.run_consumption.v1',
+        totals: { events: 1 },
+      },
     });
   });
 
@@ -277,6 +379,58 @@ describe('FileRunTerminalOutputWriter', () => {
       timeline: withoutError.events,
       errors: [],
       final_output: { status: 'completed' },
+    });
+  });
+});
+
+describe('summarizeRunConsumption', () => {
+  it('attributes events to the stage open at the time, and prefers an explicit stage', () => {
+    const summary = summarizeRunConsumption([
+      { type: 'run.created', payload: { mode: 'single_agent' } },
+      { type: 'handler.started', payload: { cursor: 'select_agent' } },
+      { type: 'handler.completed', payload: { cursor: 'select_agent', next_cursor: 'gate' } },
+      // 窗口已关：这条属于 run，不该塞给 select_agent。
+      { type: 'run.started', payload: { mode: 'single_agent' } },
+      { type: 'handler.started', payload: { cursor: 'deliver' } },
+      // 用量事件自带归属：它记在 gate 名下，即使此刻开着的是 deliver。
+      {
+        type: 'proxy.llm_usage_recorded',
+        payload: { stage_cursor: 'gate', input_tokens: 7, output_tokens: 3 },
+      },
+    ]);
+
+    expect(summary.by_stage.unattributed).toMatchObject({ events: 2 });
+    expect(summary.by_stage.select_agent).toMatchObject({ events: 2, llm_calls: 0 });
+    expect(summary.by_stage.deliver).toMatchObject({ events: 1, llm_calls: 0 });
+    expect(summary.by_stage.gate).toMatchObject({ events: 1, llm_calls: 1, total_tokens: 10 });
+    expect(summary.totals).toMatchObject({ events: 6, llm_calls: 1, total_tokens: 10 });
+    expect(summary).not.toHaveProperty('latency_by_name');
+  });
+
+  it('folds stage spans into stage durations and keeps the rest by name', () => {
+    const summary = summarizeRunConsumption(
+      [{ type: 'handler.started', payload: { cursor: 'gate' } }],
+      {
+        run_id: 'run_x',
+        span_count: 3,
+        by_name: {
+          'stage.gate': { count: 1, total_duration_ms: 42, max_duration_ms: 42 },
+          // stage 有 span 但没有事件归到它名下时，耗时仍要出现，故这里应新建桶。
+          'stage.deliver': { count: 1, total_duration_ms: 5, max_duration_ms: 5 },
+          'agent.llm_round': { count: 2, total_duration_ms: 10, max_duration_ms: 6 },
+        },
+        by_layer: {
+          stage: { count: 2, total_duration_ms: 47 },
+          agent: { count: 2, total_duration_ms: 10 },
+        },
+      },
+    );
+
+    expect(summary.by_stage.gate).toMatchObject({ events: 1, duration_ms: 42 });
+    expect(summary.by_stage.deliver).toMatchObject({ events: 0, duration_ms: 5 });
+    expect(summary.totals.duration_ms).toBe(47);
+    expect(summary.latency_by_name).toMatchObject({
+      'agent.llm_round': { count: 2, total_duration_ms: 10 },
     });
   });
 });
