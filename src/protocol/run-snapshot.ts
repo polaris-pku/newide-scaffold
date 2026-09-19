@@ -26,6 +26,8 @@ const runOutcomeSchema = z
 
 export const councilOutcomeEvidenceSchema = z
   .object({
+    role_failure_count: z.number().int().nonnegative().optional(),
+    fallback_used: z.boolean().optional(),
     status: z.enum(['completed', 'needs_human', 'failed']),
     participant_role_ids: z.array(z.string().min(1)),
     selected_artifact_refs: z.array(z.string().min(1)),

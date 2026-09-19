@@ -654,6 +654,7 @@ export function createProductionStageExecutors(
         result: councilRunResult.result,
         outcome: councilRunResult.outcome,
         plan_execution: councilRunResult.plan_execution,
+        diagnostic_refs: councilRunResult.diagnostic_refs ?? [],
         ...(strategyName ? { strategy: strategyName } : {}),
       });
       emit(context, 'artifact.selected', selection.manifest_ref, {

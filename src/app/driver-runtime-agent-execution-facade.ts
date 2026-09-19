@@ -199,7 +199,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     input: ParticipantSessionProvisionRequest,
   ): Promise<string> {
     await this.ensureRole(input.role_id);
-    const result = await this.options.driver.sendPrompt({
+    const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
       prompt: [
@@ -211,7 +211,17 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       workspace_path: input.workspace_path,
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
-    });
+    };
+    let result = await this.options.driver.sendPrompt(prompt);
+    if (isArtifactFreeRetryableFailure(result) && !/\bSESSION_READY\b/.test(result.response ?? '')) {
+      const sessionId = result.session_id && result.session_id !== this.options.driver.session_id && result.session_id !== 'session-unavailable'
+        ? result.session_id : undefined;
+      result = await this.options.driver.sendPrompt({
+        ...prompt,
+        run_id: `${prompt.run_id}:retry`,
+        ...(sessionId ? { session_id: sessionId } : {}),
+      });
+    }
     const usableSession =
       Boolean(result.session_id) &&
       result.session_id !== this.options.driver.session_id &&
@@ -629,9 +639,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
     const waitForReply = expectsMailboxReply(kind);
-    if (waitForReply && invocation.context_policy === 'council_primary_plan') {
+    if (waitForReply && invocation.context_policy?.startsWith('council_')) {
       throw new Error(
-        'Council primary planning is independent: write council-plan.md instead of waiting for a Mailbox reply',
+        'Council phases cannot wait for a Mailbox reply: continue the assigned role with the staged evidence and record any missing information in the report',
       );
     }
     invocation.mailbox_sequence += 1;
@@ -970,6 +980,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...execution.diagnostics,
         driver_status: execution.status,
         driver_attempts: driverAttempts,
+        driver_report: dispatched.cycle.buffer_snapshot.driver_return,
         dispatch_status: dispatched.status,
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],

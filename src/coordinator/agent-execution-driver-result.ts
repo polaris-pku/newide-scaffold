@@ -29,6 +29,9 @@ export function buildDriverRunResultFromAgentExecution(
       driver_id: String(input.result.diagnostics.driver_id ?? input.result.role_id),
       duration_ms: readDurationMs(input.result.diagnostics.duration_ms),
       notes: ['Adapted from AgentExecutionFacade result.'],
+      ...(input.result.diagnostics.driver_report
+        ? { driver_report: input.result.diagnostics.driver_report }
+        : {}),
     },
     ...(input.result.status === 'failed'
       ? {

@@ -188,7 +188,19 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     }
   });
 
-  it('keeps the primary Plan phase independent of blocking Mailbox requests', async () => {
+  it('retries a transient Session initialization once and preserves a known Session', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const send = vi.spyOn(driver, 'sendPrompt');
+    send.mockResolvedValueOnce({ ...driverResult(driver, 'failed', 'session_started'), error: { code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR', message: 'temporary connection loss', retryable: true } });
+    send.mockResolvedValueOnce({ ...driverResult(driver, 'succeeded', 'session_started'), response: 'SESSION_READY' });
+    const { facade } = createFacade(driver);
+    expect(await facade.provisionParticipantSession({ task_id: 'task_init', run_id: 'run_init', workspace_path: os.tmpdir(), role_id: 'proposer_a' })).toBe('session_started');
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]![0]).toMatchObject({ session_id: 'session_started', run_id: expect.stringMatching(/:retry$/) });
+  });
+
+  it.each(['council_primary_plan', 'council_proposer', 'council_reviewer', 'council_synthesizer'])(
+    'rejects blocking Mailbox requests immediately in %s', async (contextPolicy) => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-plan-mailbox-'));
     const repository = new InMemoryRepository();
     await repository.initializeAgent({ role_id: 'role_primary', name: 'Primary' });
@@ -211,7 +223,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         ...request('task_plan_mailbox', 'role_primary', workspace),
         instruction: 'Write council-plan.md.',
         driver_instruction: 'Write council-plan.md.',
-        context_policy: 'council_primary_plan',
+        context_policy: contextPolicy,
       });
 
       expect(result).toMatchObject({

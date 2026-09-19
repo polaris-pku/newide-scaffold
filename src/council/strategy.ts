@@ -131,8 +131,11 @@ export function reconcileCouncilOutcome(
     outcome: {
       ...current,
       status: 'completed',
+      decision_summary: result.decision.reason,
+      role_failure_count: councilResult.role_failure_count ?? 0,
+      fallback_used: councilResult.fallback_used ?? false,
       selected_artifact_refs: unique([
-        ...current.selected_artifact_refs,
+        ...result.selected_artifact_refs,
         councilResult.final_artifact_ref,
       ]),
       quality: councilResult.quality,

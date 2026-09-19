@@ -17,7 +17,11 @@ export function assertCouncilPlanArtifacts(
   options: { required?: boolean } = {},
 ): ArtifactRef[] {
   const materializable = artifacts.filter(isMaterializableFileArtifact);
-  const invalid = materializable.filter((artifact) => !isCouncilPlanArtifact(artifact));
+  const invalid = materializable.filter(
+    (artifact) =>
+      !isCouncilPlanArtifact(artifact) &&
+      !(phase === 'review' && isCouncilReviewArtifact(artifact)),
+  );
   if (invalid.length > 0) {
     throw new Error(
       `Council ${phase} produced product files during plan-first execution: ${invalid
@@ -29,4 +33,8 @@ export function assertCouncilPlanArtifacts(
     throw new Error(`Council ${phase} produced no materializable Plan artifact`);
   }
   return materializable;
+}
+
+export function isCouncilReviewArtifact(artifact: ArtifactRef): boolean {
+  return isMaterializableFileArtifact(artifact) && artifact.content?.target_path === 'reviews.json';
 }

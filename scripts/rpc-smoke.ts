@@ -501,6 +501,7 @@ process.stdin.on('end', () => {
   appendFileSync(new URL('./invocations.log', import.meta.url), 'invoke\\n');
   const writeResult = () => process.stdout.write(JSON.stringify({
     driver_run_result_id: 'driver_result_' + suffix,
+    response: input.prompt.includes('Review the isolated proposal inputs') ? JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }) : 'Done.',
     session_id: 'session_' + suffix,
     status: 'succeeded',
     artifacts: [artifact],

@@ -4,10 +4,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { ArtifactRef } from '../core';
-import {
-  isMaterializableFileArtifact,
-  readArtifactBytes,
-} from '../coordinator/artifact-content';
+import { isMaterializableFileArtifact, readArtifactBytes } from '../coordinator/artifact-content';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,17 +35,7 @@ export async function prepareCouncilWorkspace(
   if (await isGitWorkspace(source)) {
     await execFileAsync(
       'git',
-      [
-        '-C',
-        source,
-        '-c',
-        'core.longpaths=true',
-        'worktree',
-        'add',
-        '--detach',
-        target,
-        'HEAD',
-      ],
+      ['-C', source, '-c', 'core.longpaths=true', 'worktree', 'add', '--detach', target, 'HEAD'],
       {
         maxBuffer: 10 * 1024 * 1024,
       },
@@ -93,7 +80,18 @@ export async function stageCouncilArtifacts(
     if (!isMaterializableFileArtifact(artifact)) continue;
     const targetPath = artifact.content?.target_path;
     if (!targetPath) continue;
-    const target = path.join(workspace, 'inputs', artifact.artifact_id, targetPath);
+    if (!/^[A-Za-z0-9_-]+$/.test(artifact.artifact_id)) {
+      throw new Error(`Invalid Council artifact id: ${artifact.artifact_id}`);
+    }
+    const relative = targetPath.replaceAll('\\', '/');
+    if (
+      path.posix.isAbsolute(relative) ||
+      path.win32.isAbsolute(relative) ||
+      relative.split('/').includes('..')
+    ) {
+      throw new Error(`Council artifact target escapes workspace: ${targetPath}`);
+    }
+    const target = path.join(workspace, 'inputs', artifact.artifact_id, relative);
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, await readArtifactBytes(artifact));
   }
@@ -103,10 +101,11 @@ async function isGitWorkspace(workspace: string): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync(
       'git',
-      ['-C', workspace, 'rev-parse', '--is-inside-work-tree'],
+      ['-C', workspace, 'rev-parse', '--show-toplevel'],
       { maxBuffer: 1024 * 1024 },
     );
-    return stdout.trim() === 'true';
+    // A project nested inside another repository must not clone that parent's HEAD.
+    return (await fs.realpath(stdout.trim())) === (await fs.realpath(workspace));
   } catch {
     return false;
   }
