@@ -39,6 +39,7 @@ import {
   isCouncilReviewArtifact,
 } from '../plan-artifact';
 import { proposalReportFields } from '../proposal-adapter';
+import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles, type WorkspaceFileSnapshot } from '../../coordinator/workspace-change-detector';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -375,6 +376,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   ): Promise<CouncilRoleExecution | undefined> {
     let sessionId: string | undefined;
     let recoveryReason: string | undefined;
+    let workspaceBefore: WorkspaceFileSnapshot | undefined;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       options?.signal?.throwIfAborted();
       const phaseId = createId('council_phase');
@@ -397,7 +399,10 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         },
       });
       try {
-        if (attempt === 1) await prepare?.();
+        if (attempt === 1) {
+          await prepare?.();
+          workspaceBefore = await snapshotWorkspaceFiles(workspacePath);
+        }
         const execution = await this.runRoleWithInactivitySteering(
           input,
           executionRunId,
@@ -413,6 +418,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           phaseId,
           this.roleInactivityTimeoutMs,
           sessionId,
+          attempt > 1 ? workspaceBefore : undefined,
         );
         await validate?.(execution.result);
         for (const warning of (execution.result.diagnostics.council_warnings as string[]) ?? []) {
@@ -459,6 +465,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     phaseId: string,
     inactivityTimeoutMs: number | undefined,
     sessionId?: string,
+    workspaceBefore?: WorkspaceFileSnapshot,
   ): Promise<{ result: AgentExecutionResult }> {
     const driverRunId = `${executionRunId}_${phaseId}`;
     if (!inactivityTimeoutMs) {
@@ -481,6 +488,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
             : options,
           phaseId,
           sessionId,
+          workspaceBefore,
         ),
       };
     }
@@ -512,6 +520,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         },
         phaseId,
         sessionId,
+        workspaceBefore,
       );
       return { result };
     } catch (error) {
@@ -570,6 +579,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     options?: CouncilExecutionOptions,
     phaseId?: string,
     sessionId?: string,
+    workspaceBefore?: WorkspaceFileSnapshot,
   ): Promise<AgentExecutionResult> {
     await fs.mkdir(workspacePath, { recursive: true });
     let result: AgentExecutionResult;
@@ -615,6 +625,16 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       throw failure;
     }
     options?.signal?.throwIfAborted();
+    if (workspaceBefore && result.status === 'completed') {
+      result = {
+        ...result,
+        artifact_refs: mergeArtifacts(result.artifact_refs, await collectWorkspaceArtifacts(
+          { task_id: input.task_id, workspace_path: workspacePath },
+          workspaceBefore,
+          String(result.diagnostics.driver_id ?? result.role_id),
+        )),
+      };
+    }
     if (hasBlockingMailboxRequest(result)) {
       const failure = new CouncilRoleExecutionError(
         phase,

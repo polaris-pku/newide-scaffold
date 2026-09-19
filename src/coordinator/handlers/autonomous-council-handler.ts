@@ -46,7 +46,19 @@ export class AutonomousCouncilHandler {
         unavailableWarnings.push(`Council artifact unavailable: ${id}`);
       }
     }
-    const selected = materializableArtifacts(runResult.selected_artifact_refs, artifacts);
+    const selected = completeMaterializableArtifacts(runResult.selected_artifact_refs, artifacts);
+    const referencedIds = new Set([
+      ...runResult.selected_artifact_refs,
+      ...runResult.proposals.flatMap((proposal) => proposal.artifact_refs),
+    ]);
+    for (const id of referencedIds) {
+      if (
+        !artifacts.has(id) &&
+        !unavailableWarnings.includes(`Council artifact unavailable: ${id}`)
+      ) {
+        unavailableWarnings.push(`Council artifact unavailable: ${id}`);
+      }
+    }
     const fallback =
       selected.length > 0
         ? []
@@ -156,6 +168,14 @@ function materializableArtifacts(
     );
 }
 
+function completeMaterializableArtifacts(
+  artifactIds: readonly string[],
+  artifacts: ReadonlyMap<string, ArtifactRef>,
+): ArtifactRef[] {
+  if (artifactIds.some((id) => !artifacts.has(id))) return [];
+  return materializableArtifacts(artifactIds, artifacts);
+}
+
 function selectReviewedProposalArtifacts(
   proposals: readonly Proposal[],
   reviews: readonly Review[],
@@ -167,7 +187,9 @@ function selectReviewedProposalArtifacts(
     reviewScore.set(review.proposal_id, Math.max(reviewScore.get(review.proposal_id) ?? -1, score));
   }
   const selectedProposal = proposals
-    .filter((proposal) => materializableArtifacts(proposal.artifact_refs, artifacts).length > 0)
+    .filter(
+      (proposal) => completeMaterializableArtifacts(proposal.artifact_refs, artifacts).length > 0,
+    )
     .map((proposal, index) => ({
       proposal,
       index,

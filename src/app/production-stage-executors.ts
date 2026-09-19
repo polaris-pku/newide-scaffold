@@ -10,6 +10,7 @@ import {
   type ChangesetManifest,
 } from '../coordinator/changeset-manifest';
 import { buildDriverRunResultFromAgentExecution } from '../coordinator/agent-execution-driver-result';
+import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles } from '../coordinator/workspace-change-detector';
 import { buildRunOutputPaths } from '../coordinator/run-result';
 import { DeliverArtifactHandler } from '../coordinator/handlers/deliver-artifact-handler';
 import {
@@ -248,7 +249,7 @@ export function createProductionStageExecutors(
           : {}),
       });
       const primaryInstruction = agentExecutionInstruction(context, planFirst);
-      const executePrimary = (instruction: string) =>
+      const executePrimary = (instruction: string, sessionId = context.session_id) =>
         dependencies.agentExecutionFacade.runAgent(
           {
             task_id: context.task_id,
@@ -261,7 +262,7 @@ export function createProductionStageExecutors(
             context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
             schema_version: SCHEMA_VERSION,
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
-            ...(context.session_id ? { session_id: context.session_id } : {}),
+            ...(sessionId ? { session_id: sessionId } : {}),
             ...(context.cursor_input.mailbox_delivery_id
               ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
               : {}),
@@ -281,7 +282,7 @@ export function createProductionStageExecutors(
             primaryInstruction,
             'RETRY: the previous turn did not create the required council-plan.md artifact.',
             'Call invoke_driver and write that file now. Do not send Mailbox requests or finish with text only.',
-          ].join('\n'));
+          ].join('\n'), result.session_id || context.session_id);
           mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
         }
       }
@@ -611,6 +612,7 @@ export function createProductionStageExecutors(
             finalPlans,
             implementation.result,
             implementation.artifact_refs,
+            implementation.failed_attempts,
           );
         } catch (error) {
           emitCouncilFailure(context, 'COUNCIL_IMPLEMENTATION_FAILED', error);
@@ -908,7 +910,7 @@ async function executeFinalCouncilPlan(input: {
   dependencies: ProductionStageExecutorDependencies;
   councilRunId: string;
   phaseId: string;
-}): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[] }> {
+}): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[]; failed_attempts: number }> {
   const workspace = path.join(
     councilRunWorkspaceRoot(
       input.dependencies.councilRoot,
@@ -917,6 +919,27 @@ async function executeFinalCouncilPlan(input: {
     'primary',
   );
   await stageCouncilArtifacts(workspace, input.finalPlans);
+  const workspaceBefore = await snapshotWorkspaceFiles(workspace);
+  let phaseId = input.phaseId;
+  let failedAttempts = 0;
+  const recordFailure = (result: AgentExecutionResult, attempt: number, willRetry: boolean) => {
+    failedAttempts += 1;
+    emit(input.context, 'council.role.failed', phaseId, {
+      council_run_id: input.councilRunId,
+      phase_id: phaseId,
+      phase: 'implementation',
+      attempt,
+      will_retry: willRetry,
+      code: 'COUNCIL_IMPLEMENTATION_FAILED',
+      agent_id: result.agent_id ?? result.role_id,
+      agent_status: result.status,
+      session_id: result.session_id,
+      agent_run_id: result.agent_run_id,
+      driver_run_result_id: result.driver_run_result_id,
+      fallback_action: willRetry ? 'retry_role' : 'fail_run',
+      failure_details: result.diagnostics,
+    });
+  };
   const implementationInstruction = [
     'Implement the approved final Council Plan staged under inputs/.',
     'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
@@ -934,6 +957,7 @@ async function executeFinalCouncilPlan(input: {
           ].join('\n\n');
     emit(input.context, 'agent.execution_requested', input.context.run_id, {
       phase: 'council_plan_execution',
+      phase_id: phaseId,
       attempt,
       role_id: input.primary.role_id,
       session_id: input.primary.session_id,
@@ -968,13 +992,33 @@ async function executeFinalCouncilPlan(input: {
   let result = await runImplementation(1);
   let implementationArtifacts = implementationArtifactsFrom(result);
   if (shouldResumeFinalCouncilPlan(result, implementationArtifacts)) {
+    recordFailure(result, 1, true);
+    phaseId = createId('council_phase');
+    emit(input.context, 'council.phase.started', phaseId, {
+      council_run_id: input.councilRunId, phase_id: phaseId, phase: 'implementation', attempt: 2,
+      agent_id: input.primary.agent_id ?? input.primary.role_id,
+      session_id: input.primary.session_id, recovery: 'same_session_continuation',
+      input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
+    });
     result = await runImplementation(2);
+    if (result.status === 'completed') {
+      result = {
+        ...result,
+        artifact_refs: mergeArtifacts(result.artifact_refs, await collectWorkspaceArtifacts(
+          { task_id: input.context.task_id, workspace_path: workspace },
+          workspaceBefore,
+          String(result.diagnostics.driver_id ?? result.role_id),
+        )),
+      };
+    }
     implementationArtifacts = implementationArtifactsFrom(result);
   }
   if (result.status !== 'completed') {
+    recordFailure(result, failedAttempts + 1, false);
     throw new Error(`Primary Agent Plan execution ended with status ${result.status}`);
   }
   if (implementationArtifacts.length === 0) {
+    recordFailure(result, failedAttempts + 1, false);
     throw new Error('Primary Agent completed the final Council Plan without implementation artifacts');
   }
   emit(input.context, 'agent.execution_completed', result.agent_run_id, {
@@ -991,9 +1035,9 @@ async function executeFinalCouncilPlan(input: {
     driver_run_result_id: result.driver_run_result_id,
     diagnostics: result.diagnostics,
   });
-  emit(input.context, 'council.implementation.completed', input.phaseId, {
+  emit(input.context, 'council.implementation.completed', phaseId, {
     council_run_id: input.councilRunId,
-    phase_id: input.phaseId,
+    phase_id: phaseId,
     phase: 'implementation',
     executor_role_id: result.role_id,
     agent_id: result.agent_id ?? result.role_id,
@@ -1006,7 +1050,7 @@ async function executeFinalCouncilPlan(input: {
     ),
     response: result.response,
   });
-  return { result, artifact_refs: implementationArtifacts };
+  return { result, artifact_refs: implementationArtifacts, failed_attempts: failedAttempts };
 }
 
 function implementationArtifactsFrom(result: AgentExecutionResult): ArtifactRef[] {
@@ -1022,11 +1066,13 @@ function shouldResumeFinalCouncilPlan(
   const driverError = result.diagnostics.driver_error;
   const retryableDriverFailure =
     result.status === 'failed' &&
+    Number(result.diagnostics.driver_attempts ?? 0) < 2 &&
     ((driverError !== null &&
       typeof driverError === 'object' &&
       !Array.isArray(driverError) &&
       Reflect.get(driverError, 'retryable') === true) ||
-      result.diagnostics.driver_error_code === 'EXTERNAL_DRIVER_TRANSPORT_ERROR');
+      (result.diagnostics.driver_error_code === 'EXTERNAL_DRIVER_TRANSPORT_ERROR' &&
+        (!driverError || typeof driverError !== 'object' || Reflect.get(driverError, 'retryable') !== false)));
   return (
     result.status === 'interrupted' ||
     (result.status === 'failed' && result.diagnostics.driver_error_code === 'B_BLOCKED') ||
@@ -1040,12 +1086,18 @@ async function attachPlanExecution(
   finalPlans: ArtifactRef[],
   result: AgentExecutionResult,
   implementationArtifacts: ArtifactRef[],
+  failedAttempts: number,
 ): Promise<CouncilRunResult> {
   const firstArtifact = implementationArtifacts[0]!;
   const councilResult = councilRunResult.result;
   if (!councilResult) throw new Error('Plan-first Council stage returned no CouncilResult');
   const updatedResult = {
     ...councilResult,
+    role_failure_count: (councilResult.role_failure_count ?? 0) + failedAttempts,
+    ...(failedAttempts > 0 ? {
+      quality: 'best_effort' as const,
+      warnings: [...councilResult.warnings, `Council implementation recovered after ${String(failedAttempts)} failed attempt(s).`],
+    } : {}),
     final_artifact_ref: firstArtifact.artifact_id,
     final_artifact_sha256: sha256(await readArtifactBytes(firstArtifact)),
     verification_refs: uniqueStrings([
@@ -1064,6 +1116,11 @@ async function attachPlanExecution(
         ...implementationArtifacts,
       ],
       selected_artifact_refs: implementationRefs,
+      decision: {
+        ...councilRunResult.decision,
+        selected_artifact_refs: implementationRefs,
+        evidence_refs: uniqueStrings([...councilRunResult.decision.evidence_refs, ...finalPlans.map((plan) => plan.artifact_id)]),
+      },
       result: updatedResult,
       plan_execution: {
         executor_role_id: result.role_id,

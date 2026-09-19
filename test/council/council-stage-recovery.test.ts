@@ -100,6 +100,34 @@ function reviews(request: AgentExecutionRequest) {
 }
 
 describe('Council bounded recovery', () => {
+  it('collects all workspace changes across a synthesis continuation', async () => {
+    let attempts = 0;
+    const provider = new SynthesisAgentCouncilProvider({
+      councilRoot: await root(),
+      agentExecutionFacade: {
+        async runAgent(request) {
+          const result = completed(request);
+          if (request.role_id !== 'lead') return result;
+          attempts += 1;
+          if (attempts === 1) {
+            await fs.writeFile(path.join(request.workspace_path!, 'first.ts'), 'first');
+            return { ...result, status: 'interrupted', artifact_refs: [] };
+          }
+          await fs.writeFile(path.join(request.workspace_path!, 'second.ts'), 'second');
+          return { ...result, artifact_refs: [artifact('second.ts', 'second')] };
+        },
+      },
+    });
+    const result = await provider.runCouncilRound(input);
+    const selected = result.generated_artifact_refs.filter((artifact) =>
+      result.selected_artifact_refs.includes(artifact.artifact_id),
+    );
+    expect(selected.map((artifact) => artifact.content?.target_path).sort()).toEqual([
+      'first.ts',
+      'second.ts',
+    ]);
+    expect(attempts).toBe(2);
+  });
   it('copies a nested project rather than checking out its parent repository', async () => {
     const parent = await root();
     const target = path.join(await root(), 'participant');

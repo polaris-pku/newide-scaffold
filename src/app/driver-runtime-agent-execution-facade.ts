@@ -1,8 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import {
   SCHEMA_VERSION,
   createId,
@@ -11,11 +9,11 @@ import {
   type ArtifactRef,
 } from '../core';
 import {
-  diffWorkspaceFiles,
-  isDeliverableWorkspacePath,
+  collectWorkspaceArtifacts,
+  mergeArtifacts,
   snapshotWorkspaceFiles,
-  type WorkspaceFileSnapshot,
 } from '../coordinator/workspace-change-detector';
+export { mergeArtifacts, normalizeArtifactTargetPath } from '../coordinator/workspace-change-detector';
 import {
   AgentManager,
   InvokeDriverTool,
@@ -472,7 +470,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const workspaceArtifacts = await collectWorkspaceArtifacts(
         input,
         workspaceBefore,
-        invocation.execution,
+        invocation.execution?.diagnostics.driver_id,
       );
 
       if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
@@ -1422,50 +1420,6 @@ function delegationContext(original: string, delegated: string) {
   return [{ id: 'b_delegation', description: 'B runtime delegation guidance', content: delegated }];
 }
 
-async function collectWorkspaceArtifacts(
-  input: AgentExecutionRequest,
-  before: WorkspaceFileSnapshot | undefined,
-  execution: DriverRunResult | undefined,
-): Promise<ArtifactRef[]> {
-  if (!input.workspace_path || !before) return [];
-  const after = await snapshotWorkspaceFiles(input.workspace_path);
-  const changedFiles = diffWorkspaceFiles(before, after).filter(isDeliverableWorkspacePath);
-  const producerId = execution?.diagnostics.driver_id ?? 'agent-execution-facade';
-  const artifacts: ArtifactRef[] = [];
-
-  for (const relativePath of changedFiles) {
-    const absolutePath = path.resolve(input.workspace_path, relativePath);
-    const stat = await fs.stat(absolutePath).catch(() => undefined);
-    if (!stat?.isFile() || stat.size > 5 * 1024 * 1024) continue;
-    const bytes = await fs.readFile(absolutePath).catch(() => undefined);
-    if (!bytes) continue;
-    const fileUrl = pathToFileURL(absolutePath).href;
-    const createdAt = nowTimestamp();
-    artifacts.push({
-      artifact_id: createId('artifact'),
-      type: 'patch',
-      uri: `artifact://workspace-file/${encodeURIComponent(input.task_id)}/${encodeURIComponent(relativePath)}`,
-      sha256: createHash('sha256').update(bytes).digest('hex'),
-      producer_id: producerId,
-      task_id: input.task_id,
-      metadata: {
-        source: 'workspace-change',
-        workspace_path: input.workspace_path,
-        target_path: relativePath,
-      },
-      content: {
-        kind: 'file',
-        content_ref: fileUrl,
-        target_path: relativePath,
-        media_type: mediaTypeFor(relativePath),
-      },
-      created_at: createdAt,
-      schema_version: SCHEMA_VERSION,
-    });
-  }
-  return artifacts;
-}
-
 /**
  * 把 ToolCallingClient 适配为退休评估的 LlmClient，并构建三重门控的 LLM 层评估器。
  *
@@ -1488,40 +1442,6 @@ export function createToolRetirementEvaluator(llm: ToolCallingClient): Retiremen
     },
   };
   return new LlmRetirementEvaluator(adapter);
-}
-
-/** Normalize artifact target paths so Windows `\` and POSIX `/` compare equal. */
-export function normalizeArtifactTargetPath(value: string): string {
-  return value.replace(/\\/g, '/');
-}
-
-export function mergeArtifacts(
-  driverArtifacts: readonly ArtifactRef[],
-  workspaceArtifacts: readonly ArtifactRef[],
-): ArtifactRef[] {
-  const result: ArtifactRef[] = [];
-  const seenTargets = new Set<string>();
-  // Workspace snapshots contain the complete post-run file. Prefer them over
-  // Driver edit snippets when both artifacts target the same path.
-  for (const artifact of [...workspaceArtifacts, ...driverArtifacts]) {
-    const target = artifact.content?.target_path;
-    const key = target ? normalizeArtifactTargetPath(target) : undefined;
-    if (key && seenTargets.has(key)) continue;
-    if (key) seenTargets.add(key);
-    result.push(artifact);
-  }
-  return result;
-}
-
-function mediaTypeFor(relativePath: string): string {
-  const extension = path.extname(relativePath).toLowerCase();
-  if (extension === '.ts') return 'text/typescript';
-  if (extension === '.tsx') return 'text/tsx';
-  if (extension === '.js' || extension === '.jsx') return 'text/javascript';
-  if (extension === '.json') return 'application/json';
-  if (extension === '.css') return 'text/css';
-  if (extension === '.html') return 'text/html';
-  return 'text/plain';
 }
 
 function isArtifactFreeRetryableFailure(execution: DriverRunResult): boolean {
