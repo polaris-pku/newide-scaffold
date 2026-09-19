@@ -129,8 +129,9 @@ try {
   if (cancelled) await waitForCancellationEffects();
   const driverInvocations = usesTemporaryRunner ? await countDriverInvocations() : undefined;
   if (driverInvocations !== undefined) {
-    // Plan-first reuses Primary's initial plan as proposer 0 instead of invoking it twice.
-    const expectedInvocations = smokeMode === 'all' ? 10 : smokeMode === 'single_agent' ? 2 : 8;
+    // Plan-first reuses Primary's initial plan as proposer 0 and each Council
+    // role creates its ACP Session on the real task turn instead of a warm-up.
+    const expectedInvocations = smokeMode === 'all' ? 7 : smokeMode === 'single_agent' ? 2 : 5;
     assert(
       driverInvocations === expectedInvocations,
       `Expected ${expectedInvocations} driver invocations, received ${driverInvocations}`,

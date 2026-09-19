@@ -336,7 +336,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       !normalizedInput.session_id &&
       !boundSession &&
       normalizedInput.workspace_path &&
-      this.options.mailbox?.sessionRegistry
+      this.options.mailbox?.sessionRegistry &&
+      !normalizedInput.context_policy.startsWith('council_')
     ) {
       boundSession = await this.provisionParticipantSession(
         {

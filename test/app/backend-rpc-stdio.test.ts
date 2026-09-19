@@ -765,9 +765,9 @@ describe('backend RPC stdio entrypoint', () => {
       expect(postCouncilSequence(councilEventTypes)).toEqual(expectedOrder);
       expect(
         readFileSync(path.join(runnerDir, 'invocations.log'), 'utf8').trim().split('\n'),
-      ).toHaveLength(10);
+      ).toHaveLength(7);
       expect(readFileSync(path.join(runnerDir, 'b-env.log'), 'utf8').trim().split('\n')).toEqual(
-        Array.from({ length: 10 }, () => 'absent'),
+        Array.from({ length: 7 }, () => 'absent'),
       );
       const driverPrompts = readFileSync(path.join(runnerDir, 'prompts.log'), 'utf8');
       expect(driverPrompts).toContain('Exercise production composition.');

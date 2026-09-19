@@ -241,6 +241,50 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(send.mock.calls[1]![0]).toMatchObject({ session_id: 'session_started', run_id: expect.stringMatching(/:retry$/) });
   });
 
+  it('uses the real Council turn to create its Session without a warm-up model call', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-session-'));
+    const driver = new CapturingDriver('succeeded');
+    const original = driver.sendPrompt.bind(driver);
+    const send = vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({
+      ...await original(input),
+      session_id: 'session_council_role',
+    }));
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: 'role_proposer', name: 'Proposer' });
+    const store = new SqliteCoordinationStore(':memory:');
+    const sessions = new InMemoryParticipantSessionRegistry();
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository,
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      mailbox: {
+        service: new PersistentMailboxService(store),
+        allowedRoleIds: ['role_proposer'],
+        sessionRegistry: sessions,
+      },
+    });
+    const { session_id: _sessionId, ...input } = request(
+      'task_council_session',
+      'role_proposer',
+      workspace,
+    );
+
+    try {
+      const result = await facade.runAgent({ ...input, context_policy: 'council_proposer' });
+
+      expect(result.status).toBe('completed');
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]![0].run_id).toBe(input.run_id);
+      expect(sessions.get(input.task_id, path.resolve(workspace), input.role_id)).toBe(
+        'session_council_role',
+      );
+    } finally {
+      store.close();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it.each(['council_primary_plan', 'council_proposer', 'council_reviewer', 'council_synthesizer'])(
     'rejects blocking Mailbox requests immediately in %s', async (contextPolicy) => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-plan-mailbox-'));
