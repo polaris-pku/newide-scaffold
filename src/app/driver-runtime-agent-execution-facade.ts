@@ -125,10 +125,8 @@ interface InvocationContext {
 }
 
 const AGENT_RUNTIME_POLICY_ID = 'b-persona-tools-v1';
-const TOP_LEVEL_MEMORY_ITEM_LIMIT = 5;
-const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
-const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
-const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
+/** 协作名册里每个角色 persona 摘要的截断长度。 */
+const TOP_LEVEL_DESCRIPTION_LIMIT = 240;
 const DEFAULT_MAILBOX_DEADLINE_SECONDS = 300;
 const PRODUCTION_EXECUTION_CONTRACT =
   'Production execution contract: call invoke_driver for task work; a text-only answer is not task completion.';
@@ -566,11 +564,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
       return await withAbort(
         this.options.llm.completeWithTools(
-          withTopLevelExecutionContext(
-            input,
-            invocation.retrieval,
-            invocation.collaboration_brief,
-          ),
+          withTopLevelExecutionContext(input, invocation.collaboration_brief),
         ),
         invocation.signal,
       );
@@ -778,7 +772,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       '- Available teammate roles:',
       ...members.map(
         (member) =>
-          `  - ${member.role_id} (${member.name}, ${member.status}): ${truncate(member.persona.summary, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}`,
+          `  - ${member.role_id} (${member.name}, ${member.status}): ${truncate(member.persona.summary, TOP_LEVEL_DESCRIPTION_LIMIT)}`,
       ),
       '- Communication: use mailbox_send(to_role_id, kind, content, artifact_refs?).',
       ...(inbound
@@ -1340,14 +1334,18 @@ function withRetrievedMemory(
   };
 }
 
+/**
+ * 顶层 Agent 的每一轮只带执行契约和协作名册，不带记忆。
+ *
+ * 记忆经 driver_context 直达 Driver。若同一批记忆也预先出现在顶层上下文里，
+ * Agent 就没有理由再调 query_memory，工具轨迹随之失去"它自己认为需要什么"的
+ * 记录——而那是经验提取与技能晋升唯一的信号来源。
+ */
 function withTopLevelExecutionContext(
   input: Parameters<ToolCallingClient['completeWithTools']>[0],
-  retrieval: MemoryRetrievalResult,
   collaborationBrief: string,
 ): Parameters<ToolCallingClient['completeWithTools']>[0] {
-  const memoryContext = renderTopLevelMemoryContext(retrieval);
-  const context = [memoryContext, collaborationBrief].filter(Boolean).join('\n\n');
-  if (!context) return input;
+  if (!collaborationBrief) return input;
 
   let injected = false;
   return {
@@ -1357,48 +1355,10 @@ function withTopLevelExecutionContext(
       injected = true;
       return {
         ...message,
-        content: `${PRODUCTION_EXECUTION_CONTRACT}\n\n${message.content}\n\n${context}`,
+        content: `${PRODUCTION_EXECUTION_CONTRACT}\n\n${message.content}\n\n${collaborationBrief}`,
       };
     }),
   };
-}
-
-function renderTopLevelMemoryContext(retrieval: MemoryRetrievalResult): string {
-  if (retrieval.skills.length === 0 && retrieval.experiences.length === 0) return '';
-
-  const visibleSkills = retrieval.skills.slice(0, TOP_LEVEL_MEMORY_ITEM_LIMIT);
-  const visibleExperiences = retrieval.experiences.slice(
-    0,
-    TOP_LEVEL_MEMORY_ITEM_LIMIT - visibleSkills.length,
-  );
-  const visibleCount = visibleSkills.length + visibleExperiences.length;
-  const totalCount = retrieval.skills.length + retrieval.experiences.length;
-  const sections = [
-    renderMemorySection('Approved skills', visibleSkills, retrieval.skills.length),
-    renderMemorySection('Eligible experiences', visibleExperiences, retrieval.experiences.length),
-  ].filter((section) => section.length > 0);
-  return [
-    'Retrieved memory selected by B before execution:',
-    ...sections,
-    ...(visibleCount < totalCount
-      ? [`Omitted memory records: ${String(totalCount - visibleCount)}.`]
-      : []),
-  ].join('\n');
-}
-
-function renderMemorySection(
-  heading: string,
-  records: Array<{ id: string; description: string; content: string }>,
-  totalCount: number,
-): string {
-  if (records.length === 0) return '';
-  return [
-    `${heading} (shown ${String(records.length)} of ${String(totalCount)}):`,
-    ...records.map(
-      (record) =>
-        `- ${truncate(record.id, TOP_LEVEL_MEMORY_ID_LIMIT)}: ${truncate(record.description, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}\n  ${truncate(record.content, TOP_LEVEL_MEMORY_CONTENT_LIMIT)}`,
-    ),
-  ].join('\n');
 }
 
 function truncate(value: string, limit: number): string {
