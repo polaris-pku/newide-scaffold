@@ -40,6 +40,7 @@ export async function prepareCouncilWorkspace(
         maxBuffer: 10 * 1024 * 1024,
       },
     );
+    await copyDirtyGitFiles(source, target);
   } else {
     await fs.cp(source, target, {
       recursive: true,
@@ -56,6 +57,52 @@ export async function prepareCouncilWorkspace(
   // git worktree add does not copy untracked eval files such as .claude/settings.json
   // (gitignored so they never enter the scored patch). ACP still needs them in cwd.
   await copyEvalClaudeSettings(source, target);
+}
+
+/**
+ * A detached worktree starts from HEAD, while a task workspace may already
+ * contain the user's staged, unstaged, or untracked inputs. Materialize those
+ * differences after creating the isolated worktree so Council participants see
+ * the same task baseline without changing the source checkout.
+ */
+async function copyDirtyGitFiles(source: string, target: string): Promise<void> {
+  const tracked = await gitPathList(source, ['diff', '--name-only', '-z', 'HEAD']);
+  const untracked = await gitPathList(source, ['ls-files', '--others', '--exclude-standard', '-z']);
+  const paths = new Set([...tracked, ...untracked]);
+  for (const relative of paths) {
+    const normalized = relative.replaceAll('\\', '/');
+    if (
+      !normalized ||
+      path.posix.isAbsolute(normalized) ||
+      path.win32.isAbsolute(normalized) ||
+      normalized.split('/').includes('..')
+    ) {
+      throw new Error(`Git workspace path escapes source: ${relative}`);
+    }
+    const from = path.join(source, normalized);
+    const to = path.join(target, normalized);
+    try {
+      await fs.access(from);
+      await fs.mkdir(path.dirname(to), { recursive: true });
+      await fs.cp(from, to, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      // A tracked file deleted in the source checkout must also be absent from
+      // the participant worktree instead of silently reappearing from HEAD.
+      await fs.rm(to, { recursive: true, force: true });
+    }
+  }
+}
+
+async function gitPathList(source: string, args: string[]): Promise<string[]> {
+  const { stdout } = await execFileAsync('git', ['-C', source, ...args], {
+    encoding: 'buffer',
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return Buffer.from(stdout)
+    .toString('utf8')
+    .split('\0')
+    .filter((value) => value.length > 0);
 }
 
 async function copyEvalClaudeSettings(source: string, target: string): Promise<void> {

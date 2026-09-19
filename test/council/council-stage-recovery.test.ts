@@ -154,6 +154,36 @@ describe('Council bounded recovery', () => {
     expect(await fs.readFile(path.join(target, 'clamp.cjs'), 'utf8')).toBe('original task file');
     expect(await fs.readdir(target)).not.toContain('outer.txt');
   });
+  it('preserves dirty tracked, untracked, and deleted task inputs in a Git worktree', async () => {
+    const source = await root();
+    const target = path.join(await root(), 'participant');
+    execFileSync('git', ['init', source]);
+    await fs.writeFile(path.join(source, 'tracked.txt'), 'committed');
+    await fs.writeFile(path.join(source, 'deleted.txt'), 'remove me');
+    execFileSync('git', ['-C', source, 'add', 'tracked.txt', 'deleted.txt']);
+    execFileSync('git', [
+      '-C',
+      source,
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.test',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-m',
+      'fixture',
+    ]);
+    await fs.writeFile(path.join(source, 'tracked.txt'), 'task-local change');
+    await fs.rm(path.join(source, 'deleted.txt'));
+    await fs.writeFile(path.join(source, 'untracked.txt'), 'new task input');
+
+    await prepareCouncilWorkspace(source, target);
+
+    expect(await fs.readFile(path.join(target, 'tracked.txt'), 'utf8')).toBe('task-local change');
+    expect(await fs.readFile(path.join(target, 'untracked.txt'), 'utf8')).toBe('new task input');
+    await expect(fs.access(path.join(target, 'deleted.txt'))).rejects.toThrow();
+  });
   it('stops inactivity monitoring when the Driver finishes, allowing report processing', async () => {
     let calls = 0;
     const provider = new SynthesisAgentCouncilProvider({
