@@ -11,6 +11,7 @@ import {
   type EmbeddingProvider,
   type MemoryRepository,
 } from '../memory';
+import { seedSkills } from './seed-skills';
 
 /** HashEmbeddingProvider 的原生维度，与库中既有 vector(32) 一致。 */
 const HASH_EMBEDDING_DIMENSIONS = 32;
@@ -284,6 +285,8 @@ async function seedCatalog(
       existing.add(agent.role_id);
     }
   }
+  // 技能必须在 Agent 注册之后写入：仓储的 listSkills / saveSkill 都要求 agent 行已存在
+  await seedSkills(repository);
   for (const roleId of [...existing].sort(compareCodeUnits)) {
     await bufferRepository.ensureAgent(roleId);
   }

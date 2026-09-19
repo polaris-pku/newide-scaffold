@@ -508,6 +508,11 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(exposedTools[0]).toEqual(['query_memory', 'invoke_driver']);
     expect(systemPrompts[0]).toContain('You are Agent "tool_surface_role".');
     expect(systemPrompts[0]).toContain('## Your Identity');
+    expect(systemPrompts[0]).toContain('Retrieve what the task needs with query_memory.');
+    // 身份块不再陈述"有没有技能"：库里有多少技能与提示词无关，Agent 自己去查。
+    // 预置技能写进 persona 的缺失陈述（曾经的 "No skills yet."）会与事实相反。
+    expect(systemPrompts[0]).not.toContain('Skills Overview');
+    expect(systemPrompts[0]).not.toContain('No skills yet.');
   });
 
   it('registers and projects a market candidate without executing A', async () => {
@@ -632,7 +637,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     }
   });
 
-  it('retrieves eligible memory before planning and injects it into A and ContextPack evidence', async () => {
+  it('retrieves eligible memory before planning and injects it into the Driver, not the top-level Agent', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-b-retrieval-'));
     try {
       const roleId = 'implementer';
@@ -699,13 +704,11 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
 
       const result = await facade.runAgent(request('task_retrieval', roleId));
 
-      expect(initialMessages[0]).toContain(approvedSkill.description);
-      expect(initialMessages[0]).toContain(approvedSkill.content);
-      expect(initialMessages[0]).toContain(eligibleExperience.description);
-      expect(initialMessages[0]).toContain(eligibleExperience.content);
-      expect(initialMessages[0]).not.toContain(pendingSkill.content);
-      expect(initialMessages[0]).not.toContain(negativeExperience.content);
-      expect(initialMessages[0]).not.toContain(lowConfidenceExperience.content);
+      // 记忆不预注入顶层上下文：Agent 必须自己调 query_memory，否则它的工具轨迹里
+      // 没有"它认为需要什么"的记录。准入过滤由下面 Driver 侧的精确断言覆盖。
+      expect(initialMessages[0]).toContain('Execute through B runtime.');
+      expect(initialMessages[0]).not.toContain(approvedSkill.content);
+      expect(initialMessages[0]).not.toContain(eligibleExperience.content);
 
       const prompt = parseDriverContext(driver.prompts[0]!.prompt) as {
         task_instruction: string;
