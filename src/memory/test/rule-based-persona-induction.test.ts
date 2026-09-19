@@ -97,8 +97,8 @@ describe('ruleBasedPersonaInduction', () => {
     expect(outcome.check.eligible).toBe(true);
     expect(outcome.persona).toBeDefined();
     expect(outcome.persona!.version).toBe(2);
-    expect(outcome.persona!.skills_overview).toBe('No skills yet.');
-    expect(outcome.persona!.experience_coverage).toBe('No experiences yet.');
+    expect(outcome.persona!.skills_overview).toBe('Retrieve with query_memory.');
+    expect(outcome.persona!.experience_coverage).toBe('Retrieve with query_memory.');
     expect(outcome.persona!.recent_performance).toBe(current.recent_performance);
     expect(outcome.persona!.generated_at > current.generated_at).toBe(true);
 

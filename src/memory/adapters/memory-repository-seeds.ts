@@ -22,8 +22,10 @@ export function createSeedPersona(role_id: string, persona_seed?: string): Perso
     role_id,
     version: 1,
     summary: persona_seed ?? `Seed persona for ${role_id}`,
-    skills_overview: 'No skills yet.',
-    experience_coverage: 'No experiences yet.',
+    // 不写"尚无技能"这类缺失陈述：种子角色随 B 运行时一起预置了技能，说"没有"是假的，
+    // 而且它会作为关键词进市场投影。这里只描述获取方式。
+    skills_overview: 'Retrieve with query_memory.',
+    experience_coverage: 'Retrieve with query_memory.',
     recent_performance: 'Awaiting first task.',
     notes: 'Initialized by MemoryRepository.',
     generated_at,

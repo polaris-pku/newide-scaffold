@@ -44,7 +44,7 @@ function topTags(
 /** 生成技能覆盖概述：优先高频 tags，否则给出技能描述要点 */
 function buildSkillsOverview(skills: SkillRecord[]): string {
   if (skills.length === 0) {
-    return 'No skills yet.';
+    return 'Retrieve with query_memory.';
   }
   const tags = topTags(skills, 5);
   const scope = tags.length > 0 ? `Focus tags: ${tags.join(', ')}.` : 'Generalist.';
@@ -57,7 +57,7 @@ function buildSkillsOverview(skills: SkillRecord[]): string {
 /** 生成经验覆盖概述：统计正/负经验与置信度范围，附带高频标签 */
 function buildExperienceCoverage(experiences: ExperienceRecord[]): string {
   if (experiences.length === 0) {
-    return 'No experiences yet.';
+    return 'Retrieve with query_memory.';
   }
   const positive = experiences.filter((e) => e.type === 'positive').length;
   const negative = experiences.length - positive;

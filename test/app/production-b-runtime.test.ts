@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createProductionBRuntime } from '../../src/app/production-b-runtime';
+import { SEED_SKILLS } from '../../src/app/seed-skills';
 import { InMemoryRepository } from '../../src/memory';
 
 const roots: string[] = [];
@@ -79,6 +80,15 @@ describe('createProductionBRuntime', () => {
         'role_code_reviewer',
         'role_synthesis_engineer',
       ]),
+    );
+    // 预置技能走真实 SQL 路径（JSONB payload + vector 列）落库并读回，
+    // 这一步验证的是 SkillRecord 能通过 PgMemoryRepository 的 Zod 校验往返，
+    // 而 InMemory 分支覆盖不到它。
+    const seeded = await runtime.repository.listSkills('role_ts_engineer');
+    expect(seeded.map((skill) => skill.id).sort()).toEqual(
+      SEED_SKILLS.filter((seed) => seed.role_id === 'role_ts_engineer')
+        .map((seed) => seed.id)
+        .sort(),
     );
     await runtime.close();
   });
