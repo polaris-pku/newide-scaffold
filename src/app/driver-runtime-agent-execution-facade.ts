@@ -65,7 +65,9 @@ import type {
   DriverRunStatus,
   DriverRuntimeHandle,
   DriverStreamEvent,
+  DriverStreamEventListener,
 } from '../driver/contract';
+import { runDriverPromptWithSignal } from '../driver/abortable-driver-run';
 import {
   createDriverRuntimeInvoker,
   type DriverRuntimeInvokerInput,
@@ -174,7 +176,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.ensureRole(agentId);
   }
 
-  async provisionParticipantSession(input: ParticipantSessionProvisionRequest): Promise<string> {
+  async provisionParticipantSession(
+    input: ParticipantSessionProvisionRequest,
+    options?: AgentExecutionOptions,
+  ): Promise<string> {
+    throwIfAborted(options?.signal);
     const workspacePath = path.resolve(input.workspace_path);
     const existing = this.options.mailbox?.sessionRegistry?.get(
       input.task_id,
@@ -184,19 +190,21 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (existing) return existing;
     const key = `${input.task_id}\u0000${workspacePath}\u0000${input.role_id}`;
     const pending = this.sessionProvisioning.get(key);
-    if (pending) return pending;
-    const provisioning = this.createParticipantSession({
-      ...input,
-      workspace_path: workspacePath,
-    }).finally(() => this.sessionProvisioning.delete(key));
+    if (pending) return withAbort(pending, options?.signal);
+    const provisioning = this.createParticipantSession(
+      { ...input, workspace_path: workspacePath },
+      options,
+    ).finally(() => this.sessionProvisioning.delete(key));
     this.sessionProvisioning.set(key, provisioning);
     return provisioning;
   }
 
   private async createParticipantSession(
     input: ParticipantSessionProvisionRequest,
+    options?: AgentExecutionOptions,
   ): Promise<string> {
     await this.ensureRole(input.role_id);
+    throwIfAborted(options?.signal);
     const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
@@ -210,15 +218,21 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
-    let result = await this.options.driver.sendPrompt(prompt);
+    const onDriverEvent: DriverStreamEventListener | undefined = options?.onDriverEvent
+      ? (event) => options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
+      : undefined;
+    let result = await runDriverPromptWithSignal(
+      this.options.driver, prompt, options?.signal, onDriverEvent,
+    );
     if (isArtifactFreeRetryableFailure(result) && !/\bSESSION_READY\b/.test(result.response ?? '')) {
       const sessionId = result.session_id && result.session_id !== this.options.driver.session_id && result.session_id !== 'session-unavailable'
         ? result.session_id : undefined;
-      result = await this.options.driver.sendPrompt({
-        ...prompt,
-        run_id: `${prompt.run_id}:retry`,
-        ...(sessionId ? { session_id: sessionId } : {}),
-      });
+      result = await runDriverPromptWithSignal(
+        this.options.driver,
+        { ...prompt, run_id: `${prompt.run_id}:retry`, ...(sessionId ? { session_id: sessionId } : {}) },
+        options?.signal,
+        onDriverEvent,
+      );
     }
     const usableSession =
       Boolean(result.session_id) &&
@@ -324,12 +338,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       normalizedInput.workspace_path &&
       this.options.mailbox?.sessionRegistry
     ) {
-      boundSession = await this.provisionParticipantSession({
-        task_id: normalizedInput.task_id,
-        workspace_path: normalizedInput.workspace_path,
-        role_id: normalizedInput.role_id,
-        run_id: normalizedInput.run_id,
-      });
+      boundSession = await this.provisionParticipantSession(
+        {
+          task_id: normalizedInput.task_id,
+          workspace_path: normalizedInput.workspace_path,
+          role_id: normalizedInput.role_id,
+          run_id: normalizedInput.run_id,
+        },
+        options,
+      );
     }
     const scopedInput =
       normalizedInput.session_id || !boundSession
