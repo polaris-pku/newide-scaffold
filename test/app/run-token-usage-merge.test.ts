@@ -82,10 +82,12 @@ describe('mergeBilledTokenUsage', () => {
 
     const result = await mergeBilledTokenUsage(summaryPath, collect);
 
-    expect(collect).toHaveBeenCalledWith({
-      worktreePath: '/tmp/worktree',
-      sessionId: 'session_a',
-    });
+    expect(collect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        worktreePath: '/tmp/worktree',
+        sessionId: 'session_a',
+      }),
+    );
     expect(result).toMatchObject({
       status: 'merged',
       total_tokens_before: 1500,
@@ -115,6 +117,28 @@ describe('mergeBilledTokenUsage', () => {
       total_tokens_after: 1500,
     });
     expect(await readFile(summaryPath, 'utf8')).toBe(before);
+  });
+
+  it('scrapes every driver session the run reported, not just the primary one', async () => {
+    const runsRoot = await makeRunsRoot();
+    const summaryPath = await writeSummary(runsRoot, 'run_multi', PROXY_TOKEN_USAGE, {
+      driver_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        metric: 'context_tokens_used',
+        context_tokens_used: 10,
+        reported_costs: [],
+        sessions: [{ session_id: 'session_a' }, { session_id: 'session_b' }],
+      },
+    });
+    const collect = vi.fn(async () => CLAUDE_SCRAPED);
+
+    await mergeBilledTokenUsage(summaryPath, collect);
+
+    // session_id 是 'session_a'（writeSummary 默认），driver_usage 里还有 session_b。
+    expect(collect).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionIds: ['session_a', 'session_b'] }),
+    );
   });
 
   it('is idempotent: merging twice does not count the same tokens twice', async () => {

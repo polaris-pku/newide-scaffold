@@ -155,6 +155,55 @@ describe('collectClaudeSessionUsage', () => {
       call_count: 2,
     });
   });
+
+  it('sums every driver session when the run had several', async () => {
+    const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
+    tempDirs.push(sandboxHome);
+    const writeSession = async (sessionId: string, projectName: string, input: number) => {
+      const projectDir = path.join(sandboxHome, '.claude', 'projects', projectName);
+      await mkdir(projectDir, { recursive: true });
+      await writeFile(
+        path.join(projectDir, `${sessionId}.jsonl`),
+        `${JSON.stringify({
+          type: 'assistant',
+          uuid: `uuid-${sessionId}`,
+          sessionId,
+          message: {
+            id: `msg_${sessionId}`,
+            usage: {
+              input_tokens: input,
+              output_tokens: 1,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+          },
+        })}\n`,
+        'utf8',
+      );
+    };
+    // council 的形态：每个角色一个 project 目录、一个 session。
+    await writeSession('session-primary', '-eval-council-primary', 100);
+    await writeSession('session-reviewer', '-eval-council-review', 200);
+
+    process.env.ACP_PROCESS_SANDBOX_HOME = sandboxHome;
+    process.env.HOME = path.join(sandboxHome, 'missing-user-home');
+    delete process.env.USERPROFILE;
+
+    const result = await collectClaudeSessionUsage({
+      sessionIds: ['session-primary', 'session-reviewer'],
+      worktreePath: '/tmp/does-not-match-project-encoding/repo',
+    });
+
+    expect(result).toMatchObject({
+      input_tokens: 300,
+      output_tokens: 2,
+      total_tokens: 302,
+      call_count: 2,
+    });
+    // 多会话时没有单一取值，不能随便挑一个冒充「这个 run 的 session」。
+    expect(result.session_id).toBeUndefined();
+    expect(result.session_path).toBeUndefined();
+  });
 });
 
 function restoreEnv(name: string, value: string | undefined): void {

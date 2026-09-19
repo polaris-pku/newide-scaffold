@@ -44,9 +44,11 @@ export interface BilledTokenUsageMergeResult {
 /**
  * 读回 `summary.json`，把 Claude Code session JSONL 里的计费 token 并进 `token_usage`。
  *
- * 幂等：合并结果不比现有大就不写文件。`ENOENT`（summary 还没落盘）直接算 unchanged，
- * 由调用方决定要不要重试——但不要像旧实现那样静默 `return`，那会让「没跑到」和
- * 「跑了但没数据」在产物里长得一样。
+ * 幂等：driver 那一腿已经并过就直接跳过。`mergeTokenUsageSummaries` 是求和，收尾路径
+ * 若被重入会把同一批 token 数两遍，所以不能只靠「结果不比现有大就不写」。
+ *
+ * `ENOENT`（summary 还没落盘）算 unchanged 而不是抛错，但结果里带状态，调用方能看出
+ * 「没跑到」和「跑了但没数据」的区别。
  */
 export async function mergeBilledTokenUsage(
   summaryPath: string,
@@ -72,9 +74,11 @@ export async function mergeBilledTokenUsage(
   }
 
   const sessionId = nonEmptyString(raw.session_id);
+  const sessionIds = collectDriverSessionIds(raw, sessionId);
   const scraped = await collect({
     worktreePath,
     ...(sessionId ? { sessionId } : {}),
+    ...(sessionIds.length > 0 ? { sessionIds } : {}),
   });
   const usable = scraped.call_count > 0 || scraped.total_tokens > 0;
   if (!usable) {
@@ -97,4 +101,34 @@ export async function mergeBilledTokenUsage(
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+/**
+ * 这个 run 跑过的全部 driver 会话 id，主会话在前。
+ *
+ * `mergeSummaryExtras` 已经把 `driver_usage` 写进 summary 了，council 的每个角色各占
+ * 一条 session——只刮 `session_id` 那一个会漏掉其余角色的全部用量。实测一次四角色
+ * council run：summary 只留得下 primary 一个 id，另外三个会话的 token 全在漏。
+ */
+function collectDriverSessionIds(raw: Record<string, unknown>, primary?: string): string[] {
+  const ids: string[] = [];
+  const push = (candidate: unknown): void => {
+    const id = nonEmptyString(candidate);
+    if (id && !ids.includes(id)) ids.push(id);
+  };
+  push(primary);
+  const driverUsage = raw.driver_usage;
+  if (driverUsage && typeof driverUsage === 'object' && !Array.isArray(driverUsage)) {
+    const sessions = (driverUsage as { sessions?: unknown }).sessions;
+    if (Array.isArray(sessions)) {
+      for (const session of sessions) {
+        push(
+          session && typeof session === 'object'
+            ? (session as { session_id?: unknown }).session_id
+            : undefined,
+        );
+      }
+    }
+  }
+  return ids;
 }
