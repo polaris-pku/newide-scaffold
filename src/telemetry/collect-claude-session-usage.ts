@@ -23,15 +23,27 @@ async function sumUsageFromClaudeJsonl(
   expectedSessionId?: string,
 ): Promise<{ entries: LlmUsageEntry[]; session_id?: string }> {
   const text = await fs.readFile(filePath, 'utf-8');
-  const entries: LlmUsageEntry[] = [];
+  /**
+   * 按 assistant 消息去重。
+   *
+   * Claude Code 会把同一条 assistant 消息写成多行（实测两行：同一个 `message.id`、
+   * 不同 `uuid`、usage 数值完全相同），逐行累加会把这一轮 token 数两遍。实测一次
+   * 真实 run 的 primary session：逐行求和 input=47152，按 messageId 去重后 23576，
+   * 而 ACP 响应自己报的是 23576——正好两倍。
+   *
+   * 键用 `message.id`（同一条 API 消息的唯一标识，`uuid` 在两行里是不同的，去不了重）。
+   * 同键后写覆盖先写，保留首次出现的位置，所以顺序仍按时间。
+   */
+  const byMessageId = new Map<string, LlmUsageEntry>();
   let matchedSessionId = expectedSessionId;
 
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let obj: {
       type?: string;
+      uuid?: string;
       sessionId?: string;
-      message?: { usage?: Record<string, unknown> };
+      message?: { id?: string; usage?: Record<string, unknown> };
       usage?: Record<string, unknown>;
     };
     try {
@@ -52,7 +64,15 @@ async function sumUsageFromClaudeJsonl(
     if (![nextInput, nextOutput, nextCacheCreation, nextCacheRead].every(Number.isFinite)) {
       continue;
     }
-    entries.push({
+
+    const messageId = obj.message?.id;
+    // 没有 message.id 的记录（顶层 usage 那种形状）用行 uuid 兜底；两样都没有就按
+    // 行号各自成键，宁可不去重也不能把两轮不同的调用合成一轮。
+    const key =
+      typeof messageId === 'string' && messageId.length > 0
+        ? `message:${messageId}`
+        : `line:${obj.uuid ?? byMessageId.size}`;
+    byMessageId.set(key, {
       input_tokens: nextInput,
       output_tokens: nextOutput,
       cache_creation_input_tokens: nextCacheCreation,
@@ -64,7 +84,7 @@ async function sumUsageFromClaudeJsonl(
   }
 
   return {
-    entries,
+    entries: [...byMessageId.values()],
     ...(matchedSessionId ? { session_id: matchedSessionId } : {}),
   };
 }
