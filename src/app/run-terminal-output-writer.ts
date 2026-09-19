@@ -12,6 +12,11 @@ import {
   projectTaskDriverUsage,
   type TaskDriverUsage,
 } from './driver-usage-projector';
+import {
+  mergeBilledTokenUsage,
+  type CollectClaudeSessionUsage,
+} from './run-token-usage-merge';
+import { collectClaudeSessionUsage } from '../telemetry';
 
 export interface RunTerminalOutputWriter {
   finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | void>;
@@ -64,6 +69,11 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
      * 不注入时 `consumption` 里没有耗时，只剩事件与 token。
      */
     private readonly runLatency?: RunLatency,
+    /**
+     * driver 侧计费 token 的来源。默认刮 Claude Code 的 session JSONL；注入点是给
+     * 测试用，免得碰真实的 `~/.claude`。
+     */
+    private readonly collectClaudeUsage: CollectClaudeSessionUsage = collectClaudeSessionUsage,
   ) {}
 
   async finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | undefined> {
@@ -113,6 +123,10 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
       fs.writeFile(frontendSnapshotPath, serializedSnapshot, 'utf-8'),
     ]);
     await mergeSummaryExtras(summaryPath, { driverUsage: tokenUsage, consumption });
+    // driver 侧真实 coding agent 的计费 token 不进事件流，只能等 summary 落盘后从
+    // Claude Code 的 session JSONL 刮取再并进来。放在这里而不是 B maintenance：
+    // maintenance 由 buffer 触发，跑在 run 收尾之前，读不到 summary.json。
+    await mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage);
     return {
       artifact_ref: pathToFileURL(path.resolve(frontendSnapshotPath)).href,
       sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),

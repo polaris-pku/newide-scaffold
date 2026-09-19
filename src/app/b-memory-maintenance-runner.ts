@@ -24,13 +24,7 @@ import {
   preferDriverUsage,
   projectTaskDriverUsage,
 } from './driver-usage-projector';
-import {
-  collectClaudeSessionUsage,
-  isPopulatedRunTokenUsage,
-  mergeTokenUsageSummaries,
-  runWithLlmUsageLedger,
-  snapshotRunLedgerUsage,
-} from '../telemetry';
+import { runWithLlmUsageLedger } from '../telemetry';
 
 export interface BMemoryMaintenanceRequest {
   task_id: string;
@@ -521,33 +515,23 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     try {
       const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
       const taskId = typeof raw.task_id === 'string' ? raw.task_id : undefined;
-      const proxy = snapshotRunLedgerUsage(runId);
-      const worktreePath =
-        typeof raw.worktree_path === 'string' && raw.worktree_path.length > 0
-          ? raw.worktree_path
-          : undefined;
-      const sessionId =
-        typeof raw.session_id === 'string' && raw.session_id.length > 0
-          ? raw.session_id
-          : undefined;
-      const claude = worktreePath
-        ? await collectClaudeSessionUsage({
-            worktreePath,
-            ...(sessionId ? { sessionId } : {}),
-          })
-        : undefined;
-      const billed = claude ? mergeTokenUsageSummaries([proxy, claude]) : proxy;
       const driverUsage = preferDriverUsage(
         isDriverStreamUsage(raw.driver_usage) ? raw.driver_usage : raw.token_usage,
         taskId ? await projectTaskDriverUsage(runsRoot, taskId) : undefined,
       );
-      if (driverUsage) raw.driver_usage = driverUsage;
-      if (isPopulatedRunTokenUsage(billed)) {
-        raw.token_usage = billed;
-      } else if (isDriverStreamUsage(raw.token_usage)) {
-        delete raw.token_usage;
+      let changed = false;
+      if (driverUsage && raw.driver_usage !== driverUsage) {
+        raw.driver_usage = driverUsage;
+        changed = true;
       }
-      await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+      if (isDriverStreamUsage(raw.token_usage)) {
+        delete raw.token_usage;
+        changed = true;
+      }
+      if (changed) await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+      // 计费 token（含 driver 侧）不在这里并：本轮 refresh 早于 run 收尾，Claude Code 的
+      // session JSONL 还没写全，并进去只会低估；而且会和收尾那次并重复计数。统一由
+      // FileRunTerminalOutputWriter.finalize 在 summary 落盘后并一次（见 run-token-usage-merge）。
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       // Non-fatal: maintenance evidence already persisted.
