@@ -613,7 +613,7 @@ describe('production stage executors', () => {
     });
   });
 
-  it('emits memory.context_pack_built with ablation when council primary fails', async () => {
+  it('lets a failed plan-first primary continue into Council recovery', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
     const workspace = path.join(root, 'workspace');
     await mkdir(workspace, { recursive: true });
@@ -650,6 +650,7 @@ describe('production stage executors', () => {
         }),
       },
       councilProvider: {
+        strategyName: 'plan_first',
         runCouncilRound: async () => {
           throw new Error('Council is not expected in this unit test');
         },
@@ -692,6 +693,7 @@ describe('production stage executors', () => {
       primary_status: 'failed',
       context_pack_ref: 'context_pack_failed',
     });
+    expect(result.evidence.status).toBe('failed');
   });
 
   it('pins the primary Agent as the sole candidate when the auction is disabled', async () => {

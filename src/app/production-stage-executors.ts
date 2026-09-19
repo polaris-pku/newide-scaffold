@@ -390,9 +390,6 @@ export function createProductionStageExecutors(
             ? { ablation: context.memory_ablation }
             : {}),
         });
-        if (planFirst) {
-          throw new Error(`Primary Agent ended with status ${result.status}`);
-        }
         return {
           changeset_ref: selection.manifest_ref,
           expected_sha256: selection.expected_sha256,
