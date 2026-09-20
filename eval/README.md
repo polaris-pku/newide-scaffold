@@ -76,10 +76,14 @@ curl.exe -L -o ..\SWE-EVO\hf_out\hf_jsonl\test.jsonl `
 
 注意：`oracle` 是“拿标准答案去判卷”，不能当作 NewIDE 能力指标。真正看能力时应使用 `real`，并显式传 `--model <name>`（默认 `unspecified` 仅作占位）。
 
-`--ablation B0|B1|B2|B3` 写入 eval run 元数据与 telemetry 标签；后端可通过
+`--ablation B0|B1|B2|B3|B4` 写入 eval run 元数据与 telemetry 标签；后端可通过
 `memory_ablation` / CLI `--ablation` 把同一标签写入 `summary.json`（见
 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)）。MockMemory 不切换检索行为；真实 B Memory
 实现须自行解释该字段。
+
+档位语义见 `src/memory/ablation-policy.ts`：B0 不检索技能也不检索经验；B1 只检索经验；
+B2/B3 全开（=生产）；**B4 与 B2 的检索一致但不积累**（不抽取新经验、不晋升技能），
+用于需要稳定读取面的实验——同一 state root 内后续 run 的输入不会因前一个 run 而改变。
 
 ## Worktree 复用规则（重要）
 

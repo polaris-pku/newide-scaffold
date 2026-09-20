@@ -40,7 +40,7 @@ interface InstanceRow {
 interface ArmSummary {
   ablation: MemoryAblation;
   state_root?: string;
-  database_schema?: string;
+  pglite_data_dir?: string;
   total_count: number;
   scored_count: number;
   resolved_count: number;
@@ -67,7 +67,7 @@ if (!existsSync(experimentDir)) {
 }
 
 const dryRun = hasFlag('--dry-run');
-const arms = (['B0', 'B1', 'B2', 'B3'] as MemoryAblation[]).filter((arm) =>
+const arms = (['B0', 'B1', 'B2', 'B3', 'B4'] as MemoryAblation[]).filter((arm) =>
   existsSync(join(experimentDir, arm, 'arm-summary.json')),
 );
 

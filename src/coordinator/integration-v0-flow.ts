@@ -112,7 +112,7 @@ export interface IntegrationV0Summary {
   failure?: IntegrationV0Failure;
   worktree_path: string;
   /** F-eval ablation tag (B0–B3); echoed for --backend-summary alignment. */
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   /** Aggregated LLM token usage (LiteLLM proxy + optional Claude session scrape). */
   token_usage?: RunTokenUsageSummary;
   artifacts_materialized: number;
@@ -198,7 +198,7 @@ export interface IntegrationV0Options {
   worktreePath?: string;
   runsRoot?: string;
   /** F Harness memory ablation; recorded on summary + context_pack events. */
-  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;

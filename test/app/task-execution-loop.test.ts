@@ -533,7 +533,7 @@ function createFixture(options: FixtureOptions = {}): {
     vi.fn(
       async (context: {
         cursor_input: TInput;
-        memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+        memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
       }): Promise<TResult> => {
       calls.push(cursor);
       observedAttributions.push({ cursor, stage_cursor: getLlmUsageAttribution()?.stage_cursor });

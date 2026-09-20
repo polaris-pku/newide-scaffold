@@ -1,4 +1,4 @@
-export type MemoryAblation = 'B0' | 'B1' | 'B2' | 'B3';
+export type MemoryAblation = 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
 
 export type PredictionMode = 'stub' | 'oracle' | 'real';
 

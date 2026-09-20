@@ -11,7 +11,7 @@ export interface IntegrationV0CliOptions {
   councilProviderMode: IntegrationV0CouncilProviderMode;
   externalDriverTimeoutMs?: number;
   driverPrompt: string;
-  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   worktreePath?: string;
 }
 
@@ -113,14 +113,14 @@ function readPositiveInteger(
 
 function readMemoryAblation(
   value: string | boolean | undefined,
-): 'B0' | 'B1' | 'B2' | 'B3' | undefined {
+): 'B0' | 'B1' | 'B2' | 'B3' | 'B4' | undefined {
   if (value === undefined || value === false) {
     return undefined;
   }
-  if (value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3') {
+  if (value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3' || value === 'B4') {
     return value;
   }
-  throw new Error(`Unsupported --ablation: ${String(value)} (expected B0|B1|B2|B3)`);
+  throw new Error(`Unsupported --ablation: ${String(value)} (expected B0|B1|B2|B3|B4)`);
 }
 
 function readOptionalString(value: string | boolean | undefined): string | undefined {

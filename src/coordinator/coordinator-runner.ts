@@ -20,7 +20,7 @@ export interface CoordinatorRunRequest {
   session_id?: string;
   task_id?: string;
   task_request?: TaskCreateRequest;
-  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   worktreePath?: string;
   telemetry?: TelemetrySink;
   signal?: AbortSignal;

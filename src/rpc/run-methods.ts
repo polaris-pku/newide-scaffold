@@ -36,7 +36,7 @@ const createParamsSchema = z
     project_id: z.string().min(1).optional(),
     client_task_id: z.string().min(1).optional(),
     title: z.string().min(1).optional(),
-    memory_ablation: z.enum(['B0', 'B1', 'B2', 'B3']).optional(),
+    memory_ablation: z.enum(['B0', 'B1', 'B2', 'B3', 'B4']).optional(),
   })
   .strict();
 const runIdParamsSchema = z.object({ run_id: z.string().min(1) }).strict();

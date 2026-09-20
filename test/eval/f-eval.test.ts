@@ -16,7 +16,7 @@ import {
   assertSweEvoPythonCanImportSwebench,
 } from '../../eval/sweevo-harness-adapter';
 import type { SweEvoInstance } from '../../eval/types';
-import { parsePredictionMode } from '../../eval/validation';
+import { parseMemoryAblation, parsePredictionMode } from '../../eval/validation';
 import {
   assertSafeCandidatePatch,
   extractPatchPaths,
@@ -171,6 +171,12 @@ describe('F eval utilities', () => {
 
   it('rejects invalid prediction modes', () => {
     expect(() => parsePredictionMode('glod')).toThrow(/Invalid --mode/);
+  });
+
+  it('accepts the accumulation-frozen memory ablation and rejects unknown levels', () => {
+    expect(parseMemoryAblation('B4')).toBe('B4');
+    expect(parseMemoryAblation(undefined)).toBe('B2');
+    expect(() => parseMemoryAblation('B5')).toThrow(/Invalid --ablation/);
   });
 
   it('rejects candidate patches that modify tests or test-runner configuration', () => {

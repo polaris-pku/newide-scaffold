@@ -11,7 +11,7 @@ async function main(): Promise<void> {
         '[--patch-file <path> | --worktree-path <dir> | --backend-summary <summary.json> | --ephemeral-from <repo>]',
         '[--allow-dirty-worktree] [--keep-worktree]',
         '[--run-harness] [--harness-dry-run] [--swe-evo-root <dir>] [--max-workers 4]',
-        '[--ablation B0|B1|B2|B3] [--subset <id>] [--run-id <id>] [--model <name>] [--harness-report <path>]',
+        '[--ablation B0|B1|B2|B3|B4] [--subset <id>] [--run-id <id>] [--model <name>] [--harness-report <path>]',
       ].join(' '),
     );
     process.exitCode = 1;

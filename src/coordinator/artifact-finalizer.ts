@@ -61,7 +61,7 @@ export interface ArtifactSelectionInput {
   evidence_pack?: EvidencePack;
   question?: string;
   workspace_path?: string;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   /** Persisted Agent that produced the initial Driver proposal. */
   proposal_agent_id?: string;
 }

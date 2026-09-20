@@ -171,11 +171,6 @@ for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
 
-const databaseUrlTemplate =
-  process.env.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
-  fileEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
-  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
-
 const driverRunnerRaw =
   process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
 const driverEnvFileRaw = process.env.ACP_DRIVER_ENV_FILE ?? fileEnv.ACP_DRIVER_ENV_FILE;
@@ -433,7 +428,7 @@ if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
 const armReports: Array<{
   ablation: MemoryAblation;
   state_root: string;
-  database_schema: string;
+  pglite_data_dir: string;
   total_count: number;
   scored_count: number;
   resolved_count: number;
@@ -446,21 +441,19 @@ const armReports: Array<{
 for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
   await fs.mkdir(armDir, { recursive: true });
-  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   const isolation = await prepareAblationArmIsolation({
     experiment_root: experimentRoot,
     arm: ablation,
-    database_url: dbUrl,
   });
   await fs.mkdir(isolation.state_root, { recursive: true });
   log('');
   log(`=== arm ${ablation} ===`);
   log(`state root: ${isolation.state_root}`);
-  log(`database schema: ${isolation.database_schema}`);
+  log(`pglite data dir: ${isolation.pglite_data_dir}`);
 
-  const backend = await startBackend(ablation, {
+  const backendEnv: NodeJS.ProcessEnv = {
     ...baseEnv,
-    NEWIDE_B_DATABASE_URL: isolation.database_url,
+    NEWIDE_B_PGLITE_DATA_DIR: isolation.pglite_data_dir,
     NEWIDE_B_EMBEDDING_PROVIDER: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
     NEWIDE_B_EMBEDDING_DIMENSIONS: baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32',
     NEWIDE_STATE_ROOT: isolation.state_root,
@@ -475,7 +468,10 @@ for (const ablation of ablations) {
             baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
         }
       : {}),
-  });
+  };
+  // 臂隔离靠每臂独立的数据目录：外部 Postgres 不参与，避免臂之间共用同一台服务器。
+  delete backendEnv.NEWIDE_B_DATABASE_URL;
+  const backend = await startBackend(ablation, backendEnv);
 
   const rows: InstanceRow[] = [];
   try {
@@ -506,7 +502,7 @@ for (const ablation of ablations) {
   const armSummary = {
     ablation,
     state_root: isolation.state_root,
-    database_schema: isolation.database_schema,
+    pglite_data_dir: isolation.pglite_data_dir,
     total_count: rows.length,
     scored_count: rows.filter((row) => row.harness_scored === true).length,
     resolved_count: rows.filter((row) => row.resolved === true).length,
@@ -1130,11 +1126,11 @@ function parseAblations(raw: string): MemoryAblation[] {
     .split(',')
     .map((part) => part.trim())
     .filter(Boolean);
-  const allowed: MemoryAblation[] = ['B0', 'B1', 'B2', 'B3'];
+  const allowed: MemoryAblation[] = ['B0', 'B1', 'B2', 'B3', 'B4'];
   const out: MemoryAblation[] = [];
   for (const part of parts) {
     if (!allowed.includes(part as MemoryAblation)) {
-      throw new Error(`Invalid ablation "${part}". Expected comma-separated B0|B1|B2|B3.`);
+      throw new Error(`Invalid ablation "${part}". Expected comma-separated B0|B1|B2|B3|B4.`);
     }
     if (!out.includes(part as MemoryAblation)) out.push(part as MemoryAblation);
   }
@@ -1152,7 +1148,7 @@ async function loadMergedArmReports(
   localArms: Array<{
     ablation: MemoryAblation;
     state_root: string;
-    database_schema: string;
+    pglite_data_dir: string;
     scored_count: number;
     resolved_count: number;
     applied_count: number;
@@ -1161,7 +1157,7 @@ async function loadMergedArmReports(
   }>,
 ): Promise<typeof localArms> {
   const byAblation = new Map(localArms.map((arm) => [arm.ablation, arm]));
-  for (const ablation of ['B0', 'B1', 'B2', 'B3'] as MemoryAblation[]) {
+  for (const ablation of ['B0', 'B1', 'B2', 'B3', 'B4'] as MemoryAblation[]) {
     if (byAblation.has(ablation)) continue;
     const candidate = path.join(root, ablation, 'arm-summary.json');
     const parsed = await readJsonIfExists(candidate);
@@ -1230,13 +1226,6 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
-}
-
-function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
-  if (!template.includes('{ablation}')) {
-    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
-  }
-  return template.replaceAll('{ablation}', ablation.toLowerCase());
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {

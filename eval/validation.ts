@@ -1,7 +1,7 @@
 import type { MemoryAblation, PatchSource, PredictionMode } from './types';
 
 const PREDICTION_MODES = ['stub', 'oracle', 'real'] as const;
-const MEMORY_ABLATIONS = ['B0', 'B1', 'B2', 'B3'] as const;
+const MEMORY_ABLATIONS = ['B0', 'B1', 'B2', 'B3', 'B4'] as const;
 
 export function parsePredictionMode(value: string | undefined): PredictionMode {
   const mode = value ?? 'stub';

@@ -52,7 +52,7 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   task_id: string;
   run_id: string;
   mode: PersistedRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_request: TaskCreateRequest;
   workspace_path: string;
   session_id?: string;
@@ -177,7 +177,7 @@ export interface RunTaskExecutionInput {
   task_id: string;
   run_id: string;
   council_override?: boolean;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   session_id?: string;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
