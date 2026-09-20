@@ -40,7 +40,7 @@ interface InstanceRow {
 interface ArmSummary {
   ablation: MemoryAblation;
   state_root?: string;
-  database_schema?: string;
+  pglite_data_dir?: string;
   total_count: number;
   scored_count: number;
   resolved_count: number;
