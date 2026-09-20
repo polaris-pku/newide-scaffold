@@ -9,7 +9,7 @@ export interface SweEvoEvaluationTelemetryInput {
   f2p?: Record<string, unknown>;
   applied: boolean;
   p2p_regression: boolean;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_id?: TaskId;
   run_id?: RunId;
 }

@@ -1130,11 +1130,11 @@ function parseAblations(raw: string): MemoryAblation[] {
     .split(',')
     .map((part) => part.trim())
     .filter(Boolean);
-  const allowed: MemoryAblation[] = ['B0', 'B1', 'B2', 'B3'];
+  const allowed: MemoryAblation[] = ['B0', 'B1', 'B2', 'B3', 'B4'];
   const out: MemoryAblation[] = [];
   for (const part of parts) {
     if (!allowed.includes(part as MemoryAblation)) {
-      throw new Error(`Invalid ablation "${part}". Expected comma-separated B0|B1|B2|B3.`);
+      throw new Error(`Invalid ablation "${part}". Expected comma-separated B0|B1|B2|B3|B4.`);
     }
     if (!out.includes(part as MemoryAblation)) out.push(part as MemoryAblation);
   }
@@ -1161,7 +1161,7 @@ async function loadMergedArmReports(
   }>,
 ): Promise<typeof localArms> {
   const byAblation = new Map(localArms.map((arm) => [arm.ablation, arm]));
-  for (const ablation of ['B0', 'B1', 'B2', 'B3'] as MemoryAblation[]) {
+  for (const ablation of ['B0', 'B1', 'B2', 'B3', 'B4'] as MemoryAblation[]) {
     if (byAblation.has(ablation)) continue;
     const candidate = path.join(root, ablation, 'arm-summary.json');
     const parsed = await readJsonIfExists(candidate);

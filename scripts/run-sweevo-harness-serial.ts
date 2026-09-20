@@ -67,7 +67,7 @@ if (!existsSync(experimentDir)) {
 }
 
 const dryRun = hasFlag('--dry-run');
-const arms = (['B0', 'B1', 'B2', 'B3'] as MemoryAblation[]).filter((arm) =>
+const arms = (['B0', 'B1', 'B2', 'B3', 'B4'] as MemoryAblation[]).filter((arm) =>
   existsSync(join(experimentDir, arm, 'arm-summary.json')),
 );
 

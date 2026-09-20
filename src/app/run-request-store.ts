@@ -25,7 +25,7 @@ export interface PersistedRunRequest {
   session_id?: string;
   task_request?: TaskCreateRequest;
   mode: AppRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   project_id?: string;
   client_task_id?: string;
   title?: string;
@@ -41,7 +41,7 @@ export interface RunHistoryEntry {
   restartable: boolean;
   task_id?: string;
   mode?: AppRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   prompt?: string;
   workspace_path?: string;
   session_id?: string;
@@ -275,8 +275,8 @@ function asRunMode(value: unknown): AppRunMode | undefined {
   return value === 'single_agent' || value === 'council' ? value : undefined;
 }
 
-function asMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | undefined {
-  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3'
+function asMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | 'B4' | undefined {
+  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3' || value === 'B4'
     ? value
     : undefined;
 }

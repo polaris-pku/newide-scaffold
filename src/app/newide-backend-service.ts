@@ -135,7 +135,7 @@ export interface RunCreateParams {
   client_task_id?: string;
   title?: string;
   /** F-eval memory ablation B0–B3; recorded on summary for --backend-summary. */
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   /** Optional override for materializer base / eval worktree root. */
   worktree_path?: string;
 }
@@ -887,7 +887,7 @@ export class NewideBackendService {
     identity: { run_id: string; task_id: string };
     loop: TaskExecutionLoop;
     controller: AbortController;
-    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
     session_id?: string;
   }): Promise<void> {
     const { run_id: runId, task_id: taskId } = input.identity;
@@ -933,7 +933,7 @@ export class NewideBackendService {
     identity: { run_id: string; task_id: string };
     loop: TaskExecutionLoop;
     controller: AbortController;
-    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
     session_id?: string;
   }): Promise<void> {
     const processor = this.taskProcessor!;

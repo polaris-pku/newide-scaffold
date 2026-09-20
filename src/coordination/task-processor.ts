@@ -46,7 +46,7 @@ export interface BeginTaskRunInput {
   task_request: TaskCreateRequest;
   workspace_path: string;
   mode: PersistedRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   session_id?: string;
   restarted_from_run_id?: string;
   resume_checkpoint_id?: string;
@@ -102,7 +102,7 @@ export interface TaskRunExecutionState {
   task_id: string;
   run_id: string;
   mode: PersistedRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_request: TaskCreateRequest;
   workspace_path: string;
   resume_cursor: TaskResumeCursor;
@@ -130,7 +130,7 @@ export interface TaskLaunchContext {
   task_request: TaskCreateRequest;
   workspace_path: string;
   session_id?: string;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
 }
 
 export interface TaskResumeContext extends TaskLaunchContext {
@@ -1821,8 +1821,8 @@ function readPayloadString(payload: Record<string, unknown>, key: string): strin
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-function readMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | undefined {
-  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3'
+function readMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | 'B4' | undefined {
+  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3' || value === 'B4'
     ? value
     : undefined;
 }

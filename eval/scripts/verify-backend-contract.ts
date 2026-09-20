@@ -11,7 +11,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readBackendWorktreePath } from '../worktree-patch';
 
-const MEMORY_ABLATIONS = new Set(['B0', 'B1', 'B2', 'B3']);
+const MEMORY_ABLATIONS = new Set(['B0', 'B1', 'B2', 'B3', 'B4']);
 
 function readFlag(name: string): string | undefined {
   const argv = process.argv.slice(2);
@@ -39,7 +39,7 @@ function verifySummary(summaryPath: string): void {
   if (raw.memory_ablation !== undefined) {
     if (typeof raw.memory_ablation !== 'string' || !MEMORY_ABLATIONS.has(raw.memory_ablation)) {
       errors.push(
-        `memory_ablation must be one of B0|B1|B2|B3 when present (got ${String(raw.memory_ablation)})`,
+        `memory_ablation must be one of B0|B1|B2|B3|B4 when present (got ${String(raw.memory_ablation)})`,
       );
     }
   }

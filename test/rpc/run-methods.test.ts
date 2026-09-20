@@ -29,6 +29,54 @@ describe('RunRpcMethods', () => {
     ]);
   });
 
+  it('accepts the accumulation-frozen memory ablation and rejects unknown levels', async () => {
+    const output: string[] = [];
+    const createRun = vi.fn(async () => ({
+      run_id: 'run_1',
+      task_id: 'task_1',
+      status: 'running' as const,
+    }));
+    const service = fakeService({ createRun });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, (method, params) =>
+      session.sendNotification(method, params),
+    ).register(dispatcher);
+
+    await session.handleLine(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'run.create',
+        params: {
+          prompt: 'Build RPC',
+          workspace_path: process.cwd(),
+          memory_ablation: 'B4',
+        },
+      })}`,
+    );
+    await session.handleLine(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'run.create',
+        params: {
+          prompt: 'Build RPC',
+          workspace_path: process.cwd(),
+          memory_ablation: 'B5',
+        },
+      })}`,
+    );
+
+    expect(createRun).toHaveBeenCalledWith(
+      expect.objectContaining({ memory_ablation: 'B4' }),
+    );
+    expect(output.map((line) => JSON.parse(line))[1]).toMatchObject({
+      id: 2,
+      error: { code: -32602, message: 'Invalid params' },
+    });
+  });
+
   it('creates runs and forwards subscribed events as notifications', async () => {
     const output: string[] = [];
     let listener: ((event: AppRunEvent) => void) | undefined;

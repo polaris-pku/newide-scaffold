@@ -172,7 +172,7 @@ describe('NewideBackendService run restart', () => {
       mode: string;
       session_id?: string;
       task_request?: TaskCreateRequest;
-      memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3';
+      memoryAblation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
     }[] = [];
     let nextRun = 1;
     const service = new NewideBackendService(
