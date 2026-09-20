@@ -72,6 +72,8 @@ export interface DriverRunResult {
     driver_id: DriverId;
     duration_ms: number;
     notes: string[];
+    /** Normalized six-field report retained by the production Agent facade. */
+    driver_report?: unknown;
   };
   error?: DriverError;
   created_at: Timestamp;

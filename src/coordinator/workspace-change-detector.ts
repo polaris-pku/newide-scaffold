@@ -1,5 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../core';
 
 const IGNORED_DIRECTORIES = new Set([
   '.git',
@@ -49,6 +52,79 @@ export function diffWorkspaceFiles(
   return [...candidates]
     .filter((file) => before.get(file) !== after.get(file))
     .sort((left, right) => left.localeCompare(right));
+}
+
+/** Capture complete files against the start of a logical execution, including its retries. */
+export async function collectWorkspaceArtifacts(
+  input: { task_id: string; workspace_path?: string },
+  before: WorkspaceFileSnapshot | undefined,
+  producerId = 'agent-execution-facade',
+): Promise<ArtifactRef[]> {
+  if (!input.workspace_path || !before) return [];
+  const after = await snapshotWorkspaceFiles(input.workspace_path);
+  const changedFiles = diffWorkspaceFiles(before, after).filter(isDeliverableWorkspacePath);
+  const artifacts: ArtifactRef[] = [];
+  for (const relativePath of changedFiles) {
+    const absolutePath = path.resolve(input.workspace_path, relativePath);
+    const stat = await fs.stat(absolutePath).catch(() => undefined);
+    if (!stat?.isFile() || stat.size > 5 * 1024 * 1024) continue;
+    const bytes = await fs.readFile(absolutePath).catch(() => undefined);
+    if (!bytes) continue;
+    artifacts.push({
+      artifact_id: createId('artifact'),
+      type: 'patch',
+      uri: `artifact://workspace-file/${encodeURIComponent(input.task_id)}/${encodeURIComponent(relativePath)}`,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      producer_id: producerId,
+      task_id: input.task_id,
+      metadata: {
+        source: 'workspace-change',
+        workspace_path: input.workspace_path,
+        target_path: relativePath,
+      },
+      content: {
+        kind: 'file',
+        content_ref: pathToFileURL(absolutePath).href,
+        target_path: relativePath,
+        media_type: mediaTypeFor(relativePath),
+      },
+      created_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    });
+  }
+  return artifacts;
+}
+
+export function normalizeArtifactTargetPath(value: string): string {
+  return value.replace(/\\/g, '/');
+}
+
+/** Prefer complete current workspace files over Driver edit snippets. */
+export function mergeArtifacts(
+  driverArtifacts: readonly ArtifactRef[],
+  workspaceArtifacts: readonly ArtifactRef[],
+): ArtifactRef[] {
+  const result: ArtifactRef[] = [];
+  const seenTargets = new Set<string>();
+  for (const artifact of [...workspaceArtifacts, ...driverArtifacts]) {
+    const target = artifact.content?.target_path;
+    const key = target ? normalizeArtifactTargetPath(target) : undefined;
+    if (key && seenTargets.has(key)) continue;
+    if (key) seenTargets.add(key);
+    result.push(artifact);
+  }
+  return result;
+}
+
+function mediaTypeFor(relativePath: string): string {
+  const extension = path.extname(relativePath).toLowerCase();
+  if (extension === '.ts') return 'text/typescript';
+  if (extension === '.tsx') return 'text/tsx';
+  if (extension === '.js' || extension === '.jsx') return 'text/javascript';
+  if (extension === '.json') return 'application/json';
+  if (extension === '.css') return 'text/css';
+  if (extension === '.html') return 'text/html';
+  return 'text/plain';
 }
 
 /** Files that can represent intentional source changes and may become delivery artifacts. */

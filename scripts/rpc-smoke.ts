@@ -129,8 +129,9 @@ try {
   if (cancelled) await waitForCancellationEffects();
   const driverInvocations = usesTemporaryRunner ? await countDriverInvocations() : undefined;
   if (driverInvocations !== undefined) {
-    // Plan-first reuses Primary's initial plan as proposer 0 instead of invoking it twice.
-    const expectedInvocations = smokeMode === 'all' ? 10 : smokeMode === 'single_agent' ? 2 : 8;
+    // Plan-first reuses Primary's initial plan as proposer 0 and each Council
+    // role creates its ACP Session on the real task turn instead of a warm-up.
+    const expectedInvocations = smokeMode === 'all' ? 7 : smokeMode === 'single_agent' ? 2 : 5;
     assert(
       driverInvocations === expectedInvocations,
       `Expected ${expectedInvocations} driver invocations, received ${driverInvocations}`,
@@ -501,6 +502,7 @@ process.stdin.on('end', () => {
   appendFileSync(new URL('./invocations.log', import.meta.url), 'invoke\\n');
   const writeResult = () => process.stdout.write(JSON.stringify({
     driver_run_result_id: 'driver_result_' + suffix,
+    response: input.prompt.includes('Review the isolated proposal inputs') ? JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }) : 'Done.',
     session_id: 'session_' + suffix,
     status: 'succeeded',
     artifacts: [artifact],

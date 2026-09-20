@@ -5,6 +5,55 @@ import { AutonomousCouncilHandler } from '../../src/coordinator/handlers/autonom
 import type { CouncilProvider, CouncilRunResult, Review } from '../../src/council';
 
 describe('AutonomousCouncilHandler', () => {
+  it('uses a complete fallback when one file of the selected candidate is missing', async () => {
+    const value = runResult({
+      finalArtifact: artifact('synthesis_readable', 'main.ts', 'import "./missing";'),
+      proposalArtifacts: [artifact('artifact_a', 'main.ts', 'self-contained fallback')],
+      reviews: [review('approve')],
+    });
+    value.selected_artifact_refs.push('missing_dependency');
+    value.decision.selected_artifact_refs = [...value.selected_artifact_refs];
+    const output = await new AutonomousCouncilHandler({ councilProvider: provider(value) }).execute(
+      request(),
+    );
+    expect(output.final_artifacts.map((artifact) => artifact.artifact_id)).toEqual(['artifact_a']);
+    expect(output.council_result.fallback_used).toBe(true);
+    expect(output.council_result.warnings.join(' ')).toContain('missing_dependency');
+  });
+
+  it('skips an incomplete high-ranked proposal rather than delivering a broken subset', async () => {
+    const value = runResult({
+      proposalArtifacts: [
+        artifact('artifact_a', 'a.ts', 'needs missing file'),
+        artifact('artifact_b', 'b.ts', 'complete'),
+      ],
+      reviews: [review('approve', [], 'proposal_a'), review('needs_revision', [], 'proposal_b')],
+    });
+    value.proposals[0]!.artifact_refs.push('missing_dependency');
+    const output = await new AutonomousCouncilHandler({ councilProvider: provider(value) }).execute(
+      request(),
+    );
+    expect(output.final_artifact.artifact_id).toBe('artifact_b');
+  });
+  it('falls back to readable evidence when the synthesized artifact cannot be read', async () => {
+    const unreadable = artifact('artifact_missing', 'missing.ts', '');
+    unreadable.content!.content_ref = 'data:text/plain,%invalid';
+    const handler = new AutonomousCouncilHandler({
+      councilProvider: provider(
+        runResult({
+          finalArtifact: unreadable,
+          proposalArtifacts: [artifact('artifact_a', 'a.ts', 'usable')],
+          reviews: [review('approve')],
+        }),
+      ),
+    });
+    const output = await handler.execute(request());
+    expect(output.final_artifact.artifact_id).toBe('artifact_a');
+    expect(output.council_result).toMatchObject({ fallback_used: true, quality: 'best_effort' });
+    expect(output.council_result.warnings).toContain(
+      'Council artifact unavailable: artifact_missing',
+    );
+  });
   it('returns a verified CouncilResult for an approved synthesis artifact', async () => {
     const finalArtifact = artifact('artifact_synthesis', 'final.ts', 'verified output\n');
     const handler = new AutonomousCouncilHandler({
@@ -15,6 +64,8 @@ describe('AutonomousCouncilHandler', () => {
 
     expect(output.final_artifact.artifact_id).toBe('artifact_synthesis');
     expect(output.council_result).toEqual({
+      role_failure_count: 0,
+      fallback_used: false,
       quality: 'verified',
       final_artifact_ref: 'artifact_synthesis',
       final_artifact_sha256: sha('verified output\n'),
@@ -51,7 +102,10 @@ describe('AutonomousCouncilHandler', () => {
     const value = runResult({
       finalArtifact: undefined,
       proposalArtifacts: [proposalA, proposalB],
-      reviews: [review('reject', ['correctness'], 'proposal_a'), review('approve', [], 'proposal_b')],
+      reviews: [
+        review('reject', ['correctness'], 'proposal_a'),
+        review('approve', [], 'proposal_b'),
+      ],
     });
     const handler = new AutonomousCouncilHandler({ councilProvider: provider(value) });
 
@@ -61,7 +115,9 @@ describe('AutonomousCouncilHandler', () => {
     expect(output.council_result).toMatchObject({
       quality: 'best_effort',
       final_artifact_ref: 'artifact_b',
-      warnings: expect.arrayContaining(['Council synthesis was unavailable; selected the best available proposal.']),
+      warnings: expect.arrayContaining([
+        'Council synthesis was unavailable; selected the best available proposal.',
+      ]),
     });
   });
 
@@ -110,6 +166,39 @@ describe('AutonomousCouncilHandler', () => {
       'Council produced no materializable artifact',
     );
   });
+
+  it('skips empty approved candidates and exposes fallback and role failures consistently', async () => {
+    const value = runResult({
+      proposalArtifacts: [
+        artifact('artifact_empty', 'empty.ts', ''),
+        artifact('artifact_b', 'b.ts', 'B'),
+      ],
+      reviews: [review('approve', [], 'proposal_a')],
+    });
+    value.proposals[0]!.artifact_refs = ['missing_artifact'];
+    value.diagnostic_refs = ['COUNCIL_SYNTHESIS_FAILED:lead', 'COUNCIL_SYNTHESIS_FAILED:lead'];
+    const handler = new AutonomousCouncilHandler({ councilProvider: provider(value) });
+    const result = await handler.execute(request());
+    expect(result.final_artifact.artifact_id).toBe('artifact_b');
+    expect(result.council_result).toMatchObject({
+      role_failure_count: 2,
+      fallback_used: true,
+      quality: 'best_effort',
+    });
+    expect(result.council_run_result.decision).toMatchObject({
+      verdict: 'select',
+      selected_artifact_refs: ['artifact_b'],
+    });
+    expect(result.council_run_result.outcome).toMatchObject({
+      status: 'completed',
+      role_failure_count: 2,
+      fallback_used: true,
+      selected_artifact_refs: ['artifact_b'],
+    });
+    expect(result.council_run_result.outcome?.warnings.join(' ')).toContain(
+      'COUNCIL_SYNTHESIS_FAILED',
+    );
+  });
 });
 
 function request() {
@@ -125,7 +214,11 @@ function request() {
 }
 
 function provider(result: CouncilRunResult): CouncilProvider {
-  return { async runCouncilRound() { return result; } };
+  return {
+    async runCouncilRound() {
+      return result;
+    },
+  };
 }
 
 function runResult(input: {

@@ -1,8 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import {
   SCHEMA_VERSION,
   createId,
@@ -11,11 +9,11 @@ import {
   type ArtifactRef,
 } from '../core';
 import {
-  diffWorkspaceFiles,
-  isDeliverableWorkspacePath,
+  collectWorkspaceArtifacts,
+  mergeArtifacts,
   snapshotWorkspaceFiles,
-  type WorkspaceFileSnapshot,
 } from '../coordinator/workspace-change-detector';
+export { mergeArtifacts, normalizeArtifactTargetPath } from '../coordinator/workspace-change-detector';
 import {
   AgentManager,
   InvokeDriverTool,
@@ -67,7 +65,9 @@ import type {
   DriverRunStatus,
   DriverRuntimeHandle,
   DriverStreamEvent,
+  DriverStreamEventListener,
 } from '../driver/contract';
+import { runDriverPromptWithSignal } from '../driver/abortable-driver-run';
 import {
   createDriverRuntimeInvoker,
   type DriverRuntimeInvokerInput,
@@ -174,7 +174,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.ensureRole(agentId);
   }
 
-  async provisionParticipantSession(input: ParticipantSessionProvisionRequest): Promise<string> {
+  async provisionParticipantSession(
+    input: ParticipantSessionProvisionRequest,
+    options?: AgentExecutionOptions,
+  ): Promise<string> {
+    throwIfAborted(options?.signal);
     const workspacePath = path.resolve(input.workspace_path);
     const existing = this.options.mailbox?.sessionRegistry?.get(
       input.task_id,
@@ -184,20 +188,22 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (existing) return existing;
     const key = `${input.task_id}\u0000${workspacePath}\u0000${input.role_id}`;
     const pending = this.sessionProvisioning.get(key);
-    if (pending) return pending;
-    const provisioning = this.createParticipantSession({
-      ...input,
-      workspace_path: workspacePath,
-    }).finally(() => this.sessionProvisioning.delete(key));
+    if (pending) return withAbort(pending, options?.signal);
+    const provisioning = this.createParticipantSession(
+      { ...input, workspace_path: workspacePath },
+      options,
+    ).finally(() => this.sessionProvisioning.delete(key));
     this.sessionProvisioning.set(key, provisioning);
     return provisioning;
   }
 
   private async createParticipantSession(
     input: ParticipantSessionProvisionRequest,
+    options?: AgentExecutionOptions,
   ): Promise<string> {
     await this.ensureRole(input.role_id);
-    const result = await this.options.driver.sendPrompt({
+    throwIfAborted(options?.signal);
+    const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
       prompt: [
@@ -209,7 +215,23 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       workspace_path: input.workspace_path,
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
-    });
+    };
+    const onDriverEvent: DriverStreamEventListener | undefined = options?.onDriverEvent
+      ? (event) => options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
+      : undefined;
+    let result = await runDriverPromptWithSignal(
+      this.options.driver, prompt, options?.signal, onDriverEvent,
+    );
+    if (isArtifactFreeRetryableFailure(result) && !/\bSESSION_READY\b/.test(result.response ?? '')) {
+      const sessionId = result.session_id && result.session_id !== this.options.driver.session_id && result.session_id !== 'session-unavailable'
+        ? result.session_id : undefined;
+      result = await runDriverPromptWithSignal(
+        this.options.driver,
+        { ...prompt, run_id: `${prompt.run_id}:retry`, ...(sessionId ? { session_id: sessionId } : {}) },
+        options?.signal,
+        onDriverEvent,
+      );
+    }
     const usableSession =
       Boolean(result.session_id) &&
       result.session_id !== this.options.driver.session_id &&
@@ -312,14 +334,18 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       !normalizedInput.session_id &&
       !boundSession &&
       normalizedInput.workspace_path &&
-      this.options.mailbox?.sessionRegistry
+      this.options.mailbox?.sessionRegistry &&
+      !normalizedInput.context_policy.startsWith('council_')
     ) {
-      boundSession = await this.provisionParticipantSession({
-        task_id: normalizedInput.task_id,
-        workspace_path: normalizedInput.workspace_path,
-        role_id: normalizedInput.role_id,
-        run_id: normalizedInput.run_id,
-      });
+      boundSession = await this.provisionParticipantSession(
+        {
+          task_id: normalizedInput.task_id,
+          workspace_path: normalizedInput.workspace_path,
+          role_id: normalizedInput.role_id,
+          run_id: normalizedInput.run_id,
+        },
+        options,
+      );
     }
     const scopedInput =
       normalizedInput.session_id || !boundSession
@@ -460,7 +486,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const workspaceArtifacts = await collectWorkspaceArtifacts(
         input,
         workspaceBefore,
-        invocation.execution,
+        invocation.execution?.diagnostics.driver_id,
       );
 
       if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
@@ -623,9 +649,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
     const waitForReply = expectsMailboxReply(kind);
-    if (waitForReply && invocation.context_policy === 'council_primary_plan') {
+    if (waitForReply && invocation.context_policy?.startsWith('council_')) {
       throw new Error(
-        'Council primary planning is independent: write council-plan.md instead of waiting for a Mailbox reply',
+        'Council phases cannot wait for a Mailbox reply: continue the assigned role with the staged evidence and record any missing information in the report',
       );
     }
     invocation.mailbox_sequence += 1;
@@ -964,6 +990,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...execution.diagnostics,
         driver_status: execution.status,
         driver_attempts: driverAttempts,
+        driver_report: dispatched.cycle.buffer_snapshot.driver_return,
         dispatch_status: dispatched.status,
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],
@@ -1371,50 +1398,6 @@ function delegationContext(original: string, delegated: string) {
   return [{ id: 'b_delegation', description: 'B runtime delegation guidance', content: delegated }];
 }
 
-async function collectWorkspaceArtifacts(
-  input: AgentExecutionRequest,
-  before: WorkspaceFileSnapshot | undefined,
-  execution: DriverRunResult | undefined,
-): Promise<ArtifactRef[]> {
-  if (!input.workspace_path || !before) return [];
-  const after = await snapshotWorkspaceFiles(input.workspace_path);
-  const changedFiles = diffWorkspaceFiles(before, after).filter(isDeliverableWorkspacePath);
-  const producerId = execution?.diagnostics.driver_id ?? 'agent-execution-facade';
-  const artifacts: ArtifactRef[] = [];
-
-  for (const relativePath of changedFiles) {
-    const absolutePath = path.resolve(input.workspace_path, relativePath);
-    const stat = await fs.stat(absolutePath).catch(() => undefined);
-    if (!stat?.isFile() || stat.size > 5 * 1024 * 1024) continue;
-    const bytes = await fs.readFile(absolutePath).catch(() => undefined);
-    if (!bytes) continue;
-    const fileUrl = pathToFileURL(absolutePath).href;
-    const createdAt = nowTimestamp();
-    artifacts.push({
-      artifact_id: createId('artifact'),
-      type: 'patch',
-      uri: `artifact://workspace-file/${encodeURIComponent(input.task_id)}/${encodeURIComponent(relativePath)}`,
-      sha256: createHash('sha256').update(bytes).digest('hex'),
-      producer_id: producerId,
-      task_id: input.task_id,
-      metadata: {
-        source: 'workspace-change',
-        workspace_path: input.workspace_path,
-        target_path: relativePath,
-      },
-      content: {
-        kind: 'file',
-        content_ref: fileUrl,
-        target_path: relativePath,
-        media_type: mediaTypeFor(relativePath),
-      },
-      created_at: createdAt,
-      schema_version: SCHEMA_VERSION,
-    });
-  }
-  return artifacts;
-}
-
 /**
  * 把 ToolCallingClient 适配为退休评估的 LlmClient，并构建三重门控的 LLM 层评估器。
  *
@@ -1437,40 +1420,6 @@ export function createToolRetirementEvaluator(llm: ToolCallingClient): Retiremen
     },
   };
   return new LlmRetirementEvaluator(adapter);
-}
-
-/** Normalize artifact target paths so Windows `\` and POSIX `/` compare equal. */
-export function normalizeArtifactTargetPath(value: string): string {
-  return value.replace(/\\/g, '/');
-}
-
-export function mergeArtifacts(
-  driverArtifacts: readonly ArtifactRef[],
-  workspaceArtifacts: readonly ArtifactRef[],
-): ArtifactRef[] {
-  const result: ArtifactRef[] = [];
-  const seenTargets = new Set<string>();
-  // Workspace snapshots contain the complete post-run file. Prefer them over
-  // Driver edit snippets when both artifacts target the same path.
-  for (const artifact of [...workspaceArtifacts, ...driverArtifacts]) {
-    const target = artifact.content?.target_path;
-    const key = target ? normalizeArtifactTargetPath(target) : undefined;
-    if (key && seenTargets.has(key)) continue;
-    if (key) seenTargets.add(key);
-    result.push(artifact);
-  }
-  return result;
-}
-
-function mediaTypeFor(relativePath: string): string {
-  const extension = path.extname(relativePath).toLowerCase();
-  if (extension === '.ts') return 'text/typescript';
-  if (extension === '.tsx') return 'text/tsx';
-  if (extension === '.js' || extension === '.jsx') return 'text/javascript';
-  if (extension === '.json') return 'application/json';
-  if (extension === '.css') return 'text/css';
-  if (extension === '.html') return 'text/html';
-  return 'text/plain';
 }
 
 function isArtifactFreeRetryableFailure(execution: DriverRunResult): boolean {

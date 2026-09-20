@@ -31,15 +31,38 @@ export class AutonomousCouncilHandler {
   ): Promise<AutonomousCouncilExecution> {
     const runResult = await this.options.councilProvider.runCouncilRound(input, options);
     const artifacts = new Map(
-      [...(input.candidate_artifacts ?? []), ...runResult.generated_artifact_refs].map((artifact) => [
-        artifact.artifact_id,
-        artifact,
-      ]),
+      [...(input.candidate_artifacts ?? []), ...runResult.generated_artifact_refs].map(
+        (artifact) => [artifact.artifact_id, artifact],
+      ),
     );
-    const selected = materializableArtifacts(runResult.selected_artifact_refs, artifacts);
-    const fallback = selected.length > 0
-      ? []
-      : selectReviewedProposalArtifacts(runResult.proposals, runResult.reviews, artifacts);
+    const artifactBytes = new Map<string, Buffer>();
+    const unavailableWarnings: string[] = [];
+    for (const [id, artifact] of artifacts) {
+      if (!isMaterializableFileArtifact(artifact)) continue;
+      try {
+        artifactBytes.set(id, await readArtifactBytes(artifact));
+      } catch {
+        artifacts.delete(id);
+        unavailableWarnings.push(`Council artifact unavailable: ${id}`);
+      }
+    }
+    const selected = completeMaterializableArtifacts(runResult.selected_artifact_refs, artifacts);
+    const referencedIds = new Set([
+      ...runResult.selected_artifact_refs,
+      ...runResult.proposals.flatMap((proposal) => proposal.artifact_refs),
+    ]);
+    for (const id of referencedIds) {
+      if (
+        !artifacts.has(id) &&
+        !unavailableWarnings.includes(`Council artifact unavailable: ${id}`)
+      ) {
+        unavailableWarnings.push(`Council artifact unavailable: ${id}`);
+      }
+    }
+    const fallback =
+      selected.length > 0
+        ? []
+        : selectReviewedProposalArtifacts(runResult.proposals, runResult.reviews, artifacts);
     const finalArtifacts = selected.length > 0 ? selected : fallback;
     const finalArtifact = finalArtifacts[0];
     if (!finalArtifact) throw new Error('Council produced no materializable artifact');
@@ -57,27 +80,72 @@ export class AutonomousCouncilHandler {
         ['agent_reused_across_council_seats', 'best_effort_identity'].includes(flag),
       ),
     );
+    const diagnostics = runResult.diagnostic_refs ?? [];
+    const roleFailureCount = diagnostics.filter((ref) =>
+      /^COUNCIL_(PROPOSAL|REVIEW|SYNTHESIS)_FAILED:/.test(ref),
+    ).length;
     const verified = Boolean(
-      selected.length > 0 && runResult.synthesis && fullyApproved && !identityConflict,
+      selected.length > 0 &&
+      runResult.synthesis &&
+      fullyApproved &&
+      !identityConflict &&
+      diagnostics.length === 0 &&
+      unavailableWarnings.length === 0,
     );
-    const warnings: string[] = [];
+    const warnings: string[] = [...unavailableWarnings];
     if (fallback.length > 0) {
       warnings.push('Council synthesis was unavailable; selected the best available proposal.');
     }
     if (identityConflict) {
       warnings.push('Council reused a persisted Agent across seats; identity reuse was audited.');
     }
+    warnings.push(...unique(diagnostics).map((ref) => `Council diagnostic: ${ref}`));
+    for (const review of runResult.reviews.filter((review) => review.verdict === 'reject')) {
+      warnings.push(`Review rejected ${review.proposal_id}: ${review.reason}`);
+    }
     const councilResult: CouncilResult = {
+      role_failure_count: roleFailureCount,
+      fallback_used: fallback.length > 0,
       quality: verified ? 'verified' : 'best_effort',
       final_artifact_ref: finalArtifact.artifact_id,
-      final_artifact_sha256: sha256(await readArtifactBytes(finalArtifact)),
+      final_artifact_sha256: sha256(artifactBytes.get(finalArtifact.artifact_id)!),
       warnings,
       unmet_criteria: unmetCriteria,
       verification_refs: runResult.reviews.map((review) => review.review_id),
       decision_record_ref: runResult.decision.decision_id,
     };
+    const finalRefs = finalArtifacts.map((artifact) => artifact.artifact_id);
+    const finalDecision =
+      fallback.length > 0
+        ? {
+            ...runResult.decision,
+            verdict: 'select' as const,
+            selected_artifact_refs: finalRefs,
+            reason: `Synthesis unavailable; continuing with the best materializable proposal. ${runResult.decision.reason}`,
+          }
+        : { ...runResult.decision, selected_artifact_refs: finalRefs };
     const councilRunResult = reconcileCouncilOutcome(
-      { ...runResult, result: councilResult },
+      {
+        ...runResult,
+        decision: finalDecision,
+        selected_artifact_refs: finalRefs,
+        result: councilResult,
+        ...(runResult.output
+          ? {
+              output: {
+                ...runResult.output,
+                selected_artifact_refs: finalRefs,
+                ...(fallback.length > 0
+                  ? {
+                      status: 'selected' as const,
+                      required_next_actions: ['post_council_gate'],
+                      blocked_by: [],
+                    }
+                  : {}),
+              },
+            }
+          : {}),
+      },
       councilResult,
     );
     return {
@@ -95,10 +163,17 @@ function materializableArtifacts(
 ): ArtifactRef[] {
   return artifactIds
     .map((artifactId) => artifacts.get(artifactId))
-    .filter(
-      (artifact): artifact is ArtifactRef =>
-        Boolean(artifact && isMaterializableFileArtifact(artifact)),
+    .filter((artifact): artifact is ArtifactRef =>
+      Boolean(artifact && isMaterializableFileArtifact(artifact)),
     );
+}
+
+function completeMaterializableArtifacts(
+  artifactIds: readonly string[],
+  artifacts: ReadonlyMap<string, ArtifactRef>,
+): ArtifactRef[] {
+  if (artifactIds.some((id) => !artifacts.has(id))) return [];
+  return materializableArtifacts(artifactIds, artifacts);
 }
 
 function selectReviewedProposalArtifacts(
@@ -112,6 +187,9 @@ function selectReviewedProposalArtifacts(
     reviewScore.set(review.proposal_id, Math.max(reviewScore.get(review.proposal_id) ?? -1, score));
   }
   const selectedProposal = proposals
+    .filter(
+      (proposal) => completeMaterializableArtifacts(proposal.artifact_refs, artifacts).length > 0,
+    )
     .map((proposal, index) => ({
       proposal,
       index,
@@ -121,9 +199,8 @@ function selectReviewedProposalArtifacts(
   if (!selectedProposal) return [];
   return selectedProposal.artifact_refs
     .map((artifactId) => artifacts.get(artifactId))
-    .filter(
-      (artifact): artifact is ArtifactRef =>
-        Boolean(artifact && isMaterializableFileArtifact(artifact)),
+    .filter((artifact): artifact is ArtifactRef =>
+      Boolean(artifact && isMaterializableFileArtifact(artifact)),
     );
 }
 

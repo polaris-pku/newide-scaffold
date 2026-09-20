@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -25,6 +25,7 @@ import type { AgentBoardListItem, AgentBoardQuery } from '../../src/memory';
 
 describe('production stage executors', () => {
   it('retries a missing primary Plan and resumes a B_BLOCKED final Plan execution', async () => {
+    const events: Event[] = [];
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-plan-first-stages-'));
     const workspace = path.join(root, 'workspace');
     await mkdir(workspace, { recursive: true });
@@ -124,6 +125,9 @@ describe('production stage executors', () => {
         async runAgent(input) {
           requests.push(input);
           executionCount += 1;
+          if (executionCount === 3) {
+            await writeFile(path.join(input.workspace_path!, 'first-part.ts'), 'export const preserved = true;');
+          }
           const artifact =
             executionCount === 1
               ? missingPrimaryPlan
@@ -167,6 +171,7 @@ describe('production stage executors', () => {
       task_request: { spec: 'implement result.ts', completion_criteria: [] },
       workspace_path: workspace,
       memory_ablation: 'B0' as const,
+      on_event: (event: Event) => events.push(event),
     };
 
     const executed = await executors.execute_agent.execute({
@@ -194,6 +199,7 @@ describe('production stage executors', () => {
     expect(requests[1]).toMatchObject({
       role_id: 'role_primary',
       context_policy: 'council_primary_plan',
+      session_id: 'session_primary',
     });
     expect(requests[1]?.instruction).toContain('RETRY:');
     expect(requests[1]?.driver_instruction).toContain('RETRY:');
@@ -214,19 +220,36 @@ describe('production stage executors', () => {
       workspace_path: requests[2]?.workspace_path,
     });
     expect(requests[3]?.driver_instruction).toContain('RETRY: Resume this same Plan execution');
-    expect(council.artifact_refs).toEqual([implementation.artifact_id]);
+    expect(council.artifact_refs).toContain(implementation.artifact_id);
+    expect(council.artifact_refs).toHaveLength(2);
     const state = JSON.parse(
       await readFile(path.join(root, 'runs', 'run_plan', 'production-stage-state.json'), 'utf8'),
-    ) as { selection: { council_run_result: { plan_execution: unknown; selected_artifact_refs: string[] } } };
+    ) as { selection: { selected_artifacts: ArtifactRef[]; council_run_result: { result: { role_failure_count: number }; decision: { selected_artifact_refs: string[] }; plan_execution: unknown; selected_artifact_refs: string[] } } };
     expect(state.selection.council_run_result.plan_execution).toMatchObject({
       executor_role_id: 'role_primary',
       session_id: 'session_primary',
       final_plan_artifact_refs: [finalPlan.artifact_id],
-      implementation_artifact_refs: [implementation.artifact_id],
+      implementation_artifact_refs: council.artifact_refs,
     });
-    expect(state.selection.council_run_result.selected_artifact_refs).toEqual([
-      implementation.artifact_id,
-    ]);
+    expect(state.selection.council_run_result.selected_artifact_refs).toEqual(council.artifact_refs);
+    expect(state.selection.council_run_result.decision.selected_artifact_refs).toEqual(council.artifact_refs);
+    expect(state.selection.selected_artifacts.map((artifact) => artifact.content?.target_path).sort()).toEqual(['first-part.ts', 'src/result.ts']);
+    expect(state.selection.council_run_result.result.role_failure_count).toBe(1);
+    const failed = events.find((event) => event.event_type === 'council.role.failed')!;
+    expect(failed.payload).toMatchObject({ phase: 'implementation', attempt: 1, will_retry: true });
+    const phases = events.filter((event) => event.event_type === 'council.phase.started');
+    expect(phases).toHaveLength(2);
+    expect(phases[1]!.payload).toMatchObject({ attempt: 2 });
+    expect(phases[0]!.payload.phase_id).not.toEqual(phases[1]!.payload.phase_id);
+    await executors.gate.execute({ ...common, cursor_input: {
+      cursor: 'gate', subject_ref: council.changeset_ref, phase: 'post_council',
+      changeset_ref: council.changeset_ref, expected_sha256: council.expected_sha256,
+    } });
+    await executors.deliver.execute({ ...common, cursor_input: {
+      cursor: 'deliver', changeset_ref: council.changeset_ref, expected_sha256: council.expected_sha256,
+    } });
+    expect(await readFile(path.join(workspace, 'first-part.ts'), 'utf8')).toBe('export const preserved = true;');
+    expect(await readFile(path.join(workspace, 'src/result.ts'), 'utf8')).toBe('export {};');
   });
 
   it('enables plan_first end to end: fixed seats propose, synthesize a plan, primary implements it', async () => {
@@ -590,7 +613,7 @@ describe('production stage executors', () => {
     });
   });
 
-  it('emits memory.context_pack_built with ablation when council primary fails', async () => {
+  it('lets a failed plan-first primary continue into Council recovery', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
     const workspace = path.join(root, 'workspace');
     await mkdir(workspace, { recursive: true });
@@ -627,6 +650,7 @@ describe('production stage executors', () => {
         }),
       },
       councilProvider: {
+        strategyName: 'plan_first',
         runCouncilRound: async () => {
           throw new Error('Council is not expected in this unit test');
         },
@@ -669,6 +693,7 @@ describe('production stage executors', () => {
       primary_status: 'failed',
       context_pack_ref: 'context_pack_failed',
     });
+    expect(result.evidence.status).toBe('failed');
   });
 
   it('pins the primary Agent as the sole candidate when the auction is disabled', async () => {

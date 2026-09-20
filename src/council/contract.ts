@@ -55,6 +55,8 @@ export interface Review {
 }
 
 export interface CouncilResult {
+  role_failure_count?: number;
+  fallback_used?: boolean;
   /** @deprecated Audit metadata only; Task completion is based on final artifact convergence. */
   quality: 'verified' | 'best_effort';
   final_artifact_ref: ArtifactId;
@@ -72,6 +74,8 @@ export type CouncilOutcomeStatus = 'completed' | 'needs_human' | 'failed';
  * strategy's internal proposal/review topology.
  */
 export interface CouncilOutcome {
+  role_failure_count?: number;
+  fallback_used?: boolean;
   status: CouncilOutcomeStatus;
   participant_role_ids: string[];
   selected_artifact_refs: ArtifactId[];

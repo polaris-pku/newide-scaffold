@@ -5,6 +5,45 @@ import type { GateResult } from '../../src/gate';
 import { buildCouncilProposalFromDriverResult } from '../../src/council/proposal-adapter';
 
 describe('buildCouncilProposalFromDriverResult', () => {
+  it('preserves the primary response and normalized report evidence', () => {
+    const driver = createDriverResult([]);
+    driver.response = 'Implemented bounded input validation.';
+    expect(
+      buildCouncilProposalFromDriverResult({
+        run_id: 'run',
+        task_id: 'task',
+        driver_result: driver,
+        gate_results: [],
+      }).summary,
+    ).toBe(driver.response);
+    driver.diagnostics.driver_report = {
+      summary: 'Reject invalid CSV header offsets.',
+      artifacts: [],
+      decisions: [
+        {
+          point: 'Validate header',
+          options: ['early', 'late'],
+          chosen: 'early',
+          reason: 'Avoid indexing invalid input',
+        },
+      ],
+      assumptions: [{ assumption: 'Header is nonnegative', risk_if_wrong: 'Wrong row selected' }],
+      blockers: [
+        { blocker: 'Integration tests unavailable', attempts: [], resolution: '', resolved: false },
+      ],
+      referenced_experiences: [],
+    };
+    const proposal = buildCouncilProposalFromDriverResult({
+      run_id: 'run',
+      task_id: 'task',
+      driver_result: driver,
+      gate_results: [],
+    });
+    expect(proposal.summary).toBe('Reject invalid CSV header offsets.');
+    expect(proposal.claims?.[0]?.statement).toContain('Avoid indexing invalid input');
+    expect(proposal.assumptions).toEqual(['Header is nonnegative']);
+    expect(proposal.known_risks).toEqual(['Wrong row selected', 'Integration tests unavailable']);
+  });
   it('builds a council proposal from driver artifacts and gate evidence', () => {
     const driverResult = createDriverResult([
       createArtifact('artifact_patch_001'),

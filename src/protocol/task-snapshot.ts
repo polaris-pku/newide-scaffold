@@ -38,6 +38,8 @@ export const marketSelectionEvidenceSchema = z
 
 export const councilResultEvidenceSchema = z
   .object({
+    role_failure_count: z.number().int().nonnegative().optional(),
+    fallback_used: z.boolean().optional(),
     quality: z.enum(['verified', 'best_effort']),
     final_artifact_ref: z.string().min(1),
     final_artifact_sha256: z.string().regex(/^[a-f0-9]{64}$/),

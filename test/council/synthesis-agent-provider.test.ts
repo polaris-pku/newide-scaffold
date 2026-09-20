@@ -149,9 +149,7 @@ describe('SynthesisAgentCouncilProvider', () => {
           session_id: `session_${input.role_id}`,
           response:
             input.role_id === COUNCIL_AGENTS.reviewer
-              ? JSON.stringify({
-                  reviews: ['proposal-placeholder'],
-                })
+              ? reviewResponse(input)
               : `${input.role_id} completed`,
           tool_events: [],
           diagnostics: {
@@ -469,6 +467,8 @@ describe('SynthesisAgentCouncilProvider', () => {
               'transcript',
             ),
             diagnostics: { driver_id: `driver_${input.role_id}` },
+            session_id: `session_${input.role_id}`,
+            response: input.council_seat === 'reviewer' ? reviewResponse(input) : 'Completed',
             status: input.role_id === failedAgent ? 'failed' : 'completed',
             created_at: '2026-07-07T00:00:00.000Z',
             schema_version: SCHEMA_VERSION,
@@ -497,9 +497,6 @@ describe('SynthesisAgentCouncilProvider', () => {
       expect(requests.slice(2)).toEqual([
         COUNCIL_AGENTS.reviewer,
         COUNCIL_AGENTS.synthesizer,
-        ...(failedAgent === COUNCIL_AGENTS.synthesizer
-          ? [COUNCIL_AGENTS.synthesizer]
-          : []),
       ]);
       expect(lifecycleEvents).toContainEqual(
         expect.objectContaining({
@@ -625,13 +622,19 @@ function completedExecution(input: AgentExecutionRequest) {
     artifact_refs: [createArtifact(`artifact_${input.role_id}`, input.role_id)],
     transcript_ref: createArtifact(`transcript_${input.role_id}`, input.role_id, 'transcript'),
     session_id: input.session_id ?? `session_${input.role_id}`,
-    response: 'completed',
+    response: input.council_seat === 'reviewer' ? reviewResponse(input) : 'completed',
     tool_events: [],
     diagnostics: { driver_id: `driver_${input.role_id}` },
     status: 'completed' as const,
     created_at: '2026-07-07T00:00:00.000Z',
     schema_version: SCHEMA_VERSION,
   };
+}
+
+function reviewResponse(input: AgentExecutionRequest): string {
+  return JSON.stringify({ reviews: [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])].map((id) => ({
+    proposal_id: id, verdict: 'approve', reason: 'Evidence supports this proposal.', unmet_criteria: [], evidence_refs: [],
+  })) });
 }
 
 const COUNCIL_AGENTS = {
