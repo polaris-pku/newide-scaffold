@@ -8,4 +8,7 @@ tasks:
     timeoutMs: 60000
     maxRetries: 2
     temperature: 0.1
-    maxTokens: 4000
+    # 经验提取的 JSON 响应实测需 616~3491 completion token（该模型带 reasoning，
+    # 长度方差大），4000 余量不足会截断在字符串中间 → 提取静默降级到规则版。
+    # 8000 对齐 profiles.yaml 的 coding 档。
+    maxTokens: 8000

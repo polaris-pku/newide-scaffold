@@ -159,6 +159,9 @@ function toToolCalls(resultToolCalls: unknown[]): ToolCall[] {
 // LiteLLMToolCallingClient
 // ──────────────────────────────────────────────
 
+/** 默认 task profile（对应 config/memory-query.yaml） */
+const DEFAULT_TASK_NAME = 'memory-query';
+
 export interface LiteLLMToolCallingClientOptions {
   /** LiteLLM 任务类型（默认 'memory-query'，对应 config/memory-query.yaml） */
   taskName?: string;
@@ -167,7 +170,8 @@ export interface LiteLLMToolCallingClientOptions {
 
   /**
    * 模型名称覆盖（如 'deepseek-v4-flash'）。
-   * 设此值后忽略 YAML 配置中的 model，但温度/超时等仍从 YAML 读取。
+   * 只覆盖 provider 与 model；temperature 与 maxTokens 仍按 task profile 解析。
+   * （profile 的 timeoutMs / maxRetries 目前未在本客户端生效。）
    * 未传时回退 DEEPSEEK_MODEL，避免 eval 仍打已下线的 deepseek-chat。
    */
   model?: string;
@@ -191,7 +195,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
   private readonly modelOverride: string | undefined;
 
   constructor(options: LiteLLMToolCallingClientOptions = {}) {
-    this.taskName = options.taskName ?? 'memory-query';
+    this.taskName = options.taskName ?? DEFAULT_TASK_NAME;
 
     // 构造参数覆盖环境变量
     if (options.apiKey) {
@@ -224,26 +228,29 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     // 1. 解析模型：
     //    - 传了 modelOverride → 使用 openai provider + 指定 model
     //    - 没传 → 从 LiteLLMClient 的 model pool 按 YAML 配置解析
+    //
+    // 无论走哪条路，temperature / maxTokens 都取 task profile——modelOverride 只该
+    // 覆盖 provider 与 model。此前覆盖分支把两者写死成 0.3 / 2000，使 memory-query.yaml
+    // 的 maxTokens 从未生效：长响应被截断在 JSON 字符串中间，经验提取静默降级到规则版。
     let providerName: string;
     let modelId: string;
-    let temperature: number;
-    let maxTokens: number;
+
+    const registeredTasks = this.client.modelPool.config.getTasks();
+    const resolved = this.client.modelPool.resolve(
+      registeredTasks.includes(this.taskName) ? this.taskName : DEFAULT_TASK_NAME,
+    );
 
     if (this.modelOverride) {
       providerName = preferAnthropicCompat() ? 'anthropic' : 'openai';
       modelId = this.modelOverride;
-      temperature = 0.3;
-      maxTokens = 2000;
     } else {
-      const resolved = this.client.modelPool.resolve(this.taskName);
       providerName = resolved.provider;
       modelId = resolved.model;
-      temperature = resolved.temperature;
-      maxTokens = resolved.maxTokens;
       if (preferAnthropicCompat() && providerName === 'openai') {
         providerName = 'anthropic';
       }
     }
+    const { temperature, maxTokens } = resolved;
 
     // 2. 解析 provider 得到 AI SDK model 实例
     const model = await resolveProviderModel(providerName, modelId);
