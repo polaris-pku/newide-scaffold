@@ -263,7 +263,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
           });
 
           let skills: SkillRecord[] = [];
-          const warnings: string[] = [...usageWarnings];
+          const warnings: string[] = [...usageWarnings, ...(result.extraction.warnings ?? [])];
           if (ablationPolicy.promote_skills) {
             const outcomes = await promoteExperiencesForAgent(
               input.role_id,

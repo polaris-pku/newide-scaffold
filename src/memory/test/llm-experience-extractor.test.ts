@@ -105,6 +105,9 @@ describe('LlmExperienceExtractor', () => {
     expect(result.experiences).toHaveLength(1);
     expect(result.experiences[0]!.type).toBe('positive');
     expect(result.experiences[0]!.tags).toContain('auto-generated');
+    // 降级原因必须留痕，否则事后无法判断为什么没走 LLM
+    expect(result.warnings?.[0]).toContain('LLM extraction failed');
+    expect(result.warnings?.[0]).toContain('rule-based');
   });
 
   it('LLM 抛异常 → 降级到 rule-based 提取', async () => {
@@ -119,7 +122,7 @@ describe('LlmExperienceExtractor', () => {
     expect(result.experiences[0]!.type).toBe('positive');
   });
 
-  it('LLM 返回 experiences 数组为空 → 降级', async () => {
+  it('LLM 返回 experiences 数组为空 → 合法的空结果，不降级到 rule-based', async () => {
     const llm = new MockLlmClient([
       {
         response: JSON.stringify({ experiences: [] }),
@@ -131,8 +134,11 @@ describe('LlmExperienceExtractor', () => {
 
     const result = await extractor.extract(snapshot);
 
-    // 空数组 → 降级到 rule-based
-    expect(result.experiences).toHaveLength(1);
+    // 空数组是「本次任务没有满足准入判据的经验」，直接返回空；
+    // 降级到 rule-based 会重新造出被提示词过滤掉的流水账
+    expect(result.experiences).toHaveLength(0);
+    expect(result.result.experiences_created).toBe(0);
+    expect(result.result.negative_experiences).toBe(0);
   });
 
   it('LLM 返回的 confidence 越界（1.5）→ 降级', async () => {

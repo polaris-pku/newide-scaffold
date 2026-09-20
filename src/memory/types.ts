@@ -23,6 +23,12 @@ export interface ExtractionOutput {
   experiences: ExperienceRecord[];
   /** 提取摘要统计（新建/更新/晋升计数等） */
   result: ExtractResult;
+  /**
+   * 提取过程中的诊断信息（如 LLM 提取失败并降级到规则版的原因）。
+   * 由调用方汇入维护记录的 warnings——降级若不留痕，事后无法判断
+   * 「这条经验为什么是流水账」。
+   */
+  warnings?: string[];
 }
 
 /**
