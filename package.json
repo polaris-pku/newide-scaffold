@@ -47,6 +47,7 @@
     "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
     "eval:build-pr-context": "tsx eval/scripts/build-sweevo-pr-context.ts",
     "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
+    "eval:verify-review-delivery": "tsx scripts/verify-council-review-delivery.ts",
     "prepare": "husky"
   },
   "lint-staged": {
