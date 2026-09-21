@@ -399,9 +399,10 @@ describe('Council bounded recovery', () => {
       { artifact_mode: 'plan' },
     );
     expect(result.proposals).toHaveLength(2);
-    expect(result.diagnostic_refs).toEqual(
-      expect.arrayContaining(['COUNCIL_REVIEW_FAILED:r0', 'COUNCIL_SYNTHESIS_FAILED:s0']),
-    );
+    // 评审失败就不再合成，因此只剩评审的失败诊断，且没有可选产物。
+    expect(result.diagnostic_refs).toEqual(expect.arrayContaining(['COUNCIL_REVIEW_FAILED:r0']));
+    expect(result.reviews).toEqual([]);
+    expect(result.selected_artifact_refs).toEqual([]);
   });
 
   it.each(['../outside.txt', '..\\outside.txt', '/tmp/outside.txt', 'C:\\outside.txt'])(

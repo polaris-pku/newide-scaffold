@@ -8,6 +8,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../../core';
 import type { DriverStreamEvent } from '../../driver/contract';
+import { extractJsonObject } from '../../driver/driver-return-converter';
 import {
   isMaterializableFileArtifact,
   readArtifactBytes,
@@ -233,13 +234,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       },
       async (result) => {
         parsedReviews = await readReviews(result, reviewerWorkspace);
-        if (
-          proposals.some(
-            (proposal) =>
-              parsedReviews?.filter((review) => review.proposal_id === proposal.proposal_id)
-                .length !== 1,
-          )
-        ) {
+        if (!coversEveryProposal(proposals, parsedReviews)) {
           throw new CouncilRoleExecutionError(
             'review',
             reviewerParticipant,
@@ -258,7 +253,15 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     );
     const reviewer = reviewerExecution?.result;
     if (reviewer) generatedResults.push(reviewer);
-    const reviews = buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews);
+    // 评审缺失时不做任何替代：兜底编一条 needs_revision 等于把没审过的提案记成已否决
+    // （2026-09-20 的批次里，14 条 approve 就是这样被静默改写成 reject 的）。同 Session
+    // 重试已在 tryRunRole 里用满；走到这里就不再有评审，于是跳过合成——决策没有可选产物，
+    // 上层据此让这次 run 失败，而不是产出一个没经过评审的结果。
+    const reviews =
+      reviewer !== undefined && coversEveryProposal(proposals, parsedReviews)
+        ? buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews)
+        : [];
+    const reviewed = reviews.length > 0;
     if (reviewer) {
       await emitLifecycle(options, {
         type: 'council.review.completed',
@@ -280,59 +283,63 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       });
     }
 
-    const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
-    const maxRounds = Math.min(Math.max(input.max_rounds ?? 2, 1), 2);
-    const synthesisExecution = await this.tryRunRole(
-      input,
-      executionRunId,
-      councilRunId,
-      synthesizerParticipant,
-      buildSynthesisInstruction(input.question, 1, options?.artifact_mode),
-      proposals.flatMap((proposal) => proposal.artifact_refs),
-      'synthesis',
-      synthesizerWorkspace,
-      options,
-      diagnosticRefs,
-      maxRounds,
-      async () => {
-        await prepareCouncilWorkspace(
-          options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
-          synthesizerWorkspace,
-        );
-        await stageCouncilArtifacts(synthesizerWorkspace, candidateArtifacts);
-        await writeProposalManifest(synthesizerWorkspace, proposals, candidateArtifacts);
-        await fs.writeFile(
-          path.join(synthesizerWorkspace, 'reviews.json'),
-          JSON.stringify(reviews, null, 2),
-          'utf-8',
-        );
-      },
-    );
-    const synthesizer = synthesisExecution?.result;
-    const synthesisPhaseId = synthesisExecution?.phase_id;
-    if (synthesizer) generatedResults.push(synthesizer);
-
-    const synthesis = synthesizer
-      ? buildSynthesis(input, proposals, reviews, synthesizerParticipant, synthesizer)
-      : undefined;
-    if (synthesis && synthesizer) {
-      await emitLifecycle(options, {
-        type: 'council.synthesis.completed',
-        payload: {
-          council_run_id: councilRunId,
-          ...(synthesisPhaseId ? { phase_id: synthesisPhaseId } : {}),
-          phase: 'synthesis',
-          ...participantAuditPayload(synthesizerParticipant),
-          agent_run_id: synthesizer.agent_run_id,
-          driver_run_result_id: synthesizer.driver_run_result_id,
-          context_pack_ref: synthesizer.context_pack_ref,
-          memory_buffer_ref: synthesizer.memory_buffer_ref,
-          session_id: synthesizer.session_id,
-          synthesis_id: synthesis.synthesis_id,
-          synthesis: { ...synthesis },
-          artifact_refs: synthesis.artifact_refs,
+    let synthesizer: AgentExecutionResult | undefined;
+    let synthesis: CouncilSynthesis | undefined;
+    if (reviewed) {
+      const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
+      const maxRounds = Math.min(Math.max(input.max_rounds ?? 2, 1), 2);
+      const synthesisExecution = await this.tryRunRole(
+        input,
+        executionRunId,
+        councilRunId,
+        synthesizerParticipant,
+        buildSynthesisInstruction(input.question, 1, options?.artifact_mode),
+        proposals.flatMap((proposal) => proposal.artifact_refs),
+        'synthesis',
+        synthesizerWorkspace,
+        options,
+        diagnosticRefs,
+        maxRounds,
+        async () => {
+          await prepareCouncilWorkspace(
+            options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
+            synthesizerWorkspace,
+          );
+          await stageCouncilArtifacts(synthesizerWorkspace, candidateArtifacts);
+          await writeProposalManifest(synthesizerWorkspace, proposals, candidateArtifacts);
+          await fs.writeFile(
+            path.join(synthesizerWorkspace, 'reviews.json'),
+            JSON.stringify(reviews, null, 2),
+            'utf-8',
+          );
         },
-      });
+      );
+      synthesizer = synthesisExecution?.result;
+      const synthesisPhaseId = synthesisExecution?.phase_id;
+      if (synthesizer) generatedResults.push(synthesizer);
+
+      synthesis = synthesizer
+        ? buildSynthesis(input, proposals, reviews, synthesizerParticipant, synthesizer)
+        : undefined;
+      if (synthesis && synthesizer) {
+        await emitLifecycle(options, {
+          type: 'council.synthesis.completed',
+          payload: {
+            council_run_id: councilRunId,
+            ...(synthesisPhaseId ? { phase_id: synthesisPhaseId } : {}),
+            phase: 'synthesis',
+            ...participantAuditPayload(synthesizerParticipant),
+            agent_run_id: synthesizer.agent_run_id,
+            driver_run_result_id: synthesizer.driver_run_result_id,
+            context_pack_ref: synthesizer.context_pack_ref,
+            memory_buffer_ref: synthesizer.memory_buffer_ref,
+            session_id: synthesizer.session_id,
+            synthesis_id: synthesis.synthesis_id,
+            synthesis: { ...synthesis },
+            artifact_refs: synthesis.artifact_refs,
+          },
+        });
+      }
     }
     const selectedArtifactRefs =
       synthesizer?.artifact_refs
@@ -1099,33 +1106,36 @@ function buildProposal(
   };
 }
 
+/** 每个提案必须恰好有一条结构化评审；多一条少一条都算这次评审没有交付。 */
+function coversEveryProposal(
+  proposals: readonly Proposal[],
+  parsed: ParsedReview[] | undefined,
+): parsed is ParsedReview[] {
+  return (
+    parsed !== undefined &&
+    proposals.every(
+      (proposal) =>
+        parsed.filter((review) => review.proposal_id === proposal.proposal_id).length === 1,
+    )
+  );
+}
+
 function buildReviews(
   proposals: readonly Proposal[],
   participant: CouncilParticipantBinding,
-  result: AgentExecutionResult | undefined,
-  parsed?: ParsedReview[],
+  result: AgentExecutionResult,
+  parsed: readonly ParsedReview[],
 ): Review[] {
   return proposals.map((proposal) => {
-    const item = parsed?.find((candidate) => candidate.proposal_id === proposal.proposal_id);
+    const item = parsed.find((candidate) => candidate.proposal_id === proposal.proposal_id);
     if (!item) {
-      return {
-        review_id: createId('review'),
-        proposal_id: proposal.proposal_id,
-        reviewer_id: result?.agent_id ?? participant.agent_id,
-        verdict: 'needs_revision',
-        reason: result
-          ? 'Reviewer did not return a valid structured review for this proposal.'
-          : 'Reviewer execution failed; proposal remains unverified.',
-        unmet_criteria: ['structured_review'],
-        evidence_refs: [],
-        created_at: nowTimestamp(),
-        schema_version: SCHEMA_VERSION,
-      };
+      // coversEveryProposal 已在上游守过；这里报错而不是编造一条裁决。
+      throw new Error(`Reviewer returned no structured review for ${proposal.proposal_id}`);
     }
     return {
       review_id: createId('review'),
       proposal_id: proposal.proposal_id,
-      reviewer_id: result?.agent_id ?? participant.agent_id,
+      reviewer_id: result.agent_id ?? participant.agent_id,
       verdict: item.verdict,
       reason: item.reason,
       unmet_criteria: [...item.unmet_criteria],
@@ -1215,12 +1225,44 @@ interface ParsedReview {
 
 function parseReviewPayload(response: string | undefined): ParsedReview[] | undefined {
   const raw = (response ?? '').trim();
+  const tagged = [
+    ...raw.matchAll(/<<<DRIVER_RETURN>>>\s*([\s\S]*?)\s*<<<END_DRIVER_RETURN>>>/g),
+  ].map((match) => match[1]?.trim() ?? '');
   const fenced = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(
     (match) => match[1]?.trim() ?? '',
   );
-  for (const source of [raw, ...fenced].filter(Boolean)) {
+  for (const source of [raw, ...tagged, ...fenced].filter(Boolean)) {
     const parsed = parseReviewCandidate(source);
-    if (parsed) return parsed;
+    if (parsed && parsed.length > 0) return parsed;
+  }
+  return parseEmbeddedReviewPayload(raw);
+}
+
+/**
+ * 从文本任意位置抽出内嵌的评审报文。
+ *
+ * 真实 Driver 很少把评审报文当成整段回复：它通常裹在散文里、放在 `<<<DRIVER_RETURN>>>`
+ * 标记块中，或直接挂在六字段报告对象上，而且常常没有代码围栏。整段解析、标记块解析和围栏
+ * 解析都会落空，报文就此丢掉——2026-09-20 的 A3 批次里 14 题有 10 题就是这么退回模板裁决的。
+ *
+ * 这里以 `"reviews"` 为锚点，由内向外尝试每一个包裹它的 `{`，取第一个能解析成完整评审报文的
+ * 候选。步数设上限，避免在超长回复上退化成二次方扫描。
+ */
+function parseEmbeddedReviewPayload(raw: string): ParsedReview[] | undefined {
+  const anchor = raw.indexOf('"reviews"');
+  if (anchor < 0) return undefined;
+  const maxAttempts = 400;
+  let attempts = 0;
+  for (
+    let start = raw.lastIndexOf('{', anchor);
+    start >= 0 && attempts < maxAttempts;
+    start = raw.lastIndexOf('{', start - 1)
+  ) {
+    attempts += 1;
+    const candidate = extractJsonObject(raw, start);
+    if (!candidate) continue;
+    const parsed = parseReviewCandidate(candidate);
+    if (parsed && parsed.length > 0) return parsed;
   }
   return undefined;
 }

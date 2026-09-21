@@ -117,11 +117,12 @@ describe('SynthesisAgentCouncilProvider', () => {
 
     expect(result.selected_artifact_refs).toEqual([]);
     expect(result.decision.verdict).toBe('request_revision');
+    // 提案被拒就没有可评审之物，于是不合成——因此不再出现 COUNCIL_SYNTHESIS_FAILED。
+    expect(result.reviews).toEqual([]);
     expect(result.diagnostic_refs).toEqual(
       expect.arrayContaining([
         expect.stringMatching(/^COUNCIL_PROPOSAL_FAILED:/),
         expect.stringMatching(/^COUNCIL_REVIEW_FAILED:/),
-        expect.stringMatching(/^COUNCIL_SYNTHESIS_FAILED:/),
       ]),
     );
   });
@@ -426,22 +427,87 @@ describe('SynthesisAgentCouncilProvider', () => {
     );
   });
 
-  it('does not turn an unstructured reviewer response into approve', async () => {
+  it('refuses to synthesize when the reviewer returns no structured review', async () => {
     const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade: createFacade() });
 
     const result = await provider.runCouncilRound(baseInput());
 
-    expect(result.reviews).not.toHaveLength(0);
-    expect(result.reviews.every((review) => review.verdict === 'needs_revision')).toBe(true);
-    expect(result.reviews.every((review) => review.unmet_criteria?.includes('structured_review'))).toBe(
-      true,
+    // 不做替代：评审缺失时既不留一条编造的裁决，也不在没有评审的情况下合成。
+    // 于是没有可选产物，上层据此让这次 run 失败——绝不把没审过的提案记成已否决。
+    expect(result.reviews).toEqual([]);
+    expect(result.synthesis).toBeUndefined();
+    expect(result.selected_artifact_refs).toEqual([]);
+    expect(result.decision.verdict).toBe('request_revision');
+    expect(result.diagnostic_refs).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^COUNCIL_REVIEW_FAILED:/)]),
     );
+  });
+
+  it.each([
+    [
+      'prose followed by a bare review payload',
+      (ids: string[]) => `Here are my verdicts.\n${JSON.stringify(reviewPayload(ids))}`,
+    ],
+    [
+      'review payload nested in the driver report inside the tagged block',
+      (ids: string[]) =>
+        [
+          'I read both plans.',
+          '<<<DRIVER_RETURN>>>',
+          JSON.stringify({
+            artifacts: [],
+            summary: 'Review saved',
+            decisions: [],
+            blockers: [],
+            referenced_experiences: [],
+            assumptions: [],
+            reviews: reviewPayload(ids).reviews,
+          }),
+          '<<<END_DRIVER_RETURN>>>',
+        ].join('\n'),
+    ],
+  ])('reads a review payload delivered as %s', async (_label, respond) => {
+    // 这是 2026-09-20 批次里 Driver 的真实输出形状：散文加裸 JSON，没有代码围栏。
+    // 旧的解析器只认整段 JSON 与围栏块，于是把这些评审全丢了。
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        const result = completedExecution(input);
+        if (input.council_seat !== 'reviewer') return result;
+        const ids = [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])];
+        return { ...result, response: respond(ids) };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+
+    const result = await provider.runCouncilRound(baseInput());
+
+    expect(result.reviews.map((review) => review.verdict)).toEqual(['approve', 'approve']);
+    expect(result.selected_artifact_refs).toHaveLength(1);
+  });
+
+  it('records a stable diagnostic and leaves no reviewed result when the reviewer fails', async () => {
+    const requests: string[] = [];
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        requests.push(input.role_id);
+        const result = completedExecution(input);
+        return input.role_id === COUNCIL_AGENTS.reviewer ? { ...result, status: 'failed' } : result;
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+
+    const result = await provider.runCouncilRound(baseInput());
+
+    expect(result.diagnostic_refs).toContain(`COUNCIL_REVIEW_FAILED:participant_reviewer_0`);
+    expect(result.reviews).toEqual([]);
+    // 评审失败就不合成：审者之后不该再有合成者的一轮。
+    expect(requests.slice(2)).toEqual([COUNCIL_AGENTS.reviewer]);
+    expect(result.decision.verdict).toBe('request_revision');
   });
 
   it.each([
     [COUNCIL_AGENTS.proposerA, 'participant_proposer_0', 'COUNCIL_PROPOSAL_FAILED'],
     [COUNCIL_AGENTS.proposerB, 'participant_proposer_1', 'COUNCIL_PROPOSAL_FAILED'],
-    [COUNCIL_AGENTS.reviewer, 'participant_reviewer_0', 'COUNCIL_REVIEW_FAILED'],
     [COUNCIL_AGENTS.synthesizer, 'participant_synthesizer_0', 'COUNCIL_SYNTHESIS_FAILED'],
   ] as const)(
     'records a stable diagnostic and continues autonomously when %s fails',
@@ -635,6 +701,18 @@ function reviewResponse(input: AgentExecutionRequest): string {
   return JSON.stringify({ reviews: [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])].map((id) => ({
     proposal_id: id, verdict: 'approve', reason: 'Evidence supports this proposal.', unmet_criteria: [], evidence_refs: [],
   })) });
+}
+
+function reviewPayload(proposalIds: readonly string[]) {
+  return {
+    reviews: proposalIds.map((id) => ({
+      proposal_id: id,
+      verdict: 'approve' as const,
+      reason: 'The plan is feasible, scoped, and verifiable.',
+      unmet_criteria: [],
+      evidence_refs: ['artifact_plan'],
+    })),
+  };
 }
 
 const COUNCIL_AGENTS = {
