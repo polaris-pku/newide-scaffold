@@ -10,6 +10,10 @@
  *   3. Zod 校验返回内容
  *   4. 校验通过 → 映射为 ExperienceRecord[]
  *   5. 校验失败/调用异常 → 降级到 RuleBasedExperienceExtractor
+ *
+ * 注意空数组语义：LLM 返回 `experiences: []` 表示「本次任务没有满足准入判据的经验」，
+ * 是合法结果，直接返回空列表。它**不**触发降级——规则版提取器会把决策与假设原文
+ * 重新拼成流水账，正是提取提示词要过滤掉的东西。只有解析失败或调用异常才降级。
  */
 import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
@@ -178,10 +182,6 @@ export class LlmExperienceExtractor implements ExperienceExtractor {
 
       const parsed = parseLlmResponse(raw);
 
-      if (parsed.experiences.length === 0) {
-        return this.fallback.extract(snapshot, agentContext);
-      }
-
       const experiences = toExperienceRecords(parsed.experiences, snapshot, agentContext);
 
       return {
@@ -193,8 +193,19 @@ export class LlmExperienceExtractor implements ExperienceExtractor {
           skills_promoted: 0,
         },
       };
-    } catch {
-      return this.fallback.extract(snapshot, agentContext);
+    } catch (error) {
+      // 降级必须留痕：真实 run 里出现过 3 个角色中 2 个静默降级、
+      // 维护记录 warnings 为空，事后无从判断降级原因。
+      const fallback = await this.fallback.extract(snapshot, agentContext);
+      return {
+        ...fallback,
+        warnings: [
+          ...(fallback.warnings ?? []),
+          `LLM extraction failed; fell back to rule-based: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ],
+      };
     }
   }
 }
