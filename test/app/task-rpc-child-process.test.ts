@@ -560,6 +560,8 @@ function writeFakeDriver(runnerDir: string): void {
   writeFileSync(
     path.join(runnerDir, 'fake.mjs'),
     `import { createHash } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 let body='';
 process.stdin.on('data', chunk => body += chunk);
 process.stdin.on('end', () => {
@@ -568,7 +570,12 @@ process.stdin.on('end', () => {
   const councilRole = String(input.workspace_path || '').replaceAll('\\\\', '/').includes('.newide/council');
   const suffix = createHash('sha256').update(JSON.stringify([input.task_id, input.workspace_path, input.prompt, input.instruction, input.agent_id])).digest('hex').slice(0, 16);
   const artifact = { artifact_id: 'artifact_' + suffix, type: councilRole ? 'diff' : 'driver_result', uri: 'artifact://fake/result', producer_id: 'fake-acp', task_id: input.task_id, ...(councilRole ? { content: { kind: 'text', content_ref: 'data:text/plain,COUNCIL_FINAL%0A', target_path: 'council-output.txt', media_type: 'text/plain' } } : {}), created_at, schema_version: input.schema_version };
-  const response = input.prompt.includes('Review the isolated proposal inputs') ? JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }) : 'Fake ACP completed.';
+  const reviewPrompt = input.prompt.includes('Review the isolated proposal inputs');
+  if (reviewPrompt && input.workspace_path) {
+    // 评审的契约产物是工作区里的 reviews.json：报告里写什么不算交付。
+    writeFileSync(join(input.workspace_path, 'reviews.json'), JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }));
+  }
+  const response = reviewPrompt ? 'Review written to reviews.json.' : 'Fake ACP completed.';
   process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: 'session_fake', status: 'succeeded', response, artifacts: [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
 });
 `,

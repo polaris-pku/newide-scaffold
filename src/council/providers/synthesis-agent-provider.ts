@@ -50,6 +50,11 @@ export type CouncilRoleFailureCode =
 type CouncilPhase = 'proposal' | 'review' | 'synthesis';
 type CouncilRoleFailureDetails = Record<string, unknown>;
 
+/** 审者必须交付的评审文件，取用只认它——见 readReviews。 */
+const REVIEW_FILE = 'reviews.json';
+/** 审者角色的尝试次数；用尽仍拿不到评审就停，不做任何替代。 */
+const REVIEW_ATTEMPTS = 2;
+
 interface CouncilRoleExecution {
   result: AgentExecutionResult;
   phase_id: string;
@@ -80,8 +85,11 @@ export class CouncilRoleExecutionError extends Error {
     readonly agent_run_id?: string,
     readonly driver_run_result_id?: string,
     readonly failure_details: CouncilRoleFailureDetails = {},
+    message?: string,
   ) {
-    super(`Council ${council_phase} role failed`);
+    // 终端失败原因取的是 error.message（stageFailure → failStage），所以拿不到评审这类
+    // 需要说清因果的场合要显式给文案，不能只剩一句通用的 "role failed"。
+    super(message ?? `Council ${council_phase} role failed`);
     this.name = 'CouncilRoleExecutionError';
     this.code = failureCode(council_phase);
   }
@@ -223,7 +231,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       reviewerWorkspace,
       options,
       diagnosticRefs,
-      2,
+      REVIEW_ATTEMPTS,
       async () => {
         await prepareCouncilWorkspace(
           options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
@@ -243,7 +251,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
             result.driver_run_result_id,
             {
               reason:
-                'Write reviews.json with exactly one structured review for each proposal in proposals.json.',
+                'Write reviews.json at the root of this workspace with exactly one structured review for each proposal in proposals.json.',
               retryable: true,
               session_id: result.session_id,
             },
@@ -253,15 +261,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     );
     const reviewer = reviewerExecution?.result;
     if (reviewer) generatedResults.push(reviewer);
-    // 评审缺失时不做任何替代：兜底编一条 needs_revision 等于把没审过的提案记成已否决
-    // （2026-09-20 的批次里，14 条 approve 就是这样被静默改写成 reject 的）。同 Session
-    // 重试已在 tryRunRole 里用满；走到这里就不再有评审，于是跳过合成——决策没有可选产物，
-    // 上层据此让这次 run 失败，而不是产出一个没经过评审的结果。
-    const reviews =
-      reviewer !== undefined && coversEveryProposal(proposals, parsedReviews)
-        ? buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews)
-        : [];
-    const reviewed = reviews.length > 0;
+    const undelivered = reviewDeliveryFailure(
+      proposals,
+      reviewerParticipant,
+      reviewer,
+      parsedReviews,
+    );
+    if (undelivered) throw undelivered;
+    const reviews = buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews ?? []);
     if (reviewer) {
       await emitLifecycle(options, {
         type: 'council.review.completed',
@@ -283,63 +290,59 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       });
     }
 
-    let synthesizer: AgentExecutionResult | undefined;
-    let synthesis: CouncilSynthesis | undefined;
-    if (reviewed) {
-      const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
-      const maxRounds = Math.min(Math.max(input.max_rounds ?? 2, 1), 2);
-      const synthesisExecution = await this.tryRunRole(
-        input,
-        executionRunId,
-        councilRunId,
-        synthesizerParticipant,
-        buildSynthesisInstruction(input.question, 1, options?.artifact_mode),
-        proposals.flatMap((proposal) => proposal.artifact_refs),
-        'synthesis',
-        synthesizerWorkspace,
-        options,
-        diagnosticRefs,
-        maxRounds,
-        async () => {
-          await prepareCouncilWorkspace(
-            options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
-            synthesizerWorkspace,
-          );
-          await stageCouncilArtifacts(synthesizerWorkspace, candidateArtifacts);
-          await writeProposalManifest(synthesizerWorkspace, proposals, candidateArtifacts);
-          await fs.writeFile(
-            path.join(synthesizerWorkspace, 'reviews.json'),
-            JSON.stringify(reviews, null, 2),
-            'utf-8',
-          );
-        },
-      );
-      synthesizer = synthesisExecution?.result;
-      const synthesisPhaseId = synthesisExecution?.phase_id;
-      if (synthesizer) generatedResults.push(synthesizer);
+    const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
+    const maxRounds = Math.min(Math.max(input.max_rounds ?? 2, 1), 2);
+    const synthesisExecution = await this.tryRunRole(
+      input,
+      executionRunId,
+      councilRunId,
+      synthesizerParticipant,
+      buildSynthesisInstruction(input.question, 1, options?.artifact_mode),
+      proposals.flatMap((proposal) => proposal.artifact_refs),
+      'synthesis',
+      synthesizerWorkspace,
+      options,
+      diagnosticRefs,
+      maxRounds,
+      async () => {
+        await prepareCouncilWorkspace(
+          options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
+          synthesizerWorkspace,
+        );
+        await stageCouncilArtifacts(synthesizerWorkspace, candidateArtifacts);
+        await writeProposalManifest(synthesizerWorkspace, proposals, candidateArtifacts);
+        await fs.writeFile(
+          path.join(synthesizerWorkspace, REVIEW_FILE),
+          JSON.stringify(reviews, null, 2),
+          'utf-8',
+        );
+      },
+    );
+    const synthesizer = synthesisExecution?.result;
+    const synthesisPhaseId = synthesisExecution?.phase_id;
+    if (synthesizer) generatedResults.push(synthesizer);
 
-      synthesis = synthesizer
-        ? buildSynthesis(input, proposals, reviews, synthesizerParticipant, synthesizer)
-        : undefined;
-      if (synthesis && synthesizer) {
-        await emitLifecycle(options, {
-          type: 'council.synthesis.completed',
-          payload: {
-            council_run_id: councilRunId,
-            ...(synthesisPhaseId ? { phase_id: synthesisPhaseId } : {}),
-            phase: 'synthesis',
-            ...participantAuditPayload(synthesizerParticipant),
-            agent_run_id: synthesizer.agent_run_id,
-            driver_run_result_id: synthesizer.driver_run_result_id,
-            context_pack_ref: synthesizer.context_pack_ref,
-            memory_buffer_ref: synthesizer.memory_buffer_ref,
-            session_id: synthesizer.session_id,
-            synthesis_id: synthesis.synthesis_id,
-            synthesis: { ...synthesis },
-            artifact_refs: synthesis.artifact_refs,
-          },
-        });
-      }
+    const synthesis = synthesizer
+      ? buildSynthesis(input, proposals, reviews, synthesizerParticipant, synthesizer)
+      : undefined;
+    if (synthesis && synthesizer) {
+      await emitLifecycle(options, {
+        type: 'council.synthesis.completed',
+        payload: {
+          council_run_id: councilRunId,
+          ...(synthesisPhaseId ? { phase_id: synthesisPhaseId } : {}),
+          phase: 'synthesis',
+          ...participantAuditPayload(synthesizerParticipant),
+          agent_run_id: synthesizer.agent_run_id,
+          driver_run_result_id: synthesizer.driver_run_result_id,
+          context_pack_ref: synthesizer.context_pack_ref,
+          memory_buffer_ref: synthesizer.memory_buffer_ref,
+          session_id: synthesizer.session_id,
+          synthesis_id: synthesis.synthesis_id,
+          synthesis: { ...synthesis },
+          artifact_refs: synthesis.artifact_refs,
+        },
+      });
     }
     const selectedArtifactRefs =
       synthesizer?.artifact_refs
@@ -811,6 +814,13 @@ async function writeProposalManifest(
   );
 }
 
+/**
+ * 只认审者交付的 reviews.json：先是它落盘后被收集成的 artifact，其次是工作区根目录上的文件。
+ *
+ * 刻意不解析 `result.response`：报告是散文，从这里抽评审会引入"这份裁决到底是谁写的"的
+ * 歧义（工作区里还铺着提案与主执行者的产物，其中出现同名文件并不稀奇），而契约产物必须是
+ * 可署名、可复查的那一份。文件缺失就是这次评审没有交付，交由重试与上游的失败路径处理。
+ */
 async function readReviews(
   result: AgentExecutionResult,
   workspace: string,
@@ -818,7 +828,7 @@ async function readReviews(
   const artifact = result.artifact_refs.find(isCouncilReviewArtifact);
   if (artifact) return parseReviewPayload((await readArtifactBytes(artifact)).toString('utf8'));
   try {
-    const file = await fs.realpath(path.join(workspace, 'reviews.json'));
+    const file = await fs.realpath(path.join(workspace, REVIEW_FILE));
     const root = await fs.realpath(workspace);
     if (!file.startsWith(`${root}${path.sep}`))
       throw new Error('Review file escapes Council workspace');
@@ -826,7 +836,7 @@ async function readReviews(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  return parseReviewPayload(result.response);
+  return undefined;
 }
 
 function completedProposalEvent(
@@ -1120,22 +1130,55 @@ function coversEveryProposal(
   );
 }
 
+/**
+ * 有提案就必须有一条可署名的 reviews.json；拿不到就返回一个终止错误，由调用方抛出。
+ *
+ * 不做任何替代品——2026-09-20 的批次里，14 条 approve 就是这样被兜底的 needs_revision
+ * 静默改写成 reject 的。同 Session 重试已在 tryRunRole 里用满，走到这里说明重试也没用，
+ * 于是让这次 run 失败，而不是产出一个没经过评审的结果。
+ */
+function reviewDeliveryFailure(
+  proposals: readonly Proposal[],
+  participant: CouncilParticipantBinding,
+  reviewer: AgentExecutionResult | undefined,
+  parsed: ParsedReview[] | undefined,
+): CouncilRoleExecutionError | undefined {
+  // 没有提案就没有可评审之物，不必强求评审文件。
+  if (proposals.length === 0) return undefined;
+  if (reviewer !== undefined && coversEveryProposal(proposals, parsed)) return undefined;
+  return new CouncilRoleExecutionError(
+    'review',
+    participant,
+    reviewer?.status ?? 'failed',
+    reviewer?.agent_run_id,
+    reviewer?.driver_run_result_id,
+    {
+      reason: `Reviewer wrote no ${REVIEW_FILE} at the workspace root for every proposal.`,
+      retryable: false,
+      ...(reviewer?.session_id ? { session_id: reviewer.session_id } : {}),
+    },
+    `Council review role produced no ${REVIEW_FILE} at the workspace root after ${String(
+      REVIEW_ATTEMPTS,
+    )} attempts; the council cannot produce a reviewed result.`,
+  );
+}
+
 function buildReviews(
   proposals: readonly Proposal[],
   participant: CouncilParticipantBinding,
-  result: AgentExecutionResult,
+  result: AgentExecutionResult | undefined,
   parsed: readonly ParsedReview[],
 ): Review[] {
   return proposals.map((proposal) => {
     const item = parsed.find((candidate) => candidate.proposal_id === proposal.proposal_id);
     if (!item) {
-      // coversEveryProposal 已在上游守过；这里报错而不是编造一条裁决。
+      // reviewDeliveryFailure 已在上游守过；这里报错而不是编造一条裁决。
       throw new Error(`Reviewer returned no structured review for ${proposal.proposal_id}`);
     }
     return {
       review_id: createId('review'),
       proposal_id: proposal.proposal_id,
-      reviewer_id: result.agent_id ?? participant.agent_id,
+      reviewer_id: result?.agent_id ?? participant.agent_id,
       verdict: item.verdict,
       reason: item.reason,
       unmet_criteria: [...item.unmet_criteria],
@@ -1334,14 +1377,16 @@ function buildReviewerInstruction(
       'Read proposals.json for proposal summaries and the exact mapping from proposal_id to staged input files. Read only those files inside this workspace; do not inspect parent directories, run state, market ledgers, other sessions or driver streams.',
       'Compare scope, implementation feasibility, unnecessary changes, risks, and verification coverage.',
       'Do not modify product files.',
-      'Write reviews.json in this workspace: {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. Include exactly one review per proposal. Then return the normal structured Driver report.',
+      `Write exactly one review per proposal to the relative path ${REVIEW_FILE} at the root of the current role workspace; never construct an absolute path. The file must contain {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. That file is the review deliverable — a summary in the Driver report is not a substitute for it.`,
+      'Then return the normal structured Driver report.',
     ].join(' ');
   }
   return [
     `Review the isolated proposal inputs for: ${question}.`,
     `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
     'Use proposals.json to map each proposal_id to its staged files. Stay inside this workspace; do not inspect parent directories, run state, market ledgers or driver streams.',
-    'Write reviews.json: {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. Include exactly one review per proposal. Then return the normal structured Driver report.',
+    `Write exactly one review per proposal to the relative path ${REVIEW_FILE} at the root of the current role workspace; never construct an absolute path. The file must contain {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. That file is the review deliverable — a summary in the Driver report is not a substitute for it.`,
+    'Then return the normal structured Driver report.',
     'A successful tool call is not approval; verdict must be based on the proposal evidence.',
   ].join(' ');
 }

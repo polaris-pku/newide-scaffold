@@ -99,7 +99,13 @@ function createCouncilFacade(requests: AgentExecutionRequest[]): AgentExecutionF
       requests.push(input);
       const artifacts =
         input.context_policy === 'council_reviewer'
-          ? []
+          ? [
+              artifact(
+                `artifact_${input.role_id}`,
+                'reviews.json',
+                structuredReviews(input.instruction),
+              ),
+            ]
           : [
               artifact(
                 `artifact_${input.role_id}`,
@@ -120,10 +126,7 @@ function createCouncilFacade(requests: AgentExecutionRequest[]): AgentExecutionF
         artifact_refs: artifacts,
         transcript_ref: transcript(input.role_id),
         session_id: `session_${input.role_id}`,
-        response:
-          input.context_policy === 'council_reviewer'
-            ? structuredReviews(input.instruction)
-            : `${input.role_id} completed`,
+        response: `${input.role_id} completed`,
         tool_events: [],
         diagnostics: {
           driver_id: `driver_${input.role_id}`,
