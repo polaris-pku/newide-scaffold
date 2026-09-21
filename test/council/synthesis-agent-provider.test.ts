@@ -29,7 +29,7 @@ describe('SynthesisAgentCouncilProvider', () => {
           driver_run_result_id: `driver_result_${input.role_id}`,
           artifact_refs:
             input.council_seat === 'reviewer'
-              ? []
+              ? [reviewsArtifact(JSON.stringify(reviewPayload(proposalIds)))]
               : [createArtifact(`artifact_${input.role_id}`, input.role_id, 'file', targetPath)],
           transcript_ref: createArtifact(
             `transcript_${input.role_id}`,
@@ -37,24 +37,7 @@ describe('SynthesisAgentCouncilProvider', () => {
             'transcript',
           ),
           session_id: `session_${input.role_id}`,
-          response:
-            input.council_seat === 'reviewer'
-              ? [
-                  'Review completed.',
-                  '```json',
-                  JSON.stringify({
-                    reviews: proposalIds.map((proposalId) => ({
-                      proposal_id: proposalId,
-                      verdict: 'approve',
-                      reason: 'Plan is actionable.',
-                      unmet_criteria: [],
-                      evidence_refs: [],
-                    })),
-                  }),
-                  '```',
-                  '<<<DRIVER_RETURN>>>',
-                ].join('\n')
-              : `${input.role_id} completed`,
+          response: `${input.role_id} completed`,
           tool_events: [],
           diagnostics: { driver_id: `driver_${input.role_id}` },
           status: 'completed',
@@ -117,11 +100,12 @@ describe('SynthesisAgentCouncilProvider', () => {
 
     expect(result.selected_artifact_refs).toEqual([]);
     expect(result.decision.verdict).toBe('request_revision');
+    // 提案被拒就没有可评审之物，于是不合成——因此不再出现 COUNCIL_SYNTHESIS_FAILED。
+    expect(result.reviews).toEqual([]);
     expect(result.diagnostic_refs).toEqual(
       expect.arrayContaining([
         expect.stringMatching(/^COUNCIL_PROPOSAL_FAILED:/),
         expect.stringMatching(/^COUNCIL_REVIEW_FAILED:/),
-        expect.stringMatching(/^COUNCIL_SYNTHESIS_FAILED:/),
       ]),
     );
   });
@@ -140,17 +124,14 @@ describe('SynthesisAgentCouncilProvider', () => {
           role_id: input.role_id,
           context_pack_ref: `context_${input.role_id}`,
           driver_run_result_id: `driver_result_${input.role_id}`,
-          artifact_refs: [createArtifact(`artifact_${input.role_id}`, input.role_id)],
+          artifact_refs: withReview(input, [createArtifact(`artifact_${input.role_id}`, input.role_id)]),
           transcript_ref: createArtifact(
             `transcript_${input.role_id}`,
             input.role_id,
             'transcript',
           ),
           session_id: `session_${input.role_id}`,
-          response:
-            input.role_id === COUNCIL_AGENTS.reviewer
-              ? reviewResponse(input)
-              : `${input.role_id} completed`,
+          response: `${input.role_id} completed`,
           tool_events: [],
           diagnostics: {
             driver_id: `driver_${input.role_id}`,
@@ -426,22 +407,123 @@ describe('SynthesisAgentCouncilProvider', () => {
     );
   });
 
-  it('does not turn an unstructured reviewer response into approve', async () => {
+  it('stops when the reviewer writes no reviews.json, and says why', async () => {
     const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade: createFacade() });
+
+    // createFacade 的审者只留一句散文回复、不落文件；严格取用不认这条路。
+    await expect(provider.runCouncilRound(baseInput())).rejects.toThrow(
+      /produced no reviews\.json at the workspace root after 2 attempts/,
+    );
+  });
+
+  it.each([
+    [
+      'prose followed by a bare review payload',
+      (ids: string[]) => `Here are my verdicts.\n${JSON.stringify(reviewPayload(ids))}`,
+    ],
+    [
+      'review payload nested in the driver report inside the tagged block',
+      (ids: string[]) =>
+        [
+          'I read both plans.',
+          '<<<DRIVER_RETURN>>>',
+          JSON.stringify({
+            artifacts: [],
+            summary: 'Review saved',
+            decisions: [],
+            blockers: [],
+            referenced_experiences: [],
+            assumptions: [],
+            reviews: reviewPayload(ids).reviews,
+          }),
+          '<<<END_DRIVER_RETURN>>>',
+        ].join('\n'),
+    ],
+  ])('reads a reviews.json whose content is %s', async (_label, body) => {
+    // 这是 2026-09-20 批次里 Driver 的真实输出形状：散文加裸 JSON，没有代码围栏。
+    // 旧解析器只认整段 JSON 与围栏块，于是把这些评审全丢了。
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        const result = completedExecution(input);
+        if (input.council_seat !== 'reviewer') return result;
+        const ids = [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])];
+        return { ...result, artifact_refs: [reviewsArtifact(body(ids))] };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
 
     const result = await provider.runCouncilRound(baseInput());
 
-    expect(result.reviews).not.toHaveLength(0);
-    expect(result.reviews.every((review) => review.verdict === 'needs_revision')).toBe(true);
-    expect(result.reviews.every((review) => review.unmet_criteria?.includes('structured_review'))).toBe(
-      true,
+    expect(result.reviews.map((review) => review.verdict)).toEqual(['approve', 'approve']);
+    expect(result.selected_artifact_refs).toHaveLength(1);
+  });
+
+  it('does not accept a review payload that only appears in the response text', async () => {
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        const result = completedExecution(input);
+        if (input.council_seat !== 'reviewer') return result;
+        const ids = [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])];
+        // 报告里说得再全也不算交付：契约产物是工作区里的 reviews.json。
+        return { ...result, artifact_refs: [], response: JSON.stringify(reviewPayload(ids)) };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+
+    await expect(provider.runCouncilRound(baseInput())).rejects.toThrow(
+      /produced no reviews\.json/,
     );
+  });
+
+  it('does not accept reviews.json written outside the workspace root', async () => {
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        const result = completedExecution(input);
+        if (input.council_seat !== 'reviewer') return result;
+        const ids = [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])];
+        return {
+          ...result,
+          artifact_refs: [reviewsArtifact(JSON.stringify(reviewPayload(ids)), 'outputs/reviews.json')],
+        };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+
+    await expect(provider.runCouncilRound(baseInput())).rejects.toThrow(
+      /produced no reviews\.json/,
+    );
+  });
+
+  it('records the review failure and stops when the reviewer role fails', async () => {
+    const requests: string[] = [];
+    const lifecycleEvents: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        requests.push(input.role_id);
+        const result = completedExecution(input);
+        return input.role_id === COUNCIL_AGENTS.reviewer ? { ...result, status: 'failed' } : result;
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade });
+
+    await expect(
+      provider.runCouncilRound(baseInput(), {
+        onLifecycleEvent: (event) => lifecycleEvents.push(event),
+      }),
+    ).rejects.toThrow(/produced no reviews\.json/);
+    // 审者失败不再"继续自主推进"：审计里留下原因，任务停下，且不合成。
+    expect(lifecycleEvents).toContainEqual(
+      expect.objectContaining({
+        type: 'council.role.failed',
+        payload: expect.objectContaining({ code: 'COUNCIL_REVIEW_FAILED' }),
+      }),
+    );
+    expect(requests.slice(2)).toEqual([COUNCIL_AGENTS.reviewer]);
   });
 
   it.each([
     [COUNCIL_AGENTS.proposerA, 'participant_proposer_0', 'COUNCIL_PROPOSAL_FAILED'],
     [COUNCIL_AGENTS.proposerB, 'participant_proposer_1', 'COUNCIL_PROPOSAL_FAILED'],
-    [COUNCIL_AGENTS.reviewer, 'participant_reviewer_0', 'COUNCIL_REVIEW_FAILED'],
     [COUNCIL_AGENTS.synthesizer, 'participant_synthesizer_0', 'COUNCIL_SYNTHESIS_FAILED'],
   ] as const)(
     'records a stable diagnostic and continues autonomously when %s fails',
@@ -457,10 +539,12 @@ describe('SynthesisAgentCouncilProvider', () => {
             role_id: input.role_id,
             context_pack_ref: `context_${input.role_id}`,
             driver_run_result_id: `driver_result_${input.role_id}`,
-            artifact_refs:
+            artifact_refs: withReview(
+              input,
               input.role_id === failedAgent
                 ? []
                 : [createArtifact(`artifact_${input.role_id}`, input.role_id)],
+            ),
             transcript_ref: createArtifact(
               `transcript_${input.role_id}`,
               input.role_id,
@@ -468,7 +552,7 @@ describe('SynthesisAgentCouncilProvider', () => {
             ),
             diagnostics: { driver_id: `driver_${input.role_id}` },
             session_id: `session_${input.role_id}`,
-            response: input.council_seat === 'reviewer' ? reviewResponse(input) : 'Completed',
+            response: 'Completed',
             status: input.role_id === failedAgent ? 'failed' : 'completed',
             created_at: '2026-07-07T00:00:00.000Z',
             schema_version: SCHEMA_VERSION,
@@ -619,10 +703,13 @@ function completedExecution(input: AgentExecutionRequest) {
     role_id: input.role_id,
     context_pack_ref: `context_${input.role_id}`,
     driver_run_result_id: `driver_result_${input.role_id}`,
-    artifact_refs: [createArtifact(`artifact_${input.role_id}`, input.role_id)],
+    artifact_refs:
+      input.council_seat === 'reviewer'
+        ? [reviewsArtifact(reviewResponse(input))]
+        : [createArtifact(`artifact_${input.role_id}`, input.role_id)],
     transcript_ref: createArtifact(`transcript_${input.role_id}`, input.role_id, 'transcript'),
     session_id: input.session_id ?? `session_${input.role_id}`,
-    response: input.council_seat === 'reviewer' ? reviewResponse(input) : 'completed',
+    response: input.council_seat === 'reviewer' ? 'Review written to reviews.json.' : 'completed',
     tool_events: [],
     diagnostics: { driver_id: `driver_${input.role_id}` },
     status: 'completed' as const,
@@ -635,6 +722,46 @@ function reviewResponse(input: AgentExecutionRequest): string {
   return JSON.stringify({ reviews: [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])].map((id) => ({
     proposal_id: id, verdict: 'approve', reason: 'Evidence supports this proposal.', unmet_criteria: [], evidence_refs: [],
   })) });
+}
+
+function reviewPayload(proposalIds: readonly string[]) {
+  return {
+    reviews: proposalIds.map((id) => ({
+      proposal_id: id,
+      verdict: 'approve' as const,
+      reason: 'The plan is feasible, scoped, and verifiable.',
+      unmet_criteria: [],
+      evidence_refs: ['artifact_plan'],
+    })),
+  };
+}
+
+/**
+ * 审者按契约必须交付 reviews.json；拼到任何假件的 artifact_refs 上。
+ * 注意它取的是 proposal ids 来自指令的合法评审，所以整轮能走完。
+ */
+function withReview(input: AgentExecutionRequest, artifacts: ArtifactRef[]): ArtifactRef[] {
+  return input.council_seat === 'reviewer'
+    ? [...artifacts, reviewsArtifact(reviewResponse(input))]
+    : artifacts;
+}
+
+/** 审者按契约交付的评审文件；targetPath 可换成子目录来测严格性。 */
+function reviewsArtifact(body: string, targetPath = 'reviews.json'): ArtifactRef {
+  return {
+    artifact_id: 'artifact_reviews',
+    type: 'file',
+    uri: 'artifact://file/artifact_reviews',
+    producer_id: COUNCIL_AGENTS.reviewer,
+    task_id: 'task_observer',
+    content: {
+      kind: 'text',
+      content_ref: `data:text/plain,${encodeURIComponent(body)}`,
+      target_path: targetPath,
+    },
+    created_at: '2026-07-07T00:00:00.000Z',
+    schema_version: SCHEMA_VERSION,
+  };
 }
 
 const COUNCIL_AGENTS = {

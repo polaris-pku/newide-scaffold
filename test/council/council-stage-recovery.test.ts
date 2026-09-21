@@ -64,7 +64,7 @@ function completed(request: AgentExecutionRequest): AgentExecutionResult {
     driver_run_result_id: `driver_${request.run_id}`,
     artifact_refs:
       request.council_seat === 'reviewer'
-        ? []
+        ? [artifact('reviews.json', reviews(request))]
         : [
             {
               ...artifact(
@@ -77,7 +77,7 @@ function completed(request: AgentExecutionRequest): AgentExecutionResult {
     session_id: request.session_id ?? `session_${request.role_id}`,
     response:
       request.council_seat === 'reviewer'
-        ? reviews(request)
+        ? 'Review written to reviews.json.'
         : 'Choose a bounded fix because it preserves compatibility.',
     tool_events: [],
     diagnostics: {},
@@ -350,7 +350,7 @@ describe('Council bounded recovery', () => {
           const result = completed(request);
           if (request.council_seat !== 'reviewer') return result;
           requests.push(request);
-          return requests.length === 1 ? { ...result, response: '{"reviews":[]}' } : result;
+          return requests.length === 1 ? { ...result, artifact_refs: [] } : result;
         },
       },
     });
@@ -383,7 +383,10 @@ describe('Council bounded recovery', () => {
     expect(result.diagnostic_refs?.join(' ')).toContain('accidental.py');
   });
 
-  it('keeps an unreadable staged candidate from discarding other participant results', async () => {
+  it('stops the council when a staged candidate cannot be read', async () => {
+    // 不可读的候选会让审者跑不起来（prepare 抛错），评审因此没有交付。严格契约下整轮停下，
+    // 而不是降级出一个没经过评审的结果；真实原因留在 council.role.failed 里可查。
+    const lifecycle: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const provider = new SynthesisAgentCouncilProvider({
       councilRoot: await root(),
       agentExecutionFacade: {
@@ -394,13 +397,17 @@ describe('Council bounded recovery', () => {
     });
     const bad = artifact('bad-plan.md');
     bad.content!.content_ref = path.join(await root(), 'missing.md');
-    const result = await provider.runCouncilRound(
-      { ...input, candidate_artifacts: [bad] },
-      { artifact_mode: 'plan' },
-    );
-    expect(result.proposals).toHaveLength(2);
-    expect(result.diagnostic_refs).toEqual(
-      expect.arrayContaining(['COUNCIL_REVIEW_FAILED:r0', 'COUNCIL_SYNTHESIS_FAILED:s0']),
+    await expect(
+      provider.runCouncilRound(
+        { ...input, candidate_artifacts: [bad] },
+        { artifact_mode: 'plan', onLifecycleEvent: (event) => lifecycle.push(event) },
+      ),
+    ).rejects.toThrow(/produced no reviews\.json/);
+    expect(lifecycle).toContainEqual(
+      expect.objectContaining({
+        type: 'council.role.failed',
+        payload: expect.objectContaining({ code: 'COUNCIL_REVIEW_FAILED', phase: 'review' }),
+      }),
     );
   });
 

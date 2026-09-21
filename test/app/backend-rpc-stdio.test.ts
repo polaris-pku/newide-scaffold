@@ -559,7 +559,8 @@ describe('backend RPC stdio entrypoint', () => {
       );
       writeFileSync(
         path.join(runnerDir, 'fake-driver.mjs'),
-        `import { appendFileSync, existsSync } from 'node:fs';
+        `import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 	let body='';
 	process.stdin.on('data', chunk => body += chunk);
 	process.stdin.on('end', () => {
@@ -573,6 +574,9 @@ describe('backend RPC stdio entrypoint', () => {
   const response = input.prompt.includes('Review the isolated proposal inputs') ? JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }) : 'Fake ACP completed the request.';
   const councilRole = String(input.workspace_path || '').replaceAll('\\\\', '/').includes('.newide/council');
   const artifact = { artifact_id: 'artifact_fake_acp', type: councilRole ? 'diff' : 'driver_result', uri: 'artifact://fake/result', producer_id: 'claude-fake', task_id: input.task_id, ...(councilRole ? { content: { kind: 'text', content_ref: 'data:text/plain,COUNCIL_FINAL%0A', target_path: 'council-output.txt', media_type: 'text/plain' } } : {}), created_at, schema_version: input.schema_version };
+  if (input.prompt.includes('Review the isolated proposal inputs') && !reviewerFailed && input.workspace_path) {
+    writeFileSync(join(input.workspace_path, 'reviews.json'), response);
+  }
   process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_result_fake_acp', session_id: 'session_fake_acp', status: reviewerFailed ? 'failed' : 'succeeded', response: reviewerFailed ? '' : response, artifacts: reviewerFailed ? [] : [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_fake_acp', type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'claude-fake', duration_ms: 1, notes: ['fake ACP process'] }, ...(reviewerFailed ? { error: { code: 'FAKE_REVIEW_FAILURE', message: 'controlled failure', retryable: false } } : {}), created_at, schema_version: input.schema_version }));
 });
 `,
@@ -787,21 +791,21 @@ describe('backend RPC stdio entrypoint', () => {
       );
       const failedSnapshot = await waitForTerminal(service, failedCouncilCreated.run_id);
       unsubscribeFailed();
-      expect(service.getRunSnapshot(failedCouncilCreated.run_id)).toMatchObject({
-        status: 'completed',
-        council: {
-          result: {
-            quality: 'best_effort',
-          },
-          outcome: { status: 'completed' },
-        },
-        errors: [],
-      });
-      expect(failedNotifications.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
+      // 审者交付不出 reviews.json 就等于这次没有评审。议会不再降级出一个没被评审过的
+      // 结果（旧行为会伪造 needs_revision 并照常完成），而是让这次 run 直接失败，
+      // 并把原因写进终止错误里。
+      const failedRunSnapshot = service.getRunSnapshot(failedCouncilCreated.run_id);
+      expect(failedRunSnapshot.status).toBe('failed');
+      expect(failedRunSnapshot.errors.map((error) => error.message).join('\n')).toContain(
+        'produced no reviews.json at the workspace root',
       );
-      expect(failedSnapshot.events.map((event) => event.type)).toContain('council.completed');
-      expect(failedSnapshot.events.map((event) => event.type)).toContain('worktree.materialized');
+      expect(failedNotifications.map((event) => event.type)).toEqual(
+        expect.arrayContaining(['council.role.failed', 'council.failed', 'run.failed']),
+      );
+      expect(failedSnapshot.events.map((event) => event.type)).not.toContain('council.completed');
+      expect(failedSnapshot.events.map((event) => event.type)).not.toContain(
+        'worktree.materialized',
+      );
       const failedAudit = readFileSync(
         path.join('.newide', 'runs', failedCouncilCreated.run_id, 'audit.jsonl'),
         'utf8',
@@ -810,7 +814,7 @@ describe('backend RPC stdio entrypoint', () => {
         .split('\n')
         .map((line) => JSON.parse(line) as AppRunEvent);
       expect(failedAudit.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.failed', 'run.failed']),
       );
     } finally {
       await service?.close();

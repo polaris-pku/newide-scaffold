@@ -8,6 +8,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../../core';
 import type { DriverStreamEvent } from '../../driver/contract';
+import { extractJsonObject } from '../../driver/driver-return-converter';
 import {
   isMaterializableFileArtifact,
   readArtifactBytes,
@@ -49,6 +50,11 @@ export type CouncilRoleFailureCode =
 type CouncilPhase = 'proposal' | 'review' | 'synthesis';
 type CouncilRoleFailureDetails = Record<string, unknown>;
 
+/** 审者必须交付的评审文件，取用只认它——见 readReviews。 */
+const REVIEW_FILE = 'reviews.json';
+/** 审者角色的尝试次数；用尽仍拿不到评审就停，不做任何替代。 */
+const REVIEW_ATTEMPTS = 2;
+
 interface CouncilRoleExecution {
   result: AgentExecutionResult;
   phase_id: string;
@@ -79,8 +85,11 @@ export class CouncilRoleExecutionError extends Error {
     readonly agent_run_id?: string,
     readonly driver_run_result_id?: string,
     readonly failure_details: CouncilRoleFailureDetails = {},
+    message?: string,
   ) {
-    super(`Council ${council_phase} role failed`);
+    // 终端失败原因取的是 error.message（stageFailure → failStage），所以拿不到评审这类
+    // 需要说清因果的场合要显式给文案，不能只剩一句通用的 "role failed"。
+    super(message ?? `Council ${council_phase} role failed`);
     this.name = 'CouncilRoleExecutionError';
     this.code = failureCode(council_phase);
   }
@@ -222,7 +231,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       reviewerWorkspace,
       options,
       diagnosticRefs,
-      2,
+      REVIEW_ATTEMPTS,
       async () => {
         await prepareCouncilWorkspace(
           options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
@@ -233,13 +242,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       },
       async (result) => {
         parsedReviews = await readReviews(result, reviewerWorkspace);
-        if (
-          proposals.some(
-            (proposal) =>
-              parsedReviews?.filter((review) => review.proposal_id === proposal.proposal_id)
-                .length !== 1,
-          )
-        ) {
+        if (!coversEveryProposal(proposals, parsedReviews)) {
           throw new CouncilRoleExecutionError(
             'review',
             reviewerParticipant,
@@ -248,7 +251,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
             result.driver_run_result_id,
             {
               reason:
-                'Write reviews.json with exactly one structured review for each proposal in proposals.json.',
+                'Write reviews.json at the root of this workspace with exactly one structured review for each proposal in proposals.json.',
               retryable: true,
               session_id: result.session_id,
             },
@@ -258,7 +261,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     );
     const reviewer = reviewerExecution?.result;
     if (reviewer) generatedResults.push(reviewer);
-    const reviews = buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews);
+    const undelivered = reviewDeliveryFailure(
+      proposals,
+      reviewerParticipant,
+      reviewer,
+      parsedReviews,
+    );
+    if (undelivered) throw undelivered;
+    const reviews = buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews ?? []);
     if (reviewer) {
       await emitLifecycle(options, {
         type: 'council.review.completed',
@@ -302,7 +312,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         await stageCouncilArtifacts(synthesizerWorkspace, candidateArtifacts);
         await writeProposalManifest(synthesizerWorkspace, proposals, candidateArtifacts);
         await fs.writeFile(
-          path.join(synthesizerWorkspace, 'reviews.json'),
+          path.join(synthesizerWorkspace, REVIEW_FILE),
           JSON.stringify(reviews, null, 2),
           'utf-8',
         );
@@ -804,6 +814,13 @@ async function writeProposalManifest(
   );
 }
 
+/**
+ * 只认审者交付的 reviews.json：先是它落盘后被收集成的 artifact，其次是工作区根目录上的文件。
+ *
+ * 刻意不解析 `result.response`：报告是散文，从这里抽评审会引入"这份裁决到底是谁写的"的
+ * 歧义（工作区里还铺着提案与主执行者的产物，其中出现同名文件并不稀奇），而契约产物必须是
+ * 可署名、可复查的那一份。文件缺失就是这次评审没有交付，交由重试与上游的失败路径处理。
+ */
 async function readReviews(
   result: AgentExecutionResult,
   workspace: string,
@@ -811,7 +828,7 @@ async function readReviews(
   const artifact = result.artifact_refs.find(isCouncilReviewArtifact);
   if (artifact) return parseReviewPayload((await readArtifactBytes(artifact)).toString('utf8'));
   try {
-    const file = await fs.realpath(path.join(workspace, 'reviews.json'));
+    const file = await fs.realpath(path.join(workspace, REVIEW_FILE));
     const root = await fs.realpath(workspace);
     if (!file.startsWith(`${root}${path.sep}`))
       throw new Error('Review file escapes Council workspace');
@@ -819,7 +836,7 @@ async function readReviews(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  return parseReviewPayload(result.response);
+  return undefined;
 }
 
 function completedProposalEvent(
@@ -1099,28 +1116,64 @@ function buildProposal(
   };
 }
 
+/** 每个提案必须恰好有一条结构化评审；多一条少一条都算这次评审没有交付。 */
+function coversEveryProposal(
+  proposals: readonly Proposal[],
+  parsed: ParsedReview[] | undefined,
+): parsed is ParsedReview[] {
+  return (
+    parsed !== undefined &&
+    proposals.every(
+      (proposal) =>
+        parsed.filter((review) => review.proposal_id === proposal.proposal_id).length === 1,
+    )
+  );
+}
+
+/**
+ * 有提案就必须有一条可署名的 reviews.json；拿不到就返回一个终止错误，由调用方抛出。
+ *
+ * 不做任何替代品——2026-09-20 的批次里，14 条 approve 就是这样被兜底的 needs_revision
+ * 静默改写成 reject 的。同 Session 重试已在 tryRunRole 里用满，走到这里说明重试也没用，
+ * 于是让这次 run 失败，而不是产出一个没经过评审的结果。
+ */
+function reviewDeliveryFailure(
+  proposals: readonly Proposal[],
+  participant: CouncilParticipantBinding,
+  reviewer: AgentExecutionResult | undefined,
+  parsed: ParsedReview[] | undefined,
+): CouncilRoleExecutionError | undefined {
+  // 没有提案就没有可评审之物，不必强求评审文件。
+  if (proposals.length === 0) return undefined;
+  if (reviewer !== undefined && coversEveryProposal(proposals, parsed)) return undefined;
+  return new CouncilRoleExecutionError(
+    'review',
+    participant,
+    reviewer?.status ?? 'failed',
+    reviewer?.agent_run_id,
+    reviewer?.driver_run_result_id,
+    {
+      reason: `Reviewer wrote no ${REVIEW_FILE} at the workspace root for every proposal.`,
+      retryable: false,
+      ...(reviewer?.session_id ? { session_id: reviewer.session_id } : {}),
+    },
+    `Council review role produced no ${REVIEW_FILE} at the workspace root after ${String(
+      REVIEW_ATTEMPTS,
+    )} attempts; the council cannot produce a reviewed result.`,
+  );
+}
+
 function buildReviews(
   proposals: readonly Proposal[],
   participant: CouncilParticipantBinding,
   result: AgentExecutionResult | undefined,
-  parsed?: ParsedReview[],
+  parsed: readonly ParsedReview[],
 ): Review[] {
   return proposals.map((proposal) => {
-    const item = parsed?.find((candidate) => candidate.proposal_id === proposal.proposal_id);
+    const item = parsed.find((candidate) => candidate.proposal_id === proposal.proposal_id);
     if (!item) {
-      return {
-        review_id: createId('review'),
-        proposal_id: proposal.proposal_id,
-        reviewer_id: result?.agent_id ?? participant.agent_id,
-        verdict: 'needs_revision',
-        reason: result
-          ? 'Reviewer did not return a valid structured review for this proposal.'
-          : 'Reviewer execution failed; proposal remains unverified.',
-        unmet_criteria: ['structured_review'],
-        evidence_refs: [],
-        created_at: nowTimestamp(),
-        schema_version: SCHEMA_VERSION,
-      };
+      // reviewDeliveryFailure 已在上游守过；这里报错而不是编造一条裁决。
+      throw new Error(`Reviewer returned no structured review for ${proposal.proposal_id}`);
     }
     return {
       review_id: createId('review'),
@@ -1215,12 +1268,44 @@ interface ParsedReview {
 
 function parseReviewPayload(response: string | undefined): ParsedReview[] | undefined {
   const raw = (response ?? '').trim();
+  const tagged = [
+    ...raw.matchAll(/<<<DRIVER_RETURN>>>\s*([\s\S]*?)\s*<<<END_DRIVER_RETURN>>>/g),
+  ].map((match) => match[1]?.trim() ?? '');
   const fenced = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(
     (match) => match[1]?.trim() ?? '',
   );
-  for (const source of [raw, ...fenced].filter(Boolean)) {
+  for (const source of [raw, ...tagged, ...fenced].filter(Boolean)) {
     const parsed = parseReviewCandidate(source);
-    if (parsed) return parsed;
+    if (parsed && parsed.length > 0) return parsed;
+  }
+  return parseEmbeddedReviewPayload(raw);
+}
+
+/**
+ * 从文本任意位置抽出内嵌的评审报文。
+ *
+ * 真实 Driver 很少把评审报文当成整段回复：它通常裹在散文里、放在 `<<<DRIVER_RETURN>>>`
+ * 标记块中，或直接挂在六字段报告对象上，而且常常没有代码围栏。整段解析、标记块解析和围栏
+ * 解析都会落空，报文就此丢掉——2026-09-20 的 A3 批次里 14 题有 10 题就是这么退回模板裁决的。
+ *
+ * 这里以 `"reviews"` 为锚点，由内向外尝试每一个包裹它的 `{`，取第一个能解析成完整评审报文的
+ * 候选。步数设上限，避免在超长回复上退化成二次方扫描。
+ */
+function parseEmbeddedReviewPayload(raw: string): ParsedReview[] | undefined {
+  const anchor = raw.indexOf('"reviews"');
+  if (anchor < 0) return undefined;
+  const maxAttempts = 400;
+  let attempts = 0;
+  for (
+    let start = raw.lastIndexOf('{', anchor);
+    start >= 0 && attempts < maxAttempts;
+    start = raw.lastIndexOf('{', start - 1)
+  ) {
+    attempts += 1;
+    const candidate = extractJsonObject(raw, start);
+    if (!candidate) continue;
+    const parsed = parseReviewCandidate(candidate);
+    if (parsed && parsed.length > 0) return parsed;
   }
   return undefined;
 }
@@ -1292,14 +1377,16 @@ function buildReviewerInstruction(
       'Read proposals.json for proposal summaries and the exact mapping from proposal_id to staged input files. Read only those files inside this workspace; do not inspect parent directories, run state, market ledgers, other sessions or driver streams.',
       'Compare scope, implementation feasibility, unnecessary changes, risks, and verification coverage.',
       'Do not modify product files.',
-      'Write reviews.json in this workspace: {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. Include exactly one review per proposal. Then return the normal structured Driver report.',
+      `Write exactly one review per proposal to the relative path ${REVIEW_FILE} at the root of the current role workspace; never construct an absolute path. The file must contain {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. That file is the review deliverable — a summary in the Driver report is not a substitute for it.`,
+      'Then return the normal structured Driver report.',
     ].join(' ');
   }
   return [
     `Review the isolated proposal inputs for: ${question}.`,
     `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
     'Use proposals.json to map each proposal_id to its staged files. Stay inside this workspace; do not inspect parent directories, run state, market ledgers or driver streams.',
-    'Write reviews.json: {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. Include exactly one review per proposal. Then return the normal structured Driver report.',
+    `Write exactly one review per proposal to the relative path ${REVIEW_FILE} at the root of the current role workspace; never construct an absolute path. The file must contain {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. That file is the review deliverable — a summary in the Driver report is not a substitute for it.`,
+    'Then return the normal structured Driver report.',
     'A successful tool call is not approval; verdict must be based on the proposal evidence.',
   ].join(' ');
 }

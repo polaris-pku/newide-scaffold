@@ -465,7 +465,7 @@ export function parseDriverReturnFromTranscript(transcriptText: string): DriverR
  * 从字符串的指定位置开始提取完整 JSON 对象。
  * 通过大括号计数确保提取到完整的闭合对象。
  */
-function extractJsonObject(text: string, startIndex: number): string | null {
+export function extractJsonObject(text: string, startIndex: number): string | null {
   let depth = 0;
   let inString = false;
   let escaped = false;

@@ -922,6 +922,8 @@ function boardQuery(agents: AgentBoardListItem[]): AgentBoardQuery {
  */
 function planFirstScriptedResponse(input: AgentExecutionRequest): AgentExecutionResult {
   const targetPath = planFirstTargetPath(input);
+  const body =
+    input.council_seat === 'reviewer' ? reviewPayload(input) : `output for ${input.role_id}\n`;
   const artifact: ArtifactRef = targetPath
     ? {
         artifact_id: `artifact_${input.role_id}_${input.context_policy}`,
@@ -929,7 +931,7 @@ function planFirstScriptedResponse(input: AgentExecutionRequest): AgentExecution
         producer_id: input.role_id,
         content: {
           kind: 'text',
-          content_ref: `data:text/plain;charset=utf-8,${encodeURIComponent(`output for ${input.role_id}\n`)}`,
+          content_ref: `data:text/plain;charset=utf-8,${encodeURIComponent(body)}`,
           target_path: targetPath,
         },
         created_at: nowTimestamp(),
@@ -942,26 +944,6 @@ function planFirstScriptedResponse(input: AgentExecutionRequest): AgentExecution
         created_at: nowTimestamp(),
         schema_version: SCHEMA_VERSION,
       };
-  const response =
-    input.context_policy === 'council_reviewer'
-      ? [
-          'Reviews:',
-          '```json',
-          JSON.stringify({
-            reviews: (input.instruction.match(/proposal_[a-z0-9-]+/g) ?? []).map(
-              (proposalId) => ({
-                proposal_id: proposalId,
-                verdict: 'approve',
-                reason: 'Plan is actionable.',
-                unmet_criteria: [],
-                evidence_refs: [],
-              }),
-            ),
-          }),
-          '```',
-          '<<<DRIVER_RETURN>>>',
-        ].join('\n')
-      : `${input.role_id} completed`;
   return {
     agent_run_id: `agent_run_${input.role_id}_${input.context_policy}`,
     agent_id: input.role_id,
@@ -971,7 +953,7 @@ function planFirstScriptedResponse(input: AgentExecutionRequest): AgentExecution
     artifact_refs: [artifact],
     transcript_ref: transcriptArtifact(`transcript_${input.role_id}_${input.context_policy}`),
     session_id: input.session_id ?? 'session_primary',
-    response,
+    response: `${input.role_id} completed`,
     tool_events: [],
     diagnostics: { driver_id: 'acp-external' },
     status: 'completed',
@@ -980,11 +962,24 @@ function planFirstScriptedResponse(input: AgentExecutionRequest): AgentExecution
   };
 }
 
+/** 审者的契约产物是 reviews.json——评审不再从回复文本里取。 */
+function reviewPayload(input: AgentExecutionRequest): string {
+  return JSON.stringify({
+    reviews: (input.instruction.match(/proposal_[a-z0-9-]+/g) ?? []).map((proposalId) => ({
+      proposal_id: proposalId,
+      verdict: 'approve',
+      reason: 'Plan is actionable.',
+      unmet_criteria: [],
+      evidence_refs: [],
+    })),
+  });
+}
+
 function planFirstTargetPath(input: AgentExecutionRequest): string | undefined {
   if (input.context_policy === 'council_plan_execution') return 'src/result.ts';
   if (input.context_policy === 'council_primary_plan') return 'council-plan.md';
   if (input.council_seat === 'proposer') return 'council-plan.md';
-  if (input.council_seat === 'reviewer') return undefined;
+  if (input.council_seat === 'reviewer') return 'reviews.json';
   if (input.council_seat === 'synthesizer') return 'final-plan.md';
   return undefined;
 }
