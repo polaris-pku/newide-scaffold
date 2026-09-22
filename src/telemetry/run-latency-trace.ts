@@ -36,6 +36,7 @@ export {
   RUN_LATENCY_SPANS,
   agentToolSpan,
   driverMilestoneSpan,
+  driverPhaseSpan,
   latencySpan,
   resolveRunLatencySpan,
   stageSpan,

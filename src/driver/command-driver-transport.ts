@@ -1,5 +1,12 @@
 import { spawn, type ChildProcess, type SpawnOptionsWithoutStdio } from 'node:child_process';
 import { nowTimestamp } from '../core';
+import {
+  driverPhaseSpan,
+  latencySpan,
+  recordRunLatencySpan,
+  withRunLatencySpan,
+  type RunLatencySpanRef,
+} from '../telemetry';
 import type {
   DriverPrompt,
   DriverRunResult,
@@ -65,7 +72,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   }
 
   async run(input: DriverPrompt): Promise<DriverRunResult> {
-    const stdout = await this.execute(input);
+    const stdout = await withRunLatencySpan('driver.invoke', {}, () => this.execute(input));
     return parseDriverRunResult(stdout);
   }
 
@@ -118,6 +125,84 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       let timeout: NodeJS.Timeout | undefined;
       let inactivityTimeout: NodeJS.Timeout | undefined;
       let forceKillTimeout: NodeJS.Timeout | undefined;
+
+      // ── 耗时埋点 ──
+      //
+      // 这些记录是从流回调里发出的，而 `recordRunLatencySpan` 查的是
+      // AsyncLocalStorage 的「当前」上下文。实测确认：流回调继承的是创建该子进程
+      // 时的上下文，也就是发起这次调用的那个 run，并发跑多个 run 也各归各的。
+      // 「attributes concurrent driver spans to the run that invoked them」那条
+      // 用例钉住了这个假设——万一将来传播行为变了，它会先红，而不是让埋点悄悄消失。
+      //
+      // （如果确实要脱离上下文，可以在 execute 开头同步抓 getRunLatencyRecorder()
+      // 并在闭包里用它；实测并非必要，故不预先付出这份复杂度。）
+      const openPhases = new Map<
+        string,
+        { ref: RunLatencySpanRef; mono: number; wall: string; meta?: Record<string, unknown> }
+      >();
+
+      const openPhase = (ref: RunLatencySpanRef, meta?: Record<string, unknown>): void => {
+        openPhases.set(ref.name, {
+          ref,
+          mono: performance.now(),
+          wall: nowTimestamp(),
+          ...(meta ? { meta } : {}),
+        });
+      };
+
+      const closePhase = (ref: RunLatencySpanRef, phaseOk = true): void => {
+        const opened = openPhases.get(ref.name);
+        if (!opened) return;
+        openPhases.delete(ref.name);
+        recordRunLatencySpan(ref, {
+          started_at: opened.wall,
+          completed_at: nowTimestamp(),
+          // 同一个进程内的单调钟差值，不受系统时间调整影响。
+          duration_ms: Math.max(0, performance.now() - opened.mono),
+          ok: phaseOk,
+          ...(opened.meta ? { meta: opened.meta } : {}),
+        });
+      };
+
+      /**
+       * 收尾时把还开着的段按给定结果关掉。
+       *
+       * 不这样做的话，凡是没走到正常终点的段都会从流水里凭空消失——而失败恰恰是
+       * 最需要归因的场景。参数用进程的退出方式，正常退出时那一段就是成功的。
+       */
+      const closeAllOpenPhases = (phaseOk: boolean): void => {
+        for (const opened of [...openPhases.values()]) closePhase(opened.ref, phaseOk);
+      };
+
+      /** 把 ACP 侧上报的进度映射成本次调用的段。 */
+      const trackDriverEvent = (event: DriverStreamEvent): void => {
+        if (event.event_type === 'driver.turn_started') {
+          closePhase(latencySpan('driver.handshake'));
+          openPhase(latencySpan('driver.turn'));
+          return;
+        }
+        if (event.event_type === 'driver.turn_completed') {
+          closePhase(latencySpan('driver.turn'));
+          openPhase(latencySpan('driver.shutdown'));
+          return;
+        }
+        if (event.event_type !== 'driver.phase') return;
+
+        const payload =
+          event.payload && typeof event.payload === 'object'
+            ? (event.payload as Record<string, unknown>)
+            : undefined;
+        const phase = typeof payload?.phase === 'string' ? payload.phase : undefined;
+        if (!phase) return;
+
+        const ref = driverPhaseSpan(phase);
+        if (payload?.boundary === 'started') {
+          // session 段的 mode 区分 create / load，两者成本形态不同。
+          openPhase(ref, payload.mode === undefined ? undefined : { mode: payload.mode });
+          return;
+        }
+        closePhase(ref, payload?.ok !== false);
+      };
 
       const child = spawn(this.command, this.args, this.spawnOptions());
       this.activeChildren.set(input.run_id, child);
@@ -187,7 +272,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           if (newline < 0) break;
           const line = stderrPending.slice(0, newline);
           stderrPending = stderrPending.slice(newline + 1);
-          this.consumeStderrLine(line, true, input, () => ++eventSequence, stderrChunks);
+          this.consumeStderrLine(line, true, input, () => ++eventSequence, stderrChunks, trackDriverEvent);
         }
       });
 
@@ -210,8 +295,18 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         settled = true;
         clearTimers();
         if (stderrPending) {
-          this.consumeStderrLine(stderrPending, false, input, () => ++eventSequence, stderrChunks);
+          this.consumeStderrLine(
+            stderrPending,
+            false,
+            input,
+            () => ++eventSequence,
+            stderrChunks,
+            trackDriverEvent,
+          );
         }
+        // 收尾：没走到正常终点的段在这里关掉，按进程自己的退出方式定成败。不补这
+        // 一下，半路失败的调用在流水里就只剩一个孤零零的开始，而失败最需要归因。
+        closeAllOpenPhases(code === 0 && signal === null);
         this.stderr = Buffer.concat(stderrChunks).toString('utf8');
         const stdout = Buffer.concat(stdoutChunks).toString('utf8');
         const stderrSummary = summarizeText(this.stderr);
@@ -269,6 +364,10 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         resolve(stdout);
       });
 
+      // 握手段从写 stdin 起算：进程启动加上 ACP initialize / authenticate / session
+      // 都在这一段里，直到 ACP 侧报出 turn_started。spawn() 本身不阻塞，所以它前面
+      // 没有可观测的等待，不另设一段。
+      openPhase(latencySpan('driver.handshake'));
       child.stdin.end(JSON.stringify(input));
     });
   }
@@ -279,6 +378,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
     input: DriverPrompt,
     nextSequence: () => number,
     diagnostics: Buffer[],
+    onEvent?: (event: DriverStreamEvent) => void,
   ): void {
     const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
     if (!normalized.startsWith(DRIVER_EVENT_PREFIX)) {
@@ -286,6 +386,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       return;
     }
 
+    let event: DriverStreamEvent;
     try {
       const parsed = JSON.parse(normalized.slice(DRIVER_EVENT_PREFIX.length)) as Record<
         string,
@@ -294,7 +395,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       if (!parsed || typeof parsed.event_type !== 'string') {
         throw new Error('event_type is required');
       }
-      this.emitEvent({
+      event = {
         schema_version:
           typeof parsed.schema_version === 'string' ? parsed.schema_version : 'driver-event.v1',
         event_type: parsed.event_type,
@@ -305,11 +406,17 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         ...(typeof parsed.session_id === 'string' ? { session_id: parsed.session_id } : {}),
         sequence: typeof parsed.sequence === 'number' ? parsed.sequence : nextSequence(),
         created_at: typeof parsed.created_at === 'string' ? parsed.created_at : nowTimestamp(),
-      });
+      };
     } catch {
       // A malformed reserved line stays diagnostic output and cannot break the run.
       diagnostics.push(Buffer.from(terminatedByNewline ? `${line}\n` : line, 'utf8'));
+      return;
     }
+
+    this.emitEvent(event);
+    // 埋点在解析成功之后单独调用：把它放进上面的 try 里的话，埋点自己抛错会被
+    // 误判成「这行是畸形的」，于是合法事件被降级成诊断输出。
+    onEvent?.(event);
   }
 
   private emitEvent(event: DriverStreamEvent): void {

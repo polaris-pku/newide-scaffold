@@ -64,7 +64,13 @@ export const RUN_LATENCY_SPANS = {
   'agent.llm_round': 'agent',
 
   // ---- driver：ACP driver 调用本体 ----
+  // 这三段由 transport 自己观测，首尾相接铺满 driver.invoke，不留空档也不重叠：
+  // 进程启动其实也算在 handshake 里，因为 spawn() 是非阻塞的，写 stdin 之前没有
+  // 可观测的等待。ACP 侧上报的内部段（见 driverPhaseSpan）嵌在它们之内。
   'driver.invoke': 'driver',
+  'driver.handshake': 'driver',
+  'driver.turn': 'driver',
+  'driver.shutdown': 'driver',
 } as const satisfies Record<string, RunLatencyLayer>;
 
 /** 登记名联合。拼错的 span 名在这里被挡住。 */
@@ -115,6 +121,20 @@ export type DriverTimingMilestoneName = (typeof DRIVER_TIMING_MILESTONES)[number
  */
 export function driverMilestoneSpan(name: DriverTimingMilestoneName): RunLatencySpanRef {
   return { name, layer: 'driver' };
+}
+
+/**
+ * 动态族：ACP 侧上报的段耗时（`driver.phase.<phase>`）。
+ *
+ * 段名来自另一个仓库的契约——`driver.phase` 事件的 `payload.phase`，运行时才知道，
+ * 所以只能做成动态族，拿不到编译期校验。它是 transport 自测那几段的更细一层：
+ * `driver.handshake` 拆开就是 initialize + authenticate + session。
+ *
+ * 之所以值得记：判断「冷启动贵在哪」靠的正是这一层——它当初把 npx 的包解析开销
+ * 从 ACP 握手里分辨了出来。
+ */
+export function driverPhaseSpan(phase: string): RunLatencySpanRef {
+  return { name: `driver.phase.${phase}`, layer: 'driver' };
 }
 
 /** 登记名或现成 ref 统一成 ref；供 recorder 与自由函数共用。 */
