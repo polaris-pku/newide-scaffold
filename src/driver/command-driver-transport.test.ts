@@ -3,7 +3,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION } from '../core';
-import { CommandDriverTransport } from './command-driver-transport';
+import {
+  RunLatencyRecorder,
+  runWithRunLatencyRecorder,
+  type RunLatencySpan,
+  type RunLatencyTraceSink,
+} from '../telemetry';
+import { CommandDriverTransport, DRIVER_EVENT_PREFIX } from './command-driver-transport';
 import type { DriverPrompt } from './contract';
 
 const PROMPT: DriverPrompt = {
@@ -20,6 +26,44 @@ const PROMPT: DriverPrompt = {
  * 就等于让这个测试只在一个平台上可能通过。
  */
 const TERMINATED = process.platform === 'win32' ? /exited with code 1/ : /exited with signal/;
+
+class CollectingLatencySink implements RunLatencyTraceSink {
+  readonly spans: RunLatencySpan[] = [];
+
+  append(span: RunLatencySpan): void {
+    this.spans.push(span);
+  }
+}
+
+function createLatencyRecorder(
+  sink: RunLatencyTraceSink,
+  runId = 'run_driver_spans'
+): RunLatencyRecorder {
+  return new RunLatencyRecorder({ run_id: runId, task_id: 'task_driver_spans', sink });
+}
+
+/** 一段子进程脚本：按给定顺序把 driver 事件写到 stderr 的保留审计通道上。 */
+function driverEventsBody(events: string): string {
+  return `
+    readInput((raw) => {
+      const PREFIX = ${JSON.stringify(DRIVER_EVENT_PREFIX)};
+      let sequence = 0;
+      const emit = (eventType, payload) => {
+        process.stderr.write(PREFIX + JSON.stringify({
+          schema_version: 'driver-event.v1',
+          event_type: eventType,
+          payload,
+          task_id: 'task_command',
+          run_id: 'run_command',
+          sequence: ++sequence,
+          created_at: new Date().toISOString(),
+        }) + '\\n');
+      };
+      ${events}
+      process.stdout.write(JSON.stringify(driverRunResult(JSON.parse(raw).task_id)));
+    });
+  `;
+}
 
 describe('CommandDriverTransport', () => {
   it('sends DriverPrompt through stdin and returns DriverRunResult from stdout JSON', async () => {
@@ -127,6 +171,91 @@ describe('CommandDriverTransport', () => {
       }
     }
   );
+
+  it('records the driver phase spans of a run inside a latency recorder', async () => {
+    const sink = new CollectingLatencySink();
+    const transport = new CommandDriverTransport(
+      nodeCommand(
+        driverEventsBody(`
+          emit('driver.phase', { phase: 'initialize', boundary: 'started' });
+          emit('driver.phase', { phase: 'initialize', boundary: 'completed', ok: true });
+          emit('driver.phase', { phase: 'session', boundary: 'started', mode: 'create' });
+          emit('driver.phase', { phase: 'session', boundary: 'completed', ok: true });
+          emit('driver.turn_started', { prompt_length: 1 });
+          emit('driver.turn_completed', { stop_reason: 'done' });
+        `)
+      ),
+    );
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () => transport.run(PROMPT));
+
+    const names = sink.spans.map((span) => span.name);
+    // 这一组同时是 ALS 上下文的证据：recordRunLatencySpan 取不到 store 时是静默
+    // no-op，而流回调未必继承 run 的上下文——真取不到的话这里一条都不会出现。
+    for (const expected of [
+      'driver.invoke',
+      'driver.handshake',
+      'driver.turn',
+      'driver.shutdown',
+      'driver.phase.initialize',
+      'driver.phase.session',
+    ]) {
+      expect(names).toContain(expected);
+    }
+
+    expect(sink.spans.find((span) => span.name === 'driver.phase.session')?.meta).toMatchObject({
+      mode: 'create',
+    });
+    expect(sink.spans.every((span) => span.run_id === 'run_driver_spans')).toBe(true);
+    expect(sink.spans.every((span) => span.layer === 'driver')).toBe(true);
+    expect(sink.spans.every((span) => span.ok)).toBe(true);
+  });
+
+  it('attributes concurrent driver spans to the run that invoked them', async () => {
+    // 并发是真实存在的：Council 的两个 proposer 就是 Promise.all 一起跑的。
+    // 每条流回调如果各自去查当前上下文，就可能把 span 记到「这条流所属」的那个 run
+    // 上，而不是「发起这次调用」的那个 run。
+    const events = `
+      emit('driver.turn_started', { prompt_length: 1 });
+      emit('driver.turn_completed', { stop_reason: 'done' });
+    `;
+    const sinkA = new CollectingLatencySink();
+    const sinkB = new CollectingLatencySink();
+
+    await Promise.all([
+      runWithRunLatencyRecorder(createLatencyRecorder(sinkA, 'run_a'), () =>
+        new CommandDriverTransport(nodeCommand(driverEventsBody(events))).run(PROMPT)
+      ),
+      runWithRunLatencyRecorder(createLatencyRecorder(sinkB, 'run_b'), () =>
+        new CommandDriverTransport(nodeCommand(driverEventsBody(events))).run(PROMPT)
+      ),
+    ]);
+
+    expect(sinkA.spans.length).toBeGreaterThan(0);
+    expect(sinkB.spans.length).toBeGreaterThan(0);
+    expect(sinkA.spans.every((span) => span.run_id === 'run_a')).toBe(true);
+    expect(sinkB.spans.every((span) => span.run_id === 'run_b')).toBe(true);
+  });
+
+  it('closes an unfinished driver phase as failed when the runner dies', async () => {
+    const sink = new CollectingLatencySink();
+    const transport = new CommandDriverTransport(
+      nodeCommand(`
+        readInput(() => {
+          process.exit(3);
+        });
+      `),
+    );
+
+    await expect(
+      runWithRunLatencyRecorder(createLatencyRecorder(sink), () => transport.run(PROMPT)),
+    ).rejects.toThrow(/exited with code 3/);
+
+    // 半路夭折的段要按失败收尾，否则它在流水里只剩一个开始，而失败最需要归因。
+    expect(sink.spans.find((span) => span.name === 'driver.handshake')?.ok).toBe(false);
+    // 没走到 turn 就不该凭空多出 turn 段——否则耗时会被算到没发生过的事情上。
+    expect(sink.spans.some((span) => span.name === 'driver.turn')).toBe(false);
+  });
 
   it('does not cap total turn duration while the Driver remains active', async () => {
     const transport = new CommandDriverTransport({
