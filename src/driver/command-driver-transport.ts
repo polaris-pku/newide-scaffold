@@ -327,7 +327,15 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       stdio: ['pipe', 'pipe', 'pipe'],
     };
 
-    if (this.timeoutMs !== undefined && process.platform !== 'win32') {
+    // 让子进程自成进程组，terminateChild 的 process.kill(-pid) 才有组可杀。
+    // 条件只依赖平台：此前它还要求 timeoutMs 存在，而生产构建并不传 timeoutMs
+    // （只传 inactivityTimeoutMs），于是进程组永远不建，kill(-pid) 必抛 ESRCH，
+    // 每次都退回单进程 kill，ACP agent 孙进程被 init 收养。
+    //
+    // Windows 不走这条：libuv 会把非 detached 的子进程放进 Job Object
+    // （KILL_ON_JOB_CLOSE），父进程一死整棵树随之回收。反过来，在 Windows 上设
+    // detached 会把它移出 job，那才会真的制造孤儿进程。
+    if (process.platform !== 'win32') {
       options.detached = true;
     }
 
@@ -423,6 +431,18 @@ function parseDriverRunResult(stdout: string): DriverRunResult {
   return parsed;
 }
 
+/**
+ * 终止直接子进程及其子孙。
+ *
+ * POSIX：对负 pid 发信号即杀整个进程组，所以 spawnOptions 必须设 detached，
+ * 否则没有组可杀、这里会静默退化成只杀直接子进程。
+ *
+ * Windows：杀直接子进程就够了，不需要 taskkill。libuv 会把非 detached 的子进程
+ * 放进 Job Object（KILL_ON_JOB_CLOSE），父进程一死，job 内包括孙进程在内的所有
+ * 进程都被回收——这一点已实测确认（孙进程自行 detached 则会活下来）。
+ * 所以这里不要"顺手"补一个 taskkill：多余，而且会掩盖真正的机制；更不要给
+ * Windows 设 detached，那会把子进程移出 job，结果正好相反。
+ */
 function terminateChild(pid: number | undefined, signal: NodeJS.Signals): void {
   if (pid === undefined) {
     return;
