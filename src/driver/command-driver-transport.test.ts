@@ -14,6 +14,13 @@ const PROMPT: DriverPrompt = {
   schema_version: SCHEMA_VERSION,
 };
 
+/**
+ * 被终止的直接子进程如何收场，两个平台不同：POSIX 下它死于信号，Windows 下 Node
+ * 的 kill 走 TerminateProcess，子进程以退出码结束、signal 为空。断言写死其中一个
+ * 就等于让这个测试只在一个平台上可能通过。
+ */
+const TERMINATED = process.platform === 'win32' ? /exited with code 1/ : /exited with signal/;
+
 describe('CommandDriverTransport', () => {
   it('sends DriverPrompt through stdin and returns DriverRunResult from stdout JSON', async () => {
     const transport = new CommandDriverTransport(
@@ -154,12 +161,12 @@ describe('CommandDriverTransport', () => {
 
     await transport.interrupt('cancel first', 'run_cancel_first');
 
-    await expect(first).rejects.toThrow(/exited with signal/);
+    await expect(first).rejects.toThrow(TERMINATED);
     expect(activeChildren().has('run_cancel_first')).toBe(false);
     expect(activeChildren().has('run_cancel_second')).toBe(true);
 
     await transport.interrupt('test cleanup', 'run_cancel_second');
-    await expect(second).rejects.toThrow(/exited with signal/);
+    await expect(second).rejects.toThrow(TERMINATED);
     expect(activeChildren().size).toBe(0);
   });
 
