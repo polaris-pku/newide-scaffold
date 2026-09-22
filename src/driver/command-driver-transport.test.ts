@@ -1,3 +1,6 @@
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION } from '../core';
 import { CommandDriverTransport } from './command-driver-transport';
@@ -10,6 +13,13 @@ const PROMPT: DriverPrompt = {
   created_at: '2026-07-03T00:00:00.000Z',
   schema_version: SCHEMA_VERSION,
 };
+
+/**
+ * 被终止的直接子进程如何收场，两个平台不同：POSIX 下它死于信号，Windows 下 Node
+ * 的 kill 走 TerminateProcess，子进程以退出码结束、signal 为空。断言写死其中一个
+ * 就等于让这个测试只在一个平台上可能通过。
+ */
+const TERMINATED = process.platform === 'win32' ? /exited with code 1/ : /exited with signal/;
 
 describe('CommandDriverTransport', () => {
   it('sends DriverPrompt through stdin and returns DriverRunResult from stdout JSON', async () => {
@@ -74,6 +84,50 @@ describe('CommandDriverTransport', () => {
     await expect(transport.run(PROMPT)).rejects.toThrow(/produced no output for 50ms/);
   });
 
+  // 这条验证的是 POSIX 的进程组回收。Windows 上机制不同——libuv 用 Job Object 回收
+  // 非 detached 的子进程，有修复和没修复孙进程都会死，在这里断言不出任何东西；反而
+  // 因为多起两个进程，把同文件里几条时序敏感的用例推过了阈值。所以只在 POSIX 跑。
+  it.skipIf(process.platform === 'win32')(
+    'reclaims the grandchild process when a run is interrupted',
+    async () => {
+      // 进程链与真实情况一致：newide → runner（直接子进程）→ ACP agent（孙进程）。
+      // 孙进程刻意不读 stdin，因此永远不会靠 EOF 自行退出——存活与否只取决于
+      // 我们有没有真正杀掉整棵进程树，而不是取决于对端是否自觉。
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'driver-tree-'));
+      const pidFile = path.join(dir, 'grandchild.pid');
+
+      try {
+        const transport = new CommandDriverTransport({
+          ...nodeCommand(`
+            const { spawn } = require('node:child_process');
+            const { writeFileSync } = require('node:fs');
+            readInput(() => {
+              const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+                stdio: 'ignore',
+              });
+              writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid));
+              setInterval(() => {}, 1000);
+            });
+          `),
+          // 足够长，确保是 interrupt 而不是超时路径终止的它。
+          inactivityTimeoutMs: 30_000,
+        });
+
+        const pending = transport.run(PROMPT).catch(() => undefined);
+        const grandchildPid = await readPid(pidFile);
+        expect(isAlive(grandchildPid)).toBe(true);
+
+        await transport.interrupt('test teardown');
+        await pending;
+
+        await waitFor(() => !isAlive(grandchildPid));
+        expect(isAlive(grandchildPid)).toBe(false);
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+  );
+
   it('does not cap total turn duration while the Driver remains active', async () => {
     const transport = new CommandDriverTransport({
       ...nodeCommand(`
@@ -107,12 +161,12 @@ describe('CommandDriverTransport', () => {
 
     await transport.interrupt('cancel first', 'run_cancel_first');
 
-    await expect(first).rejects.toThrow(/exited with signal/);
+    await expect(first).rejects.toThrow(TERMINATED);
     expect(activeChildren().has('run_cancel_first')).toBe(false);
     expect(activeChildren().has('run_cancel_second')).toBe(true);
 
     await transport.interrupt('test cleanup', 'run_cancel_second');
-    await expect(second).rejects.toThrow(/exited with signal/);
+    await expect(second).rejects.toThrow(TERMINATED);
     expect(activeChildren().size).toBe(0);
   });
 
@@ -265,4 +319,46 @@ function nodeCommand(body: string): { command: string; args: string[] } {
       `,
     ],
   };
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 子进程把孙进程 pid 落盘后才算起来了，轮询等它出现。 */
+async function readPid(pidFile: string): Promise<number> {
+  let pid: number | undefined;
+  await waitFor(async () => {
+    try {
+      pid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+      return Number.isInteger(pid) && pid > 0;
+    } catch {
+      return false;
+    }
+  }, '孙进程 pid 未在预期时间内落盘');
+  return pid as number;
+}
+
+/**
+ * 轮询直到条件成立。
+ *
+ * 终止是异步的：直接子进程 close 不等于孙进程已经消失，所以这里必须给一点余量，
+ * 否则测试会在正确的实现上偶发失败。
+ */
+async function waitFor(
+  condition: () => boolean | Promise<boolean>,
+  message = '条件未在预期时间内成立',
+  timeoutMs = 5_000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await condition()) return;
+    if (Date.now() > deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
