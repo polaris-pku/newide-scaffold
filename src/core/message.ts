@@ -29,6 +29,17 @@ export interface MessageRecipient {
   role_id?: RoleId;
 }
 
+/**
+ * Mailbox-internal message envelope.
+ *
+ * Disposition (P0 decision, issue #145): **coexist** — cross-protocol
+ * traffic (SAP/AAP/ADP frames) must use `protocolFrameSchema` from the
+ * `src/core` barrel instead of this type; `Message` stays the mailbox's
+ * internal envelope with no field changes and no consumer migration in P0.
+ * Migration boundary is C2 (after C1): align `Message`/Delivery with the AAP
+ * envelope via the delivery-boundary `exchange_id ↔ message_id` mapping —
+ * `message_id` never enters a protocol envelope.
+ */
 export interface Message {
   message_id: MessageId;
   thread_id: ThreadId;

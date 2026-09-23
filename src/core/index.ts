@@ -7,3 +7,8 @@ export * from './checkpoint';
 export * from './decision';
 export * from './message';
 export * from './lease';
+export * from './protocol-envelope';
+export * from './protocol-sap';
+export * from './protocol-adp';
+export * from './protocol-aap';
+export * from './protocol-frame';
