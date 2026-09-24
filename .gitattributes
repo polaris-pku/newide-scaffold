@@ -1,0 +1,3 @@
+# Protocol fixtures are byte-round-tripped by test/protocol/protocol-frames.test.ts;
+# keep them LF in every working tree so the assertion is platform-stable.
+fixtures/protocol/*.json text eol=lf

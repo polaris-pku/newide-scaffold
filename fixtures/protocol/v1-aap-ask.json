@@ -1,0 +1,24 @@
+{
+  "protocol": "agent-agent",
+  "protocol_version": "1.0",
+  "exchange_id": "ex-aap-00051",
+  "causation_id": "ex-sap-00041",
+  "task_id": "task-0088",
+  "run_id": "run-20260921-001",
+  "producer": {
+    "kind": "agent",
+    "role_id": "implementer"
+  },
+  "consumer": {
+    "kind": "agent",
+    "role_id": "reviewer"
+  },
+  "attempt": 1,
+  "created_at": "2026-09-21T09:04:00.000Z",
+  "deadline_at": "2026-09-21T09:10:00.000Z",
+  "command": "agent.ask",
+  "instruction": {
+    "text": "请复核 src/protocol/sap.ts 的字段校验与判重处理，并给出是否可合的结论。",
+    "ref": null
+  }
+}
