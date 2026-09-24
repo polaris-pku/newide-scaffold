@@ -114,6 +114,45 @@ describe('protocol transactional delivery', () => {
     store.close();
   });
 
+  it('makes call journal append idempotent and archives only settled rows', () => {
+    const store = new SqliteCoordinationStore(createDatabase());
+    store.commitState(initialCommit());
+    store.withProtocolTransaction((tx) => {
+      const first = tx.appendCall({
+        task_id: ask.task_id, run_id: ask.run_id, call_id: 'call-archive', role_id: 'implementer',
+        event: 'memory_query', status: 'ok', summary: 'done',
+        completed_at: '2026-09-21T09:04:01.000Z',
+      });
+      const second = tx.appendCall({
+        task_id: ask.task_id, run_id: ask.run_id, call_id: 'call-archive', role_id: 'implementer',
+        event: 'memory_query', status: 'ok', summary: 'duplicate',
+        completed_at: '2026-09-21T09:04:02.000Z',
+      });
+      expect(second).toEqual(first);
+    });
+    store.withProtocolTransaction((tx) => {
+      tx.enqueueOutbox({ id: 'settled', destination: 'reviewer', frame: ask });
+    });
+    const claimed = store.claimOutbox('settled', 'worker', '2026-09-21T09:04:00.000Z',
+      '2026-09-21T09:05:00.000Z', 1)!;
+    store.markOutboxSent('settled', 'worker', claimed.revision, '2026-09-21T09:04:30.000Z');
+    const archived = store.archiveSettled('2026-09-21T09:05:00.000Z');
+    expect(archived).toEqual({ outbox: 0, inbox: 0 });
+    expect(store.getOutbox('settled')?.status).toBe('sent');
+    store.withProtocolTransaction((tx) => {
+      tx.enqueueOutbox({ id: 'failed', destination: 'reviewer', frame: {
+        ...ask, exchange_id: 'ex-aap-failed', attempt: 1,
+      } });
+    });
+    const failed = store.claimOutbox('failed', 'worker', '2026-09-21T09:04:00.000Z',
+      '2026-09-21T09:05:00.000Z', 1)!;
+    store.failOutbox('failed', 'worker', failed.revision, '2026-09-21T09:04:30.000Z');
+    expect(store.archiveSettled('2026-09-21T09:07:00.000Z')).toEqual({ outbox: 1, inbox: 0 });
+    expect(store.getOutbox('failed')).toBeUndefined();
+    expect(store.getOutbox('settled')?.status).toBe('sent');
+    store.close();
+  });
+
   it('claims each outbox once across workers, recovers expired leases and never replays sent', () => {
     const databasePath = createDatabase();
     const first = new SqliteCoordinationStore(databasePath);

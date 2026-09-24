@@ -192,6 +192,9 @@ export class SqliteCoordinationStore
     return this.withProtocolTransaction(() =>
       this.protocolDelivery.renewInboxLease(key, owner, expectedRevision, now, leaseExpiresAt));
   }
+  archiveSettled(before: string, limit?: number) {
+    return this.protocolDelivery.archiveSettled(before, limit);
+  }
 
   getTaskAggregate(taskId: string): PersistedTaskAggregate | undefined {
     const taskRow = this.database.prepare('SELECT * FROM tasks WHERE task_id = ?').get(taskId);

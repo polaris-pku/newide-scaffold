@@ -147,4 +147,5 @@ export interface ProtocolDeliveryStore {
     now: string,
     leaseExpiresAt: string,
   ): ProtocolInboxRecord;
+  archiveSettled(before: string, limit?: number): { outbox: number; inbox: number };
 }

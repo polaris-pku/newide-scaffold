@@ -76,6 +76,10 @@ export function migrateProtocolDelivery(database: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS journal_task_run_seq
       ON journal(task_id, run_id, seq);
+    CREATE UNIQUE INDEX IF NOT EXISTS journal_call_id
+      ON journal(id) WHERE kind = 'call';
+    CREATE TABLE IF NOT EXISTS outbox_archive AS SELECT * FROM outbox WHERE 0;
+    CREATE TABLE IF NOT EXISTS inbox_archive AS SELECT * FROM inbox WHERE 0;
   `);
 }
 
@@ -188,6 +192,10 @@ export class SqliteProtocolDelivery {
   appendCall(input: AppendProtocolCall): ProtocolJournalRecord {
     required(input.call_id, 'call_id');
     required(input.event, 'event');
+    const existing = this.database.prepare(
+      `SELECT * FROM journal WHERE kind = 'call' AND id = ?`,
+    ).get(input.call_id);
+    if (existing) return readJournal(existing);
     return this.insertJournal({
       task_id: input.task_id, run_id: input.run_id, ts: input.completed_at,
       kind: 'call', id: input.call_id, causation_id: null, role_id: input.role_id,
@@ -330,6 +338,43 @@ export class SqliteProtocolDelivery {
     const record = this.requireInbox(key);
     this.appendFrame(record.frame, 'inbox.lease_renewed', record.status, owner, now);
     return record;
+  }
+
+  archiveSettled(before: string, limit = 1000): { outbox: number; inbox: number } {
+    if (!Number.isInteger(limit) || limit <= 0) throw new Error('Archive limit must be positive');
+    const outboxRows = this.database.prepare(`
+      SELECT id FROM outbox
+      WHERE status IN ('complete', 'failed') AND completed_at IS NOT NULL
+        AND completed_at < ? ORDER BY completed_at, id LIMIT ?
+    `).all(before, limit);
+    const inboxRows = this.database.prepare(`
+      SELECT consumer_id, protocol, exchange_id FROM inbox
+      WHERE status = 'complete' AND completed_at IS NOT NULL
+        AND completed_at < ? ORDER BY completed_at, consumer_id, protocol, exchange_id LIMIT ?
+    `).all(before, limit);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of outboxRows) {
+        this.database.prepare(`
+          INSERT OR IGNORE INTO outbox_archive SELECT * FROM outbox WHERE id = ?
+        `).run(String(row.id));
+        this.database.prepare('DELETE FROM outbox WHERE id = ?').run(String(row.id));
+      }
+      for (const row of inboxRows) {
+        this.database.prepare(`
+          INSERT OR IGNORE INTO inbox_archive
+          SELECT * FROM inbox WHERE consumer_id = ? AND protocol = ? AND exchange_id = ?
+        `).run(String(row.consumer_id), String(row.protocol), String(row.exchange_id));
+        this.database.prepare(`
+          DELETE FROM inbox WHERE consumer_id = ? AND protocol = ? AND exchange_id = ?
+        `).run(String(row.consumer_id), String(row.protocol), String(row.exchange_id));
+      }
+      this.database.exec('COMMIT');
+      return { outbox: outboxRows.length, inbox: inboxRows.length };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   private updateClaimedOutbox(
