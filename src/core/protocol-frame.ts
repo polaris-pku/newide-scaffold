@@ -21,5 +21,12 @@ import { aapFrameSchema } from './protocol-aap';
 import { adpFrameSchema } from './protocol-adp';
 import { sapFrameSchema } from './protocol-sap';
 
+// 总并集 = P0 对外唯一校验入口。z.union 按序试三个协议的帧集：
+// - 合法帧必在且只在一个协议的某分支里完整通过；
+// - 方向 XOR 不靠事后 refine：command 系分支带 result/status、receipt 系分支带 command
+//   都会被各自的 .strict() 以多余键拒掉；两边都不带则没有分支能通过；
+// - 用普通 z.union 而非 discriminatedUnion：每个 protocol 值有多个 variant，
+//   普通 union 行为等价、实现更简单。
 export const protocolFrameSchema = z.union([sapFrameSchema, adpFrameSchema, aapFrameSchema]);
+// 类型与校验同源：ProtocolFrame = 8 种合法帧（3 command + 2 cancel + 3 receipt）的联合。
 export type ProtocolFrame = z.infer<typeof protocolFrameSchema>;
