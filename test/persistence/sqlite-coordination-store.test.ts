@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe('SqliteCoordinationStore', () => {
-  it('creates the v3 coordination schema in WAL mode', () => {
+  it('creates the v4 coordination and protocol delivery schema in WAL mode', () => {
     const { databasePath, store } = createStore();
     store.close();
 
@@ -40,10 +40,13 @@ describe('SqliteCoordinationStore', () => {
         'checkpoints',
         'messages',
         'deliveries',
+        'outbox',
+        'inbox',
+        'journal',
       ]),
     );
     expect(journalMode).toEqual({ journal_mode: 'wal' });
-    expect(migration).toEqual({ version: 3 });
+    expect(migration).toEqual({ version: 4 });
 
     const runtimeColumns = database
       .prepare('PRAGMA table_info(task_runtime_states)')
