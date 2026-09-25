@@ -17,6 +17,7 @@
 import type { AgentHandle, DriverReturn, AgentStatus } from '../schemas';
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { AgentLoopState, AgentTaskRequest } from '../agent-types';
+import type { CallJournalPort } from '../ports/call-journal';
 import type { MemoryCycleResult } from '../types';
 import type { CompetitionClaimEvaluator } from '../ports/competition-claim-evaluator';
 import type { AgentCompetitionClaim } from '../competition-types';
@@ -44,6 +45,11 @@ export interface AgentToolConfig {
   systemPrompt?: string;
   /** 单次任务最大 tool-calling 轮次（防死循环，默认 20） */
   maxToolCalls?: number;
+  /**
+   * 进程内调用留档端口（可选）：memory_query 在调用完成（成功/失败）时单点上报；
+   * 缺省不留档，行为与不注入时完全一致。
+   */
+  callJournal?: CallJournalPort;
 }
 
 // ──────────────────────────────────────────────
@@ -236,6 +242,18 @@ export class Agent {
           continue;
         }
 
+        // 进程内调用留档（B1）：只记 query_memory，且 task 必须带 task_id（journal
+        // 外键前提）。emit 覆盖含 JSON.parse 的整段 try——失败行的耗时语义是
+        // 「这次调用尝试花了多久」；与上面 latency span 刻意排除解析失败的口径不同
+        // （span 防「工具慢」误报）。
+        const journal = toolConfig.callJournal;
+        const task = this.currentTask;
+        const journaled =
+          journal !== undefined && tool.name === 'query_memory' && task?.task_id !== undefined;
+        const startedAt = journaled ? Date.now() : 0;
+        let journalStatus: 'ok' | 'error' = 'ok';
+        let journalSummary = '';
+
         try {
           const args = JSON.parse(toolCall.function.arguments);
           // 只包工具本身，不含参数解析：解析失败时并没有工具在跑，记一条耗时只会
@@ -259,12 +277,40 @@ export class Agent {
             content,
             tool_call_id: toolCall.id,
           });
+          if (journaled) {
+            journalStatus = 'ok';
+            journalSummary = summarizeQueryResult(result);
+          }
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
           this.loopMessages.push({
             role: 'tool',
-            content: `Error executing ${tool.name}: ${error instanceof Error ? error.message : String(error)}`,
+            content: `Error executing ${tool.name}: ${message}`,
             tool_call_id: toolCall.id,
           });
+          if (journaled) {
+            journalStatus = 'error';
+            journalSummary = message;
+          }
+        } finally {
+          if (journaled) {
+            try {
+              journal!.record({
+                call_id: toolCall.id,
+                event: 'memory_query',
+                task_id: task!.task_id!,
+                run_id: task!.run_id,
+                role_id,
+                workspace_path: task!.workspace_path,
+                status: journalStatus,
+                summary: journalSummary.slice(0, 300),
+                duration_ms: Date.now() - startedAt,
+                completed_at: nowTimestamp(),
+              });
+            } catch {
+              // best-effort：留档绝不打断执行循环（对齐 recordDispatchMetrics 惯用法）
+            }
+          }
         }
       }
     } else {
@@ -493,4 +539,15 @@ export class Agent {
       },
     };
   }
+}
+
+/** 从 QueryMemoryOutput 提取结果摘要（防御式取数：字段缺失时退回通用描述） */
+function summarizeQueryResult(result: unknown): string {
+  if (result && typeof result === 'object') {
+    const { skills, experiences } = result as { skills?: unknown; experiences?: unknown };
+    const skillCount = Array.isArray(skills) ? skills.length : 0;
+    const experienceCount = Array.isArray(experiences) ? experiences.length : 0;
+    return `skills=${skillCount} experiences=${experienceCount}`;
+  }
+  return String(result);
 }
