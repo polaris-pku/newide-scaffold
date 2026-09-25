@@ -25,6 +25,7 @@ import {
   type AgentTaskRequest,
   type AgentHandle,
   type BufferRepository,
+  type CallJournalPort,
   type CollectCompetitionClaimsOptions,
   type CompetitionClaimBatch,
   type CreateAgentSpec,
@@ -90,6 +91,8 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   embedding?: EmbeddingProvider;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
+  /** 进程内调用留档（B1）：注入后 memory_query 调用收尾写 P1 journal；缺省不留档 */
+  callJournal?: CallJournalPort;
   mailbox?: {
     service: PersistentMailboxService;
     /** 协作名册：静态数组或动态提供者（每次使用时查询，支持运行时新增 Agent） */
@@ -163,6 +166,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         },
         tools,
         maxToolCalls: this.options.mailbox ? 6 : 4,
+        ...(this.options.callJournal ? { callJournal: this.options.callJournal } : {}),
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
@@ -415,6 +419,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const task: AgentTaskRequest = {
       spec: input.instruction,
       task_id: input.task_id,
+      // 进程内调用留档（B1）的 journal 外键与 Session 绑定键：与 invocationContext
+      // 同源（workspace_path 已在上面 path.resolve 归一化）。
+      run_id: input.run_id,
+      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       call_id: createId('call'),
       source_driver: this.options.driver.driver_id,
     };
@@ -1122,6 +1130,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         run_id: input.run_id,
         role_id: runtimeRoleId,
         buffer_seq: bufferSeq,
+        // Session 绑定键之一：extract 留档（B1）要靠它解析真实 Session
+        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
       });
     } catch (error) {

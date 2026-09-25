@@ -12,6 +12,8 @@ import {
   InMemoryBufferRepository,
   InMemoryRepository,
   createAgentMemoryScope,
+  type CallJournalEvent,
+  type CallJournalPort,
   type ExperienceExtractor,
   type LlmClient,
 } from '../../src/memory';
@@ -56,6 +58,83 @@ describe('BMemoryMaintenanceRunner', () => {
     });
     await expect(evidenceStore.get(result.maintenance_ref)).resolves.toMatchObject({
       status: 'completed',
+    });
+  });
+
+  describe('CallJournalPort 留档（B1）', () => {
+    function createStubPort(): CallJournalPort & { events: CallJournalEvent[] } {
+      const events: CallJournalEvent[] = [];
+      return { events, record: (event) => void events.push(event) };
+    }
+
+    it('processBuffer 成功 → 1 条 extract 事件，含 task/run/role/workspace', async () => {
+      const port = createStubPort();
+      const { runner, repository, bufferRepository } = await fixture(
+        maintenanceLlm(),
+        undefined,
+        undefined,
+        { callJournal: port },
+      );
+      const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_j1');
+
+      await runner.processBuffer({
+        task_id: 'task_j1',
+        run_id: 'run_j1',
+        role_id: 'role_ts_engineer',
+        buffer_seq: seq,
+        workspace_path: '/ws/proj',
+      });
+
+      expect(port.events).toHaveLength(1);
+      expect(port.events[0]).toMatchObject({
+        event: 'extract',
+        status: 'ok',
+        task_id: 'task_j1',
+        run_id: 'run_j1',
+        role_id: 'role_ts_engineer',
+        workspace_path: '/ws/proj',
+      });
+      expect(port.events[0].call_id).toContain('extract:role_ts_engineer:');
+      expect(port.events[0].duration_ms).toBeGreaterThanOrEqual(0);
+    });
+
+    it('failingExtractor → 记 error 事件，evidence failed 行为不变', async () => {
+      const port = createStubPort();
+      const { runner, repository, bufferRepository } = await fixture(
+        maintenanceLlm(),
+        undefined,
+        failingExtractor(),
+        { callJournal: port },
+      );
+      const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_j2');
+
+      const result = await runner.processBuffer({
+        task_id: 'task_j2',
+        run_id: 'run_j2',
+        role_id: 'role_ts_engineer',
+        buffer_seq: seq,
+      });
+
+      expect(result.status).toBe('failed');
+      expect(port.events).toHaveLength(1);
+      expect(port.events[0]).toMatchObject({
+        event: 'extract', status: 'error', task_id: 'task_j2', run_id: 'run_j2',
+      });
+      expect(port.events[0].summary).toContain('LLM provider unavailable');
+    });
+
+    it('不注入 port → 正常完成且无事件', async () => {
+      const { runner, repository, bufferRepository } = await fixture();
+      const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_j3');
+
+      const result = await runner.processBuffer({
+        task_id: 'task_j3',
+        run_id: 'run_j3',
+        role_id: 'role_ts_engineer',
+        buffer_seq: seq,
+      });
+
+      expect(result.status).toBe('completed');
     });
   });
 
@@ -575,7 +654,11 @@ async function fixture(
   llm: LlmClient = maintenanceLlm(),
   providedEvidenceStore?: BMemoryMaintenanceEvidenceStore,
   extractor?: ExperienceExtractor,
-  extra?: { runsRoot?: string; promotion?: { confidenceThreshold?: number; autoApprove?: boolean } },
+  extra?: {
+    runsRoot?: string;
+    promotion?: { confidenceThreshold?: number; autoApprove?: boolean };
+    callJournal?: CallJournalPort;
+  },
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'newide-b-maintenance-'));
   roots.push(root);
@@ -593,6 +676,7 @@ async function fixture(
     ...(extractor ? { extractor } : {}),
     ...(extra?.runsRoot ? { runsRoot: extra.runsRoot } : {}),
     ...(extra?.promotion ? { promotion: extra.promotion } : {}),
+    ...(extra?.callJournal ? { callJournal: extra.callJournal } : {}),
   });
   return { runner, repository, bufferRepository, evidenceStore };
 }

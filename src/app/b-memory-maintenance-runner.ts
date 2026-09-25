@@ -12,6 +12,7 @@ import {
   promoteExperiencesForAgent,
   resolveMemoryAblationPolicy,
   type BufferRepository,
+  type CallJournalPort,
   type ExperienceExtractor,
   type LlmClient,
   type MemoryAblation,
@@ -33,6 +34,8 @@ export interface BMemoryMaintenanceRequest {
   buffer_seq: number;
   /** RFC §1.2 ablation; B2/B3 enable inline skill promotion with auto-approve. */
   memory_ablation?: MemoryAblation;
+  /** 工作区绝对路径（Session 绑定键之一）；extract 留档（B1）解析真实 Session 用 */
+  workspace_path?: string;
 }
 
 export interface BSkillPromotionRequest {
@@ -87,6 +90,8 @@ export interface BMemoryMaintenanceRunnerOptions {
   runsRoot?: string;
   /** 可选提取器注入（默认 LlmExperienceExtractor + 规则版降级）；测试注入失败提取器用。 */
   extractor?: ExperienceExtractor;
+  /** 进程内调用留档（B1）：注入后 extract 收尾写 P1 journal；缺省不留档 */
+  callJournal?: CallJournalPort;
   /**
    * 技能晋升配置（全自动化测评用）：
    * - confidenceThreshold：晋升置信度门槛（默认 0.95；无人评分时经验置信度难达标，
@@ -247,11 +252,15 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
           const result = await processPendingBuffer(memory, input.buffer_seq, {
             task: {
               task_id: input.task_id,
+              // extract 留档（B1）的 journal 外键与 Session 绑定键
+              run_id: input.run_id,
+              ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
               call_id: `maintenance:${input.run_id}:${String(input.buffer_seq)}`,
               source_driver: pending.snapshot.source_driver,
               spec: pending.snapshot.task_description,
             },
             extractor: this.extractor,
+            ...(this.options.callJournal ? { callJournal: this.options.callJournal } : {}),
             promote: async () => ({
               check: {
                 eligible: false,
