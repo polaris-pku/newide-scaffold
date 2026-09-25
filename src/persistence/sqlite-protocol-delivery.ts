@@ -71,6 +71,8 @@ export function migrateProtocolDelivery(database: DatabaseSync): void {
       status TEXT NOT NULL,
       summary TEXT NOT NULL,
       payload_json TEXT,
+      session_id TEXT,
+      duration_ms INTEGER,
       CHECK (kind != 'call' OR (causation_id IS NULL AND payload_json IS NULL)),
       CHECK (kind = 'call' OR payload_json IS NOT NULL)
     );
@@ -81,6 +83,27 @@ export function migrateProtocolDelivery(database: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS outbox_archive AS SELECT * FROM outbox WHERE 0;
     CREATE TABLE IF NOT EXISTS inbox_archive AS SELECT * FROM inbox WHERE 0;
   `);
+  ensureJournalCallColumns(database);
+}
+
+/**
+ * 旧库的 journal 表没有 session_id / duration_ms 两列（CREATE TABLE IF NOT EXISTS
+ * 对已存在的表不生效），这里按 PRAGMA table_info 探测后 ALTER TABLE 补列，与
+ * sqlite-coordination-store 的 ensureRuntimeCursorInputColumn 同一模式。
+ */
+function ensureJournalCallColumns(database: DatabaseSync): void {
+  const columns = new Set(
+    database
+      .prepare('PRAGMA table_info(journal)')
+      .all()
+      .map((row) => String((row as { name: string }).name)),
+  );
+  if (!columns.has('session_id')) {
+    database.exec('ALTER TABLE journal ADD COLUMN session_id TEXT');
+  }
+  if (!columns.has('duration_ms')) {
+    database.exec('ALTER TABLE journal ADD COLUMN duration_ms INTEGER');
+  }
 }
 
 export class SqliteProtocolDelivery {
@@ -200,6 +223,7 @@ export class SqliteProtocolDelivery {
       task_id: input.task_id, run_id: input.run_id, ts: input.completed_at,
       kind: 'call', id: input.call_id, causation_id: null, role_id: input.role_id,
       event: input.event, status: input.status, summary: input.summary, frame: null,
+      session_id: input.session_id ?? null, duration_ms: input.duration_ms ?? null,
     });
   }
 
@@ -409,6 +433,7 @@ export class SqliteProtocolDelivery {
       task_id: frame.task_id, run_id: frame.run_id, ts: at, kind,
       id: frame.exchange_id, causation_id: frame.causation_id,
       role_id: frame.producer.role_id, event, status, summary, frame,
+      session_id: null, duration_ms: null,
     });
   }
 
@@ -416,12 +441,13 @@ export class SqliteProtocolDelivery {
     const result = this.database.prepare(`
       INSERT INTO journal (
         task_id, run_id, ts, kind, id, causation_id, role_id,
-        event, status, summary, payload_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        event, status, summary, payload_json, session_id, duration_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       entry.task_id, entry.run_id, entry.ts, entry.kind, entry.id,
       entry.causation_id, entry.role_id, entry.event, entry.status,
       entry.summary, entry.frame ? JSON.stringify(entry.frame) : null,
+      entry.session_id, entry.duration_ms,
     );
     return { ...entry, seq: Number(result.lastInsertRowid) };
   }
@@ -477,6 +503,9 @@ function readJournal(row: Record<string, unknown>): ProtocolJournalRecord {
     event: String(row.event), status: String(row.status), summary: String(row.summary),
     frame: row.payload_json === null ? null
       : protocolFrameSchema.parse(JSON.parse(String(row.payload_json))),
+    session_id: nullable(row.session_id),
+    duration_ms: row.duration_ms === null || row.duration_ms === undefined
+      ? null : Number(row.duration_ms),
   };
 }
 

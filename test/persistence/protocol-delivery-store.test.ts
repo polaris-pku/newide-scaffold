@@ -75,6 +75,7 @@ describe('protocol transactional delivery', () => {
         task_id: ask.task_id, run_id: ask.run_id, call_id: 'call-1', role_id: 'implementer',
         event: 'memory_query', status: 'ok', summary: 'done',
         completed_at: '2026-09-21T09:04:01.000Z',
+        session_id: 'sess-1', duration_ms: 42,
       });
     });
     expect(store.getTaskAggregate('task-0088')).toBeDefined();
@@ -84,11 +85,16 @@ describe('protocol transactional delivery', () => {
       { seq: 1, kind: 'aap', causation_id: ask.causation_id },
       { seq: 2, kind: 'call', causation_id: null },
     ]);
+    const callRow = store.listJournal(ask.task_id, ask.run_id)[1];
+    expect(callRow.session_id).toBe('sess-1');
+    expect(callRow.duration_ms).toBe(42);
     store.close();
 
     const reopened = new SqliteCoordinationStore(databasePath);
     expect(reopened.getOutbox('out-1')).toBeDefined();
     expect(reopened.listRecoverableOutbox('2026-09-21T09:04:10.000Z')).toHaveLength(1);
+    // 两新列跨重开持久
+    expect(reopened.listJournal(ask.task_id, ask.run_id)[1].duration_ms).toBe(42);
     reopened.close();
   });
 
@@ -122,6 +128,7 @@ describe('protocol transactional delivery', () => {
         task_id: ask.task_id, run_id: ask.run_id, call_id: 'call-archive', role_id: 'implementer',
         event: 'memory_query', status: 'ok', summary: 'done',
         completed_at: '2026-09-21T09:04:01.000Z',
+        session_id: 'sess-a', duration_ms: 7,
       });
       const second = tx.appendCall({
         task_id: ask.task_id, run_id: ask.run_id, call_id: 'call-archive', role_id: 'implementer',
@@ -129,6 +136,8 @@ describe('protocol transactional delivery', () => {
         completed_at: '2026-09-21T09:04:02.000Z',
       });
       expect(second).toEqual(first);
+      expect(second.session_id).toBe('sess-a');
+      expect(second.duration_ms).toBe(7);
     });
     store.withProtocolTransaction((tx) => {
       tx.enqueueOutbox({ id: 'settled', destination: 'reviewer', frame: ask });

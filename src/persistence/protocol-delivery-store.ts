@@ -59,6 +59,10 @@ export interface ProtocolJournalRecord {
   status: string;
   summary: string;
   frame: ProtocolFrame | null;
+  /** 真实会话标识（Task/workspace/role 绑定）；协议帧行恒为 null */
+  session_id: string | null;
+  /** 调用耗时（毫秒）；协议帧行恒为 null */
+  duration_ms: number | null;
 }
 
 export interface EnqueueProtocolOutbox {
@@ -87,6 +91,10 @@ export interface AppendProtocolCall {
   status: string;
   summary: string;
   completed_at: string;
+  /** 真实会话标识；解析不到时省略或传 null */
+  session_id?: string | null;
+  /** 调用耗时（毫秒） */
+  duration_ms?: number | null;
 }
 
 /** All writes on this port use the same SQLite transaction and connection. */
