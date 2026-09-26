@@ -827,6 +827,11 @@ export class SqliteCoordinationStore
       this.database
         .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
         .run(4, new Date().toISOString());
+      // version 5: journal 补 session_id / duration_ms 两列（守卫在 migrateProtocolDelivery
+      // 内的 ensureJournalCallColumns，对旧库 ALTER TABLE 补列）
+      this.database
+        .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(5, new Date().toISOString());
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');

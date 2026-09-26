@@ -15,6 +15,7 @@ import type {
   ExperienceRecord,
 } from '../schemas';
 import type { AgentTaskRequest } from '../agent-types';
+import type { CallJournalPort } from '../ports/call-journal';
 import type { ExtractionOutput, PromotionOutcome } from '../types';
 import { writePendingBuffer } from './buffer-writer';
 
@@ -52,6 +53,10 @@ export interface TaskBufferIngestInput {
 /**
  * processPendingBuffer 的输入。
  * 指定提取器与晋升处理器，对单条 pending buffer 执行后处理。
+ *
+ * 留档说明（B1）：只有本函数（生产提取路径，maintenance runner 驱动）接入
+ * CallJournalPort；extractBuffer / extractAllBuffers 无生产调用方且没有 task/run
+ * 身份可填，不留档——将来获得调用方时复用同一 record 模式。
  */
 export interface ProcessPendingInput {
   task: AgentTaskRequest;
@@ -61,6 +66,8 @@ export interface ProcessPendingInput {
     task: AgentTaskRequest,
     experiences: ExperienceRecord[],
   ) => Promise<PromotionOutcome>;
+  /** 进程内调用留档端口（可选）：缺省不留档，行为不变 */
+  callJournal?: CallJournalPort;
 }
 
 /** processPendingBuffer 的返回：提取结果 + 晋升结果 */
@@ -68,6 +75,12 @@ export interface ProcessPendingResult {
   extraction: ExtractionOutput;
   promotion: PromotionOutcome;
 }
+
+/**
+ * extract 留档 call_id 的进程内尝试序号：Date.now() 在同毫秒内会碰撞，
+ * 拼上单调序号保证每次尝试（含快速失败重试）的 call_id 唯一。
+ */
+let extractAttemptSequence = 0;
 
 /**
  * 将 Driver 报告与 Agent 上下文写入 pending buffer。
@@ -107,19 +120,54 @@ export async function processPendingBuffer(
     throw new Error(`Pending buffer not found: seq=${seq}`);
   }
 
-  const extraction = await input.extractor.extract(pending.snapshot, pending.agentContext);
+  // 进程内调用留档（B1）：收尾时单点上报，成功与失败都记；call_id 每次尝试唯一
+  // （时刻 + 进程内序号，同毫秒重试也不撞），否则首次失败行会因 journal 幂等索引
+  // 吞掉重试的成功行。留档失败绝不影响提取主流程（best-effort）。
+  const journal = input.callJournal;
+  const startedAt = Date.now();
+  const attemptSeq = ++extractAttemptSequence;
+  const record = (status: 'ok' | 'error', summary: string): void => {
+    if (!journal) return;
+    try {
+      journal.record({
+        call_id: `extract:${memory.role_id}:${String(seq)}:${String(startedAt)}:${String(attemptSeq)}`,
+        event: 'extract',
+        task_id: input.task.task_id ?? pending.snapshot.task_id,
+        run_id: input.task.run_id,
+        role_id: memory.role_id,
+        workspace_path: input.task.workspace_path,
+        status,
+        summary: summary.slice(0, 300),
+        duration_ms: Date.now() - startedAt,
+        completed_at: nowTimestamp(),
+      });
+    } catch {
+      // best-effort：留档绝不打断提取流程（对齐 recordDispatchMetrics 惯用法）
+    }
+  };
 
-  for (const experience of extraction.experiences) {
-    await memory.saveExperience(experience);
+  try {
+    const extraction = await input.extractor.extract(pending.snapshot, pending.agentContext);
+
+    for (const experience of extraction.experiences) {
+      await memory.saveExperience(experience);
+    }
+
+    const promotion = await input.promote(memory, input.task, extraction.experiences);
+    if (promotion.skill) {
+      extraction.result.skills_promoted = 1;
+    }
+
+    await memory.markBufferProcessed(seq);
+    record(
+      'ok',
+      `experiences=${String(extraction.experiences.length)} skills_promoted=${String(extraction.result.skills_promoted)}`,
+    );
+    return { extraction, promotion };
+  } catch (error) {
+    record('error', error instanceof Error ? error.message : String(error));
+    throw error;
   }
-
-  const promotion = await input.promote(memory, input.task, extraction.experiences);
-  if (promotion.skill) {
-    extraction.result.skills_promoted = 1;
-  }
-
-  await memory.markBufferProcessed(seq);
-  return { extraction, promotion };
 }
 
 /**

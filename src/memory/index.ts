@@ -374,6 +374,7 @@ export type { ExperienceExtractor } from './ports/experience-extractor';
 export type { EmbeddingProvider } from './ports/embedding-provider';
 export type { LlmClient, LlmMessage } from './ports/llm-client';
 export type { AgentContextCleaner, AgentContextCleanInput } from './ports/agent-context-cleaner';
+export type { CallJournalPort, CallJournalEvent } from './ports/call-journal';
 export type { BufferTriggerPolicy } from './ports/buffer-trigger-policy';
 export type { PromotionTriggerPolicy } from './ports/promotion-trigger-policy';
 export type { PersonaTriggerPolicy } from './ports/persona-trigger-policy';

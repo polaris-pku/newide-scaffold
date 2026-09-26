@@ -30,6 +30,7 @@ import { MailboxRpcMethods } from '../rpc/mailbox-methods';
 import { MemoryRpcMethods } from '../rpc/memory-methods';
 import { FileRunEvidenceStore, SqliteCoordinationStore } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
+import { ProtocolCallJournal } from './protocol-call-journal';
 import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
 import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
@@ -237,6 +238,21 @@ export async function createProductionBackendService(
     const memoryLlm =
       dependencies.memoryLlm ??
       new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env));
+    // 协议存储先于 B 侧装配创建：CallJournal（B1 调用留档）与 facade 都要用
+    // coordinationStore / participantSessions。
+    const configuredDatabasePath =
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
+    const databasePath =
+      configuredDatabasePath === ':memory:'
+        ? configuredDatabasePath
+        : path.resolve(configuredDatabasePath);
+    coordinationStore = new SqliteCoordinationStore(databasePath);
+    const mailboxService = new PersistentMailboxService(coordinationStore);
+    const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
+    const protocolCallJournal = new ProtocolCallJournal({
+      store: coordinationStore,
+      sessionRegistry: participantSessions,
+    });
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
@@ -247,6 +263,8 @@ export async function createProductionBackendService(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
         runsRoot,
+        // dependencies.memoryMaintenance 覆盖路径会绕过留档（测试缝，接受）
+        callJournal: protocolCallJournal,
         promotion: {
           confidenceThreshold: readNumberEnv(
             env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD,
@@ -267,15 +285,6 @@ export async function createProductionBackendService(
       bCapabilities.boardQuery,
       bRuntime.market_agent_ids,
     );
-    const configuredDatabasePath =
-      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
-    const databasePath =
-      configuredDatabasePath === ':memory:'
-        ? configuredDatabasePath
-        : path.resolve(configuredDatabasePath);
-    coordinationStore = new SqliteCoordinationStore(databasePath);
-    const mailboxService = new PersistentMailboxService(coordinationStore);
-    const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       repository: bCapabilities.repository,
@@ -287,6 +296,9 @@ export async function createProductionBackendService(
           createProductionToolCallingClient(productionLlm, env),
         ),
       memoryMaintenance: bCapabilities.maintenance,
+      // B1 调用留档与 mailbox.sessionRegistry 无关：journal 用自己持有的注册表引用，
+      // ephemeral 会话下注册表为空 → session_id 记 null（规定回退）。
+      callJournal: protocolCallJournal,
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),

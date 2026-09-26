@@ -23,6 +23,10 @@ export interface AgentTaskRequest {
   spec: string;
   /** 任务唯一标识；缺省则在 runOnce 内自动生成 */
   task_id?: string;
+  /** 本次执行所属 run；进程内调用留档（CallJournalPort）的 journal 外键前提 */
+  run_id?: string;
+  /** 本次执行的工作区（绝对路径）；Session 绑定键 (task, workspace, role) 之一 */
+  workspace_path?: string;
   /** Driver 调用 ID，写入 AgentContextSnapshot.driver_calls 供溯源 */
   call_id?: string;
   /** 执行该任务的 Driver 标识；缺省为 "mock-driver" */

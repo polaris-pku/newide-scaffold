@@ -22,6 +22,8 @@ import {
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
+  type CallJournalEvent,
+  type CallJournalPort,
   type ToolCallingClient,
 } from '../../src/memory';
 import type { ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
@@ -396,6 +398,87 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       maintenance_ref: 'b_maintenance_test',
       status: 'scheduled',
     });
+  });
+
+  it('journals memory_query with request identity and forwards workspace to maintenance', async () => {
+    const events: CallJournalEvent[] = [];
+    const callJournal: CallJournalPort = { record: (event) => void events.push(event) };
+    const requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
+    const memoryMaintenance: BMemoryMaintenancePort = {
+      async scheduleBuffer(input) {
+        requests.push(input);
+        return {
+          maintenance_ref: 'b_maintenance_journal',
+          kind: 'experience_extraction',
+          status: 'scheduled',
+          ...input,
+          experiences: [],
+          skills: [],
+          warnings: [],
+          created_at: '2026-07-21T00:00:00.000Z',
+          completed_at: '2026-07-21T00:00:01.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    // 第一轮：query_memory；第二轮：invoke_driver；第三轮：完成
+    let turn = 0;
+    const llm: ToolCallingClient = {
+      async completeWithTools(input) {
+        const lastMessage = input.messages.at(-1);
+        if (lastMessage?.role === 'tool') {
+          turn += 1;
+          if (turn === 1) return driverToolCalls('tool_call_drv_journal');
+          return { content: 'Task completed. [done]', tool_calls: undefined };
+        }
+        return {
+          content: null,
+          tool_calls: [
+            {
+              id: 'tool_call_query_journal',
+              type: 'function',
+              function: { name: 'query_memory', arguments: '{"query": "boundaries"}' },
+            },
+          ],
+        };
+      },
+    };
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-journal-agent-'));
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm,
+      memoryMaintenance,
+      callJournal,
+    });
+
+    try {
+      const result = await facade.runAgent(
+        request('task_journal_facade', 'proposer_a', workspace),
+      );
+      expect(result.status).toBe('completed');
+
+      // memory_query 事件带 request 同源身份（run / workspace 归一化后）
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        event: 'memory_query',
+        call_id: 'tool_call_query_journal',
+        task_id: 'task_journal_facade',
+        run_id: 'run_task_journal_facade',
+        role_id: 'proposer_a',
+        workspace_path: path.resolve(workspace),
+        status: 'ok',
+      });
+      // invoke_driver 不在 B1 留档范围
+      expect(events.map((event) => event.event)).toEqual(['memory_query']);
+
+      // maintenance 转发了 workspace（extract 留档的 Session 绑定键）
+      expect(requests).toHaveLength(1);
+      expect(requests[0].workspace_path).toBe(path.resolve(workspace));
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
   });
 
   it('applies memory_ablation B0/B1/B2 to retrieval and maintenance scheduling', async () => {
