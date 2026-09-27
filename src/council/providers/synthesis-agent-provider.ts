@@ -41,6 +41,7 @@ import {
 } from '../plan-artifact';
 import { proposalReportFields } from '../proposal-adapter';
 import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles, type WorkspaceFileSnapshot } from '../../coordinator/workspace-change-detector';
+import type { SapTaskBridge } from '../../coordination/sap-task-bridge';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -115,6 +116,7 @@ export class CouncilRoleExecutionError extends Error {
 
 export interface SynthesisAgentCouncilProviderOptions {
   agentExecutionFacade: AgentExecutionFacade;
+  sapBridge?: SapTaskBridge;
   participantResolver?: CouncilParticipantResolver;
   councilRoot?: string;
   /** Steer only after a started Driver turn stops emitting all stream events. */
@@ -126,6 +128,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private readonly participantResolver: CouncilParticipantResolver | undefined;
   private readonly councilRoot: string;
   private readonly roleInactivityTimeoutMs: number | undefined;
+  private readonly sapBridge: SapTaskBridge | undefined;
 
   constructor(options: SynthesisAgentCouncilProviderOptions) {
     this.agentExecutionFacade = options.agentExecutionFacade;
@@ -135,6 +138,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       options.roleInactivityTimeoutMs,
       'roleInactivityTimeoutMs',
     );
+    this.sapBridge = options.sapBridge;
   }
 
   async runCouncilRound(
@@ -429,6 +433,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           this.roleInactivityTimeoutMs,
           sessionId,
           attempt > 1 ? workspaceBefore : undefined,
+          attempt,
         );
         await validate?.(execution.result);
         for (const warning of (execution.result.diagnostics.council_warnings as string[]) ?? []) {
@@ -476,6 +481,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     inactivityTimeoutMs: number | undefined,
     sessionId?: string,
     workspaceBefore?: WorkspaceFileSnapshot,
+    attempt = 1,
   ): Promise<{ result: AgentExecutionResult }> {
     const driverRunId = `${executionRunId}_${phaseId}`;
     if (!inactivityTimeoutMs) {
@@ -499,6 +505,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           phaseId,
           sessionId,
           workspaceBefore,
+          attempt,
         ),
       };
     }
@@ -531,6 +538,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         phaseId,
         sessionId,
         workspaceBefore,
+        attempt,
       );
       return { result };
     } catch (error) {
@@ -590,8 +598,31 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     phaseId?: string,
     sessionId?: string,
     workspaceBefore?: WorkspaceFileSnapshot,
+    attempt = 1,
   ): Promise<AgentExecutionResult> {
     await fs.mkdir(workspacePath, { recursive: true });
+    const sapDispatch = this.sapBridge?.createExecute({
+      task_id: input.task_id,
+      run_id: input.run_id ?? executionRunId,
+      role_id: participant.agent_id,
+      instruction,
+      council_seat: participant.seat,
+      ...(input.deadline_at ? { deadline_at: input.deadline_at } : {}),
+      exchange_id: councilSapExchangeId(
+        input.run_id ?? executionRunId,
+        phase,
+        participant.participant_id,
+        attempt,
+      ),
+    });
+    let sapAdmission;
+    if (sapDispatch && this.sapBridge) {
+      this.sapBridge.persistExecute(sapDispatch);
+      sapAdmission = this.sapBridge.beginExecute(sapDispatch);
+      if (!sapAdmission.should_execute) {
+        throw new Error(`Council SAP execute ${sapDispatch.frame.exchange_id} is already active or complete`);
+      }
+    }
     let result: AgentExecutionResult;
     try {
       result = await this.agentExecutionFacade.runAgent(
@@ -619,7 +650,15 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           : undefined,
       );
     } catch (error) {
-      if (options?.signal?.aborted) throw error;
+      if (options?.signal?.aborted) {
+        if (sapDispatch && this.sapBridge) {
+          this.sapBridge.enqueueCancel(
+            sapDispatch,
+            this.sapBridge.createCancel({ execute: sapDispatch.frame }),
+          );
+        }
+        throw error;
+      }
       const failure = new CouncilRoleExecutionError(
         phase,
         participant,
@@ -633,6 +672,42 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         },
       );
       throw failure;
+    }
+    if (sapDispatch && sapAdmission && this.sapBridge && result.status !== 'interrupted') {
+      const disposition = this.sapBridge.acceptResult(
+        sapAdmission,
+        this.sapBridge.createResult({
+          execute: sapDispatch.frame,
+          status: result.status,
+          summary: `Council ${phase} role ended with status ${result.status}.`,
+          ...(result.status === 'failed'
+            ? {
+                error: {
+                  code: 'council_role_failed',
+                  message: `Council ${phase} role failed.`,
+                  retryable: true,
+                },
+              }
+            : {}),
+          exchange_id: `sap_result_${sapDispatch.frame.exchange_id}`,
+        }),
+      );
+      if (disposition !== 'accepted') {
+        throw new CouncilRoleExecutionError(
+          phase,
+          participant,
+          'failed',
+          result.agent_run_id,
+          result.driver_run_result_id,
+          {
+            council_run_id: councilRunId,
+            ...(phaseId ? { phase_id: phaseId } : {}),
+            reason: `SAP result was ${disposition}; Council cannot use it for a decision.`,
+            retryable: true,
+            session_id: result.session_id,
+          },
+        );
+      }
     }
     options?.signal?.throwIfAborted();
     if (workspaceBefore && result.status === 'completed') {
@@ -1435,4 +1510,13 @@ function buildFinalizationInstruction(
     ...(requiredArtifact ? [`Ensure ${requiredArtifact} exists before returning.`] : []),
     'Return the required structured Driver report in this turn.',
   ].join(' ');
+}
+
+function councilSapExchangeId(
+  runId: string,
+  phase: CouncilPhase,
+  participantId: string,
+  attempt: number,
+): string {
+  return `sap_council:${runId}:${phase}:${participantId}:attempt:${String(attempt)}`;
 }

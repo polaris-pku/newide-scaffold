@@ -32,6 +32,8 @@ export interface SapExecutionAdmission {
   lease_owner: string;
 }
 
+export type SapResultDisposition = 'accepted' | 'duplicate' | 'late';
+
 export interface SapTaskBridgeOptions {
   store: ProtocolDeliveryStore;
   now?: () => string;
@@ -113,6 +115,12 @@ export class SapTaskBridge {
     });
   }
 
+  persistExecute(dispatch: SapExecuteDispatch): ProtocolOutboxRecord {
+    return this.options.store.withProtocolTransaction((transaction) =>
+      this.enqueueExecute(transaction, dispatch),
+    );
+  }
+
   commitDispatch(
     state: CoordinationStateCommit,
     dispatch: SapExecuteDispatch,
@@ -138,6 +146,20 @@ export class SapTaskBridge {
         exchange_id: dispatch.frame.exchange_id,
       });
       if (existingInbox?.status === 'complete') {
+        return {
+          should_execute: false,
+          execute_inbox: existingInbox,
+          execute_outbox: requireOutbox(transaction, dispatch.outbox_id),
+          lease_owner: leaseOwner,
+        };
+      }
+      // A local cancel is the System's terminal decision when no Agent receipt
+      // can be trusted. Keep the inbox row for audit/reconciliation, but never
+      // reclaim the cancelled execute after its processing lease expires.
+      if (
+        existingInbox &&
+        transaction.getOutbox(`outbox_sap_cancel_${dispatch.frame.exchange_id}`)
+      ) {
         return {
           should_execute: false,
           execute_inbox: existingInbox,
@@ -257,7 +279,7 @@ export class SapTaskBridge {
     return sapCancelCommandSchema.parse({
       protocol: 'system-agent',
       protocol_version: PROTOCOL_VERSION,
-      exchange_id: input.exchange_id ?? this.createId('sap_cancel'),
+      exchange_id: input.exchange_id ?? `sap_cancel_${input.execute.exchange_id}`,
       causation_id: input.execute.exchange_id,
       task_id: input.execute.task_id,
       run_id: input.execute.run_id,
@@ -289,75 +311,69 @@ export class SapTaskBridge {
     result: SapResultFrame,
   ): PersistedCoordinationEvent[] {
     return this.options.store.withProtocolTransaction((transaction) => {
-      if (result.causation_id !== admission.execute_inbox.exchange_id) {
-        throw new Error('SAP result does not belong to the admitted execute exchange');
+      const disposition = this.classifyResultInTransaction(transaction, admission, result);
+      if (disposition !== 'accepted') {
+        throw new Error(`SAP result ${result.exchange_id} is ${disposition}`);
       }
       const events = transaction.commitState(state);
-      transaction.completeInbox({
-        key: {
-          consumer_id: admission.execute_inbox.consumer_id,
-          protocol: admission.execute_inbox.protocol,
-          exchange_id: admission.execute_inbox.exchange_id,
-        },
-        lease_owner: admission.lease_owner,
-        expected_revision: admission.execute_inbox.revision,
-        completed_at: result.created_at,
-        reply: {
-          id: `outbox_${result.exchange_id}`,
-          destination: 'system',
-          frame: result,
-        },
-      });
-      const replyOutbox = requireOutbox(transaction, `outbox_${result.exchange_id}`);
-      const replyLeaseOwner = `sap-system:${result.exchange_id}`;
-      const replyLeaseExpiresAt = minTimestamp(
-        new Date(Date.parse(result.created_at) + this.leaseDurationMs).toISOString(),
-        result.deadline_at,
-      );
-      const claimedReply = transaction.claimOutbox(
-        replyOutbox.id,
-        replyLeaseOwner,
-        result.created_at,
-        replyLeaseExpiresAt,
-        replyOutbox.revision,
-      );
-      if (!claimedReply) throw new Error(`SAP result ${result.exchange_id} could not be claimed`);
-      transaction.markOutboxSent(
-        claimedReply.id,
-        replyLeaseOwner,
-        claimedReply.revision,
-        result.created_at,
-      );
-      const systemInbox = transaction.receiveInbox({
-        consumer_id: 'system',
-        frame: result,
-        received_at: result.created_at,
-      }).inbox;
-      const claimedSystemInbox = transaction.claimInbox(
-        {
-          consumer_id: systemInbox.consumer_id,
-          protocol: systemInbox.protocol,
-          exchange_id: systemInbox.exchange_id,
-        },
-        replyLeaseOwner,
-        result.created_at,
-        replyLeaseExpiresAt,
-        systemInbox.revision,
-      );
-      if (!claimedSystemInbox) {
-        throw new Error(`SAP result ${result.exchange_id} was already processed`);
-      }
-      transaction.completeInbox({
-        key: {
-          consumer_id: claimedSystemInbox.consumer_id,
-          protocol: claimedSystemInbox.protocol,
-          exchange_id: claimedSystemInbox.exchange_id,
-        },
-        lease_owner: replyLeaseOwner,
-        expected_revision: claimedSystemInbox.revision,
-        completed_at: result.created_at,
-      });
+      this.completeResultTransaction(transaction, admission, result);
       return events;
+    });
+  }
+
+  acceptResult(
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+  ): SapResultDisposition {
+    return this.options.store.withProtocolTransaction((transaction) => {
+      const disposition = this.classifyResultInTransaction(transaction, admission, result);
+      if (disposition === 'late') this.completeLateResultTransaction(transaction, result);
+      if (disposition === 'accepted') this.completeResultTransaction(transaction, admission, result);
+      return disposition;
+    });
+  }
+
+  classifyResult(
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+  ): SapResultDisposition {
+    return this.options.store.withProtocolTransaction((transaction) =>
+      this.classifyResultInTransaction(transaction, admission, result),
+    );
+  }
+
+  private classifyResultInTransaction(
+    transaction: ProtocolDeliveryTransaction,
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+  ): SapResultDisposition {
+    if (result.causation_id !== admission.execute_inbox.exchange_id) {
+      throw new Error('SAP result does not belong to the admitted execute exchange');
+    }
+    const current = transaction.getInbox({
+      consumer_id: admission.execute_inbox.consumer_id,
+      protocol: admission.execute_inbox.protocol,
+      exchange_id: admission.execute_inbox.exchange_id,
+    });
+    if (current?.status === 'complete') {
+      return current.reply_exchange_id === result.exchange_id ? 'duplicate' : 'late';
+    }
+    if (transaction.getOutbox(`outbox_sap_cancel_${admission.execute_inbox.exchange_id}`)) {
+      return 'late';
+    }
+    return result.created_at > admission.execute_inbox.frame.deadline_at
+      ? 'late'
+      : 'accepted';
+  }
+
+  recordLateResult(
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+  ): void {
+    this.options.store.withProtocolTransaction((transaction) => {
+      if (this.classifyResultInTransaction(transaction, admission, result) === 'late') {
+        this.completeLateResultTransaction(transaction, result);
+      }
     });
   }
 
@@ -377,6 +393,160 @@ export class SapTaskBridge {
         });
       }
       return events;
+    });
+  }
+
+  enqueueCancel(dispatch: SapExecuteDispatch, cancel: SapCancelFrame): void {
+    this.options.store.withProtocolTransaction((transaction) => {
+      const outboxId = `outbox_${cancel.exchange_id}`;
+      if (!transaction.getOutbox(outboxId)) {
+        transaction.enqueueOutbox({
+          id: outboxId,
+          destination: dispatch.destination,
+          frame: cancel,
+        });
+      }
+    });
+  }
+
+  private completeResultTransaction(
+    transaction: ProtocolDeliveryTransaction,
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+  ): void {
+    if (result.causation_id !== admission.execute_inbox.exchange_id) {
+      throw new Error('SAP result does not belong to the admitted execute exchange');
+    }
+    transaction.completeInbox({
+      key: {
+        consumer_id: admission.execute_inbox.consumer_id,
+        protocol: admission.execute_inbox.protocol,
+        exchange_id: admission.execute_inbox.exchange_id,
+      },
+      lease_owner: admission.lease_owner,
+      expected_revision: admission.execute_inbox.revision,
+      completed_at: result.created_at,
+      reply: {
+        id: `outbox_${result.exchange_id}`,
+        destination: 'system',
+        frame: result,
+      },
+    });
+    const replyOutbox = requireOutbox(transaction, `outbox_${result.exchange_id}`);
+    const replyLeaseOwner = `sap-system:${result.exchange_id}`;
+    const replyLeaseExpiresAt = minTimestamp(
+      new Date(Date.parse(result.created_at) + this.leaseDurationMs).toISOString(),
+      result.deadline_at,
+    );
+    const claimedReply = transaction.claimOutbox(
+      replyOutbox.id,
+      replyLeaseOwner,
+      result.created_at,
+      replyLeaseExpiresAt,
+      replyOutbox.revision,
+    );
+    if (!claimedReply) throw new Error(`SAP result ${result.exchange_id} could not be claimed`);
+    transaction.markOutboxSent(
+      claimedReply.id,
+      replyLeaseOwner,
+      claimedReply.revision,
+      result.created_at,
+    );
+    const systemInbox = transaction.receiveInbox({
+      consumer_id: 'system',
+      frame: result,
+      received_at: result.created_at,
+    }).inbox;
+    const claimedSystemInbox = transaction.claimInbox(
+      {
+        consumer_id: systemInbox.consumer_id,
+        protocol: systemInbox.protocol,
+        exchange_id: systemInbox.exchange_id,
+      },
+      replyLeaseOwner,
+      result.created_at,
+      replyLeaseExpiresAt,
+      systemInbox.revision,
+    );
+    if (!claimedSystemInbox) {
+      throw new Error(`SAP result ${result.exchange_id} was already processed`);
+    }
+    transaction.completeInbox({
+      key: {
+        consumer_id: claimedSystemInbox.consumer_id,
+        protocol: claimedSystemInbox.protocol,
+        exchange_id: claimedSystemInbox.exchange_id,
+      },
+      lease_owner: replyLeaseOwner,
+      expected_revision: claimedSystemInbox.revision,
+      completed_at: result.created_at,
+    });
+  }
+
+  private completeLateResultTransaction(
+    transaction: ProtocolDeliveryTransaction,
+    result: SapResultFrame,
+  ): void {
+    if (!transaction.getOutbox(`outbox_${result.exchange_id}`)) {
+      transaction.enqueueOutbox({
+        id: `outbox_${result.exchange_id}`,
+        destination: 'system',
+        frame: result,
+      });
+    }
+    this.deliverResultToSystem(transaction, result);
+  }
+
+  private deliverResultToSystem(
+    transaction: ProtocolDeliveryTransaction,
+    result: SapResultFrame,
+  ): void {
+    const replyOutbox = requireOutbox(transaction, `outbox_${result.exchange_id}`);
+    if (replyOutbox.status === 'pending') {
+      const owner = `sap-system:${result.exchange_id}`;
+      const expires = new Date(
+        Date.parse(result.created_at) + this.leaseDurationMs,
+      ).toISOString();
+      const claimed = transaction.claimOutbox(
+        replyOutbox.id,
+        owner,
+        result.created_at,
+        expires,
+        replyOutbox.revision,
+      );
+      if (claimed) {
+        transaction.markOutboxSent(claimed.id, owner, claimed.revision, result.created_at);
+      }
+    }
+    const received = transaction.receiveInbox({
+      consumer_id: 'system',
+      frame: result,
+      received_at: result.created_at,
+    }).inbox;
+    if (received.status === 'complete') return;
+    const owner = `sap-system:${result.exchange_id}`;
+    const expires = new Date(Date.parse(result.created_at) + this.leaseDurationMs).toISOString();
+    const claimed = transaction.claimInbox(
+      {
+        consumer_id: received.consumer_id,
+        protocol: received.protocol,
+        exchange_id: received.exchange_id,
+      },
+      owner,
+      result.created_at,
+      expires,
+      received.revision,
+    );
+    if (!claimed) return;
+    transaction.completeInbox({
+      key: {
+        consumer_id: claimed.consumer_id,
+        protocol: claimed.protocol,
+        exchange_id: claimed.exchange_id,
+      },
+      lease_owner: owner,
+      expected_revision: claimed.revision,
+      completed_at: result.created_at,
     });
   }
 }

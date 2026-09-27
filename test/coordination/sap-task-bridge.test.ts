@@ -73,6 +73,121 @@ describe('SapTaskBridge', () => {
       });
     store.close();
   });
+
+  it('accepts one terminal result and records competing results without changing the accepted reply', () => {
+    const store = new SqliteCoordinationStore(':memory:');
+    store.commitState(initialCommit());
+    const bridge = createBridge(store);
+    const dispatch = bridge.createExecute({
+      task_id: 'task_sap',
+      run_id: 'run_sap',
+      role_id: 'role_engineer',
+      instruction: 'Implement the requested change.',
+      exchange_id: 'sap_execute_result_race',
+    });
+    bridge.persistExecute(dispatch);
+    const admission = bridge.beginExecute(dispatch);
+    const accepted = bridge.createResult({
+      execute: dispatch.frame,
+      status: 'completed',
+      summary: 'Completed.',
+      exchange_id: 'sap_result_accepted',
+    });
+    const competing = bridge.createResult({
+      execute: dispatch.frame,
+      status: 'failed',
+      summary: 'Conflicting result.',
+      error: { code: 'conflict', message: 'Conflicting result.', retryable: false },
+      exchange_id: 'sap_result_competing',
+    });
+
+    expect(bridge.acceptResult(admission, accepted)).toBe('accepted');
+    expect(bridge.acceptResult(admission, accepted)).toBe('duplicate');
+    expect(bridge.acceptResult(admission, competing)).toBe('late');
+    expect(store.getInbox({
+      consumer_id: 'role_engineer',
+      protocol: 'system-agent',
+      exchange_id: dispatch.frame.exchange_id,
+    })).toMatchObject({ status: 'complete', reply_exchange_id: accepted.exchange_id });
+    expect(store.getInbox({
+      consumer_id: 'system',
+      protocol: 'system-agent',
+      exchange_id: competing.exchange_id,
+    })).toMatchObject({ status: 'complete' });
+    expect(store.listJournal('task_sap', 'run_sap').filter((entry) =>
+      entry.event === 'inbox.completed' && entry.id === dispatch.frame.exchange_id,
+    )).toHaveLength(1);
+    store.close();
+  });
+
+  it('does not accept a result after cancel or deadline, but keeps the late result auditable', () => {
+    const store = new SqliteCoordinationStore(':memory:');
+    store.commitState(initialCommit());
+    let now = '2026-09-27T08:00:00.000Z';
+    const bridge = new SapTaskBridge({ store, now: () => now });
+    const cancelled = bridge.createExecute({
+      task_id: 'task_sap', run_id: 'run_sap', role_id: 'role_engineer',
+      instruction: 'Work.', exchange_id: 'sap_execute_cancelled',
+    });
+    bridge.persistExecute(cancelled);
+    const cancelledAdmission = bridge.beginExecute(cancelled);
+    bridge.enqueueCancel(cancelled, bridge.createCancel({ execute: cancelled.frame }));
+    now = '2026-09-27T08:31:00.000Z';
+    expect(bridge.beginExecute(cancelled).should_execute).toBe(false);
+    now = '2026-09-27T08:00:00.000Z';
+    const cancelledResult = bridge.createResult({
+      execute: cancelled.frame, status: 'completed', summary: 'Completed after cancel.',
+      exchange_id: 'sap_result_after_cancel',
+    });
+    expect(bridge.acceptResult(cancelledAdmission, cancelledResult)).toBe('late');
+    expect(store.getOutbox('outbox_sap_cancel_sap_execute_cancelled')).toBeDefined();
+
+    const expired = bridge.createExecute({
+      task_id: 'task_sap', run_id: 'run_sap', role_id: 'role_engineer',
+      instruction: 'Work.', exchange_id: 'sap_execute_expired',
+      deadline_at: '2026-09-27T08:01:00.000Z',
+    });
+    bridge.persistExecute(expired);
+    const expiredAdmission = bridge.beginExecute(expired);
+    now = '2026-09-27T08:02:00.000Z';
+    const expiredResult = bridge.createResult({
+      execute: expired.frame, status: 'completed', summary: 'Completed too late.',
+      exchange_id: 'sap_result_after_deadline',
+    });
+    expect(bridge.acceptResult(expiredAdmission, expiredResult)).toBe('late');
+    for (const exchangeId of [cancelled.frame.exchange_id, expired.frame.exchange_id]) {
+      expect(store.getInbox({
+        consumer_id: 'role_engineer', protocol: 'system-agent', exchange_id: exchangeId,
+      })).toMatchObject({ status: 'processing', reply_exchange_id: null });
+    }
+    expect(store.listJournal('task_sap', 'run_sap').map((entry) => entry.id))
+      .toContain(expiredResult.exchange_id);
+    store.close();
+  });
+
+  it('rolls back the SAP reply when the Task state commit fails', () => {
+    const store = new SqliteCoordinationStore(':memory:');
+    store.commitState(initialCommit());
+    const bridge = createBridge(store);
+    const dispatch = bridge.createExecute({
+      task_id: 'task_sap', run_id: 'run_sap', role_id: 'role_engineer',
+      instruction: 'Work.', exchange_id: 'sap_execute_rollback',
+    });
+    bridge.persistExecute(dispatch);
+    const admission = bridge.beginExecute(dispatch);
+    const result = bridge.createResult({
+      execute: dispatch.frame, status: 'completed', summary: 'Completed.',
+      exchange_id: 'sap_result_rollback',
+    });
+    expect(() => bridge.commitResult({ ...initialCommit(), expected_task_revision: 999 }, admission, result))
+      .toThrow();
+    expect(store.getInbox({
+      consumer_id: 'role_engineer', protocol: 'system-agent',
+      exchange_id: dispatch.frame.exchange_id,
+    })).toMatchObject({ status: 'processing', reply_exchange_id: null });
+    expect(store.getOutbox(`outbox_${result.exchange_id}`)).toBeUndefined();
+    store.close();
+  });
 });
 
 function createDatabase(): string {

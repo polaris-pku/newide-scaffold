@@ -326,6 +326,7 @@ export async function createProductionBackendService(
     const councilProposerCount = readCouncilProposerCount(env.NEWIDE_COUNCIL_PROPOSERS);
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
+      sapBridge,
       councilRoot: path.join(stateRoot, 'council'),
       roleInactivityTimeoutMs: readDriverTimeout(
         env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS,
