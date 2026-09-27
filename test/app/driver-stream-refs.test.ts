@@ -1,8 +1,8 @@
 /**
- * payload_ref 取回工具：引用解析、审计行读取、按 sequence 定位原始事件。
+ * payload_ref 取回工具：引用解析、审计行读取、按键定位原始事件。
  *
  * 与 FileDriverStreamAuditWriter 是天然的一对——这里直接用 writer 落真实文件再
- * 取回，顺带验证两种形状的行（事件行 / 截断标记行）都能安全读过。
+ * 取回，顺带验证三种形状的行（事件行 / 截断标记行 / 双键行）都能安全读过。
  */
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -39,26 +39,57 @@ describe('driver-stream-refs', () => {
     await fs.rm(runsRoot, { recursive: true, force: true });
   });
 
-  it('parses well-formed refs and rejects everything else', () => {
-    expect(parseDriverStreamRef('driver-stream.jsonl#sequence=12')).toBe(12);
-    expect(parseDriverStreamRef('driver-stream.jsonl#sequence=abc')).toBeUndefined();
+  it('parses both ref shapes and rejects everything else', () => {
+    expect(parseDriverStreamRef('driver-stream.jsonl#stream_sequence=12')).toEqual({
+      kind: 'stream_sequence',
+      value: 12,
+    });
+    expect(parseDriverStreamRef('driver-stream.jsonl#sequence=12')).toEqual({
+      kind: 'sequence',
+      value: 12,
+    });
+    expect(parseDriverStreamRef('driver-stream.jsonl#stream_sequence=abc')).toBeUndefined();
     expect(parseDriverStreamRef('elsewhere.jsonl#sequence=12')).toBeUndefined();
     expect(parseDriverStreamRef('')).toBeUndefined();
   });
 
   it('resolves a ref back to the original event written by the audit writer', async () => {
     const writer = new FileDriverStreamAuditWriter(runsRoot);
-    await writer.append('run_1', 'task_1', eventOf(1));
-    await writer.append('run_1', 'task_1', eventOf(2));
+    await writer.append('run_1', 'task_1', eventOf(1), 1);
+    await writer.append('run_1', 'task_1', eventOf(2), 2);
 
-    const resolved = await resolveDriverStreamRef(runsRoot, 'run_1', 'driver-stream.jsonl#sequence=2');
+    const resolved = await resolveDriverStreamRef(
+      runsRoot,
+      'run_1',
+      'driver-stream.jsonl#stream_sequence=2',
+    );
     expect(resolved).toEqual(eventOf(2));
   });
 
+  it('keeps colliding driver sequences apart via stream_sequence', async () => {
+    // 两次 invoke 各自从 sequence=1 重置；run 级 stream_sequence 继续递增。
+    const writer = new FileDriverStreamAuditWriter(runsRoot);
+    await writer.append('run_1', 'task_1', eventOf(1), 1);
+    await writer.append('run_1', 'task_1', eventOf(2), 2);
+    await writer.append('run_1', 'task_1', eventOf(1), 3);
+    await writer.append('run_1', 'task_1', eventOf(2), 4);
+
+    await expect(
+      resolveDriverStreamRef(runsRoot, 'run_1', 'driver-stream.jsonl#stream_sequence=3'),
+    ).resolves.toEqual(eventOf(1));
+    await expect(
+      resolveDriverStreamRef(runsRoot, 'run_1', 'driver-stream.jsonl#stream_sequence=4'),
+    ).resolves.toEqual(eventOf(2));
+    // 旧式引用不唯一：只保证命中首行，不报错。
+    await expect(
+      resolveDriverStreamRef(runsRoot, 'run_1', 'driver-stream.jsonl#sequence=1'),
+    ).resolves.toEqual(eventOf(1));
+  });
+
   it('reads every line including truncation markers without choking', async () => {
-    const writer = new FileDriverStreamAuditWriter(runsRoot, 260);
+    const writer = new FileDriverStreamAuditWriter(runsRoot, 300);
     for (let sequence = 1; sequence <= 5; sequence += 1) {
-      await writer.append('run_1', 'task_1', eventOf(sequence));
+      await writer.append('run_1', 'task_1', eventOf(sequence), sequence);
     }
 
     const lines = await readDriverStreamAuditLines(runsRoot, 'run_1');
@@ -67,11 +98,15 @@ describe('driver-stream-refs', () => {
   });
 
   it('returns undefined for unknown runs and unreachable sequences', async () => {
-    await expect(resolveDriverStreamRef(runsRoot, 'run_missing', 'driver-stream.jsonl#sequence=1')).resolves.toBeUndefined();
+    await expect(
+      resolveDriverStreamRef(runsRoot, 'run_missing', 'driver-stream.jsonl#sequence=1'),
+    ).resolves.toBeUndefined();
 
     const writer = new FileDriverStreamAuditWriter(runsRoot);
-    await writer.append('run_1', 'task_1', eventOf(1));
-    await expect(resolveDriverStreamRef(runsRoot, 'run_1', 'driver-stream.jsonl#sequence=99')).resolves.toBeUndefined();
+    await writer.append('run_1', 'task_1', eventOf(1), 1);
+    await expect(
+      resolveDriverStreamRef(runsRoot, 'run_1', 'driver-stream.jsonl#stream_sequence=99'),
+    ).resolves.toBeUndefined();
     await expect(readDriverStreamAuditLines(runsRoot, 'run_missing')).resolves.toEqual([]);
   });
 });

@@ -33,7 +33,10 @@ export type MissingReconcileSignal = 'driver-stream' | 'timeline';
 
 /** 重放产物：真相源投影出的事件，按信封序号排列。 */
 export interface ReplayedDriverEvent {
+  /** driver 侧序号（每次 invoke 重置，多 invoke 下不唯一）；缺失为 -1。 */
   sequence: number;
+  /** run 级单调序号（信封字段）；老数据没有。 */
+  stream_sequence?: number;
   event_type: string;
   payload: Record<string, unknown>;
 }
@@ -46,6 +49,7 @@ export interface DriverStreamReplay {
 }
 
 export interface TypeMismatch {
+  /** 对账键值：见 `DriverStreamReconcileResult.key`。 */
   sequence: number;
   replayed: string;
   timeline: string;
@@ -58,11 +62,17 @@ export interface DriverStreamReconcileResult {
   truncated: boolean;
   audit_events: number;
   timeline_driver_events: number;
-  /** 真相源里有、timeline 里没有的序号——投影丢失点。 */
+  /**
+   * 对账键。`stream_sequence`（run 级唯一）在两侧都有时逐序号精确配对；老数据
+   * 退化为 `sequence`（每次 invoke 重置），此时按「同键的类型多重集」配对——
+   * 同一键出现多次不算差异，只有类型组成对不上才是。
+   */
+  key: 'stream_sequence' | 'sequence';
+  /** 真相源里有、timeline 里没有的键——投影丢失点。 */
   missing_in_timeline: number[];
-  /** timeline 里有、真相源里没有的序号——多见于截断或外部写入。 */
+  /** timeline 里有、真相源里没有的键——多见于截断或外部写入。 */
   unexpected_in_timeline: number[];
-  /** 同序号但事件类型不同——投影逻辑在两次消费之间变过。 */
+  /** 同键下类型对不上——投影逻辑在两次消费之间变过。 */
   type_mismatches: TypeMismatch[];
   by_type_replayed: Record<string, number>;
   by_type_timeline: Record<string, number>;
@@ -83,10 +93,11 @@ function buildReplay(runId: string, lines: DriverStreamAuditLine[]): DriverStrea
   const events: ReplayedDriverEvent[] = [];
   for (const line of lines) {
     if (!line.event) continue;
-    const projected = projectDriverStreamLifecycleEvent(line.event);
+    const projected = projectDriverStreamLifecycleEvent(line.event, line.stream_sequence);
     if (!projected) continue;
     events.push({
       sequence: typeof line.event.sequence === 'number' ? line.event.sequence : -1,
+      ...(typeof line.stream_sequence === 'number' ? { stream_sequence: line.stream_sequence } : {}),
       event_type: String(projected.event_type),
       payload: projected.payload,
     });
@@ -110,9 +121,24 @@ export async function reconcileDriverStreamRun(
   if (replay.audit_events === 0) missing.push('driver-stream');
   if (timelineEvents === undefined) missing.push('timeline');
 
-  const timelineBySequence = new Map<number, string>();
+  // 键的选择：两侧都有 run 级唯一序号时精确配对；否则退化为 driver 侧序号，
+  // 按「同键类型多重集」配对——invoke 间序号碰撞不再报假差异。
+  const keyKind: 'stream_sequence' | 'sequence' =
+    replay.events.length > 0 &&
+    replay.events.every((event) => event.stream_sequence !== undefined) &&
+    (timelineEvents?.length ?? 0) > 0 &&
+    (timelineEvents ?? []).every((event) => event.stream_sequence !== undefined)
+      ? 'stream_sequence'
+      : 'sequence';
+  const keyOf = (
+    event: ReplayedDriverEvent | TimelineDriverEvent,
+  ): number => (keyKind === 'stream_sequence' ? (event.stream_sequence ?? -1) : event.sequence);
+
+  const timelineIndex = new Map<number, Map<string, number>>();
   for (const event of timelineEvents ?? []) {
-    timelineBySequence.set(event.sequence, event.event_type);
+    const bucket = timelineIndex.get(keyOf(event)) ?? new Map<string, number>();
+    bucket.set(event.event_type, (bucket.get(event.event_type) ?? 0) + 1);
+    timelineIndex.set(keyOf(event), bucket);
   }
 
   const missingInTimeline: number[] = [];
@@ -120,23 +146,22 @@ export async function reconcileDriverStreamRun(
   const byTypeReplayed: Record<string, number> = {};
   for (const event of replay.events) {
     byTypeReplayed[event.event_type] = (byTypeReplayed[event.event_type] ?? 0) + 1;
-    const timelineType = timelineBySequence.get(event.sequence);
-    if (timelineType === undefined) {
-      missingInTimeline.push(event.sequence);
+    const key = keyOf(event);
+    const bucket = timelineIndex.get(key);
+    if (bucket && takeType(bucket, event.event_type)) continue;
+    if (bucket && bucket.size > 0) {
+      // 同键还在，只是类型对不上：按类型组成报告差异，并配对掉一条避免重复报。
+      const counterpart = [...bucket.keys()].sort()[0];
+      takeType(bucket, counterpart);
+      typeMismatches.push({ sequence: key, replayed: event.event_type, timeline: counterpart });
       continue;
     }
-    if (timelineType !== event.event_type) {
-      typeMismatches.push({
-        sequence: event.sequence,
-        replayed: event.event_type,
-        timeline: timelineType,
-      });
-    }
+    missingInTimeline.push(key);
   }
 
-  const replayedSequences = new Set(replay.events.map((event) => event.sequence));
-  const unexpectedInTimeline = [...timelineBySequence.keys()]
-    .filter((sequence) => !replayedSequences.has(sequence))
+  const unexpectedInTimeline = [...timelineIndex.entries()]
+    .filter(([, bucket]) => bucket.size > 0)
+    .map(([key]) => key)
     .sort((left, right) => left - right);
 
   const byTypeTimeline: Record<string, number> = {};
@@ -150,6 +175,7 @@ export async function reconcileDriverStreamRun(
     truncated: replay.truncated,
     audit_events: replay.audit_events,
     timeline_driver_events: timelineEvents?.length ?? 0,
+    key: keyKind,
     missing_in_timeline: missingInTimeline.sort((left, right) => left - right),
     unexpected_in_timeline: unexpectedInTimeline,
     type_mismatches: typeMismatches,
@@ -159,16 +185,28 @@ export async function reconcileDriverStreamRun(
   };
 }
 
+/** 从类型多重集里配对掉一条；配到返回 true。 */
+function takeType(bucket: Map<string, number>, eventType: string): boolean {
+  const count = bucket.get(eventType) ?? 0;
+  if (count === 0) return false;
+  if (count === 1) bucket.delete(eventType);
+  else bucket.set(eventType, count - 1);
+  return true;
+}
+
 interface TimelineDriverEvent {
+  /** driver 侧序号；两侧都没有 run 级序号时作退化键。 */
   sequence: number;
+  /** run 级单调序号；老 timeline 没有。 */
+  stream_sequence?: number;
   event_type: string;
 }
 
 /**
  * 读 timeline.json 里的 driver 事件流投影部分。
  *
- * 判别与 consumption 归属同一口径：payload 带 event_sequence。文件不存在返回
- * undefined（区别于「存在但没有 driver 事件」的空数组）。
+ * 判别与 consumption 归属同一口径：payload 带 event_sequence / stream_sequence。
+ * 文件不存在返回 undefined（区别于「存在但没有 driver 事件」的空数组）。
  */
 async function readTimelineDriverEvents(
   runsRoot: string,
@@ -193,9 +231,12 @@ async function readTimelineDriverEvents(
       record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
         ? (record.payload as Record<string, unknown>)
         : {};
-    if (typeof payload.event_sequence !== 'number') continue;
+    const eventSequence = payload.event_sequence;
+    const streamSequence = payload.stream_sequence;
+    if (typeof eventSequence !== 'number' && typeof streamSequence !== 'number') continue;
     events.push({
-      sequence: payload.event_sequence,
+      sequence: typeof eventSequence === 'number' ? eventSequence : -1,
+      ...(typeof streamSequence === 'number' ? { stream_sequence: streamSequence } : {}),
       event_type: typeof record.type === 'string' ? record.type : 'unknown',
     });
   }
@@ -218,7 +259,7 @@ export function renderDriverStreamReconcile(results: readonly DriverStreamReconc
     ].filter((flag): flag is string => flag !== undefined);
     lines.push(`${result.run_id}  [${flags.join(' ')}]`);
     lines.push(
-      `  audit=${result.audit_events}  timeline_driver=${result.timeline_driver_events}`,
+      `  audit=${result.audit_events}  timeline_driver=${result.timeline_driver_events}  key=${result.key}`,
     );
     if (result.missing_in_timeline.length > 0) {
       lines.push(`  丢失于 timeline（投影丢失点）: ${result.missing_in_timeline.join(', ')}`);

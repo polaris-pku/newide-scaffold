@@ -31,8 +31,12 @@ function streamEvent(sequence: number, update: Record<string, unknown>): DriverS
   };
 }
 
-function timelineEntry(event: DriverStreamEvent, index: number): Record<string, unknown> {
-  const projected = projectDriverStreamLifecycleEvent(event)!;
+function timelineEntry(
+  event: DriverStreamEvent,
+  index: number,
+  streamSequence?: number,
+): Record<string, unknown> {
+  const projected = projectDriverStreamLifecycleEvent(event, streamSequence)!;
   return {
     event_id: `run_event_${index}`,
     sequence: index,
@@ -156,6 +160,63 @@ describe('driver-stream-reconcile', () => {
 
     const replay = await replayDriverStream(runsRoot, 'run_1');
     expect(replay.truncated).toBe(true);
+  });
+
+  it('does not read invoke-colliding legacy sequences as diffs', async () => {
+    // 两次 invoke 各自从 sequence=1 重置、类型组成不同：老配对会把后一次覆盖前
+    // 一次、报出成片假「类型不一致」。退化键下按同键类型多重集配对，不算差异。
+    const colliding = [
+      streamEvent(1, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } }),
+      streamEvent(2, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc_1',
+        title: 'Edit',
+        kind: 'edit',
+      }),
+      streamEvent(1, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 't' } }),
+      streamEvent(3, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'tc_1',
+        status: 'completed',
+      }),
+    ];
+    const writer = new FileDriverStreamAuditWriter(runsRoot);
+    for (const event of colliding) await writer.append('run_1', 'task_1', event);
+    await writeTimeline(colliding.map((event, index) => timelineEntry(event, index + 1)));
+
+    const result = await reconcileDriverStreamRun(runsRoot, 'run_1');
+    expect(result.key).toBe('sequence');
+    expect(result.type_mismatches).toEqual([]);
+    expect(result.missing_in_timeline).toEqual([]);
+    expect(result.unexpected_in_timeline).toEqual([]);
+    expect(result.ok).toBe(true);
+  });
+
+  it('pairs precisely by stream_sequence when both sides carry it', async () => {
+    const colliding = [
+      streamEvent(1, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } }),
+      streamEvent(2, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tc_1',
+        title: 'Edit',
+        kind: 'edit',
+      }),
+      streamEvent(1, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 't' } }),
+    ];
+    const writer = new FileDriverStreamAuditWriter(runsRoot);
+    for (const [index, event] of colliding.entries()) {
+      await writer.append('run_1', 'task_1', event, index + 1);
+    }
+    // timeline 少了 stream_sequence=3 那条：唯一键下丢失点精确到序号。
+    await writeTimeline([
+      timelineEntry(colliding[0], 1, 1),
+      timelineEntry(colliding[1], 2, 2),
+    ]);
+
+    const result = await reconcileDriverStreamRun(runsRoot, 'run_1');
+    expect(result.key).toBe('stream_sequence');
+    expect(result.missing_in_timeline).toEqual([3]);
+    expect(result.ok).toBe(false);
   });
 
   it('parses cli args and demands an explicit scope', () => {

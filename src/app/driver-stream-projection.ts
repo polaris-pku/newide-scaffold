@@ -6,28 +6,43 @@
  *   （`driver.*` 原样保留，其余收进 `driver.session_update_unknown`），不再静默丢弃。
  * - 小字段内联；序列化后超过 PAYLOAD_INLINE_LIMIT_BYTES 的大字段（工具 rawInput /
  *   rawOutput / content、长 stderr、大 chunk）不内联，由 `payload_ref` 指回
- *   driver-stream.jsonl 的原始行（`driver-stream.jsonl#sequence=<n>`，相对 run 目录）。
- *   信封没有 sequence 时无法引用，大字段一律内联——宁可胖，不可丢。
- * - 信封字段 session_id / role_id / event_sequence 统一放 payload 顶层。
+ *   driver-stream.jsonl 的原始行（相对 run 目录）。引用优先用 run 级单调序号
+ *   `driver-stream.jsonl#stream_sequence=<n>`——driver 自带的 `event.sequence`
+ *   每次 invoke 重置，多 invoke 下不唯一；老数据没有 stream_sequence 时退化为
+ *   `driver-stream.jsonl#sequence=<n>`。两个序号都没有时无法引用，大字段一律
+ *   内联——宁可胖，不可丢。
+ * - 信封字段 session_id / role_id / event_sequence / stream_sequence 统一放 payload 顶层。
  */
 import { SCHEMA_VERSION, createId, type Event } from '../core';
 import type { DriverStreamEvent } from '../driver/contract';
 
-/** payload_ref 指回 driver-stream.jsonl 原始行的引用前缀。 */
+/** payload_ref 指回 driver-stream.jsonl 原始行的引用前缀（run 级唯一键，优先）。 */
+export const DRIVER_STREAM_SEQUENCE_REF_PREFIX = 'driver-stream.jsonl#stream_sequence=';
+/** payload_ref 的旧式引用前缀（driver 侧序号，多 invoke 下不唯一，仅为老数据兼容）。 */
 export const DRIVER_STREAM_REF_PREFIX = 'driver-stream.jsonl#sequence=';
 
 /** 载荷内联上限（JSON 序列化字节）。超限字段走 payload_ref，不进事件模型。 */
 export const PAYLOAD_INLINE_LIMIT_BYTES = 8 * 1024;
 
-export function projectDriverStreamLifecycleEvent(event: DriverStreamEvent): Event | undefined {
+export function projectDriverStreamLifecycleEvent(
+  event: DriverStreamEvent,
+  streamSequence?: number,
+): Event | undefined {
   const rawPayload = recordValue(event.payload);
   const update = recordValue(rawPayload?.update);
-  const hasRef = typeof event.sequence === 'number';
+  const hasStreamRef = typeof streamSequence === 'number';
+  const hasLegacyRef = typeof event.sequence === 'number';
+  const hasRef = hasStreamRef || hasLegacyRef;
   const payload: Record<string, unknown> = {
     ...(event.session_id ? { session_id: event.session_id } : {}),
     ...(event.role_id ? { role_id: event.role_id } : {}),
     ...(event.sequence !== undefined ? { event_sequence: event.sequence } : {}),
-    ...(hasRef ? { payload_ref: `${DRIVER_STREAM_REF_PREFIX}${String(event.sequence)}` } : {}),
+    ...(hasStreamRef ? { stream_sequence: streamSequence } : {}),
+    ...(hasStreamRef
+      ? { payload_ref: `${DRIVER_STREAM_SEQUENCE_REF_PREFIX}${String(streamSequence)}` }
+      : hasLegacyRef
+        ? { payload_ref: `${DRIVER_STREAM_REF_PREFIX}${String(event.sequence)}` }
+        : {}),
   };
 
   let eventType: string;
