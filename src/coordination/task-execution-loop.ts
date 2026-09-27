@@ -26,6 +26,12 @@ import {
   withRunLatencySpan,
   type RunLatencyRecorder,
 } from '../telemetry';
+import type {
+  SapExecuteDispatch,
+  SapExecutionAdmission,
+  SapResultFrame,
+  SapTaskBridge,
+} from './sap-task-bridge';
 
 type CursorInput<TCursor extends TaskResumeCursor> = Extract<TaskCursorInput, { cursor: TCursor }>;
 
@@ -83,6 +89,7 @@ interface StageAdvanceMetadata {
   final_output?: PersistedTaskFinalOutput;
   warnings?: string[];
   council_override_input?: Extract<TaskCursorInput, { cursor: 'council' }>;
+  sap_result?: { admission: SapExecutionAdmission; frame: SapResultFrame };
 }
 
 export interface SelectAgentStageResult extends StageResult {
@@ -171,6 +178,7 @@ export interface TaskExecutionLoopOptions {
    * 不注入时全部埋点自动退化为空操作，单测与 example 无需改动。
    */
   create_latency_recorder?: (input: { run_id: string; task_id: string }) => RunLatencyRecorder;
+  sap_bridge?: SapTaskBridge;
 }
 
 export interface RunTaskExecutionInput {
@@ -193,6 +201,7 @@ export class TaskExecutionLoop {
   private readonly createLatencyRecorder:
     | ((input: { run_id: string; task_id: string }) => RunLatencyRecorder)
     | undefined;
+  private readonly sapBridge: SapTaskBridge | undefined;
 
   constructor(options: TaskExecutionLoopOptions) {
     this.processor = options.processor;
@@ -201,6 +210,7 @@ export class TaskExecutionLoop {
     this.createInvocationId =
       options.create_invocation_id ?? ((cursor) => createId(`invocation_${cursor}`));
     this.createLatencyRecorder = options.create_latency_recorder;
+    this.sapBridge = options.sap_bridge;
   }
 
   async run(input: RunTaskExecutionInput): Promise<TaskSnapshot> {
@@ -236,7 +246,15 @@ export class TaskExecutionLoop {
         return this.processor.getTaskSnapshot(input.task_id);
       }
 
-      const result = await this.executeStage(state, cursorInput, input);
+      let result: TaskStageCommitResult;
+      try {
+        result = await this.executeStage(state, cursorInput, input);
+      } catch (error) {
+        if (error instanceof SapExecutionAlreadyClaimedError) {
+          return this.processor.getTaskSnapshot(input.task_id);
+        }
+        throw error;
+      }
       if (result.snapshot.task.status !== 'running') return result.snapshot;
     }
   }
@@ -255,12 +273,18 @@ export class TaskExecutionLoop {
     >,
   ): Promise<TaskStageCommitResult> {
     const invocationId = this.createInvocationId(cursorInput.cursor);
+    const sapDispatch = this.createSapDispatch(state, cursorInput, invocationId);
     const started = this.processor.startStage({
       run_id: state.run_id,
       expected_cursor: cursorInput.cursor,
       invocation_id: invocationId,
+      ...(sapDispatch ? { sap_execute: sapDispatch } : {}),
     });
     this.notifyCommittedEvents(controls, started.committed_events);
+    const sapAdmission = sapDispatch ? this.sapBridge!.beginExecute(sapDispatch) : undefined;
+    if (sapAdmission && !sapAdmission.should_execute) {
+      throw new SapExecutionAlreadyClaimedError(sapAdmission.execute_inbox.exchange_id);
+    }
 
     try {
       switch (cursorInput.cursor) {
@@ -324,6 +348,14 @@ export class TaskExecutionLoop {
                       trigger: 'persistent_override' as const,
                       primary_evidence_ref: evidence.uri,
                       candidate_manifest_ref: result.changeset_ref,
+                    },
+                  }
+                : {}),
+              ...(sapDispatch && sapAdmission
+                ? {
+                    sap_result: {
+                      admission: sapAdmission,
+                      frame: this.createSapResult(sapDispatch, result),
                     },
                   }
                 : {}),
@@ -502,6 +534,7 @@ export class TaskExecutionLoop {
         ...(metadata.session_id ? { session_id: metadata.session_id } : {}),
         ...(metadata.final_output ? { final_output: metadata.final_output } : {}),
         ...(metadata.warnings ? { warnings: metadata.warnings } : {}),
+        ...(metadata.sap_result ? { sap_result: metadata.sap_result } : {}),
         ...(result.artifact_refs ? { artifact_refs: result.artifact_refs } : {}),
       });
     } catch (error) {
@@ -520,6 +553,45 @@ export class TaskExecutionLoop {
       .catch((error: unknown) => {
         throw new StageEvidenceWriteError(error);
       });
+  }
+
+  private createSapDispatch(
+    state: TaskRunExecutionState,
+    cursorInput: Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>,
+    invocationId: string,
+  ): SapExecuteDispatch | undefined {
+    if (!this.sapBridge || cursorInput.cursor !== 'execute_agent') return undefined;
+    return this.sapBridge.createExecute({
+      task_id: state.task_id,
+      run_id: state.run_id,
+      role_id: cursorInput.winner_agent_id,
+      instruction: state.task_request.spec,
+      exchange_id: `sap_${invocationId}`,
+    });
+  }
+
+  private createSapResult(
+    dispatch: SapExecuteDispatch,
+    result: ExecuteAgentStageResult,
+  ): SapResultFrame {
+    const status = sapStatus(result.evidence.status);
+    return this.sapBridge!.createResult({
+      execute: dispatch.frame,
+      status,
+      summary: status === 'completed'
+        ? 'Agent execution completed and the Task cursor advanced.'
+        : `Agent execution ended with status ${status}.`,
+      ...(status === 'failed'
+        ? {
+            error: {
+              code: 'agent_execution_failed',
+              message: 'Agent execution returned a failed result.',
+              retryable: false,
+            },
+          }
+        : {}),
+      exchange_id: `sap_result_${dispatch.frame.exchange_id}`,
+    });
   }
 
   private async writeFailureEvidence(
@@ -554,6 +626,13 @@ class StageEvidenceWriteError extends Error {
   constructor(readonly originalError: unknown) {
     super(errorMessage(originalError));
     this.name = 'StageEvidenceWriteError';
+  }
+}
+
+class SapExecutionAlreadyClaimedError extends Error {
+  constructor(readonly exchangeId: string) {
+    super(`SAP execute ${exchangeId} is already active or complete`);
+    this.name = 'SapExecutionAlreadyClaimedError';
   }
 }
 
@@ -633,6 +712,10 @@ function assertGateResultIdentity(result: GateStageResult, input: CursorInput<'g
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sapStatus(value: unknown): SapResultFrame['status'] {
+  return value === 'failed' || value === 'cancelled' ? value : 'completed';
 }
 
 function stageFailure(

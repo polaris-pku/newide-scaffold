@@ -12,6 +12,7 @@ import {
 import { buildResumePackage, buildSafepointCheckpoint, type ResumePackage } from '../checkpoint';
 import {
   parseTaskCursorInput,
+  type CoordinationStateCommit,
   type CoordinationStateStore,
   type MailboxStateStore,
   type PersistedRunMode,
@@ -32,12 +33,19 @@ import type { AppRunEvent } from '../app/run-registry';
 import { projectPersistedRunSnapshot } from '../app/task-run-snapshot-projector';
 import { projectTaskSnapshot, type TaskRunFact } from '../app/task-snapshot-projector';
 import type { ParticipantSessionRegistry } from './participant-session-registry';
+import type {
+  SapExecuteDispatch,
+  SapExecutionAdmission,
+  SapResultFrame,
+  SapTaskBridge,
+} from './sap-task-bridge';
 
 export interface TaskProcessorOptions {
   now?: () => string;
   createEventId?: () => string;
   runsRoot?: string;
   participantSessions?: ParticipantSessionRegistry;
+  sapBridge?: SapTaskBridge;
 }
 
 export interface BeginTaskRunInput {
@@ -72,6 +80,7 @@ export interface StartTaskStageInput {
   expected_cursor: TaskResumeCursor;
   invocation_id: string;
   event?: Event;
+  sap_execute?: SapExecuteDispatch;
 }
 
 export interface AdvanceTaskStageInput extends StartTaskStageInput {
@@ -83,6 +92,7 @@ export interface AdvanceTaskStageInput extends StartTaskStageInput {
   session_id?: string;
   final_output?: PersistedTaskFinalOutput;
   warnings?: string[];
+  sap_result?: { admission: SapExecutionAdmission; frame: SapResultFrame };
 }
 
 export interface FailTaskStageInput extends StartTaskStageInput {
@@ -91,6 +101,7 @@ export interface FailTaskStageInput extends StartTaskStageInput {
   artifact_refs?: string[];
   owner_agent_id?: string;
   session_id?: string;
+  sap_result?: { admission: SapExecutionAdmission; frame: SapResultFrame };
 }
 
 export interface TaskStageCommitResult {
@@ -193,6 +204,7 @@ export class TaskProcessor {
         Partial<Pick<MailboxStateStore, 'getMailboxHighWatermark' | 'listMailboxDeliveriesAfter'>>)
     | undefined;
   private readonly participantSessions?: ParticipantSessionRegistry;
+  private readonly sapBridge?: SapTaskBridge;
 
   constructor(
     private readonly store: CoordinationStateStore,
@@ -205,6 +217,7 @@ export class TaskProcessor {
     this.createEventId = options.createEventId ?? (() => createId('event'));
     this.runsRoot = options.runsRoot ?? '.newide/runs';
     if (options.participantSessions) this.participantSessions = options.participantSessions;
+    if (options.sapBridge) this.sapBridge = options.sapBridge;
     this.mailboxStore = options.mailboxStore;
   }
 
@@ -356,7 +369,7 @@ export class TaskProcessor {
         invocation_id: input.invocation_id,
       });
     assertStageEvent(event, 'handler.started', aggregate.task.task_id, input.run_id);
-    const committed = this.store.commitState({
+    const commit: CoordinationStateCommit = {
       expected_task_revision: aggregate.task.revision,
       task: {
         ...aggregate.task,
@@ -377,12 +390,21 @@ export class TaskProcessor {
             invocation_id: input.invocation_id,
             started_at: timestamp,
             started_event_id: event.event_id,
+            ...(input.sap_execute
+              ? {
+                  sap_outbox_id: input.sap_execute.outbox_id,
+                  sap_exchange_id: input.sap_execute.frame.exchange_id,
+                }
+              : {}),
           },
         },
         updated_at: timestamp,
       },
       events: [event],
-    });
+    };
+    const committed = input.sap_execute
+      ? this.requireSapBridge().commitDispatch(commit, input.sap_execute)
+      : this.store.commitState(commit);
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
@@ -501,13 +523,20 @@ export class TaskProcessor {
 
     let committed: PersistedCoordinationEvent[];
     try {
-      committed = this.store.commitState({
+      const commit = {
         expected_task_revision: aggregate.task.revision,
         task,
         run: nextRun,
         runtime_state: runtimeState,
         events: [event, ...(terminalEvent ? [terminalEvent] : [])],
-      });
+      };
+      committed = input.sap_result
+        ? this.requireSapBridge().commitResult(
+            commit,
+            input.sap_result.admission,
+            input.sap_result.frame,
+          )
+        : this.store.commitState(commit);
     } catch (error) {
       throw new TaskProcessorStageCommitError('handler.completed', error);
     }
@@ -558,7 +587,7 @@ export class TaskProcessor {
       ...(input.evidence_ref ? [input.evidence_ref.uri] : []),
       ...(input.artifact_refs ?? []),
     ]);
-    const committed = this.store.commitState({
+    const commit: CoordinationStateCommit = {
       expected_task_revision: aggregate.task.revision,
       task: {
         ...aggregate.task,
@@ -592,7 +621,14 @@ export class TaskProcessor {
         updated_at: timestamp,
       },
       events: [event, terminalEvent],
-    });
+    };
+    const committed = input.sap_result
+      ? this.requireSapBridge().commitResult(
+          commit,
+          input.sap_result.admission,
+          input.sap_result.frame,
+        )
+      : this.store.commitState(commit);
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
@@ -978,7 +1014,7 @@ export class TaskProcessor {
     const { error: _previousRunError, ...runWithoutError } = run;
     const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
 
-    this.store.commitState({
+    const commit: CoordinationStateCommit = {
       expected_task_revision: aggregate.task.revision,
       task: {
         ...taskWithoutTerminalOutput,
@@ -1015,7 +1051,21 @@ export class TaskProcessor {
         updated_at: timestamp,
       },
       events: [terminalEvent],
-    });
+    };
+    const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+    const sapOutboxId = input.status === 'cancelled'
+      ? readPayloadString(activeStage ?? {}, 'sap_outbox_id')
+      : undefined;
+    const sapDispatch = sapOutboxId ? this.requireSapBridge().getDispatch(sapOutboxId) : undefined;
+    if (sapDispatch) {
+      this.requireSapBridge().commitCancel(
+        commit,
+        sapDispatch,
+        this.requireSapBridge().createCancel({ execute: sapDispatch.frame }),
+      );
+    } else {
+      this.store.commitState(commit);
+    }
     return this.getTaskSnapshot(aggregate.task.task_id);
   }
 
@@ -1253,6 +1303,11 @@ export class TaskProcessor {
       .find((candidate) => candidate.runs.some((run) => run.run_id === runId));
     if (!aggregate) throw new TaskProcessorRunNotFoundError(runId);
     return aggregate;
+  }
+
+  private requireSapBridge(): SapTaskBridge {
+    if (!this.sapBridge) throw new Error('SAP bridge is not configured');
+    return this.sapBridge;
   }
 
   private recoverInterruptedTask(aggregate: PersistedTaskAggregate): TaskSnapshot {

@@ -7,6 +7,8 @@ import {
   type SapFrame,
 } from '../core';
 import type {
+  CoordinationStateCommit,
+  PersistedCoordinationEvent,
   ProtocolDeliveryStore,
   ProtocolDeliveryTransaction,
   ProtocolInboxRecord,
@@ -111,6 +113,17 @@ export class SapTaskBridge {
     });
   }
 
+  commitDispatch(
+    state: CoordinationStateCommit,
+    dispatch: SapExecuteDispatch,
+  ): PersistedCoordinationEvent[] {
+    return this.options.store.withProtocolTransaction((transaction) => {
+      const events = transaction.commitState(state);
+      this.enqueueExecute(transaction, dispatch);
+      return events;
+    });
+  }
+
   beginExecute(dispatch: SapExecuteDispatch): SapExecutionAdmission {
     const now = this.now();
     const leaseOwner = `sap-agent:${dispatch.frame.consumer.role_id}:${dispatch.frame.exchange_id}`;
@@ -133,6 +146,25 @@ export class SapTaskBridge {
         };
       }
       const outbox = requireOutbox(transaction, dispatch.outbox_id);
+      if (existingInbox) {
+        const reclaimed = transaction.claimInbox(
+          {
+            consumer_id: existingInbox.consumer_id,
+            protocol: existingInbox.protocol,
+            exchange_id: existingInbox.exchange_id,
+          },
+          leaseOwner,
+          now,
+          leaseExpiresAt,
+          existingInbox.revision,
+        );
+        return {
+          should_execute: reclaimed !== undefined,
+          execute_inbox: reclaimed ?? existingInbox,
+          execute_outbox: outbox,
+          lease_owner: leaseOwner,
+        };
+      }
       const claimedOutbox = transaction.claimOutbox(
         dispatch.outbox_id,
         leaseOwner,
@@ -143,13 +175,11 @@ export class SapTaskBridge {
       if (!claimedOutbox) {
         return {
           should_execute: false,
-          execute_inbox:
-            existingInbox ??
-            transaction.receiveInbox({
-              consumer_id: dispatch.destination,
-              frame: dispatch.frame,
-              received_at: now,
-            }).inbox,
+          execute_inbox: transaction.receiveInbox({
+            consumer_id: dispatch.destination,
+            frame: dispatch.frame,
+            received_at: now,
+          }).inbox,
           execute_outbox: outbox,
           lease_owner: leaseOwner,
         };
@@ -238,6 +268,115 @@ export class SapTaskBridge {
       deadline_at: input.execute.deadline_at,
       command: 'agent.cancel',
       target_exchange_id: input.execute.exchange_id,
+    });
+  }
+
+  getDispatch(outboxId: string): SapExecuteDispatch | undefined {
+    const outbox = this.options.store.getOutbox(outboxId);
+    if (!outbox || !('command' in outbox.frame) || outbox.frame.command !== 'agent.execute') {
+      return undefined;
+    }
+    return {
+      outbox_id: outbox.id,
+      destination: outbox.destination,
+      frame: sapExecuteCommandSchema.parse(outbox.frame),
+    };
+  }
+
+  commitResult(
+    state: CoordinationStateCommit,
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+  ): PersistedCoordinationEvent[] {
+    return this.options.store.withProtocolTransaction((transaction) => {
+      if (result.causation_id !== admission.execute_inbox.exchange_id) {
+        throw new Error('SAP result does not belong to the admitted execute exchange');
+      }
+      const events = transaction.commitState(state);
+      transaction.completeInbox({
+        key: {
+          consumer_id: admission.execute_inbox.consumer_id,
+          protocol: admission.execute_inbox.protocol,
+          exchange_id: admission.execute_inbox.exchange_id,
+        },
+        lease_owner: admission.lease_owner,
+        expected_revision: admission.execute_inbox.revision,
+        completed_at: result.created_at,
+        reply: {
+          id: `outbox_${result.exchange_id}`,
+          destination: 'system',
+          frame: result,
+        },
+      });
+      const replyOutbox = requireOutbox(transaction, `outbox_${result.exchange_id}`);
+      const replyLeaseOwner = `sap-system:${result.exchange_id}`;
+      const replyLeaseExpiresAt = minTimestamp(
+        new Date(Date.parse(result.created_at) + this.leaseDurationMs).toISOString(),
+        result.deadline_at,
+      );
+      const claimedReply = transaction.claimOutbox(
+        replyOutbox.id,
+        replyLeaseOwner,
+        result.created_at,
+        replyLeaseExpiresAt,
+        replyOutbox.revision,
+      );
+      if (!claimedReply) throw new Error(`SAP result ${result.exchange_id} could not be claimed`);
+      transaction.markOutboxSent(
+        claimedReply.id,
+        replyLeaseOwner,
+        claimedReply.revision,
+        result.created_at,
+      );
+      const systemInbox = transaction.receiveInbox({
+        consumer_id: 'system',
+        frame: result,
+        received_at: result.created_at,
+      }).inbox;
+      const claimedSystemInbox = transaction.claimInbox(
+        {
+          consumer_id: systemInbox.consumer_id,
+          protocol: systemInbox.protocol,
+          exchange_id: systemInbox.exchange_id,
+        },
+        replyLeaseOwner,
+        result.created_at,
+        replyLeaseExpiresAt,
+        systemInbox.revision,
+      );
+      if (!claimedSystemInbox) {
+        throw new Error(`SAP result ${result.exchange_id} was already processed`);
+      }
+      transaction.completeInbox({
+        key: {
+          consumer_id: claimedSystemInbox.consumer_id,
+          protocol: claimedSystemInbox.protocol,
+          exchange_id: claimedSystemInbox.exchange_id,
+        },
+        lease_owner: replyLeaseOwner,
+        expected_revision: claimedSystemInbox.revision,
+        completed_at: result.created_at,
+      });
+      return events;
+    });
+  }
+
+  commitCancel(
+    state: CoordinationStateCommit,
+    dispatch: SapExecuteDispatch,
+    cancel: SapCancelFrame,
+  ): PersistedCoordinationEvent[] {
+    return this.options.store.withProtocolTransaction((transaction) => {
+      const events = transaction.commitState(state);
+      const outboxId = `outbox_${cancel.exchange_id}`;
+      if (!transaction.getOutbox(outboxId)) {
+        transaction.enqueueOutbox({
+          id: outboxId,
+          destination: dispatch.destination,
+          frame: cancel,
+        });
+      }
+      return events;
     });
   }
 }
