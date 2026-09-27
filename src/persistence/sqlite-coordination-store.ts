@@ -124,9 +124,27 @@ export class SqliteCoordinationStore
     try {
       const transaction: ProtocolDeliveryTransaction = {
         commitState: (input) => { ensureOpen(); return this.writeCoordinationState(input); },
+        getOutbox: (id) => { ensureOpen(); return this.protocolDelivery.getOutbox(id); },
+        getInbox: (key) => { ensureOpen(); return this.protocolDelivery.getInbox(key); },
         enqueueOutbox: (input) => { ensureOpen(); return this.protocolDelivery.enqueueOutbox(input); },
         receiveInbox: (input) => { ensureOpen(); return this.protocolDelivery.receiveInbox(input); },
         completeInbox: (input) => { ensureOpen(); return this.protocolDelivery.completeInbox(input); },
+        claimOutbox: (id, owner, now, leaseExpiresAt, expectedRevision) => {
+          ensureOpen();
+          return this.protocolDelivery.claimOutbox(
+            id, owner, now, leaseExpiresAt, expectedRevision,
+          );
+        },
+        markOutboxSent: (id, owner, expectedRevision, at) => {
+          ensureOpen();
+          return this.protocolDelivery.markOutboxSent(id, owner, expectedRevision, at);
+        },
+        claimInbox: (key, owner, now, leaseExpiresAt, expectedRevision) => {
+          ensureOpen();
+          return this.protocolDelivery.claimInbox(
+            key, owner, now, leaseExpiresAt, expectedRevision,
+          );
+        },
         appendCall: (input) => { ensureOpen(); return this.protocolDelivery.appendCall(input); },
       };
       const result = operation(transaction);
