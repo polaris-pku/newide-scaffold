@@ -77,7 +77,8 @@ describe('NewideBackendService', () => {
     });
 
     finish?.(completedResult('run_stream', 'task_stream'));
-    await viWaitFor(() => service.getSnapshot('run_stream').status === 'completed');
+    // 收尾要写 4 份终态文件并刮一次 Claude 计费目录，100ms 的默认预算在负载下会误报。
+    await viWaitFor(() => service.getSnapshot('run_stream').status === 'completed', 2000);
   });
 
   it('returns real ids before the runner completes and records telemetry', async () => {
@@ -793,8 +794,8 @@ describe('NewideBackendService', () => {
   });
 });
 
-async function viWaitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function viWaitFor(predicate: () => boolean, attempts = 100): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
