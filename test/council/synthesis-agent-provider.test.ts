@@ -270,15 +270,22 @@ describe('SynthesisAgentCouncilProvider', () => {
       councilRoot,
       sapBridge: bridge,
     });
+    const dispatched: string[] = [];
 
     const result = await provider.runCouncilRound({
       ...baseInput(),
       run_id: 'run_council_sap',
       task_id: 'task_council_sap',
       question: 'Verify every Council seat uses SAP.',
+    }, {
+      onSapDispatch: (dispatch) => {
+        dispatched.push(dispatch.frame.exchange_id);
+        bridge.persistExecute(dispatch);
+      },
     });
 
     expect(result.selected_artifact_refs).not.toEqual([]);
+    expect(dispatched).toHaveLength(4);
     const expected = [
       ['proposal', 'participant_proposer_0'],
       ['proposal', 'participant_proposer_1'],

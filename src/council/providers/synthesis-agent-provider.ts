@@ -617,7 +617,11 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     });
     let sapAdmission;
     if (sapDispatch && this.sapBridge) {
-      this.sapBridge.persistExecute(sapDispatch);
+      if (options?.onSapDispatch) {
+        await options.onSapDispatch(sapDispatch);
+      } else {
+        this.sapBridge.persistExecute(sapDispatch);
+      }
       sapAdmission = this.sapBridge.beginExecute(sapDispatch);
       if (!sapAdmission.should_execute) {
         throw new Error(`Council SAP execute ${sapDispatch.frame.exchange_id} is already active or complete`);

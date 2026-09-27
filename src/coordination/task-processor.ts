@@ -413,6 +413,68 @@ export class TaskProcessor {
     };
   }
 
+  /**
+   * Persist one Council seat dispatch together with the current Task stage.
+   * Seats may be dispatched concurrently; each attempt rereads the aggregate
+   * and retries the existing optimistic revision boundary.
+   */
+  recordCouncilSapDispatch(runId: string, dispatch: SapExecuteDispatch): void {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const aggregate = this.requireAggregateForRun(runId);
+      const run = requireRun(aggregate, runId);
+      const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+      if (!activeStage || activeStage.cursor !== 'council') {
+        throw new Error(`Council SAP dispatch requires an active council stage for ${runId}`);
+      }
+      const rawActiveStage =
+        aggregate.runtime_state.diagnostics.active_stage &&
+        typeof aggregate.runtime_state.diagnostics.active_stage === 'object'
+          ? (aggregate.runtime_state.diagnostics.active_stage as Record<string, unknown>)
+          : {};
+      const storedExchangeIds = Array.isArray(rawActiveStage.council_sap_exchange_ids)
+        ? (rawActiveStage.council_sap_exchange_ids as unknown[])
+            .filter((value): value is string => typeof value === 'string')
+        : [];
+      if (storedExchangeIds.includes(dispatch.frame.exchange_id)) return;
+      const timestamp = dispatch.frame.created_at;
+      const event = this.createEvent(
+        'council.sap.dispatched',
+        dispatch.frame.exchange_id,
+        aggregate.task.task_id,
+        runId,
+        {
+          cursor: 'council',
+          exchange_id: dispatch.frame.exchange_id,
+          role_id: dispatch.frame.consumer.role_id,
+          council_seat: dispatch.frame.council_seat,
+        },
+      );
+      const commit: CoordinationStateCommit = {
+        expected_task_revision: aggregate.task.revision,
+        task: { ...aggregate.task, revision: aggregate.task.revision + 1, updated_at: timestamp },
+        run: { ...run, revision: run.revision + 1, updated_at: timestamp },
+        runtime_state: {
+          ...aggregate.runtime_state,
+          diagnostics: {
+            ...aggregate.runtime_state.diagnostics,
+            active_stage: {
+              ...(rawActiveStage as Record<string, unknown>),
+              council_sap_exchange_ids: [...storedExchangeIds, dispatch.frame.exchange_id],
+            },
+          },
+          updated_at: timestamp,
+        },
+        events: [event],
+      };
+      try {
+        this.requireSapBridge().commitDispatch(commit, dispatch);
+        return;
+      } catch (error) {
+        if (!isRevisionConflict(error) || attempt === 3) throw error;
+      }
+    }
+  }
+
   advanceStage(input: AdvanceTaskStageInput): TaskStageCommitResult {
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       try {

@@ -71,6 +71,7 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
   on_event?: (event: Event) => void;
+  on_sap_dispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>;
 }
 
 export interface CouncilEscalationRequest {
@@ -366,7 +367,11 @@ export class TaskExecutionLoop {
         }
         case 'council': {
           const result = await runStageWithAttribution('council', () =>
-            this.executors.council.execute(stageContext(state, cursorInput, controls)),
+            this.executors.council.execute(
+              stageContext(state, cursorInput, controls, async (dispatch) => {
+                await this.processor.recordCouncilSapDispatch(state.run_id, dispatch);
+              }),
+            ),
           );
           assertChangesetResult(result, 'Council');
           return await this.persistAndAdvance(
@@ -668,6 +673,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     RunTaskExecutionInput,
     'memory_ablation' | 'session_id' | 'signal' | 'on_driver_event' | 'on_event'
   >,
+  onSapDispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>,
 ): TaskStageExecutionContext<TCursor> {
   return {
     task_id: state.task_id,
@@ -687,6 +693,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
     ...(controls.on_event ? { on_event: controls.on_event } : {}),
+    ...(onSapDispatch ? { on_sap_dispatch: onSapDispatch } : {}),
   };
 }
 

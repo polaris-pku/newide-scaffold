@@ -20,6 +20,7 @@ import {
 import { buildCouncilProposalFromDriverResult } from '../council/proposal-adapter';
 import type { AutonomousCouncilHandler } from './handlers/autonomous-council-handler';
 import type { DriverStreamEventListener } from '../driver/contract';
+import type { SapExecuteDispatch } from '../coordination/sap-task-bridge';
 
 export type SelectionMode = 'single_agent' | 'council';
 
@@ -70,6 +71,7 @@ export interface ArtifactSelectionExecutionOptions {
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
   onCouncilLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
+  onSapDispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>;
 }
 
 export interface ArtifactSelectorOptions {
@@ -173,6 +175,7 @@ export class ArtifactSelector {
             ...(execution.onCouncilLifecycleEvent
               ? { onLifecycleEvent: execution.onCouncilLifecycleEvent }
               : {}),
+            ...(execution.onSapDispatch ? { onSapDispatch: execution.onSapDispatch } : {}),
           }
         : undefined;
     const autonomousExecution = this.options.councilHandler
