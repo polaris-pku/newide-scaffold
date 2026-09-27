@@ -8,6 +8,7 @@ import type { AppRunSnapshot } from './run-registry';
 import { projectRunSnapshot } from './run-snapshot-projector';
 import {
   isDriverStreamUsage,
+  mergeTaskDriverUsage,
   preferDriverUsage,
   projectTaskDriverUsage,
   type TaskDriverUsage,
@@ -83,6 +84,12 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
      * 测试用，免得碰真实的 `~/.claude`。
      */
     private readonly collectClaudeUsage: CollectClaudeSessionUsage = collectClaudeSessionUsage,
+    /**
+     * 进程内实时折叠的 driver usage（事件流正源）。终态时它与文件回读的兜底
+     * 合并：文件可能被保留上限截断而缺尾，正源补上；不注入时行为与从前一致
+     * （只信文件回读，截断缺尾标 complete: false）。
+     */
+    private readonly accumulatedUsage?: (taskId: string) => TaskDriverUsage | undefined,
   ) {}
 
   async finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | undefined> {
@@ -95,7 +102,10 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
     const frontendSnapshotPath = path.join(runDir, 'frontend-snapshot.json');
 
     const projected = projectRunSnapshot(snapshot);
-    const tokenUsage = await projectTaskDriverUsage(this.runsRoot, snapshot.task_id);
+    const tokenUsage = mergeTaskDriverUsage(
+      await projectTaskDriverUsage(this.runsRoot, snapshot.task_id),
+      this.accumulatedUsage?.(snapshot.task_id),
+    );
     const consumption = summarizeRunConsumption(
       projected.timeline,
       this.runLatency?.snapshot(snapshot.run_id),
