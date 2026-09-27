@@ -360,7 +360,7 @@ describe('TaskProcessor', () => {
         },
       },
     });
-    expect(aggregate?.events).toContainEqual(
+    expect(store.getTaskAggregate('task_council_sap_tx')?.events).toContainEqual(
       expect.objectContaining({
         event_type: 'council.sap.dispatched',
         subject_id: 'sap_council_seat_tx',
@@ -370,6 +370,40 @@ describe('TaskProcessor', () => {
       status: 'pending',
       exchange_id: 'sap_council_seat_tx',
     });
+    const admission = sapBridge.beginExecute(dispatch);
+    const result = sapBridge.createResult({
+      execute: dispatch.frame,
+      status: 'completed',
+      summary: 'Reviewer completed.',
+      exchange_id: 'sap_result_sap_council_seat_tx',
+    });
+    expect(
+      processor.recordCouncilSapResult(
+        'run_council_sap_tx',
+        admission,
+        result,
+        'review',
+        'participant_reviewer',
+      ),
+    ).toBe('accepted');
+    expect(store.getTaskAggregate('task_council_sap_tx')).toMatchObject({
+      runtime_state: {
+        diagnostics: {
+          active_stage: {
+            council_sap_result_exchange_ids: ['sap_result_sap_council_seat_tx'],
+          },
+        },
+      },
+    });
+    expect(store.getOutbox('outbox_sap_result_sap_council_seat_tx')).toMatchObject({
+      status: 'sent',
+    });
+    expect(store.getTaskAggregate('task_council_sap_tx')?.events).toContainEqual(
+      expect.objectContaining({
+        event_type: 'council.sap.result.received',
+        subject_id: 'sap_result_sap_council_seat_tx',
+      }),
+    );
     expect(store.listJournal('task_council_sap_tx', 'run_council_sap_tx')).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ id: 'sap_council_seat_tx', event: 'outbox.enqueued' }),

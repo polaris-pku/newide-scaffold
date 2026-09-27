@@ -690,9 +690,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       );
     }
     if (sapDispatch && sapAdmission && this.sapBridge && result.status !== 'interrupted') {
-      const disposition = this.sapBridge.acceptResult(
-        sapAdmission,
-        this.sapBridge.createResult({
+      const sapResult = this.sapBridge.createResult({
           execute: sapDispatch.frame,
           status: result.status,
           summary: `Council ${phase} role ended with status ${result.status}.`,
@@ -706,8 +704,15 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
               }
             : {}),
           exchange_id: `sap_result_${sapDispatch.frame.exchange_id}`,
-        }),
-      );
+        });
+      const disposition = options?.onSapResult
+        ? await options.onSapResult({
+            admission: sapAdmission,
+            frame: sapResult,
+            phase,
+            participant_id: participant.participant_id,
+          })
+        : this.sapBridge.acceptResult(sapAdmission, sapResult);
       if (disposition !== 'accepted') {
         throw new CouncilRoleExecutionError(
           phase,

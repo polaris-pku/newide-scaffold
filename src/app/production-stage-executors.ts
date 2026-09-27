@@ -545,6 +545,7 @@ export function createProductionStageExecutors(
             ...(context.signal ? { signal: context.signal } : {}),
             ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
             ...(context.on_sap_dispatch ? { onSapDispatch: context.on_sap_dispatch } : {}),
+            ...(context.on_sap_result ? { onSapResult: context.on_sap_result } : {}),
             onCouncilLifecycleEvent: (event) =>
               emit(
                 context,

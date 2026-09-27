@@ -37,6 +37,7 @@ import type {
   SapCancelFrame,
   SapExecuteDispatch,
   SapExecutionAdmission,
+  SapResultDisposition,
   SapResultFrame,
   SapTaskBridge,
 } from './sap-task-bridge';
@@ -473,6 +474,85 @@ export class TaskProcessor {
         if (!isRevisionConflict(error) || attempt === 3) throw error;
       }
     }
+  }
+
+  /** Persist an accepted Council seat receipt with the active Task stage. */
+  recordCouncilSapResult(
+    runId: string,
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+    phase: 'proposal' | 'review' | 'synthesis',
+    participantId: string,
+  ): SapResultDisposition {
+    const bridge = this.requireSapBridge();
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const disposition = bridge.classifyResult(admission, result);
+      if (disposition !== 'accepted') {
+        return bridge.acceptResult(admission, result);
+      }
+      const aggregate = this.requireAggregateForRun(runId);
+      const run = requireRun(aggregate, runId);
+      const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+      if (!activeStage || activeStage.cursor !== 'council') {
+        throw new Error(`Council SAP result requires an active council stage for ${runId}`);
+      }
+      const rawActiveStage =
+        aggregate.runtime_state.diagnostics.active_stage &&
+        typeof aggregate.runtime_state.diagnostics.active_stage === 'object'
+          ? (aggregate.runtime_state.diagnostics.active_stage as Record<string, unknown>)
+          : {};
+      const storedResults = Array.isArray(rawActiveStage.council_sap_result_exchange_ids)
+        ? (rawActiveStage.council_sap_result_exchange_ids as unknown[])
+            .filter((value): value is string => typeof value === 'string')
+        : [];
+      if (storedResults.includes(result.exchange_id)) return 'duplicate';
+      const timestamp = result.created_at;
+      const event = this.createEvent(
+        'council.sap.result.received',
+        result.exchange_id,
+        aggregate.task.task_id,
+        runId,
+        {
+          cursor: 'council',
+          phase,
+          participant_id: participantId,
+          exchange_id: result.exchange_id,
+          causation_id: result.causation_id,
+          status: result.status,
+        },
+      );
+      const commit: CoordinationStateCommit = {
+        expected_task_revision: aggregate.task.revision,
+        task: { ...aggregate.task, revision: aggregate.task.revision + 1, updated_at: timestamp },
+        run: { ...run, revision: run.revision + 1, updated_at: timestamp },
+        runtime_state: {
+          ...aggregate.runtime_state,
+          diagnostics: {
+            ...aggregate.runtime_state.diagnostics,
+            active_stage: {
+              ...rawActiveStage,
+              council_sap_result_exchange_ids: [...storedResults, result.exchange_id],
+            },
+          },
+          updated_at: timestamp,
+        },
+        events: [event],
+      };
+      try {
+        bridge.commitResult(commit, admission, result);
+        return 'accepted';
+      } catch (error) {
+        if (
+          attempt < 3 &&
+          error instanceof Error &&
+          /SAP result .* is (duplicate|late)/.test(error.message)
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error(`Council SAP result ${result.exchange_id} could not be committed`);
   }
 
   advanceStage(input: AdvanceTaskStageInput): TaskStageCommitResult {

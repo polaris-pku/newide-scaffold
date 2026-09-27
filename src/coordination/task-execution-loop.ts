@@ -30,6 +30,7 @@ import type {
   SapExecuteDispatch,
   SapExecutionAdmission,
   SapResultFrame,
+  SapResultDisposition,
   SapTaskBridge,
 } from './sap-task-bridge';
 
@@ -72,6 +73,12 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   on_driver_event?: DriverStreamEventListener;
   on_event?: (event: Event) => void;
   on_sap_dispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>;
+  on_sap_result?: (input: {
+    admission: SapExecutionAdmission;
+    frame: SapResultFrame;
+    phase: 'proposal' | 'review' | 'synthesis';
+    participant_id: string;
+  }) => SapResultDisposition | Promise<SapResultDisposition>;
 }
 
 export interface CouncilEscalationRequest {
@@ -370,7 +377,15 @@ export class TaskExecutionLoop {
             this.executors.council.execute(
               stageContext(state, cursorInput, controls, async (dispatch) => {
                 await this.processor.recordCouncilSapDispatch(state.run_id, dispatch);
-              }),
+              }, async (result) =>
+                this.processor.recordCouncilSapResult(
+                  state.run_id,
+                  result.admission,
+                  result.frame,
+                  result.phase,
+                  result.participant_id,
+                ),
+              ),
             ),
           );
           assertChangesetResult(result, 'Council');
@@ -674,6 +689,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     'memory_ablation' | 'session_id' | 'signal' | 'on_driver_event' | 'on_event'
   >,
   onSapDispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>,
+  onSapResult?: TaskStageExecutionContext<TCursor>['on_sap_result'],
 ): TaskStageExecutionContext<TCursor> {
   return {
     task_id: state.task_id,
@@ -694,6 +710,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
     ...(controls.on_event ? { on_event: controls.on_event } : {}),
     ...(onSapDispatch ? { on_sap_dispatch: onSapDispatch } : {}),
+    ...(onSapResult ? { on_sap_result: onSapResult } : {}),
   };
 }
 

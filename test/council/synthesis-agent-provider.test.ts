@@ -271,6 +271,7 @@ describe('SynthesisAgentCouncilProvider', () => {
       sapBridge: bridge,
     });
     const dispatched: string[] = [];
+    const received: string[] = [];
 
     const result = await provider.runCouncilRound({
       ...baseInput(),
@@ -282,10 +283,15 @@ describe('SynthesisAgentCouncilProvider', () => {
         dispatched.push(dispatch.frame.exchange_id);
         bridge.persistExecute(dispatch);
       },
+      onSapResult: ({ frame, admission }) => {
+        received.push(frame.exchange_id);
+        return bridge.acceptResult(admission, frame);
+      },
     });
 
     expect(result.selected_artifact_refs).not.toEqual([]);
     expect(dispatched).toHaveLength(4);
+    expect(received).toHaveLength(4);
     const expected = [
       ['proposal', 'participant_proposer_0'],
       ['proposal', 'participant_proposer_1'],
