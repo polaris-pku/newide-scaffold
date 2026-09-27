@@ -13,7 +13,7 @@ import { IntegrationV0CoordinatorRunner } from '../../src/coordinator/coordinato
 import { runSnapshotSchema } from '../../src/protocol/run-snapshot';
 
 describe('NewideBackendService', () => {
-  it('keeps raw driver chunks out of the state timeline and publishes lifecycle events', async () => {
+  it('projects raw driver chunks into the state timeline alongside lifecycle events', async () => {
     let finish: ((result: IntegrationV0Result) => void) | undefined;
     const runnerResult = new Promise<IntegrationV0Result>((resolve) => {
       finish = resolve;
@@ -29,7 +29,13 @@ describe('NewideBackendService', () => {
           session_id: 'session_stream',
           sequence: 1,
           created_at: '2026-07-20T00:00:01.000Z',
-          payload: { text: 'working' },
+          payload: {
+            sessionId: 'session_stream',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'working' },
+            },
+          },
         });
         request.onDriverEvent?.({
           schema_version: 'driver-event.v1',
@@ -51,6 +57,15 @@ describe('NewideBackendService', () => {
       events: [
         { type: 'run.started' },
         {
+          type: 'driver.agent_message_chunk',
+          source: 'driver',
+          payload: {
+            session_id: 'session_stream',
+            event_sequence: 1,
+            content: { type: 'text', text: 'working' },
+          },
+        },
+        {
           type: 'driver.turn_started',
           source: 'driver',
           payload: {
@@ -62,7 +77,8 @@ describe('NewideBackendService', () => {
     });
 
     finish?.(completedResult('run_stream', 'task_stream'));
-    await viWaitFor(() => service.getSnapshot('run_stream').status === 'completed');
+    // 收尾要写 4 份终态文件并刮一次 Claude 计费目录，100ms 的默认预算在负载下会误报。
+    await viWaitFor(() => service.getSnapshot('run_stream').status === 'completed', 2000);
   });
 
   it('returns real ids before the runner completes and records telemetry', async () => {
@@ -778,8 +794,8 @@ describe('NewideBackendService', () => {
   });
 });
 
-async function viWaitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function viWaitFor(predicate: () => boolean, attempts = 100): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 1));
   }

@@ -60,6 +60,15 @@ export interface RunConsumptionSummary {
 /** 归属不到 stage 的事件的桶名，与账本汇总里的桶同名。 */
 const UNATTRIBUTED_STAGE = 'unattributed';
 
+/**
+ * driver 事件流投影事件的桶名。
+ *
+ * 这些事件自带 event_sequence（driver-stream 信封序号），是执行过程的观测副本：
+ * 量级由会话长度决定而不是阶段做功，算进 enclosing stage 会让 execute_agent 的
+ * 事件计数被 chunk 洪流淹没。单独成桶既不丢总数，也不污染阶段口径。
+ */
+const DRIVER_STREAM_STAGE = 'driver_stream';
+
 export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
   constructor(
     private readonly runsRoot = '.newide/runs',
@@ -328,6 +337,10 @@ function emptyConsumptionMetrics(): RunConsumptionMetrics {
  * 把 cache 也算进 `total_tokens`。两者在今天的生产出口上一致（唯一的记账点不传 cache
  * 字段），一旦有人开始传就会分叉，分叉是刻意的：这一版是完整口径。
  *
+ * driver 事件流的投影事件（payload 带 event_sequence）单独归 `driver_stream` 桶：
+ * 它们是执行过程的观测副本，量级由会话长度决定而不是阶段做功，混进 enclosing stage
+ * 会让阶段事件计数虚高。总数仍含它们——总数是各桶之和，口径不变。
+ *
  * 任何一步都不抛错——它跑在终态写盘路径上，观测算不出来只该少一块，不该弄挂 run。
  */
 export function summarizeRunConsumption(
@@ -351,7 +364,11 @@ export function summarizeRunConsumption(
       const cursor = readNonEmptyString(payload.cursor);
       if (cursor) currentStage = cursor;
     }
-    const metrics = bucketFor(readNonEmptyString(payload.stage_cursor) ?? currentStage);
+    // driver 事件流投影（带 event_sequence）归自己的桶，不占阶段做功的计数。
+    const stage = isDriverStreamProjection(payload)
+      ? DRIVER_STREAM_STAGE
+      : (readNonEmptyString(payload.stage_cursor) ?? currentStage);
+    const metrics = bucketFor(stage);
     metrics.events += 1;
     if (event.type !== 'proxy.llm_usage_recorded') {
       // 关窗要在归属之后：stage 结束后的 run.completed 之类的生命周期事件属于 run，
@@ -409,6 +426,16 @@ function readNonEmptyString(value: unknown): string | undefined {
 function readFiniteNumber(value: unknown): number {
   const parsed = Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * driver 事件流的投影事件：payload 带 event_sequence（driver-stream 信封序号）。
+ *
+ * 阶段自己发的 driver.* 领域事件（如 driver.run_result）没有这个字段，仍算阶段做功
+ * ——所以用它而不是 `type.startsWith('driver.')` 做判别。
+ */
+function isDriverStreamProjection(payload: Record<string, unknown>): boolean {
+  return typeof payload.event_sequence === 'number';
 }
 
 async function writeJsonIfMissing(filePath: string, value: unknown): Promise<void> {
