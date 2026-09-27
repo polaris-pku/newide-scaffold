@@ -2,8 +2,11 @@
  * payload_ref 的取回工具：事件载荷超限字段指回 driver-stream.jsonl 的原始行，
  * 这里按引用把完整事件取回来。
  *
- * 引用形如 `driver-stream.jsonl#sequence=<n>`，相对 run 目录解析：
- * `<runsRoot>/<runId>/driver-stream.jsonl` 里 `event.sequence === n` 的那一行。
+ * 引用相对 run 目录解析（`<runsRoot>/<runId>/driver-stream.jsonl`），两种形状：
+ * - `driver-stream.jsonl#stream_sequence=<n>` —— 信封的 run 级单调序号，唯一，优先；
+ * - `driver-stream.jsonl#sequence=<n>` —— driver 自带序号（每次 invoke 重置），老数据
+ *   兼容用，多 invoke 下不唯一，解析只取首个命中行，尽力而为。
+ *
  * 文件被保留策略截断、或 run 目录不存在时返回 undefined——引用是尽力而为的
  * 观测通道，取不到不应让调用方失败。
  */
@@ -16,17 +19,28 @@ export interface DriverStreamAuditLine {
   run_id: string;
   task_id: string;
   recorded_at: string;
+  /** run 级单调序号（接收点分配）。老行没有。 */
+  stream_sequence?: number;
   /** 保留策略截断标记行：没有 event 字段，读取方跳过即可。 */
   truncated?: boolean;
   event?: DriverStreamEvent;
 }
 
-const REF_PATTERN = /^driver-stream\.jsonl#sequence=(\d+)$/;
+export interface DriverStreamRefKey {
+  kind: 'stream_sequence' | 'sequence';
+  value: number;
+}
 
-/** 解析引用里的 sequence；引用形状不对返回 undefined。 */
-export function parseDriverStreamRef(ref: string): number | undefined {
-  const match = REF_PATTERN.exec(ref);
-  return match ? Number(match[1]) : undefined;
+const STREAM_REF_PATTERN = /^driver-stream\.jsonl#stream_sequence=(\d+)$/;
+const LEGACY_REF_PATTERN = /^driver-stream\.jsonl#sequence=(\d+)$/;
+
+/** 解析引用里的键；引用形状不对返回 undefined。 */
+export function parseDriverStreamRef(ref: string): DriverStreamRefKey | undefined {
+  const stream = STREAM_REF_PATTERN.exec(ref);
+  if (stream) return { kind: 'stream_sequence', value: Number(stream[1]) };
+  const legacy = LEGACY_REF_PATTERN.exec(ref);
+  if (legacy) return { kind: 'sequence', value: Number(legacy[1]) };
+  return undefined;
 }
 
 /** 读取一个 run 的全部审计行（含截断标记行）。文件不存在返回空数组。 */
@@ -56,11 +70,11 @@ export async function resolveDriverStreamRef(
   runId: string,
   ref: string,
 ): Promise<DriverStreamEvent | undefined> {
-  const sequence = parseDriverStreamRef(ref);
-  if (sequence === undefined) return undefined;
+  const key = parseDriverStreamRef(ref);
+  if (key === undefined) return undefined;
   const lines = await readDriverStreamAuditLines(runsRoot, runId);
-  for (const line of lines) {
-    if (line.event?.sequence === sequence) return line.event;
+  if (key.kind === 'stream_sequence') {
+    return lines.find((line) => line.stream_sequence === key.value)?.event;
   }
-  return undefined;
+  return lines.find((line) => line.event?.sequence === key.value)?.event;
 }

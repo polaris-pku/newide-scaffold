@@ -244,6 +244,8 @@ export class NewideBackendService {
   private readonly runWorkspaces = new Map<string, string>();
   private readonly taskListeners = new Map<string, Set<(event: AppRunEvent) => void>>();
   private readonly pendingRunStarts = new Set<PendingRunStart>();
+  /** run 级 driver 事件序号计数器：每 run 内单调递增，作为引用与对账的唯一键。 */
+  private readonly driverStreamSequences = new Map<string, number>();
   /**
    * 任务级 driver usage 累加器：事件流到达即折叠，是 `summary.driver_context_usage` 的
    * 正源；文件回读退为截断/崩溃时的兜底。见 driver-usage-projector 的类文档。
@@ -1681,11 +1683,21 @@ export class NewideBackendService {
   ): void {
     // usage 观测在这里进正源（进程内累加），文件回读只是兜底。
     this.driverUsageFor(identity.task_id).observe(event);
+    // run 级单调序号：driver 自带的 event.sequence 每次 invoke 重置，多 invoke 下
+    // 不唯一。引用（payload_ref）与对账需要 run 内唯一的键，在接收点统一分配，
+    // 落盘信封与投影 payload 各带一份。
+    const streamSequence = this.nextDriverStreamSequence(identity.run_id);
     void this.driverStreamAuditWriter
-      .append(identity.run_id, identity.task_id, event)
+      .append(identity.run_id, identity.task_id, event, streamSequence)
       .catch(() => undefined);
-    const projected = projectDriverStreamLifecycleEvent(event);
+    const projected = projectDriverStreamLifecycleEvent(event, streamSequence);
     if (projected) this.appendDomainEvent(identity, projected);
+  }
+
+  private nextDriverStreamSequence(runId: string): number {
+    const next = (this.driverStreamSequences.get(runId) ?? 0) + 1;
+    this.driverStreamSequences.set(runId, next);
+    return next;
   }
 
   /** 任务级 driver usage 累加器（事件流正源）的当前快照；无观测返回 undefined。 */

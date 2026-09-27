@@ -449,13 +449,14 @@ function readFiniteNumber(value: unknown): number {
 }
 
 /**
- * driver 事件流的投影事件：payload 带 event_sequence（driver-stream 信封序号）。
+ * driver 事件流的投影事件：payload 带 event_sequence / stream_sequence（driver-stream
+ * 信封序号）。
  *
- * 阶段自己发的 driver.* 领域事件（如 driver.run_result）没有这个字段，仍算阶段做功
+ * 阶段自己发的 driver.* 领域事件（如 driver.run_result）没有这些字段，仍算阶段做功
  * ——所以用它而不是 `type.startsWith('driver.')` 做判别。
  */
 function isDriverStreamProjection(payload: Record<string, unknown>): boolean {
-  return typeof payload.event_sequence === 'number';
+  return typeof payload.event_sequence === 'number' || typeof payload.stream_sequence === 'number';
 }
 
 async function writeJsonIfMissing(filePath: string, value: unknown): Promise<void> {

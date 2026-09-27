@@ -3,7 +3,17 @@ import path from 'node:path';
 import type { DriverStreamEvent } from '../driver/contract';
 
 export interface DriverStreamAuditWriter {
-  append(runId: string, taskId: string, event: DriverStreamEvent): Promise<void>;
+  /**
+   * `streamSequence` 是 run 级单调序号（接收点统一分配）。driver 自带的
+   * `event.sequence` 每次 invoke 重置，只在单次 invoke 内唯一；信封把它原样
+   * 保留，另带 `stream_sequence` 作为 run 内唯一键（引用与对账都靠它）。
+   */
+  append(
+    runId: string,
+    taskId: string,
+    event: DriverStreamEvent,
+    streamSequence?: number,
+  ): Promise<void>;
   flush(runId: string): Promise<void>;
 }
 
@@ -41,7 +51,12 @@ export class FileDriverStreamAuditWriter implements DriverStreamAuditWriter {
     private readonly maxBytesPerRun: number = DEFAULT_DRIVER_STREAM_MAX_BYTES,
   ) {}
 
-  append(runId: string, taskId: string, event: DriverStreamEvent): Promise<void> {
+  append(
+    runId: string,
+    taskId: string,
+    event: DriverStreamEvent,
+    streamSequence?: number,
+  ): Promise<void> {
     const previous = this.queues.get(runId) ?? Promise.resolve();
     const next = previous.then(async () => {
       if (this.truncatedRuns.has(runId)) return;
@@ -53,6 +68,7 @@ export class FileDriverStreamAuditWriter implements DriverStreamAuditWriter {
         run_id: runId,
         task_id: taskId,
         recorded_at: new Date().toISOString(),
+        ...(streamSequence !== undefined ? { stream_sequence: streamSequence } : {}),
       };
       const size = await fs
         .stat(filePath)

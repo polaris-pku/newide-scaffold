@@ -51,8 +51,8 @@ function driverEvent(
   };
 }
 
-function project(event: DriverStreamEvent) {
-  const projected = projectDriverStreamLifecycleEvent(event);
+function project(event: DriverStreamEvent, streamSequence?: number) {
+  const projected = projectDriverStreamLifecycleEvent(event, streamSequence);
   expect(projected).toBeDefined();
   return projected!;
 }
@@ -228,5 +228,40 @@ describe('projectDriverStreamLifecycleEvent —— 大字段外置与内联底�
       sessionEvent('usage_update', { used: 1, size: 2 }, { role_id: 'role_a' }),
     );
     expect(projected.payload.role_id).toBe('role_a');
+  });
+});
+
+describe('projectDriverStreamLifecycleEvent —— run 级唯一序号与引用键', () => {
+  it('优先用 stream_sequence 做引用键，老数据退化为 driver 侧序号', () => {
+    const event = sessionEvent(
+      'agent_message_chunk',
+      { content: { type: 'text', text: 'hi' } },
+      { sequence: 7 },
+    );
+
+    const projected = project(event, 42);
+    expect(projected.payload).toMatchObject({
+      event_sequence: 7,
+      stream_sequence: 42,
+      payload_ref: 'driver-stream.jsonl#stream_sequence=42',
+    });
+
+    const legacy = project(event);
+    expect(legacy.payload.stream_sequence).toBeUndefined();
+    expect(legacy.payload.payload_ref).toBe('driver-stream.jsonl#sequence=7');
+  });
+
+  it('有 stream_sequence 时大字段外置引用也用唯一键', () => {
+    const projected = project(
+      sessionEvent(
+        'tool_call',
+        { toolCallId: 'tc_big', rawInput: { blob: 'x'.repeat(PAYLOAD_INLINE_LIMIT_BYTES) } },
+        { sequence: 7 },
+      ),
+      42,
+    );
+
+    expect(projected.payload.raw_input).toBeUndefined();
+    expect(projected.payload.payload_ref).toBe('driver-stream.jsonl#stream_sequence=42');
   });
 });

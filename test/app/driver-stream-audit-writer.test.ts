@@ -72,6 +72,16 @@ describe('FileDriverStreamAuditWriter', () => {
     expect(lines[1].event).toEqual(chunkEvent(2, 'world'));
   });
 
+  it('carries the run-level stream_sequence in the envelope when given', async () => {
+    const writer = new FileDriverStreamAuditWriter(runsRoot);
+    await writer.append('run_1', 'task_1', chunkEvent(1, 'a'), 5);
+    await writer.append('run_1', 'task_1', chunkEvent(2, 'b'));
+
+    const lines = await readLines(runsRoot, 'run_1');
+    expect(lines[0].stream_sequence).toBe(5);
+    expect(lines[1].stream_sequence).toBeUndefined();
+  });
+
   it('stops appending past the retention cap and leaves one truncation marker', async () => {
     const writer = new FileDriverStreamAuditWriter(runsRoot, 700);
     for (let sequence = 1; sequence <= 4; sequence += 1) {
