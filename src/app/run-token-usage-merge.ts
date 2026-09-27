@@ -19,6 +19,7 @@ import {
   collectClaudeSessionUsage,
   isPopulatedRunTokenUsage,
   mergeTokenUsageSummaries,
+  type RunTokenUsageSummary,
 } from '../telemetry';
 
 export type CollectClaudeSessionUsage = typeof collectClaudeSessionUsage;
@@ -95,8 +96,108 @@ export async function mergeBilledTokenUsage(
   }
 
   raw.token_usage = merged;
+  const driverBilled = buildDriverBilledUsage(merged, raw);
+  if (driverBilled) raw.driver_billed_usage = driverBilled;
   await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
   return { status: 'merged', total_tokens_before: before, total_tokens_after: merged.total_tokens };
+}
+
+/**
+ * summary 的 `driver_billed_usage` 块：driver 侧（真实 coding agent）的**实际计费消耗**。
+ *
+ * 与 `driver_context_usage` 是两种口径，刻意分开命名：那个是上下文占用快照
+ * （`metric: context_tokens_used`，会话结束时上下文有多大），这个是真正烧掉的计费
+ * 流量（input / output / cache_creation / cache_read 细分 + 调用数）。逐会话细分
+ * 并上 `role_id` 与自报成本，让「每个角色 context 占多少、实际烧多少」并排可读。
+ */
+function buildDriverBilledUsage(
+  merged: RunTokenUsageSummary,
+  raw: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const sessions = Object.values(merged.by_session ?? {}).sort((left, right) =>
+    left.session_id.localeCompare(right.session_id),
+  );
+  if (sessions.length === 0) return undefined;
+  const contextBySession = readContextSessionsBySessionId(raw);
+  const leg = merged.by_source.claude_session_jsonl;
+  const totals = leg ??
+    sessions.reduce(
+      (sum, session) => ({
+        input_tokens: sum.input_tokens + session.input_tokens,
+        output_tokens: sum.output_tokens + session.output_tokens,
+        cache_creation_input_tokens:
+          sum.cache_creation_input_tokens + session.cache_creation_input_tokens,
+        cache_read_input_tokens: sum.cache_read_input_tokens + session.cache_read_input_tokens,
+        total_input_tokens: sum.total_input_tokens + session.total_input_tokens,
+        total_tokens: sum.total_tokens + session.total_tokens,
+        call_count: sum.call_count + session.call_count,
+      }),
+      {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        total_input_tokens: 0,
+        total_tokens: 0,
+        call_count: 0,
+      },
+    );
+  return {
+    source: 'claude_session_jsonl',
+    metric: 'billed_tokens',
+    input_tokens: totals.input_tokens,
+    output_tokens: totals.output_tokens,
+    cache_creation_input_tokens: totals.cache_creation_input_tokens,
+    cache_read_input_tokens: totals.cache_read_input_tokens,
+    total_input_tokens: totals.total_input_tokens,
+    total_tokens: totals.total_tokens,
+    call_count: totals.call_count,
+    reported_costs: readContextReportedCosts(raw),
+    sessions: sessions.map((session) => {
+      const context = contextBySession.get(session.session_id);
+      return {
+        ...session,
+        ...(context?.role_id ? { role_id: context.role_id } : {}),
+        ...(context?.reported_cost ? { reported_cost: context.reported_cost } : {}),
+      };
+    }),
+  };
+}
+
+function readContextSessionsBySessionId(
+  raw: Record<string, unknown>,
+): Map<string, { role_id?: string; reported_cost?: unknown }> {
+  const result = new Map<string, { role_id?: string; reported_cost?: unknown }>();
+  for (const session of readContextSessions(raw)) {
+    const sessionId = nonEmptyString(session.session_id);
+    if (!sessionId) continue;
+    result.set(sessionId, {
+      ...(nonEmptyString(session.role_id) ? { role_id: nonEmptyString(session.role_id)! } : {}),
+      ...(session.reported_cost ? { reported_cost: session.reported_cost } : {}),
+    });
+  }
+  return result;
+}
+
+function readContextReportedCosts(raw: Record<string, unknown>): unknown[] {
+  const costs: unknown[] = [];
+  for (const session of readContextSessions(raw)) {
+    if (session.reported_cost) costs.push(session.reported_cost);
+  }
+  return costs;
+}
+
+function readContextSessions(raw: Record<string, unknown>): Array<{
+  session_id?: unknown;
+  role_id?: unknown;
+  reported_cost?: unknown;
+}> {
+  const block = raw.driver_context_usage ?? raw.driver_usage;
+  if (block && typeof block === 'object' && !Array.isArray(block)) {
+    const sessions = (block as { sessions?: unknown }).sessions;
+    if (Array.isArray(sessions)) return sessions as Array<{ session_id?: unknown }>;
+  }
+  return [];
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -106,7 +207,7 @@ function nonEmptyString(value: unknown): string | undefined {
 /**
  * 这个 run 跑过的全部 driver 会话 id，主会话在前。
  *
- * `mergeSummaryExtras` 已经把 `driver_usage` 写进 summary 了，council 的每个角色各占
+ * `mergeSummaryExtras` 已经把 `driver_context_usage` 写进 summary 了，council 的每个角色各占
  * 一条 session——只刮 `session_id` 那一个会漏掉其余角色的全部用量。实测一次四角色
  * council run：summary 只留得下 primary 一个 id，另外三个会话的 token 全在漏。
  */
@@ -117,7 +218,7 @@ function collectDriverSessionIds(raw: Record<string, unknown>, primary?: string)
     if (id && !ids.includes(id)) ids.push(id);
   };
   push(primary);
-  const driverUsage = raw.driver_usage;
+  const driverUsage = raw.driver_context_usage ?? raw.driver_usage;
   if (driverUsage && typeof driverUsage === 'object' && !Array.isArray(driverUsage)) {
     const sessions = (driverUsage as { sessions?: unknown }).sessions;
     if (Array.isArray(sessions)) {

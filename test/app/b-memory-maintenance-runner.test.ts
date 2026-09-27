@@ -637,9 +637,9 @@ describe('BMemoryMaintenanceRunner', () => {
 
     const summary = JSON.parse(await readFile(path.join(runDir, 'summary.json'), 'utf8')) as {
       token_usage?: { source?: string; schema_version?: string };
-      driver_usage?: { source?: string; context_tokens_used?: number };
+      driver_context_usage?: { source?: string; context_tokens_used?: number };
     };
-    expect(summary.driver_usage).toMatchObject({
+    expect(summary.driver_context_usage).toMatchObject({
       source: 'driver_stream_usage_update',
       context_tokens_used: 321,
     });

@@ -8,6 +8,7 @@ import {
   emptyTokenUsageSummary,
   type LlmUsageEntry,
   type RunTokenUsageSummary,
+  type SessionBilledUsage,
   toRunTokenUsageSummary,
 } from './llm-usage-ledger';
 
@@ -123,7 +124,7 @@ export async function collectClaudeSessionUsage(input: {
   /**
    * 一个 run 可能跑过多个 driver 会话——council 每个角色一个，summary 里只留得下
    * 一个 `session_id`。只刮那一个会漏掉其余角色的全部用量，所以调用方要把
-   * `driver_usage.sessions` 里的 id 都传进来。
+   * `driver_context_usage.sessions` 里的 id 都传进来。
    */
   sessionIds?: readonly string[];
   worktreePath: string;
@@ -185,6 +186,9 @@ export async function collectClaudeSessionUsage(input: {
   const entries: LlmUsageEntry[] = [];
   const contributingPaths: string[] = [];
   const contributingSessionIds = new Set<string>();
+  // 逐会话计费细分：一个文件一个会话，按会话累计，供 summary 的
+  // driver_billed_usage 把「每个角色实际烧了多少」与 context 占用并排展示。
+  const bySession = new Map<string, SessionBilledUsage>();
   for (const candidate of candidates) {
     const resolved = path.resolve(candidate);
     if (seenPaths.has(resolved) || !candidate.endsWith('.jsonl')) continue;
@@ -199,21 +203,64 @@ export async function collectClaudeSessionUsage(input: {
       if (usage.entries.length === 0) continue;
       entries.push(...usage.entries);
       contributingPaths.push(candidate);
-      contributingSessionIds.add(usage.session_id ?? baseName);
+      const sessionId = usage.session_id ?? baseName;
+      contributingSessionIds.add(sessionId);
+      bySession.set(
+        sessionId,
+        addSessionBilledUsage(bySession.get(sessionId), sessionId, usage.entries),
+      );
     } catch {
       // try next candidate
     }
   }
 
   if (entries.length === 0) return emptyTokenUsageSummary(withKnownSessionId(input));
-  return toRunTokenUsageSummary(entries, {
-    // 多会话时这两个字段没有单一取值，留空而不是随便挑一个，免得被当成「这个 run
-    // 的 session」读。
-    ...(contributingPaths.length === 1 ? { session_path: contributingPaths[0]! } : {}),
-    ...(contributingSessionIds.size === 1
-      ? { session_id: [...contributingSessionIds][0]! }
+  return {
+    ...toRunTokenUsageSummary(entries, {
+      // 多会话时这两个字段没有单一取值，留空而不是随便挑一个，免得被当成「这个 run
+      // 的 session」读。
+      ...(contributingPaths.length === 1 ? { session_path: contributingPaths[0]! } : {}),
+      ...(contributingSessionIds.size === 1
+        ? { session_id: [...contributingSessionIds][0]! }
+        : {}),
+    }),
+    ...(bySession.size > 0
+      ? {
+          by_session: Object.fromEntries(
+            [...bySession.entries()].sort(([left], [right]) => left.localeCompare(right)),
+          ),
+        }
       : {}),
-  });
+  };
+}
+
+/** 把一个会话的一批（已按 messageId 去重的）计费记录累进该会话的细分。 */
+function addSessionBilledUsage(
+  previous: SessionBilledUsage | undefined,
+  sessionId: string,
+  entries: readonly LlmUsageEntry[],
+): SessionBilledUsage {
+  const next: SessionBilledUsage = previous ?? {
+    session_id: sessionId,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    total_input_tokens: 0,
+    total_tokens: 0,
+    call_count: 0,
+  };
+  for (const entry of entries) {
+    next.input_tokens += entry.input_tokens;
+    next.output_tokens += entry.output_tokens;
+    next.cache_creation_input_tokens += entry.cache_creation_input_tokens ?? 0;
+    next.cache_read_input_tokens += entry.cache_read_input_tokens ?? 0;
+    next.call_count += 1;
+  }
+  next.total_input_tokens =
+    next.input_tokens + next.cache_creation_input_tokens + next.cache_read_input_tokens;
+  next.total_tokens = next.total_input_tokens + next.output_tokens;
+  return next;
 }
 
 function distinctSessionIds(candidates: readonly (string | undefined)[]): string[] {
@@ -285,6 +332,31 @@ export function mergeTokenUsageSummaries(
   const session = usable.find((part) => part.session_id);
   const sessionPath = usable.find((part) => part.session_path);
 
+  // 逐会话细分同样求和合并；同会话出现在多份里时按字段累加（与 by_source 同规）。
+  const bySession = new Map<string, SessionBilledUsage>();
+  for (const part of usable) {
+    for (const [sessionId, sessionUsage] of Object.entries(part.by_session ?? {})) {
+      const prev = bySession.get(sessionId);
+      bySession.set(
+        sessionId,
+        prev
+          ? {
+              session_id: sessionId,
+              input_tokens: prev.input_tokens + sessionUsage.input_tokens,
+              output_tokens: prev.output_tokens + sessionUsage.output_tokens,
+              cache_creation_input_tokens:
+                prev.cache_creation_input_tokens + sessionUsage.cache_creation_input_tokens,
+              cache_read_input_tokens:
+                prev.cache_read_input_tokens + sessionUsage.cache_read_input_tokens,
+              total_input_tokens: prev.total_input_tokens + sessionUsage.total_input_tokens,
+              total_tokens: prev.total_tokens + sessionUsage.total_tokens,
+              call_count: prev.call_count + sessionUsage.call_count,
+            }
+          : { ...sessionUsage },
+      );
+    }
+  }
+
   return {
     schema_version: 'newide.token_usage.v1',
     source: sources.length === 1 ? (sources[0] ?? 'unavailable') : 'mixed',
@@ -297,6 +369,13 @@ export function mergeTokenUsageSummaries(
     call_count: usable.reduce((sum, part) => sum + part.call_count, 0),
     sources,
     by_source,
+    ...(bySession.size > 0
+      ? {
+          by_session: Object.fromEntries(
+            [...bySession.entries()].sort(([left], [right]) => left.localeCompare(right)),
+          ),
+        }
+      : {}),
     ...(session?.session_id ? { session_id: session.session_id } : {}),
     ...(sessionPath?.session_path ? { session_path: sessionPath.session_path } : {}),
   };

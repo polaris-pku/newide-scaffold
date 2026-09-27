@@ -52,11 +52,25 @@ export interface LlmUsageTotals {
   by_source: Partial<Record<LlmUsageSource, Omit<LlmUsageTotals, 'by_source' | 'sources'>>>;
 }
 
+/** 单个 driver 会话的实际计费细分（按 session JSONL 逐会话汇总）。 */
+export interface SessionBilledUsage {
+  session_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  total_input_tokens: number;
+  total_tokens: number;
+  call_count: number;
+}
+
 export interface RunTokenUsageSummary extends LlmUsageTotals {
   schema_version: 'newide.token_usage.v1';
   source: LlmUsageSource | 'mixed' | 'unavailable';
   session_id?: string;
   session_path?: string;
+  /** 逐会话计费细分（键为 session id）；只有刮取到会话级数据时才有。 */
+  by_session?: Record<string, SessionBilledUsage>;
 }
 
 export interface LlmUsageLedger {

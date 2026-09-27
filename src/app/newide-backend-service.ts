@@ -108,6 +108,7 @@ import {
   FileDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
+import { TaskDriverUsageAccumulator, type TaskDriverUsage } from './driver-usage-projector';
 import { projectDriverStreamLifecycleEvent } from './driver-stream-projection';
 import {
   createUnavailableSystemStatusService,
@@ -243,6 +244,11 @@ export class NewideBackendService {
   private readonly runWorkspaces = new Map<string, string>();
   private readonly taskListeners = new Map<string, Set<(event: AppRunEvent) => void>>();
   private readonly pendingRunStarts = new Set<PendingRunStart>();
+  /**
+   * 任务级 driver usage 累加器：事件流到达即折叠，是 `summary.driver_context_usage` 的
+   * 正源；文件回读退为截断/崩溃时的兜底。见 driver-usage-projector 的类文档。
+   */
+  private readonly driverUsageByTask = new Map<string, TaskDriverUsageAccumulator>();
   private closing = false;
   private closePromise?: Promise<void>;
 
@@ -250,7 +256,12 @@ export class NewideBackendService {
     private readonly runner: CoordinatorRunner = new IntegrationV0CoordinatorRunner(),
     private readonly registry = new InMemoryRunRegistry(),
     private readonly auditWriter: RunAuditWriter = new FileRunAuditWriter(),
-    private readonly terminalWriter: RunTerminalOutputWriter = new FileRunTerminalOutputWriter(),
+    private readonly terminalWriter: RunTerminalOutputWriter = new FileRunTerminalOutputWriter(
+      undefined,
+      undefined,
+      undefined,
+      (taskId) => this.getAccumulatedDriverUsage(taskId),
+    ),
     private readonly requestStore: RunRequestStore = new FileRunRequestStore(),
     private readonly taskProcessor?: TaskProcessor,
     private readonly mailboxService?: PersistentMailboxService,
@@ -1668,11 +1679,26 @@ export class NewideBackendService {
     identity: { run_id: string; task_id: string },
     event: DriverStreamEvent,
   ): void {
+    // usage 观测在这里进正源（进程内累加），文件回读只是兜底。
+    this.driverUsageFor(identity.task_id).observe(event);
     void this.driverStreamAuditWriter
       .append(identity.run_id, identity.task_id, event)
       .catch(() => undefined);
     const projected = projectDriverStreamLifecycleEvent(event);
     if (projected) this.appendDomainEvent(identity, projected);
+  }
+
+  /** 任务级 driver usage 累加器（事件流正源）的当前快照；无观测返回 undefined。 */
+  getAccumulatedDriverUsage(taskId: string): TaskDriverUsage | undefined {
+    return this.driverUsageByTask.get(taskId)?.finalize();
+  }
+
+  private driverUsageFor(taskId: string): TaskDriverUsageAccumulator {
+    const existing = this.driverUsageByTask.get(taskId);
+    if (existing) return existing;
+    const created = new TaskDriverUsageAccumulator();
+    this.driverUsageByTask.set(taskId, created);
+    return created;
   }
 
   private async persistTerminal(runId: string, staged: StagedTerminalTransition): Promise<void> {

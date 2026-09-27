@@ -261,7 +261,7 @@ describe('FileRunTerminalOutputWriter', () => {
 
     const summary = await readJson(path.join(runDir, 'summary.json'));
     expect(summary).toMatchObject({
-      driver_usage: {
+      driver_context_usage: {
         available: true,
         source: 'driver_stream_usage_update',
         context_tokens_used: 321,
@@ -271,7 +271,7 @@ describe('FileRunTerminalOutputWriter', () => {
     expect(summary).not.toHaveProperty('token_usage');
   });
 
-  it('merges driver_usage into an existing v1 summary without replacing billed tokens', async () => {
+  it('merges driver_context_usage into an existing v1 summary without replacing billed tokens', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
     tempDirs.push(runsRoot);
     const runDir = path.join(runsRoot, 'run_failed');
@@ -321,7 +321,7 @@ describe('FileRunTerminalOutputWriter', () => {
         total_tokens: 15,
         call_count: 1,
       },
-      driver_usage: {
+      driver_context_usage: {
         available: true,
         source: 'driver_stream_usage_update',
         context_tokens_used: 321,
@@ -333,6 +333,36 @@ describe('FileRunTerminalOutputWriter', () => {
         totals: { events: 1 },
       },
     });
+  });
+
+  it('migrates a legacy driver_usage block to driver_context_usage', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_failed');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, 'summary.json'),
+      `${JSON.stringify({
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        driver_usage: {
+          available: true,
+          source: 'driver_stream_usage_update',
+          metric: 'context_tokens_used',
+          context_tokens_used: 321,
+          reported_costs: [],
+          sessions: [{ session_id: 'session_usage', role_id: 'role_usage', complete: true }],
+          complete: true,
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
+
+    const summary = await readJson(path.join(runDir, 'summary.json'));
+    expect(summary.driver_context_usage).toMatchObject({ context_tokens_used: 321 });
+    expect(summary).not.toHaveProperty('driver_usage');
   });
 
   it('preserves memory ablation in summary when execution fails before context build', async () => {
