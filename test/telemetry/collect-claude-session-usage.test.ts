@@ -66,6 +66,77 @@ describe('collectClaudeSessionUsage', () => {
     });
   });
 
+  it('reports per-session billed detail in by_session', async () => {
+    const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
+    tempDirs.push(sandboxHome);
+    const projectDir = path.join(sandboxHome, '.claude', 'projects', '-eval-by-session');
+    await mkdir(projectDir, { recursive: true });
+    const sessionLine = (
+      sessionId: string,
+      input: number,
+      output: number,
+      cacheRead: number,
+    ): string =>
+      JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          id: `msg_${sessionId}`,
+          usage: {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cacheRead,
+          },
+        },
+      });
+    await writeFile(
+      path.join(projectDir, 'session-one.jsonl'),
+      `${sessionLine('session-one', 100, 10, 50)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(projectDir, 'session-two.jsonl'),
+      `${sessionLine('session-two', 200, 20, 80)}\n`,
+      'utf8',
+    );
+
+    process.env.ACP_PROCESS_SANDBOX_HOME = sandboxHome;
+    process.env.HOME = path.join(sandboxHome, 'missing-user-home');
+    delete process.env.USERPROFILE;
+
+    const result = await collectClaudeSessionUsage({
+      sessionIds: ['session-one', 'session-two'],
+      worktreePath: '/tmp/does-not-match-project-encoding/repo',
+    });
+
+    // by_session 是「每个会话实际烧了多少」的细分，与总量同源同规（含 cache 口径）。
+    expect(result.by_session).toEqual({
+      'session-one': {
+        session_id: 'session-one',
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 50,
+        total_input_tokens: 150,
+        total_tokens: 160,
+        call_count: 1,
+      },
+      'session-two': {
+        session_id: 'session-two',
+        input_tokens: 200,
+        output_tokens: 20,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 80,
+        total_input_tokens: 280,
+        total_tokens: 300,
+        call_count: 1,
+      },
+    });
+    expect(result.total_tokens).toBe(460);
+    expect(result.call_count).toBe(2);
+  });
+
   it('counts an assistant message once when Claude Code writes the same message twice', async () => {
     const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
     tempDirs.push(sandboxHome);

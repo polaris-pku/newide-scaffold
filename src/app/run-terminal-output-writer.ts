@@ -194,7 +194,7 @@ function buildBackendSummary(
     artifacts_materialized: projected.artifacts.length,
     ...(proxyTokenUsage ? { token_usage: proxyTokenUsage } : {}),
     consumption,
-    ...(tokenUsage.available ? { driver_usage: tokenUsage } : {}),
+    ...(tokenUsage.available ? { driver_context_usage: tokenUsage } : {}),
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     result_path: paths.result_path,
     summary_path: paths.summary_path,
@@ -298,12 +298,22 @@ async function mergeSummaryExtras(
   try {
     const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
     const preferred = preferDriverUsage(
-      isDriverStreamUsage(raw.driver_usage) ? raw.driver_usage : raw.token_usage,
+      isDriverStreamUsage(raw.driver_context_usage)
+        ? raw.driver_context_usage
+        : isDriverStreamUsage(raw.driver_usage)
+          ? raw.driver_usage
+          : raw.token_usage,
       driverUsage,
     );
     let changed = false;
-    if (preferred && raw.driver_usage !== preferred) {
-      raw.driver_usage = preferred;
+    if (preferred && raw.driver_context_usage !== preferred) {
+      raw.driver_context_usage = preferred;
+      changed = true;
+    }
+    // 老 summary 的旧块名迁到新键：driver_context_usage 才是「上下文占用」的正式口径
+    // 名，旧名 driver_usage 容易被误读成消耗量（实际消耗在 driver_billed_usage）。
+    if (raw.driver_usage !== undefined) {
+      delete raw.driver_usage;
       changed = true;
     }
     if (isDriverStreamUsage(raw.token_usage)) {

@@ -48,7 +48,7 @@ interface MutableSessionUsage extends DriverSessionUsage {
 }
 
 /**
- * 任务级 usage 累加器：事件流到达即折叠，是 `summary.driver_usage` 的正源。
+ * 任务级 usage 累加器：事件流到达即折叠，是 `summary.driver_context_usage` 的正源。
  * 相比回读审计文件，它不受保留上限截断影响——截断只砍文件，砍不到进程内存。
  */
 export class TaskDriverUsageAccumulator {

@@ -245,7 +245,7 @@ export class NewideBackendService {
   private readonly taskListeners = new Map<string, Set<(event: AppRunEvent) => void>>();
   private readonly pendingRunStarts = new Set<PendingRunStart>();
   /**
-   * 任务级 driver usage 累加器：事件流到达即折叠，是 `summary.driver_usage` 的
+   * 任务级 driver usage 累加器：事件流到达即折叠，是 `summary.driver_context_usage` 的
    * 正源；文件回读退为截断/崩溃时的兜底。见 driver-usage-projector 的类文档。
    */
   private readonly driverUsageByTask = new Map<string, TaskDriverUsageAccumulator>();

@@ -9,17 +9,49 @@ import { emptyTokenUsageSummary, toRunTokenUsageSummary } from '../../src/teleme
 
 const tempDirs: string[] = [];
 
-/** driver 侧刮出来的那部分：input+cache_read 进 total_input，再加 output。 */
-const CLAUDE_SCRAPED = toRunTokenUsageSummary([
-  {
-    input_tokens: 5000,
-    output_tokens: 500,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 2000,
-    source: 'claude_session_jsonl',
-    recorded_at: '2026-09-19T00:00:00.000Z',
+/** driver 侧刮出来的那部分：input+cache_read 进 total_input，再加 output。两个会话各一条。 */
+const CLAUDE_SCRAPED = {
+  ...toRunTokenUsageSummary([
+    {
+      input_tokens: 3000,
+      output_tokens: 300,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 1200,
+      source: 'claude_session_jsonl',
+      recorded_at: '2026-09-19T00:00:00.000Z',
+    },
+    {
+      input_tokens: 2000,
+      output_tokens: 200,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 800,
+      source: 'claude_session_jsonl',
+      recorded_at: '2026-09-19T00:00:01.000Z',
+    },
+  ]),
+  by_session: {
+    session_a: {
+      session_id: 'session_a',
+      input_tokens: 3000,
+      output_tokens: 300,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 1200,
+      total_input_tokens: 4200,
+      total_tokens: 4500,
+      call_count: 1,
+    },
+    session_b: {
+      session_id: 'session_b',
+      input_tokens: 2000,
+      output_tokens: 200,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 800,
+      total_input_tokens: 2800,
+      total_tokens: 3000,
+      call_count: 1,
+    },
   },
-]);
+};
 const CLAUDE_SCRAPED_TOTAL = 5000 + 2000 + 500;
 
 const PROXY_TOKEN_USAGE = {
@@ -122,6 +154,29 @@ describe('mergeBilledTokenUsage', () => {
   it('scrapes every driver session the run reported, not just the primary one', async () => {
     const runsRoot = await makeRunsRoot();
     const summaryPath = await writeSummary(runsRoot, 'run_multi', PROXY_TOKEN_USAGE, {
+      driver_context_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        metric: 'context_tokens_used',
+        context_tokens_used: 10,
+        reported_costs: [],
+        sessions: [{ session_id: 'session_a' }, { session_id: 'session_b' }],
+        complete: true,
+      },
+    });
+    const collect = vi.fn(async () => CLAUDE_SCRAPED);
+
+    await mergeBilledTokenUsage(summaryPath, collect);
+
+    // session_id 是 'session_a'（writeSummary 默认），driver_context_usage 里还有 session_b。
+    expect(collect).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionIds: ['session_a', 'session_b'] }),
+    );
+  });
+
+  it('still collects session ids from the legacy driver_usage block', async () => {
+    const runsRoot = await makeRunsRoot();
+    const summaryPath = await writeSummary(runsRoot, 'run_legacy', PROXY_TOKEN_USAGE, {
       driver_usage: {
         available: true,
         source: 'driver_stream_usage_update',
@@ -135,10 +190,97 @@ describe('mergeBilledTokenUsage', () => {
 
     await mergeBilledTokenUsage(summaryPath, collect);
 
-    // session_id 是 'session_a'（writeSummary 默认），driver_usage 里还有 session_b。
     expect(collect).toHaveBeenCalledWith(
       expect.objectContaining({ sessionIds: ['session_a', 'session_b'] }),
     );
+  });
+
+  it('writes driver_billed_usage with per-session billed detail and roles', async () => {
+    const runsRoot = await makeRunsRoot();
+    const summaryPath = await writeSummary(runsRoot, 'run_billed', PROXY_TOKEN_USAGE, {
+      driver_context_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        metric: 'context_tokens_used',
+        context_tokens_used: 40,
+        reported_costs: [{ amount: 0.5, currency: 'USD' }],
+        sessions: [
+          {
+            session_id: 'session_a',
+            role_id: 'role_a',
+            context_tokens_used: 10,
+            reported_cost: { amount: 0.5, currency: 'USD' },
+            complete: true,
+          },
+          { session_id: 'session_b', role_id: 'role_b', context_tokens_used: 30, complete: true },
+        ],
+        complete: true,
+      },
+    });
+
+    await mergeBilledTokenUsage(summaryPath, async () => CLAUDE_SCRAPED);
+
+    const written = JSON.parse(await readFile(summaryPath, 'utf8')) as {
+      driver_billed_usage: Record<string, unknown>;
+    };
+    expect(written.driver_billed_usage).toMatchObject({
+      source: 'claude_session_jsonl',
+      metric: 'billed_tokens',
+      input_tokens: 5000,
+      output_tokens: 500,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 2000,
+      total_input_tokens: 7000,
+      total_tokens: 7500,
+      call_count: 2,
+      reported_costs: [{ amount: 0.5, currency: 'USD' }],
+    });
+    // 逐会话：实际计费 + role_id + 自报成本并排，与 context 占用是两个口径。
+    expect(written.driver_billed_usage.sessions).toEqual([
+      {
+        session_id: 'session_a',
+        input_tokens: 3000,
+        output_tokens: 300,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 1200,
+        total_input_tokens: 4200,
+        total_tokens: 4500,
+        call_count: 1,
+        role_id: 'role_a',
+        reported_cost: { amount: 0.5, currency: 'USD' },
+      },
+      {
+        session_id: 'session_b',
+        input_tokens: 2000,
+        output_tokens: 200,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 800,
+        total_input_tokens: 2800,
+        total_tokens: 3000,
+        call_count: 1,
+        role_id: 'role_b',
+      },
+    ]);
+  });
+
+  it('omits driver_billed_usage when the scrape has no per-session detail', async () => {
+    const runsRoot = await makeRunsRoot();
+    const summaryPath = await writeSummary(runsRoot, 'run_noby', PROXY_TOKEN_USAGE);
+
+    await mergeBilledTokenUsage(summaryPath, async () =>
+      toRunTokenUsageSummary([
+        {
+          input_tokens: 100,
+          output_tokens: 10,
+          source: 'claude_session_jsonl',
+          recorded_at: '2026-09-19T00:00:00.000Z',
+        },
+      ]),
+    );
+
+    const written = JSON.parse(await readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+    expect(written.driver_billed_usage).toBeUndefined();
+    expect(written.token_usage.total_tokens).toBe(1500 + 110);
   });
 
   it('is idempotent: merging twice does not count the same tokens twice', async () => {
