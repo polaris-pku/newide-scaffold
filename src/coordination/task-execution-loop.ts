@@ -448,6 +448,13 @@ export class TaskExecutionLoop {
       }
     } catch (error) {
       if (error instanceof TaskProcessorStageCommitError) throw error;
+      if (controls.signal?.aborted) {
+        const cancelled = this.processor.finishRun({
+          run_id: state.run_id,
+          status: 'cancelled',
+        });
+        return { snapshot: cancelled, committed_events: [] };
+      }
       const failureError = error instanceof StageAdvanceError ? error.originalError : error;
       const failure = stageFailure(failureError, cursorInput.cursor);
       const resultEvidence = error instanceof StageAdvanceError ? error.evidenceRef : undefined;
@@ -467,6 +474,14 @@ export class TaskExecutionLoop {
         error: failure,
         ...(failureEvidence ? { evidence_ref: failureEvidence } : {}),
         ...(resultEvidence ? { artifact_refs: [resultEvidence.uri] } : {}),
+        ...(sapDispatch
+          ? {
+              sap_cancel: {
+                dispatch: sapDispatch,
+                frame: this.sapBridge!.createCancel({ execute: sapDispatch.frame }),
+              },
+            }
+          : {}),
       });
       this.notifyCommittedEvents(controls, committed.committed_events);
       return committed;

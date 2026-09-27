@@ -327,6 +327,28 @@ describe('TaskExecutionLoop', () => {
     });
   });
 
+  it('cancels an admitted SAP execute when the Agent stage fails', async () => {
+    const fixture = createFixture({ sapEnabled: true, failAt: 'execute_agent' });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const failed = await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(failed.task.status).toBe('failed');
+    expect(fixture.store.getOutbox('outbox_sap_cancel_sap_invocation_execute_agent')).toMatchObject({
+      status: 'pending',
+      frame: {
+        command: 'agent.cancel',
+        causation_id: 'sap_invocation_execute_agent',
+        target_exchange_id: 'sap_invocation_execute_agent',
+      },
+    });
+    expect(fixture.store.getInbox({
+      consumer_id: 'agent_a',
+      protocol: 'system-agent',
+      exchange_id: 'sap_invocation_execute_agent',
+    })).toMatchObject({ status: 'processing' });
+  });
+
   it('fails the active stage when evidence cannot be persisted', async () => {
     const fixture = createFixture({ evidenceFailureAt: 'execute_agent' });
     begin(fixture.processor, selectInput, 'single_agent');

@@ -34,6 +34,7 @@ import { projectPersistedRunSnapshot } from '../app/task-run-snapshot-projector'
 import { projectTaskSnapshot, type TaskRunFact } from '../app/task-snapshot-projector';
 import type { ParticipantSessionRegistry } from './participant-session-registry';
 import type {
+  SapCancelFrame,
   SapExecuteDispatch,
   SapExecutionAdmission,
   SapResultFrame,
@@ -102,6 +103,7 @@ export interface FailTaskStageInput extends StartTaskStageInput {
   owner_agent_id?: string;
   session_id?: string;
   sap_result?: { admission: SapExecutionAdmission; frame: SapResultFrame };
+  sap_cancel?: { dispatch: SapExecuteDispatch; frame: SapCancelFrame };
 }
 
 export interface TaskStageCommitResult {
@@ -622,13 +624,19 @@ export class TaskProcessor {
       },
       events: [event, terminalEvent],
     };
-    const committed = input.sap_result
-      ? this.requireSapBridge().commitResult(
+    const committed = input.sap_cancel
+      ? this.requireSapBridge().commitCancel(
+          commit,
+          input.sap_cancel.dispatch,
+          input.sap_cancel.frame,
+        )
+      : input.sap_result
+        ? this.requireSapBridge().commitResult(
           commit,
           input.sap_result.admission,
           input.sap_result.frame,
-        )
-      : this.store.commitState(commit);
+          )
+        : this.store.commitState(commit);
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,

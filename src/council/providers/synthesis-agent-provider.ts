@@ -659,6 +659,12 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         }
         throw error;
       }
+      if (sapDispatch && this.sapBridge && sapAdmission) {
+        this.sapBridge.enqueueCancel(
+          sapDispatch,
+          this.sapBridge.createCancel({ execute: sapDispatch.frame }),
+        );
+      }
       const failure = new CouncilRoleExecutionError(
         phase,
         participant,
@@ -672,6 +678,12 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         },
       );
       throw failure;
+    }
+    if (sapDispatch && sapAdmission && this.sapBridge && result.status === 'interrupted') {
+      this.sapBridge.enqueueCancel(
+        sapDispatch,
+        this.sapBridge.createCancel({ execute: sapDispatch.frame }),
+      );
     }
     if (sapDispatch && sapAdmission && this.sapBridge && result.status !== 'interrupted') {
       const disposition = this.sapBridge.acceptResult(
