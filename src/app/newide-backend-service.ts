@@ -105,7 +105,7 @@ import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { AgentMetaPatch, BMemoryBackendService } from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
 import {
-  NoopDriverStreamAuditWriter,
+  FileDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
 import {
@@ -256,7 +256,12 @@ export class NewideBackendService {
     private readonly mailboxRecovery: Promise<unknown> = Promise.resolve(),
     private readonly closeRuntime: () => Promise<void> | void = () => undefined,
     private readonly bMemoryService?: BMemoryBackendService,
-    private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new NoopDriverStreamAuditWriter(),
+    /**
+     * driver 事件流的全量落盘。默认落文件，与 auditWriter / terminalWriter 同款
+     * ——它是投影丢事件时唯一的真相源，不该依赖组装者记得注入。测试要静默时
+     * 显式传 `new NoopDriverStreamAuditWriter()`。
+     */
+    private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new FileDriverStreamAuditWriter(),
     private readonly taskExecutionLoop?: TaskExecutionLoop,
     private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
     private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,

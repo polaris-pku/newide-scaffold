@@ -14,6 +14,7 @@ import { InMemoryRunRegistry, type AppRunEvent } from '../../src/app/run-registr
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
+import { NoopDriverStreamAuditWriter } from '../../src/app/driver-stream-audit-writer';
 import {
   TaskExecutionLoop,
   TaskProcessor,
@@ -261,7 +262,7 @@ describe('NewideBackendService Task-first view', () => {
       undefined, // mailboxRecovery
       undefined, // closeRuntime
       undefined, // bMemoryService
-      undefined, // driverStreamAuditWriter
+      new NoopDriverStreamAuditWriter(), // driverStreamAuditWriter
       loop,
       undefined, // systemStatusService
       undefined, // mailboxDeliveryWorker
