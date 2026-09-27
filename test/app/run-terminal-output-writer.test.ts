@@ -407,6 +407,24 @@ describe('summarizeRunConsumption', () => {
     expect(summary).not.toHaveProperty('latency_by_name');
   });
 
+  it('keeps driver stream projections out of stage counts and in their own bucket', () => {
+    const summary = summarizeRunConsumption([
+      { type: 'handler.started', payload: { cursor: 'execute_agent' } },
+      { type: 'driver.agent_message_chunk', payload: { event_sequence: 1, session_id: 's1' } },
+      { type: 'driver.tool_started', payload: { event_sequence: 2, tool_call_id: 'tc_1' } },
+      { type: 'driver.agent_message_chunk', payload: { event_sequence: 3 } },
+      // 阶段自己发的 driver.* 领域事件没有 event_sequence，仍算阶段做功。
+      { type: 'driver.run_result', payload: { status: 'succeeded' } },
+      { type: 'handler.completed', payload: { cursor: 'execute_agent', next_cursor: 'gate' } },
+    ]);
+
+    // started / run_result / completed 三条是阶段做功；三条流投影不占它的计数。
+    expect(summary.by_stage.execute_agent).toMatchObject({ events: 3 });
+    expect(summary.by_stage.driver_stream).toMatchObject({ events: 3 });
+    // 总数是各桶之和：driver_stream 计入总数，但不占阶段的计数。
+    expect(summary.totals.events).toBe(6);
+  });
+
   it('folds stage spans into stage durations and keeps the rest by name', () => {
     const summary = summarizeRunConsumption(
       [{ type: 'handler.started', payload: { cursor: 'gate' } }],
