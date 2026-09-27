@@ -505,11 +505,16 @@ export async function createProductionBackendService(
     )
       ? new FileRunTelemetryJsonlSink(runsRoot)
       : new NoopTelemetrySink();
+    // terminalWriter 的 usage 正源回调要引用 service，而 service 尚在构造中：用可变
+    // 持有对象让回调在 finalize 时（构造早已完成）取到进程内累加器，截断缺尾由此补全。
+    const serviceHolder: { service?: NewideBackendService } = {};
     const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
-      new FileRunTerminalOutputWriter(runsRoot, runLatency),
+      new FileRunTerminalOutputWriter(runsRoot, runLatency, undefined, (taskId) =>
+        serviceHolder.service?.getAccumulatedDriverUsage(taskId),
+      ),
       new FileRunRequestStore(runsRoot),
       taskProcessor,
       mailboxService,
@@ -529,6 +534,7 @@ export async function createProductionBackendService(
       new FileRunEventConsumptionSink(runsRoot),
       runTelemetryJsonlSink,
     );
+    serviceHolder.service = service;
     await service.recoverMailboxWaits();
     return service;
   } catch (error) {
