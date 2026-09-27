@@ -299,6 +299,13 @@ export async function createProductionBackendService(
       // B1 调用留档与 mailbox.sessionRegistry 无关：journal 用自己持有的注册表引用，
       // ephemeral 会话下注册表为空 → session_id 记 null（规定回退）。
       callJournal: protocolCallJournal,
+      // A1 / issue #149:生产路径的驱动调用经 System 内代理 A/D 的 ADP endpoint
+      // 走 invoke/result/cancel;unknown 永不自动重跑,failed 的自动重试只看
+      // 部署级 auto_retry[side_effect](.env.example)。
+      adp: {
+        store: coordinationStore,
+        side_effect: 'workspace_write',
+      },
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),

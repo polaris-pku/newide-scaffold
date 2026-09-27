@@ -73,6 +73,13 @@ import {
   createDriverRuntimeInvoker,
   type DriverRuntimeInvokerInput,
 } from '../driver/driver-runtime-invoker';
+import {
+  AdpDriverEndpoint,
+  type AdpReceiptDelivery,
+} from '../driver/adp-driver-endpoint';
+import type { AdpSideEffect } from '../core';
+import type { AdpRetryPolicy } from '../driver/adp-retry-policy';
+import type { ProtocolDeliveryStore } from '../persistence';
 import { runWithLlmUsageAttribution } from '../telemetry';
 import type {
   AgentContextPackEvidence,
@@ -93,6 +100,23 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   memoryMaintenance?: BMemoryMaintenancePort;
   /** 进程内调用留档（B1）：注入后 memory_query 调用收尾写 P1 journal；缺省不留档 */
   callJournal?: CallJournalPort;
+  /**
+   * ADP 接入（A1 / issue #149）：配置后 invoke_driver 经 System 内代理 A/D 的
+   * ADP endpoint 走 invoke/result/cancel，unknown 永不自动重跑、failed 的自动
+   * 重试只看部署级 auto_retry[side_effect]。缺省保持历史行为（不走协议）。
+   */
+  adp?: {
+    store: ProtocolDeliveryStore;
+    /** 应用装配声明的副作用分级（进 invoke 帧），缺省 workspace_write */
+    side_effect?: AdpSideEffect;
+    retryPolicy?: AdpRetryPolicy;
+    maxAutoRetries?: number;
+    deadlineSeconds?: number;
+    /** 回执经宿主内回调交还 Agent 的观察口 */
+    onReceipt?: (delivery: AdpReceiptDelivery) => void;
+    /** 外层 SAP execute 的 exchange_id 解析（C1 接入点）；缺省恒 null */
+    resolveCausationId?: (context: { task_id: string; run_id: string }) => string | null;
+  };
   mailbox?: {
     service: PersistentMailboxService;
     /** 协作名册：静态数组或动态提供者（每次使用时查询，支持运行时新增 Agent） */
@@ -142,9 +166,24 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
   private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
+  private readonly adpEndpoint?: AdpDriverEndpoint;
 
   constructor(private readonly options: DriverRuntimeAgentExecutionFacadeOptions) {
     this.invokeDriverRuntime = createDriverRuntimeInvoker(options.driver);
+    if (options.adp) {
+      this.adpEndpoint = new AdpDriverEndpoint({
+        store: options.adp.store,
+        side_effect: options.adp.side_effect ?? 'workspace_write',
+        ...(options.adp.retryPolicy ? { retryPolicy: options.adp.retryPolicy } : {}),
+        ...(options.adp.maxAutoRetries !== undefined
+          ? { maxAutoRetries: options.adp.maxAutoRetries }
+          : {}),
+        ...(options.adp.deadlineSeconds !== undefined
+          ? { deadlineSeconds: options.adp.deadlineSeconds }
+          : {}),
+        ...(options.adp.onReceipt ? { onReceipt: options.adp.onReceipt } : {}),
+      });
+    }
     this.manager = this.createManager();
   }
 
@@ -903,7 +942,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ]),
       };
       invocation.driver_invocation_context = driverInvocationContext;
-      const invoke = () => {
+      const invokeRuntime = (hooks?: {
+        onDispatch?: () => void;
+        onLateResult?: (execution: DriverRunResult) => void;
+      }) => {
         invocation.driver_attempts += 1;
         return this.invokeDriverRuntime(
           {
@@ -915,18 +957,51 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             source_driver: this.options.driver.driver_id,
             driver_context: driverInvocationContext,
           },
-          invocation.signal || invocation.onDriverEvent
+          invocation.signal || invocation.onDriverEvent || hooks
             ? {
                 ...(invocation.signal ? { signal: invocation.signal } : {}),
                 ...(invocation.onDriverEvent ? { onDriverEvent: invocation.onDriverEvent } : {}),
+                ...(hooks?.onDispatch ? { onDispatch: hooks.onDispatch } : {}),
+                ...(hooks?.onLateResult ? { onLateResult: hooks.onLateResult } : {}),
               }
             : undefined,
         );
       };
-      let result = await invoke();
+
+      if (this.adpEndpoint) {
+        // A1 / issue #149:经 ADP endpoint 走 invoke/result/cancel。unknown 永不
+        // 自动重跑,failed 的自动重试只看部署级 auto_retry[side_effect];
+        // error.retryable 仅作提示,不驱动任何重试。
+        const outcome = await this.adpEndpoint.invoke({
+          task_id: invocation.task_id,
+          run_id: invocation.run_id,
+          workspace_path: invocation.workspace_path ?? process.cwd(),
+          instruction: invocation.driver_instruction,
+          causation_id:
+            this.options.adp?.resolveCausationId?.({
+              task_id: invocation.task_id,
+              run_id: invocation.run_id,
+            }) ?? null,
+          execute: (execInput) =>
+            invokeRuntime({
+              onDispatch: execInput.control.markDispatched,
+              ...(execInput.onLateResult ? { onLateResult: execInput.onLateResult } : {}),
+            }),
+          ...(invocation.onDriverEvent ? { onEvent: invocation.onDriverEvent } : {}),
+        });
+        if (outcome.state === 'in_flight') {
+          throw new Error(`driver invocation ${outcome.exchange_id} is already in flight`);
+        }
+        if (outcome.thrown !== undefined) throw outcome.thrown;
+        if (outcome.execution) invocation.execution = outcome.execution;
+        if (outcome.report) return outcome.report;
+        throw new Error(`driver invocation ${outcome.exchange_id} settled without a report`);
+      }
+
+      let result = await invokeRuntime();
       if (isArtifactFreeRetryableFailure(result.execution)) {
         throwIfAborted(invocation.signal);
-        result = await invoke();
+        result = await invokeRuntime();
       }
       invocation.execution = result.execution;
       return result.report;

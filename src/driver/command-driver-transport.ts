@@ -14,6 +14,7 @@ import type {
   DriverStreamEventListener,
 } from './contract';
 import { assertDriverRunResult, type ExternalDriverTransport } from './external-driver-runtime';
+import { DriverTransportError } from './driver-transport-error';
 
 export const DRIVER_EVENT_PREFIX = 'NEWIDE_DRIVER_EVENT ';
 
@@ -111,7 +112,13 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   private execute(input: DriverPrompt): Promise<string> {
     return new Promise((resolve, reject) => {
       if (this.activeChildren.has(input.run_id)) {
-        reject(new Error(`Command driver run ${input.run_id} is already active`));
+        // 本次 prompt 从未交付给任何进程 → 明确证据「未执行」（A1 证据模型）。
+        reject(
+          new DriverTransportError(
+            `Command driver run ${input.run_id} is already active`,
+            'not_executed',
+          ),
+        );
         return;
       }
       const stdoutChunks: Buffer[] = [];
@@ -281,8 +288,12 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       });
 
       child.once('error', (error: Error) => {
+        // spawn 失败 = 进程从未存在、prompt 从未被消费 → 明确证据「未执行」。
         rejectOnce(
-          new Error(`Command driver failed to start ${this.commandLabel()}: ${error.message}`),
+          new DriverTransportError(
+            `Command driver failed to start ${this.commandLabel()}: ${error.message}`,
+            'not_executed',
+          ),
         );
       });
 
@@ -312,9 +323,11 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         const stderrSummary = summarizeText(this.stderr);
 
         if (timedOut && !this.requestedInterrupts.has(input.run_id)) {
+          // prompt 已交付、进程已跑过 → 断连/超时期间是否执行、副作用状态均不明。
           reject(
-            new Error(
+            new DriverTransportError(
               `Command driver timed out after ${String(this.timeoutMs)}ms: ${this.commandLabel()}. stderr: ${stderrSummary}`,
+              'execution_unconfirmed',
             ),
           );
           return;
@@ -322,8 +335,9 @@ export class CommandDriverTransport implements ExternalDriverTransport {
 
         if (inactive && !this.requestedInterrupts.has(input.run_id)) {
           reject(
-            new Error(
+            new DriverTransportError(
               `Command driver produced no output for ${String(this.inactivityTimeoutMs)}ms: ${this.commandLabel()}. stderr: ${stderrSummary}`,
+              'execution_unconfirmed',
             ),
           );
           return;
@@ -336,8 +350,9 @@ export class CommandDriverTransport implements ExternalDriverTransport {
 
         if (signal) {
           reject(
-            new Error(
+            new DriverTransportError(
               `Command driver failed: ${this.commandLabel()} exited with signal ${signal}. stderr: ${stderrSummary}`,
+              'execution_unconfirmed',
             ),
           );
           return;
@@ -345,17 +360,20 @@ export class CommandDriverTransport implements ExternalDriverTransport {
 
         if (code !== 0) {
           reject(
-            new Error(
+            new DriverTransportError(
               `Command driver failed: ${this.commandLabel()} exited with code ${String(code)}. stderr: ${stderrSummary}`,
+              'execution_unconfirmed',
             ),
           );
           return;
         }
 
         if (stdinError) {
+          // stdin 写失败无法证明 prompt 未被部分消费 → 保守按「执行状态不明」处理。
           reject(
-            new Error(
+            new DriverTransportError(
               `Command driver failed to write DriverPrompt to stdin: ${stdinError.message}. stderr: ${stderrSummary}`,
+              'execution_unconfirmed',
             ),
           );
           return;

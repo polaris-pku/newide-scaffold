@@ -6,6 +6,11 @@ import type {
   DriverRuntimeHandle,
   DriverStreamEventListener,
 } from './contract';
+import {
+  evidenceOf,
+  isDriverTransportError,
+  type DriverExecutionEvidence,
+} from './driver-transport-error';
 
 export interface ExternalDriverTransport {
   invoke(input: DriverPrompt): Promise<DriverRunResult>;
@@ -146,6 +151,10 @@ function buildTransportFailureResult(input: {
   const created_at = nowTimestamp();
   const message = errorMessage(input.error);
   const schema_version = input.input.schema_version || SCHEMA_VERSION;
+  // A1 证据模型（issue #149）：typed 传输错误携带阶段证据，据此给出区分「明确
+  // 未执行」与「结果未知」的错误码；未类型化错误保留历史形状，ADP 映射层会保守
+  // 当作执行状态不明处理。
+  const failure = transportFailureShape(input.error);
   const transcript_ref: ArtifactRef = {
     artifact_id: createId('artifact'),
     type: 'transcript',
@@ -170,16 +179,30 @@ function buildTransportFailureResult(input: {
     diagnostics: {
       driver_id: input.driver_id,
       duration_ms: 0,
-      notes: [`transport_error=${message}`],
+      notes: [`transport_error=${message}`, `execution_evidence=${failure.evidence}`],
     },
     error: {
-      code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR',
+      code: failure.code,
       message,
-      retryable: true,
+      retryable: failure.retryable,
     },
     created_at,
     schema_version,
   };
+}
+
+function transportFailureShape(error: unknown): {
+  code: string;
+  retryable: boolean;
+  evidence: DriverExecutionEvidence;
+} {
+  const evidence = evidenceOf(error);
+  if (!isDriverTransportError(error)) {
+    return { code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR', retryable: true, evidence };
+  }
+  return evidence === 'not_executed'
+    ? { code: 'DRIVER_START_FAILED', retryable: true, evidence }
+    : { code: 'DRIVER_OUTCOME_UNKNOWN', retryable: false, evidence };
 }
 
 function errorMessage(error: unknown): string {

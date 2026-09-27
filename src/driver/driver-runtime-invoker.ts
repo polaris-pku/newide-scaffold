@@ -33,6 +33,10 @@ export interface DriverRuntimeInvokerInput {
 export interface DriverRuntimeInvokerOptions {
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
+  /** ADP 证据模型:prompt 交给 transport 前回调(dispatched 时点) */
+  onDispatch?: () => void;
+  /** abort 竞速后迟到的真实结果:交还上层对账(issue #149 §4) */
+  onLateResult?: (execution: DriverRunResult) => void;
 }
 
 export interface DriverRuntimeReport {
@@ -89,6 +93,12 @@ export function createDriverRuntimeInvoker(
         },
         options?.signal,
         options?.onDriverEvent,
+        options?.onDispatch || options?.onLateResult
+          ? {
+              ...(options.onDispatch ? { onDispatch: options.onDispatch } : {}),
+              ...(options.onLateResult ? { onLateResult: options.onLateResult } : {}),
+            }
+          : undefined,
       );
     } catch (error) {
       if (isAbort(error, options?.signal)) throw error;
