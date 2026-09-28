@@ -10,7 +10,7 @@ import {
   type RunLatencyTraceSink,
 } from '../telemetry';
 import { CommandDriverTransport, DRIVER_EVENT_PREFIX } from './command-driver-transport';
-import type { DriverPrompt } from './contract';
+import type { DriverPrompt, DriverStreamEvent } from './contract';
 
 const PROMPT: DriverPrompt = {
   task_id: 'task_command',
@@ -194,6 +194,10 @@ describe('CommandDriverTransport', () => {
     // no-op，而流回调未必继承 run 的上下文——真取不到的话这里一条都不会出现。
     for (const expected of [
       'driver.invoke',
+      'driver.spawn',
+      'driver.prompt_written',
+      'driver.first_output',
+      'driver.event_channel',
       'driver.handshake',
       'driver.turn',
       'driver.shutdown',
@@ -209,6 +213,25 @@ describe('CommandDriverTransport', () => {
     expect(sink.spans.every((span) => span.run_id === 'run_driver_spans')).toBe(true);
     expect(sink.spans.every((span) => span.layer === 'driver')).toBe(true);
     expect(sink.spans.every((span) => span.ok)).toBe(true);
+  });
+
+  it('publishes diagnostic stderr and disconnect as auditable driver events', async () => {
+    const events: DriverStreamEvent[] = [];
+    const transport = new CommandDriverTransport({
+      ...nodeCommand(`
+        readInput(() => {
+          process.stderr.write('runner diagnostic\\n');
+          process.stdout.write(JSON.stringify(driverRunResult('task_command')));
+        });
+      `),
+      onEvent: (event) => events.push(event),
+    });
+
+    await transport.run(PROMPT);
+
+    expect(events.map((event) => event.event_type)).toEqual(['stderr', 'disconnect']);
+    expect(events[0]?.payload).toBe('runner diagnostic\n');
+    expect(events[1]?.payload).toEqual({ code: 0, signal: null });
   });
 
   it('attributes concurrent driver spans to the run that invoked them', async () => {

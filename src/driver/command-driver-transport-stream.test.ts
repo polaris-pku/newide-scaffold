@@ -50,7 +50,7 @@ describe('CommandDriverTransport ACP event bridge', () => {
     const result = await transport.run(PROMPT);
 
     expect(result.status).toBe('succeeded');
-    expect(events).toEqual([event]);
+    expect(events).toEqual([event, expect.objectContaining({ event_type: 'disconnect' })]);
     expect(transport.lastStderr).toBe('');
   });
 

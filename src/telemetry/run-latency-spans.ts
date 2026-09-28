@@ -107,9 +107,11 @@ export function agentToolSpan(toolName: string): RunLatencySpanRef {
 
 /** driver transport 会上报的冷启动里程碑。闭集，避免把笔误写进流水。 */
 export const DRIVER_TIMING_MILESTONES = [
+  'driver.spawn',
   'driver.prompt_written',
   'driver.first_output',
   'driver.event_channel',
+  'driver.cleanup',
 ] as const;
 
 export type DriverTimingMilestoneName = (typeof DRIVER_TIMING_MILESTONES)[number];
