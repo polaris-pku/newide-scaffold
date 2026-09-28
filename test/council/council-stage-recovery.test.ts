@@ -212,6 +212,67 @@ describe('Council bounded recovery', () => {
     expect(calls).toBe(4);
     expect(result.diagnostic_refs).toBeUndefined();
   });
+  it('stops inactivity monitoring when the Driver reports a cancellation request', async () => {
+    let calls = 0;
+    let abortedDuringSilence = false;
+    const provider = new SynthesisAgentCouncilProvider({
+      councilRoot: await root(),
+      roleInactivityTimeoutMs: 10,
+      agentExecutionFacade: {
+        async runAgent(request, options) {
+          calls += 1;
+          options?.onDriverEvent?.({
+            schema_version: 'driver-event.v1',
+            event_type: 'driver.turn_started',
+            session_id: `session_${request.role_id}`,
+          });
+          // 生产端（contract-runner）实发的取消名字是 turn_cancel_requested，
+          // 不是从未有生产者的 driver.turn_cancelled。
+          options?.onDriverEvent?.({
+            schema_version: 'driver-event.v1',
+            event_type: 'driver.turn_cancel_requested',
+            session_id: `session_${request.role_id}`,
+            payload: { reason: 'process_signal' },
+          });
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          if (options?.signal?.aborted) abortedDuringSilence = true;
+          return completed(request);
+        },
+      },
+    });
+    const result = await provider.runCouncilRound(input, { artifact_mode: 'plan' });
+    expect(calls).toBe(4);
+    expect(abortedDuringSilence).toBe(false);
+    expect(result.diagnostic_refs).toBeUndefined();
+  });
+  it('keeps inactivity monitoring armed after a failed cancellation', async () => {
+    let abortedDuringSilence = false;
+    const provider = new SynthesisAgentCouncilProvider({
+      councilRoot: await root(),
+      roleInactivityTimeoutMs: 10,
+      agentExecutionFacade: {
+        async runAgent(request, options) {
+          options?.onDriverEvent?.({
+            schema_version: 'driver-event.v1',
+            event_type: 'driver.turn_started',
+            session_id: `session_${request.role_id}`,
+          });
+          // 取消失败意味着 turn 还在跑，静默仍应触发 inactivity。
+          options?.onDriverEvent?.({
+            schema_version: 'driver-event.v1',
+            event_type: 'driver.turn_cancel_failed',
+            session_id: `session_${request.role_id}`,
+            payload: { error: 'cancel rejected' },
+          });
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          if (options?.signal?.aborted) abortedDuringSilence = true;
+          return completed(request);
+        },
+      },
+    });
+    await provider.runCouncilRound(input, { artifact_mode: 'plan' }).catch(() => undefined);
+    expect(abortedDuringSilence).toBe(true);
+  });
   it('retries a transient role failure once in its existing Session and workspace', async () => {
     const requests: AgentExecutionRequest[] = [];
     const events: CouncilLifecycleEvent[] = [];
