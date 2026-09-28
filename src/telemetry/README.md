@@ -212,7 +212,7 @@ pnpm test test/telemetry*.ts
 相关测试：
 
 - `test/telemetry.test.ts` — catalog / adapter 单元测试
-- `test/telemetry-integration.test.ts` — basic-flow mirror、memory-cycle、Harness port 集成测试
+- `test/telemetry-integration.test.ts` — orchestrator mirror、memory-cycle、Harness port 集成测试
 
 ---
 

@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { runBasicFlow } from '../src/coordinator/basic-flow';
 import { RuntimeOrchestrator } from '../src/coordinator/orchestrator';
 import { SCHEMA_VERSION, createId, nowTimestamp } from '../src/core';
 import {
@@ -15,37 +14,6 @@ import {
 } from '../src/telemetry';
 
 describe('telemetry integration', () => {
-  it('mirrors cataloged coordinator events and checkpoint L3 observations from basic flow', async () => {
-    const sink = new InMemoryTelemetrySink();
-    await runBasicFlow({ telemetry: sink });
-
-    const eventTypes = sink.list().map((record) => record.event_type);
-    expect(eventTypes).toContain('task.created');
-    expect(eventTypes).toContain('memory.context_pack_built');
-    expect(eventTypes).toContain('driver.run_result');
-    expect(eventTypes).toContain('checkpoint.saved');
-    expect(eventTypes).toContain('coord.checkpoint_observed');
-    expect(eventTypes).toContain('council.decision');
-
-    const taskCreated = sink.list().find((record) => record.event_type === 'task.created');
-    expect(taskCreated?.owner).toBe('C-owned-observed');
-
-    const councilDecision = sink.list().find((record) => record.event_type === 'council.decision');
-    expect(councilDecision?.owner).toBe('C-owned-observed');
-    expect(councilDecision?.payload).toMatchObject({
-      selected_proposal_id: expect.any(String),
-      verdict: expect.any(String),
-    });
-
-    const checkpointObserved = sink
-      .list()
-      .find((record) => record.event_type === 'coord.checkpoint_observed');
-    expect(checkpointObserved?.payload).toMatchObject({
-      checkpoint_id: expect.any(String),
-      semantic_handoff: expect.any(Object),
-    });
-  });
-
   it('records public dispatch-cycle B-owned observations without EventStore events', async () => {
     const sink = new InMemoryTelemetrySink();
     const repository = new InMemoryRepository();

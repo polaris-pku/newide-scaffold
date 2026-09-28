@@ -1,7 +1,7 @@
 /**
  * MemoryProvider 的 MVP 实现
  *
- * 为 Coordinator basic-flow 提供最小 ContextPack 装配，不读取真实 Persona/Experience/Skill。
+ * 为演示与测试提供最小 ContextPack 装配，不读取真实 Persona/Experience/Skill。
  * 与 Agent 内部 memory-query 链路独立（分叉 B2）。
  */
 import { SCHEMA_VERSION, createId, nowTimestamp } from '../core';
