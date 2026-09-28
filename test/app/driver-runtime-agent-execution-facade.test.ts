@@ -13,6 +13,7 @@ import type { BMemoryMaintenancePort } from '../../src/app/b-memory-maintenance-
 import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
 import {
   MockDriver,
+  createAdpRetryPolicy,
   type DriverCapabilities,
   type DriverPrompt,
   type DriverRunResult,
@@ -1074,6 +1075,98 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(result).toMatchObject({ status: 'failed', diagnostics: { driver_attempts: 1 } });
   });
 
+  it('ADP 装配:驱动调用经 endpoint 落账,回执经宿主内回调交还 Agent', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const store = new SqliteCoordinationStore(':memory:');
+    seedTaskRun(store, 'task_adp_facade', 'run_task_adp_facade');
+    const receipts: string[] = [];
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      adp: {
+        store,
+        side_effect: 'workspace_write',
+        onReceipt: (delivery) => receipts.push(delivery.receipt.status),
+      },
+    });
+
+    const result = await facade.runAgent(request('task_adp_facade', 'proposer_a'));
+
+    expect(result.status).toBe('completed');
+    expect(receipts).toEqual(['succeeded']);
+    const journal = store.listJournal('task_adp_facade', 'run_task_adp_facade');
+    expect(journal.find((row) => row.event === 'host.intent')).toMatchObject({
+      kind: 'call',
+      causation_id: null,
+    });
+    expect(
+      journal.some(
+        (row) => row.frame !== null && 'command' in row.frame && row.frame.command === 'driver.invoke',
+      ),
+    ).toBe(true);
+    expect(
+      journal.some(
+        (row) => row.frame !== null && 'result' in row.frame && row.frame.result === 'driver.invocation_result',
+      ),
+    ).toBe(true);
+    store.close();
+  });
+
+  it('ADP 装配:transport 失败收束为 unknown,不自动重跑(retryable 启发式失效)', async () => {
+    const driver = new RetryableOnceDriver(); // EXTERNAL_DRIVER_TRANSPORT_ERROR + retryable:true
+    const store = new SqliteCoordinationStore(':memory:');
+    seedTaskRun(store, 'task_adp_unknown', 'run_task_adp_unknown');
+    const receipts: string[] = [];
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      adp: {
+        store,
+        side_effect: 'workspace_write',
+        // 即使部署开启 workspace_write 自动重跑,unknown 也永不重跑。
+        retryPolicy: createAdpRetryPolicy({ workspace_write: true }),
+        onReceipt: (delivery) => receipts.push(delivery.receipt.status),
+      },
+    });
+
+    const result = await facade.runAgent(request('task_adp_unknown', 'proposer_a'));
+
+    expect(driver.prompts).toHaveLength(1);
+    expect(receipts).toEqual(['unknown']);
+    expect(result.diagnostics).toMatchObject({ driver_attempts: 1 });
+    store.close();
+  });
+
+  it('ADP 装配:确定失败按部署级 auto_retry[side_effect] 重执行', async () => {
+    const driver = new RetryableOnceDriver('BUSINESS_BOOM');
+    const store = new SqliteCoordinationStore(':memory:');
+    seedTaskRun(store, 'task_adp_retry', 'run_task_adp_retry');
+    const receipts: string[] = [];
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      adp: {
+        store,
+        side_effect: 'workspace_write',
+        retryPolicy: createAdpRetryPolicy({ workspace_write: true }),
+        onReceipt: (delivery) => receipts.push(delivery.receipt.status),
+      },
+    });
+
+    const result = await facade.runAgent(request('task_adp_retry', 'proposer_a'));
+
+    expect(driver.prompts).toHaveLength(2);
+    expect(receipts).toEqual(['succeeded']);
+    expect(result.diagnostics).toMatchObject({ driver_attempts: 2 });
+    store.close();
+  });
+
   it('keeps role memory isolated while reusing each role runtime', async () => {
     const driver = new CapturingDriver('succeeded');
     const { facade } = createFacade(driver);
@@ -1431,6 +1524,31 @@ describe('mergeArtifacts path normalization', () => {
     expect(merged[0]?.artifact_id).toBe('artifact_workspace_full');
   });
 });
+
+function seedTaskRun(store: SqliteCoordinationStore, task_id: string, run_id: string): void {
+  const at = '2026-09-25T09:00:00.000Z';
+  store.commitState({
+    task: {
+      task_id, status: 'created', risk_level: 'medium',
+      spec: 'ADP facade test', completion_criteria: ['done'], affected_paths: [],
+      workspace_path: '/workspace', warnings: [], revision: 1,
+      created_at: at, updated_at: at, schema_version: 'v0',
+    },
+    run: {
+      run_id, task_id, status: 'created', mode: 'single_agent',
+      workspace_path: '/workspace', revision: 1,
+      created_at: at, updated_at: at, schema_version: 'v0',
+    },
+    runtime_state: {
+      task_id, current_run_id: run_id, resume_cursor: 'execute_agent',
+      waiting_on: [], artifact_refs: [], diagnostics: {}, updated_at: at, schema_version: 'v0',
+    },
+    events: [{
+      event_id: `event-${run_id}`, event_type: 'task.created', subject_id: task_id,
+      task_id, run_id, payload: {}, created_at: at, schema_version: 'v0',
+    }],
+  });
+}
 
 function createFacade(
   driver: DriverRuntimeHandle,

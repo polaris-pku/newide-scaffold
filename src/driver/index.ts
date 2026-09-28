@@ -6,3 +6,8 @@ export * from './driver-runtime-invoker';
 export * from './mock-driver';
 export * from './driver-return-converter';
 export * from './driver-bridge';
+export * from './driver-transport-error';
+export * from './adp-invocation-state';
+export * from './adp-status-mapping';
+export * from './adp-retry-policy';
+export * from './adp-driver-endpoint';

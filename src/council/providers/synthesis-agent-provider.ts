@@ -1073,17 +1073,33 @@ function createInactivitySignal(
     }, inactivityTimeoutMs);
     timer.unref?.();
   };
+  const disarm = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    started = false;
+  };
   return {
     signal: controller.signal,
     observe: (event) => {
+      // 终态按生产端实发的名字对齐（跨仓库契约）：contract-runner 只发
+      // driver.turn_completed / driver.turn_failed。取消路径实发
+      // driver.turn_cancel_requested（进入收尾静默，解除监听）与
+      // driver.turn_cancel_failed（取消失败、turn 继续跑，恢复监听）。
+      // `driver.turn_cancelled` 从未有生产者，此前监听它是名字漂移，保留为别名。
+      if (['driver.turn_completed', 'driver.turn_failed'].includes(event.event_type)) {
+        disarm();
+        return;
+      }
       if (
-        ['driver.turn_completed', 'driver.turn_failed', 'driver.turn_cancelled'].includes(
-          event.event_type,
-        )
+        event.event_type === 'driver.turn_cancel_requested' ||
+        event.event_type === 'driver.turn_cancelled'
       ) {
-        if (timer) clearTimeout(timer);
-        timer = undefined;
-        started = false;
+        disarm();
+        return;
+      }
+      if (event.event_type === 'driver.turn_cancel_failed') {
+        started = true;
+        arm();
         return;
       }
       if (!started) {
