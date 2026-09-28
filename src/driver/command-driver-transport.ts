@@ -162,7 +162,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         });
       };
 
-      const closePhase = (ref: RunLatencySpanRef, phaseOk = true): void => {
+      const closePhase = (ref: RunLatencySpanRef, phaseOk = true, phaseError?: unknown): void => {
         const opened = openPhases.get(ref.name);
         if (!opened) return;
         openPhases.delete(ref.name);
@@ -172,6 +172,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           // 同一个进程内的单调钟差值，不受系统时间调整影响。
           duration_ms: Math.max(0, performance.now() - opened.mono),
           ok: phaseOk,
+          ...(phaseError !== undefined ? { error: String(phaseError) } : {}),
           ...(opened.meta ? { meta: opened.meta } : {}),
         });
       };
@@ -220,7 +221,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           openPhase(ref, payload.mode === undefined ? undefined : { mode: payload.mode });
           return;
         }
-        closePhase(ref, payload?.ok !== false);
+        closePhase(ref, payload?.ok !== false, payload?.error);
       };
 
       const emitDisconnect = (code: number | null, signal: NodeJS.Signals | null): void => {

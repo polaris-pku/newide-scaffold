@@ -99,6 +99,7 @@ describe('CommandDriverTransport', () => {
   });
 
   it('times out and kills child processes that keep stdio open', async () => {
+    const sink = new CollectingLatencySink();
     const transport = new CommandDriverTransport({
       ...nodeCommand(`
         const { spawn } = require('node:child_process');
@@ -112,7 +113,13 @@ describe('CommandDriverTransport', () => {
       timeoutMs: 50,
     });
 
-    await expect(transport.run(PROMPT)).rejects.toThrow(/Command driver timed out after 50ms/);
+    await expect(
+      runWithRunLatencyRecorder(createLatencyRecorder(sink), () => transport.run(PROMPT)),
+    ).rejects.toThrow(/Command driver timed out after 50ms/);
+    expect(sink.spans.find((span) => span.name === 'driver.cleanup')).toMatchObject({
+      ok: false,
+      meta: { reason: 'timeout' },
+    });
   });
 
   it('kills a Driver only after it stops producing output', async () => {
@@ -179,10 +186,14 @@ describe('CommandDriverTransport', () => {
         driverEventsBody(`
           emit('driver.phase', { phase: 'initialize', boundary: 'started' });
           emit('driver.phase', { phase: 'initialize', boundary: 'completed', ok: true });
+          emit('driver.phase', { phase: 'authenticate', boundary: 'started' });
+          emit('driver.phase', { phase: 'authenticate', boundary: 'completed', ok: true });
           emit('driver.phase', { phase: 'session', boundary: 'started', mode: 'create' });
           emit('driver.phase', { phase: 'session', boundary: 'completed', ok: true });
           emit('driver.turn_started', { prompt_length: 1 });
           emit('driver.turn_completed', { stop_reason: 'done' });
+          emit('driver.phase', { phase: 'shutdown', boundary: 'started' });
+          emit('driver.phase', { phase: 'shutdown', boundary: 'completed', ok: true });
         `)
       ),
     );
@@ -202,7 +213,9 @@ describe('CommandDriverTransport', () => {
       'driver.turn',
       'driver.shutdown',
       'driver.phase.initialize',
+      'driver.phase.authenticate',
       'driver.phase.session',
+      'driver.phase.shutdown',
     ]) {
       expect(names).toContain(expected);
     }
@@ -213,6 +226,30 @@ describe('CommandDriverTransport', () => {
     expect(sink.spans.every((span) => span.run_id === 'run_driver_spans')).toBe(true);
     expect(sink.spans.every((span) => span.layer === 'driver')).toBe(true);
     expect(sink.spans.every((span) => span.ok)).toBe(true);
+  });
+
+  it('closes phase spans as failed when ACP reports a failed phase', async () => {
+    const sink = new CollectingLatencySink();
+    const transport = new CommandDriverTransport(
+      nodeCommand(
+        driverEventsBody(`
+          emit('driver.phase', { phase: 'initialize', boundary: 'started' });
+          emit('driver.phase', {
+            phase: 'initialize',
+            boundary: 'completed',
+            ok: false,
+            error: 'agent handshake failed',
+          });
+        `),
+      ),
+    );
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () => transport.run(PROMPT));
+
+    expect(sink.spans.find((span) => span.name === 'driver.phase.initialize')).toMatchObject({
+      ok: false,
+      error: 'agent handshake failed',
+    });
   });
 
   it('publishes diagnostic stderr and disconnect as auditable driver events', async () => {
