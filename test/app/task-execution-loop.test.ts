@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION, type TaskCreateRequest } from '../../src/core';
 import {
+  SapTaskBridge,
   TaskExecutionLoop,
   type TaskExecutionLoopExecutors,
 } from '../../src/coordination';
@@ -55,6 +56,41 @@ describe('TaskExecutionLoop', () => {
     expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state).not.toHaveProperty(
       'current_run_id',
     );
+  });
+
+  it('atomically persists SAP execute/result with the Task cursor', async () => {
+    const fixture = createFixture({ sapEnabled: true });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const completed = await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(completed.task.status).toBe('completed');
+    expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state.resume_cursor).toBe('done');
+    const executeExchangeId = 'sap_invocation_execute_agent';
+    const resultExchangeId = `sap_result_${executeExchangeId}`;
+    expect(fixture.store.getOutbox(`outbox_${executeExchangeId}`)).toMatchObject({
+      status: 'complete',
+      exchange_id: executeExchangeId,
+    });
+    expect(fixture.store.getInbox({
+      consumer_id: 'agent_a',
+      protocol: 'system-agent',
+      exchange_id: executeExchangeId,
+    })).toMatchObject({ status: 'complete', reply_exchange_id: resultExchangeId });
+    expect(fixture.store.getOutbox(`outbox_${resultExchangeId}`)).toMatchObject({
+      status: 'sent',
+      exchange_id: resultExchangeId,
+    });
+    expect(fixture.store.getInbox({
+      consumer_id: 'system',
+      protocol: 'system-agent',
+      exchange_id: resultExchangeId,
+    })).toMatchObject({ status: 'complete' });
+    const sapFrames = fixture.store.listJournal('task_loop', 'run_loop')
+      .filter((entry) => entry.kind === 'sap')
+      .map((entry) => entry.frame?.exchange_id);
+    expect(sapFrames).toContain(executeExchangeId);
+    expect(sapFrames).toContain(resultExchangeId);
   });
 
   it('把提交批次记到 run 上，且条数与 events 表里的真值相等', async () => {
@@ -291,6 +327,28 @@ describe('TaskExecutionLoop', () => {
     });
   });
 
+  it('cancels an admitted SAP execute when the Agent stage fails', async () => {
+    const fixture = createFixture({ sapEnabled: true, failAt: 'execute_agent' });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const failed = await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(failed.task.status).toBe('failed');
+    expect(fixture.store.getOutbox('outbox_sap_cancel_sap_invocation_execute_agent')).toMatchObject({
+      status: 'pending',
+      frame: {
+        command: 'agent.cancel',
+        causation_id: 'sap_invocation_execute_agent',
+        target_exchange_id: 'sap_invocation_execute_agent',
+      },
+    });
+    expect(fixture.store.getInbox({
+      consumer_id: 'agent_a',
+      protocol: 'system-agent',
+      exchange_id: 'sap_invocation_execute_agent',
+    })).toMatchObject({ status: 'processing' });
+  });
+
   it('fails the active stage when evidence cannot be persisted', async () => {
     const fixture = createFixture({ evidenceFailureAt: 'execute_agent' });
     begin(fixture.processor, selectInput, 'single_agent');
@@ -489,6 +547,7 @@ interface FixtureOptions {
    * 它们由外层账本作用域提供，测试也照此走 `runWithLlmUsageLedger`。
    */
   llmUsageAt?: ReadonlyArray<TaskCursorInput['cursor']>;
+  sapEnabled?: boolean;
 }
 
 function createFixture(options: FixtureOptions = {}): {
@@ -518,7 +577,15 @@ function createFixture(options: FixtureOptions = {}): {
       new TaskProcessor(store, conflictClock()).setCouncilOverride('run_loop');
     }
   });
-  const processor = new TaskProcessor(interceptingStore, deterministicClock());
+  const sapBridge = options.sapEnabled ? new SapTaskBridge({
+    store,
+    now: deterministicClock().now,
+    create_id: (prefix) => `${prefix}_loop`,
+  }) : undefined;
+  const processor = new TaskProcessor(
+    options.sapEnabled ? store : interceptingStore,
+    { ...deterministicClock(), ...(sapBridge ? { sapBridge } : {}) },
+  );
   const calls: string[] = [];
   const inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>> = {};
   const memoryAblations: Array<string | undefined> = [];
@@ -631,6 +698,7 @@ function createFixture(options: FixtureOptions = {}): {
       evidence_store: evidenceStore,
       executors,
       create_invocation_id: (cursor) => `invocation_${cursor}`,
+      ...(sapBridge ? { sap_bridge: sapBridge } : {}),
       ...(options.latencySpans
         ? {
             create_latency_recorder: createRunLatency({

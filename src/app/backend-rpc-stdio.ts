@@ -42,6 +42,7 @@ import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
 import {
   PersistentParticipantSessionRegistry,
+  SapTaskBridge,
   TaskExecutionLoop,
   TaskProcessor,
 } from '../coordination';
@@ -247,6 +248,7 @@ export async function createProductionBackendService(
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
+    const sapBridge = new SapTaskBridge({ store: coordinationStore });
     const mailboxService = new PersistentMailboxService(coordinationStore);
     const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const protocolCallJournal = new ProtocolCallJournal({
@@ -324,6 +326,7 @@ export async function createProductionBackendService(
     const councilProposerCount = readCouncilProposerCount(env.NEWIDE_COUNCIL_PROPOSERS);
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
+      sapBridge,
       councilRoot: path.join(stateRoot, 'council'),
       roleInactivityTimeoutMs: readDriverTimeout(
         env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS,
@@ -450,6 +453,7 @@ export async function createProductionBackendService(
       runsRoot,
       mailboxStore: coordinationStore,
       participantSessions,
+      sapBridge,
     });
     taskProcessor.recoverInterruptedTasks();
     // 工厂必须活到 run 结束：`snapshot(runId)` 要拿内存缓冲算聚合，写进 summary 的
@@ -459,6 +463,7 @@ export async function createProductionBackendService(
       processor: taskProcessor,
       evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
       create_latency_recorder: runLatency.createRecorder,
+      sap_bridge: sapBridge,
       executors: createProductionStageExecutors({
         selectAgentHandler,
         agentExecutionFacade,

@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type Event, type TaskCreateRequest } from '../../src/core';
-import { TaskProcessor } from '../../src/coordination';
+import { SapTaskBridge, TaskProcessor } from '../../src/coordination';
 import { PersistentMailboxService } from '../../src/mailbox';
 import { SqliteCoordinationStore, type TaskCursorInput } from '../../src/persistence';
 import type { RunSnapshot } from '../../src/protocol/run-snapshot';
@@ -286,6 +286,128 @@ describe('TaskProcessor', () => {
     });
     expect(store.getTaskAggregate('task_stage')?.runtime_state.diagnostics).not.toHaveProperty(
       'active_stage',
+    );
+    store.close();
+  });
+
+  it('commits each Council SAP seat dispatch with the active Task stage', () => {
+    const { store } = createProcessor();
+    const clock = deterministicClock();
+    const sapBridge = new SapTaskBridge({ store, now: clock.now });
+    const processor = new TaskProcessor(store, { ...clock, sapBridge });
+    processor.beginRun({
+      task_id: 'task_council_sap_tx',
+      run_id: 'run_council_sap_tx',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'council',
+      cursor_input: selectInput,
+    });
+    processor.startStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_select_for_council',
+    });
+    processor.advanceStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_select_for_council',
+      evidence_ref: evidenceRef('select_for_council'),
+      next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+    });
+    processor.startStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_execute_for_council',
+    });
+    processor.advanceStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_execute_for_council',
+      evidence_ref: evidenceRef('execute_for_council'),
+      next_input: {
+        cursor: 'council',
+        trigger: 'explicit_mode',
+        primary_evidence_ref: 'memory://primary',
+        candidate_manifest_ref: 'memory://candidate',
+      },
+    });
+    processor.startStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'council',
+      invocation_id: 'invocation_council',
+    });
+    const dispatch = sapBridge.createExecute({
+      task_id: 'task_council_sap_tx',
+      run_id: 'run_council_sap_tx',
+      role_id: 'role_reviewer',
+      council_seat: 'reviewer',
+      instruction: 'Review the Council proposal.',
+      exchange_id: 'sap_council_seat_tx',
+    });
+
+    processor.recordCouncilSapDispatch('run_council_sap_tx', dispatch);
+    processor.recordCouncilSapDispatch('run_council_sap_tx', dispatch);
+
+    const aggregate = store.getTaskAggregate('task_council_sap_tx');
+    expect(aggregate).toMatchObject({
+      runtime_state: {
+        diagnostics: {
+          active_stage: {
+            cursor: 'council',
+            council_sap_exchange_ids: ['sap_council_seat_tx'],
+          },
+        },
+      },
+    });
+    expect(store.getTaskAggregate('task_council_sap_tx')?.events).toContainEqual(
+      expect.objectContaining({
+        event_type: 'council.sap.dispatched',
+        subject_id: 'sap_council_seat_tx',
+      }),
+    );
+    expect(store.getOutbox('outbox_sap_council_seat_tx')).toMatchObject({
+      status: 'pending',
+      exchange_id: 'sap_council_seat_tx',
+    });
+    const admission = sapBridge.beginExecute(dispatch);
+    const result = sapBridge.createResult({
+      execute: dispatch.frame,
+      status: 'completed',
+      summary: 'Reviewer completed.',
+      exchange_id: 'sap_result_sap_council_seat_tx',
+    });
+    expect(
+      processor.recordCouncilSapResult(
+        'run_council_sap_tx',
+        admission,
+        result,
+        'review',
+        'participant_reviewer',
+      ),
+    ).toBe('accepted');
+    expect(store.getTaskAggregate('task_council_sap_tx')).toMatchObject({
+      runtime_state: {
+        diagnostics: {
+          active_stage: {
+            council_sap_result_exchange_ids: ['sap_result_sap_council_seat_tx'],
+          },
+        },
+      },
+    });
+    expect(store.getOutbox('outbox_sap_result_sap_council_seat_tx')).toMatchObject({
+      status: 'sent',
+    });
+    expect(store.getTaskAggregate('task_council_sap_tx')?.events).toContainEqual(
+      expect.objectContaining({
+        event_type: 'council.sap.result.received',
+        subject_id: 'sap_result_sap_council_seat_tx',
+      }),
+    );
+    expect(store.listJournal('task_council_sap_tx', 'run_council_sap_tx')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'sap_council_seat_tx', event: 'outbox.enqueued' }),
+      ]),
     );
     store.close();
   });

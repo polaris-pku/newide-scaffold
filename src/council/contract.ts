@@ -9,6 +9,12 @@ import type {
 } from '../core';
 import type { DriverStreamEventListener } from '../driver/contract';
 import type { CouncilParticipantBinding } from './council-participant';
+import type {
+  SapExecuteDispatch,
+  SapExecutionAdmission,
+  SapResultFrame,
+  SapResultDisposition,
+} from '../coordination/sap-task-bridge';
 
 export type CouncilDecisionMode =
   | 'advisory'
@@ -237,6 +243,14 @@ export interface CouncilExecutionOptions {
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
   onLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
+  /** Host callback used to atomically persist a Council seat dispatch with Task state. */
+  onSapDispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>;
+  onSapResult?: (input: {
+    admission: SapExecutionAdmission;
+    frame: SapResultFrame;
+    phase: 'proposal' | 'review' | 'synthesis';
+    participant_id: string;
+  }) => SapResultDisposition | Promise<SapResultDisposition>;
   /** Internal strategy hint; it is not part of the public Task/Run RPC. */
   artifact_mode?: CouncilArtifactMode;
 }

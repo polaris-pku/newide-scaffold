@@ -10,6 +10,8 @@ import type {
 import type { CouncilParticipantBinding } from '../../src/council';
 import { councilRunDirName } from '../../src/council/council-workspace';
 import { SynthesisAgentCouncilProvider } from '../../src/council/providers/synthesis-agent-provider';
+import { SapTaskBridge } from '../../src/coordination';
+import { SqliteCoordinationStore, type CoordinationStateCommit } from '../../src/persistence';
 
 describe('SynthesisAgentCouncilProvider', () => {
   it('runs plan-first roles without allowing product-file changes', async () => {
@@ -248,6 +250,70 @@ describe('SynthesisAgentCouncilProvider', () => {
       'council.synthesis.completed',
     ]);
     await fs.rm(councilRoot, { recursive: true, force: true });
+  });
+
+  it('persists every Council seat execution through SAP', async () => {
+    const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-sap-'));
+    const store = new SqliteCoordinationStore(':memory:');
+    store.commitState(councilSapCommit());
+    const bridge = new SapTaskBridge({
+      store,
+      now: () => '2026-09-27T12:00:00.000Z',
+    });
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        return completedExecution(input);
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade,
+      councilRoot,
+      sapBridge: bridge,
+    });
+    const dispatched: string[] = [];
+    const received: string[] = [];
+
+    const result = await provider.runCouncilRound({
+      ...baseInput(),
+      run_id: 'run_council_sap',
+      task_id: 'task_council_sap',
+      question: 'Verify every Council seat uses SAP.',
+    }, {
+      onSapDispatch: (dispatch) => {
+        dispatched.push(dispatch.frame.exchange_id);
+        bridge.persistExecute(dispatch);
+      },
+      onSapResult: ({ frame, admission }) => {
+        received.push(frame.exchange_id);
+        return bridge.acceptResult(admission, frame);
+      },
+    });
+
+    expect(result.selected_artifact_refs).not.toEqual([]);
+    expect(dispatched).toHaveLength(4);
+    expect(received).toHaveLength(4);
+    const expected = [
+      ['proposal', 'participant_proposer_0'],
+      ['proposal', 'participant_proposer_1'],
+      ['review', 'participant_reviewer_0'],
+      ['synthesis', 'participant_synthesizer_0'],
+    ] as const;
+    for (const [phase, participantId] of expected) {
+      const exchangeId = `sap_council:run_council_sap:${phase}:${participantId}:attempt:1`;
+      expect(store.getOutbox(`outbox_${exchangeId}`)).toMatchObject({ status: 'complete' });
+      expect(store.getOutbox(`outbox_sap_result_${exchangeId}`)).toMatchObject({ status: 'sent' });
+    }
+    const sapExchangeIds = new Set(
+      store.listJournal('task_council_sap', 'run_council_sap')
+        .filter((entry) => entry.kind === 'sap')
+        .map((entry) => entry.frame?.exchange_id),
+    );
+    for (const [phase, participantId] of expected) {
+      const exchangeId = `sap_council:run_council_sap:${phase}:${participantId}:attempt:1`;
+      expect(sapExchangeIds).toContain(exchangeId);
+      expect(sapExchangeIds).toContain(`sap_result_${exchangeId}`);
+    }
+    store.close();
   });
 
   it('runs independent proposer roles concurrently', async () => {
@@ -669,6 +735,36 @@ function baseInput() {
     participants: participantBindings(),
     proposals: [],
     schema_version: SCHEMA_VERSION,
+  };
+}
+
+function councilSapCommit(): CoordinationStateCommit {
+  const at = '2026-09-27T11:59:00.000Z';
+  return {
+    task: {
+      task_id: 'task_council_sap', status: 'running', risk_level: 'low',
+      spec: 'Verify every Council seat uses SAP.', completion_criteria: ['Council completes'],
+      affected_paths: [], workspace_path: '/workspace', warnings: [], revision: 1,
+      created_at: at, updated_at: at, schema_version: SCHEMA_VERSION,
+    },
+    run: {
+      run_id: 'run_council_sap', task_id: 'task_council_sap', status: 'running',
+      mode: 'council', workspace_path: '/workspace', revision: 1,
+      created_at: at, updated_at: at, schema_version: SCHEMA_VERSION,
+    },
+    runtime_state: {
+      task_id: 'task_council_sap', current_run_id: 'run_council_sap',
+      resume_cursor: 'council',
+      cursor_input: { cursor: 'council', trigger: 'explicit_mode' },
+      waiting_on: [], artifact_refs: [], diagnostics: {}, updated_at: at,
+      schema_version: SCHEMA_VERSION,
+    },
+    events: [{
+      event_id: 'event_council_sap', event_type: 'run.started',
+      subject_id: 'run_council_sap', task_id: 'task_council_sap',
+      run_id: 'run_council_sap', payload: {}, created_at: at,
+      schema_version: SCHEMA_VERSION,
+    }],
   };
 }
 
