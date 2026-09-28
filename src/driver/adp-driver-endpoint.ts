@@ -678,8 +678,15 @@ export class AdpDriverEndpoint {
     if (live.degraded) return undefined;
     try {
       return operation();
-    } catch {
+    } catch (error) {
       live.degraded = true;
+      if (process.env.NEWIDE_ADP_DEBUG_DEGRADED) {
+        console.error(
+          `[adp] journal degraded on ${live.exchange_id}:`,
+          error instanceof Error ? error.message : String(error),
+          `| task=${live.task_id} run=${live.run_id}`,
+        );
+      }
       return undefined;
     }
   }
