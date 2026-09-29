@@ -64,9 +64,9 @@ export const RUN_LATENCY_SPANS = {
   'agent.llm_round': 'agent',
 
   // ---- driver：ACP driver 调用本体 ----
-  // 这三段由 transport 自己观测，首尾相接铺满 driver.invoke，不留空档也不重叠：
-  // 进程启动其实也算在 handshake 里，因为 spawn() 是非阻塞的，写 stdin 之前没有
-  // 可观测的等待。ACP 侧上报的内部段（见 driverPhaseSpan）嵌在它们之内。
+  // 外层调用和 turn/shutdown 由 transport 自己观测；spawn、输入交付、首个输出、
+  // 首个结构化事件和清理是独立里程碑。ACP 侧上报的 initialize/authenticate/session/
+  // shutdown 段（见 driverPhaseSpan）嵌在外层调用内。
   'driver.invoke': 'driver',
   'driver.handshake': 'driver',
   'driver.turn': 'driver',
@@ -107,9 +107,11 @@ export function agentToolSpan(toolName: string): RunLatencySpanRef {
 
 /** driver transport 会上报的冷启动里程碑。闭集，避免把笔误写进流水。 */
 export const DRIVER_TIMING_MILESTONES = [
+  'driver.spawn',
   'driver.prompt_written',
   'driver.first_output',
   'driver.event_channel',
+  'driver.cleanup',
 ] as const;
 
 export type DriverTimingMilestoneName = (typeof DRIVER_TIMING_MILESTONES)[number];

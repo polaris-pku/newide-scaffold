@@ -77,9 +77,11 @@ describe('run-latency span 登记处', () => {
 
   it('keeps the driver milestone vocabulary closed', () => {
     expect([...DRIVER_TIMING_MILESTONES]).toEqual([
+      'driver.spawn',
       'driver.prompt_written',
       'driver.first_output',
       'driver.event_channel',
+      'driver.cleanup',
     ]);
     for (const milestone of DRIVER_TIMING_MILESTONES) {
       expect(driverMilestoneSpan(milestone).name.split('.')[0]).toBe('driver');

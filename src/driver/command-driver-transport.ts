@@ -2,6 +2,7 @@ import { spawn, type ChildProcess, type SpawnOptionsWithoutStdio } from 'node:ch
 import { nowTimestamp } from '../core';
 import {
   driverPhaseSpan,
+  driverMilestoneSpan,
   latencySpan,
   recordRunLatencySpan,
   withRunLatencySpan,
@@ -94,7 +95,9 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       });
     }
     try {
-      await Promise.all(children.map((child) => terminateAndWait(child)));
+      await withRunLatencySpan(driverMilestoneSpan('driver.cleanup'), { meta: { reason } }, () =>
+        Promise.all(children.map((child) => terminateAndWait(child))).then(() => undefined),
+      );
     } finally {
       for (const id of ids) this.requestedInterrupts.delete(id);
     }
@@ -132,6 +135,8 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       let timeout: NodeJS.Timeout | undefined;
       let inactivityTimeout: NodeJS.Timeout | undefined;
       let forceKillTimeout: NodeJS.Timeout | undefined;
+      let disconnectEmitted = false;
+      let eventChannelObserved = false;
 
       // ── 耗时埋点 ──
       //
@@ -157,7 +162,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         });
       };
 
-      const closePhase = (ref: RunLatencySpanRef, phaseOk = true): void => {
+      const closePhase = (ref: RunLatencySpanRef, phaseOk = true, phaseError?: unknown): void => {
         const opened = openPhases.get(ref.name);
         if (!opened) return;
         openPhases.delete(ref.name);
@@ -167,6 +172,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           // 同一个进程内的单调钟差值，不受系统时间调整影响。
           duration_ms: Math.max(0, performance.now() - opened.mono),
           ok: phaseOk,
+          ...(phaseError !== undefined ? { error: String(phaseError) } : {}),
           ...(opened.meta ? { meta: opened.meta } : {}),
         });
       };
@@ -183,6 +189,13 @@ export class CommandDriverTransport implements ExternalDriverTransport {
 
       /** 把 ACP 侧上报的进度映射成本次调用的段。 */
       const trackDriverEvent = (event: DriverStreamEvent): void => {
+        if (typeof event.sequence === 'number') {
+          eventSequence = Math.max(eventSequence, event.sequence);
+        }
+        if (event.event_type !== 'stderr') {
+          eventChannelObserved = true;
+          closePhase(driverMilestoneSpan('driver.event_channel'));
+        }
         if (event.event_type === 'driver.turn_started') {
           closePhase(latencySpan('driver.handshake'));
           openPhase(latencySpan('driver.turn'));
@@ -208,11 +221,35 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           openPhase(ref, payload.mode === undefined ? undefined : { mode: payload.mode });
           return;
         }
-        closePhase(ref, payload?.ok !== false);
+        closePhase(ref, payload?.ok !== false, payload?.error);
       };
 
+      const emitDisconnect = (code: number | null, signal: NodeJS.Signals | null): void => {
+        if (disconnectEmitted) return;
+        disconnectEmitted = true;
+        this.emitEvent({
+          schema_version: 'driver-event.v1',
+          event_type: 'disconnect',
+          payload: { code, signal },
+          task_id: input.task_id,
+          run_id: input.run_id,
+          sequence: ++eventSequence,
+          created_at: nowTimestamp(),
+        });
+      };
+
+      const requestTermination = (reason: string): void => {
+        if (openPhases.has('driver.cleanup')) return;
+        openPhase(driverMilestoneSpan('driver.cleanup'), { reason });
+        terminateChild(child.pid, 'SIGTERM');
+      };
+
+      openPhase(driverMilestoneSpan('driver.spawn'));
+      openPhase(driverMilestoneSpan('driver.first_output'));
+      openPhase(driverMilestoneSpan('driver.event_channel'));
       const child = spawn(this.command, this.args, this.spawnOptions());
       this.activeChildren.set(input.run_id, child);
+      child.once('spawn', () => closePhase(driverMilestoneSpan('driver.spawn')));
 
       const releaseChild = (): void => {
         if (this.activeChildren.get(input.run_id) === child) {
@@ -239,13 +276,14 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         settled = true;
         clearTimers();
         releaseChild();
+        closeAllOpenPhases(false);
         reject(error);
       };
 
       if (this.timeoutMs !== undefined) {
         timeout = setTimeout(() => {
           timedOut = true;
-          terminateChild(child.pid, 'SIGTERM');
+          requestTermination('timeout');
           forceKillTimeout = setTimeout(() => {
             terminateChild(child.pid, 'SIGKILL');
           }, 1_000);
@@ -257,7 +295,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         if (inactivityTimeout) clearTimeout(inactivityTimeout);
         inactivityTimeout = setTimeout(() => {
           inactive = true;
-          terminateChild(child.pid, 'SIGTERM');
+          requestTermination('inactivity_timeout');
           forceKillTimeout = setTimeout(() => {
             terminateChild(child.pid, 'SIGKILL');
           }, 1_000);
@@ -268,11 +306,13 @@ export class CommandDriverTransport implements ExternalDriverTransport {
 
       child.stdout.on('data', (chunk: Buffer) => {
         armInactivityTimeout();
+        closePhase(driverMilestoneSpan('driver.first_output'));
         stdoutChunks.push(chunk);
       });
 
       child.stderr.on('data', (chunk: Buffer) => {
         armInactivityTimeout();
+        closePhase(driverMilestoneSpan('driver.first_output'));
         stderrPending += chunk.toString('utf8');
         for (;;) {
           const newline = stderrPending.indexOf('\n');
@@ -300,6 +340,17 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       child.once('close', (code, signal) => {
         releaseChild();
         if (settled) {
+          if (stderrPending) {
+            this.consumeStderrLine(
+              stderrPending,
+              false,
+              input,
+              () => ++eventSequence,
+              stderrChunks,
+              trackDriverEvent,
+            );
+          }
+          emitDisconnect(code, signal);
           return;
         }
 
@@ -315,6 +366,8 @@ export class CommandDriverTransport implements ExternalDriverTransport {
             trackDriverEvent,
           );
         }
+        emitDisconnect(code, signal);
+        closePhase(driverMilestoneSpan('driver.event_channel'), eventChannelObserved);
         // 收尾：没走到正常终点的段在这里关掉，按进程自己的退出方式定成败。不补这
         // 一下，半路失败的调用在流水里就只剩一个孤零零的开始，而失败最需要归因。
         closeAllOpenPhases(code === 0 && signal === null);
@@ -386,7 +439,10 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       // 都在这一段里，直到 ACP 侧报出 turn_started。spawn() 本身不阻塞，所以它前面
       // 没有可观测的等待，不另设一段。
       openPhase(latencySpan('driver.handshake'));
-      child.stdin.end(JSON.stringify(input));
+      openPhase(driverMilestoneSpan('driver.prompt_written'));
+      child.stdin.end(JSON.stringify(input), () => {
+        closePhase(driverMilestoneSpan('driver.prompt_written'));
+      });
     });
   }
 
@@ -400,7 +456,17 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   ): void {
     const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
     if (!normalized.startsWith(DRIVER_EVENT_PREFIX)) {
-      diagnostics.push(Buffer.from(terminatedByNewline ? `${line}\n` : line, 'utf8'));
+      const text = terminatedByNewline ? `${line}\n` : line;
+      diagnostics.push(Buffer.from(text, 'utf8'));
+      this.emitEvent({
+        schema_version: 'driver-event.v1',
+        event_type: 'stderr',
+        payload: text,
+        task_id: input.task_id,
+        run_id: input.run_id,
+        sequence: nextSequence(),
+        created_at: nowTimestamp(),
+      });
       return;
     }
 
@@ -427,7 +493,17 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       };
     } catch {
       // A malformed reserved line stays diagnostic output and cannot break the run.
-      diagnostics.push(Buffer.from(terminatedByNewline ? `${line}\n` : line, 'utf8'));
+      const text = terminatedByNewline ? `${line}\n` : line;
+      diagnostics.push(Buffer.from(text, 'utf8'));
+      this.emitEvent({
+        schema_version: 'driver-event.v1',
+        event_type: 'stderr',
+        payload: text,
+        task_id: input.task_id,
+        run_id: input.run_id,
+        sequence: nextSequence(),
+        created_at: nowTimestamp(),
+      });
       return;
     }
 
