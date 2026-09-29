@@ -103,6 +103,7 @@ export interface ProtocolDeliveryTransaction {
   getOutbox(id: string): ProtocolOutboxRecord | undefined;
   getInbox(key: ProtocolInboxKey): ProtocolInboxRecord | undefined;
   enqueueOutbox(input: EnqueueProtocolOutbox): ProtocolOutboxRecord;
+  activateOutbox(id: string, expectedRevision: number, at: string): ProtocolOutboxRecord;
   receiveInbox(input: {
     consumer_id: string;
     frame: ProtocolFrame;

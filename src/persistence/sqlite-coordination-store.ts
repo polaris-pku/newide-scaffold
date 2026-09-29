@@ -127,6 +127,10 @@ export class SqliteCoordinationStore
         getOutbox: (id) => { ensureOpen(); return this.protocolDelivery.getOutbox(id); },
         getInbox: (key) => { ensureOpen(); return this.protocolDelivery.getInbox(key); },
         enqueueOutbox: (input) => { ensureOpen(); return this.protocolDelivery.enqueueOutbox(input); },
+        activateOutbox: (id, expectedRevision, at) => {
+          ensureOpen();
+          return this.protocolDelivery.activateOutbox(id, expectedRevision, at);
+        },
         receiveInbox: (input) => { ensureOpen(); return this.protocolDelivery.receiveInbox(input); },
         completeInbox: (input) => { ensureOpen(); return this.protocolDelivery.completeInbox(input); },
         claimOutbox: (id, owner, now, leaseExpiresAt, expectedRevision) => {

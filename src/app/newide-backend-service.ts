@@ -59,6 +59,7 @@ import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task
 import {
   TaskProcessorRunNotFoundError,
   TaskProcessorTaskNotFoundError,
+  type AapMailboxBridge,
   type BeginTaskRunIntent,
   type ParticipantSessionProvisioner,
   type TaskProcessor,
@@ -289,6 +290,7 @@ export class NewideBackendService {
      * 别接反。
      */
     private readonly runTelemetryJsonlSink: TelemetrySink = new NoopTelemetrySink(),
+    private readonly aapBridge?: AapMailboxBridge,
   ) {}
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
@@ -368,7 +370,14 @@ export class NewideBackendService {
 
   async replyMailboxMessage(input: MailboxReplyInput): Promise<SaveMailboxReplyResult> {
     await this.mailboxRecovery;
-    return this.requireMailboxService().reply(input);
+    const result = await this.requireMailboxService().reply(input);
+    // A persisted reply is the only business wake-up signal for a waiting
+    // Task. Continue it after the reply transaction commits; a recovery pass
+    // will retry the same deterministic exchange if this process stops here.
+    await this.continueMailboxWait(result.source_delivery.task_id).catch((error: unknown) => {
+      process.stderr.write(`[mailbox] reply continuation failed: ${toError(error).message}\n`);
+    });
+    return result;
   }
 
   listMemoryAgents(status?: string): Promise<AgentBoardListItem[]> {
@@ -1120,7 +1129,45 @@ export class NewideBackendService {
       // the Task stays waiting_help forever.
       const continuationWorkspace = source.message.workspace_path;
       let reply = mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+      if (
+        !reply &&
+        source.delivery.deadline_at &&
+        Date.parse(source.delivery.deadline_at) <= Date.now()
+      ) {
+        mailbox.markFailed(sourceDeliveryId, {
+          code: 'MAILBOX_DEADLINE_EXCEEDED',
+          message: 'Mailbox request reached its local deadline without a reply',
+        });
+        processor.expireMailboxWait(
+          taskId,
+          'Mailbox request reached its local deadline without a matching reply',
+        );
+        return;
+      }
+      const aapDispatch = this.aapBridge?.createAsk({
+        task_id: source.message.task_id,
+        run_id: context.run_id,
+        from_role_id: source.message.from_role_id,
+        to_role_id: source.delivery.recipient_role_id,
+        message_id: source.message.message_id,
+        delivery_id: source.delivery.delivery_id,
+        content:
+          source.message.content?.trim() ||
+          (typeof source.message.payload.content === 'string'
+            ? source.message.payload.content
+            : JSON.stringify(source.message.payload)),
+        ...(source.delivery.deadline_at ? { deadline_at: source.delivery.deadline_at } : {}),
+        exchange_id: `aap_ask_${source.message.message_id}`,
+      });
+      // Upgrade a wait created before AAP wiring without changing its Mailbox
+      // identity. The deterministic exchange makes this idempotent.
+      if (aapDispatch) this.aapBridge!.persistAsk(aapDispatch);
+      const aapAdmission = aapDispatch ? this.aapBridge!.beginAsk(aapDispatch) : undefined;
       if (!reply) {
+        // A previous process may still own the AAP inbox lease. Preserve the
+        // durable wait; retry after lease expiry or let a matching reply wake
+        // the Task. Never turn an in-flight lease into a deadlock.
+        if (aapAdmission?.should_execute === false) return;
         if (this.participantSessionProvisioner) {
           try {
             await this.participantSessionProvisioner({
@@ -1135,23 +1182,71 @@ export class NewideBackendService {
             return;
           }
         }
-        const handled = await worker.process({
-          delivery_id: sourceDeliveryId,
-          run_id: context.run_id,
-        });
+        const waitController = new AbortController();
+        const deadlineMs = source.delivery.deadline_at
+          ? Math.max(0, Date.parse(source.delivery.deadline_at) - Date.now())
+          : undefined;
+        const deadlineTimer = deadlineMs === undefined
+          ? undefined
+          : setTimeout(() => waitController.abort(), deadlineMs);
+        let handled;
+        try {
+          handled = await worker.process({
+            delivery_id: sourceDeliveryId,
+            run_id: context.run_id,
+            signal: waitController.signal,
+          });
+        } finally {
+          if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        }
+        if (waitController.signal.aborted) {
+          mailbox.markFailed(sourceDeliveryId, {
+            code: 'MAILBOX_DEADLINE_EXCEEDED',
+            message: 'Mailbox request reached its local deadline without a reply',
+          });
+          processor.expireMailboxWait(
+            taskId,
+            'Mailbox request reached its local deadline without a matching reply',
+          );
+          return;
+        }
         if (
+          handled &&
           handled.status === 'retryable_failure' &&
           handled.error?.startsWith('COLLABORATION_DEADLOCK')
         ) {
           processor.blockMailboxDeadlock(taskId, handled.error);
           return;
         }
-        reply =
-          handled.status === 'replied' && handled.reply
-            ? mailbox.getEnvelope(handled.reply.delivery_id)
-            : mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+        reply = handled && handled.status === 'replied' && handled.reply
+          ? mailbox.getEnvelope(handled.reply.delivery_id)
+          : mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
         if (!reply) {
+          // A recipient may have completed a turn without producing its
+          // business reply. Keep the durable wait until the local deadline;
+          // the AAP lease makes a later recovery attempt idempotent.
+          if (source.delivery.deadline_at) return;
           deadlock('MAILBOX_REPLY_MISSING');
+          return;
+        }
+      }
+      if (reply && aapDispatch && aapAdmission) {
+        const replyContent =
+          reply.message.content?.trim() ||
+          (typeof reply.message.payload.content === 'string'
+            ? reply.message.payload.content
+            : JSON.stringify(reply.message.payload));
+        const replyFrame = this.aapBridge!.createReply({
+          ask: aapDispatch.frame,
+          status: 'completed',
+          summary: replyContent,
+          exchange_id: `aap_reply_${reply.message.message_id}`,
+        });
+        if (this.aapBridge!.acceptReply(aapAdmission, replyFrame) === 'late') {
+          processor.expireMailboxWait(
+            taskId,
+            'Mailbox reply arrived after the local deadline',
+          );
           return;
         }
       }
