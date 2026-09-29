@@ -41,6 +41,7 @@ import type {
   SapResultFrame,
   SapTaskBridge,
 } from './sap-task-bridge';
+import type { AapAskDispatch, AapMailboxBridge } from './aap-mailbox-bridge';
 
 export interface TaskProcessorOptions {
   now?: () => string;
@@ -48,6 +49,7 @@ export interface TaskProcessorOptions {
   runsRoot?: string;
   participantSessions?: ParticipantSessionRegistry;
   sapBridge?: SapTaskBridge;
+  aapBridge?: AapMailboxBridge;
 }
 
 export interface BeginTaskRunInput {
@@ -208,6 +210,7 @@ export class TaskProcessor {
     | undefined;
   private readonly participantSessions?: ParticipantSessionRegistry;
   private readonly sapBridge?: SapTaskBridge;
+  private readonly aapBridge?: AapMailboxBridge;
 
   constructor(
     private readonly store: CoordinationStateStore,
@@ -221,6 +224,7 @@ export class TaskProcessor {
     this.runsRoot = options.runsRoot ?? '.newide/runs';
     if (options.participantSessions) this.participantSessions = options.participantSessions;
     if (options.sapBridge) this.sapBridge = options.sapBridge;
+    if (options.aapBridge) this.aapBridge = options.aapBridge;
     this.mailboxStore = options.mailboxStore;
   }
 
@@ -665,6 +669,11 @@ export class TaskProcessor {
     };
     if (completing) delete runtimeState.current_run_id;
 
+    const aapDispatch =
+      nextInput.cursor === 'mailbox_wait'
+        ? this.createAapMailboxDispatch(aggregate, run, input, nextInput)
+        : undefined;
+
     let committed: PersistedCoordinationEvent[];
     try {
       const commit = {
@@ -680,6 +689,8 @@ export class TaskProcessor {
             input.sap_result.admission,
             input.sap_result.frame,
           )
+        : aapDispatch
+          ? this.requireAapBridge().commitWait(commit, aapDispatch)
         : this.store.commitState(commit);
     } catch (error) {
       throw new TaskProcessorStageCommitError('handler.completed', error);
@@ -697,6 +708,44 @@ export class TaskProcessor {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
     };
+  }
+
+  private createAapMailboxDispatch(
+    aggregate: PersistedTaskAggregate,
+    run: PersistedRunState,
+    input: AdvanceTaskStageInput,
+    nextInput: Extract<TaskCursorInput, { cursor: 'mailbox_wait' }>,
+  ): AapAskDispatch | undefined {
+    if (!this.aapBridge || !this.mailboxStore) return undefined;
+    if (nextInput.delivery_ids.length !== 1) {
+      throw new Error('AAP mailbox wait requires exactly one delivery');
+    }
+    const deliveryId = nextInput.delivery_ids[0]!;
+    const envelope = this.mailboxStore.getMailboxEnvelope(deliveryId);
+    if (!envelope) throw new Error(`Mailbox delivery ${deliveryId} was not found`);
+    const fromRoleId = input.owner_agent_id ?? aggregate.task.owner_agent_id;
+    if (!fromRoleId) throw new Error('AAP mailbox wait requires the sender Agent role');
+    const content =
+      envelope.message.content?.trim() ||
+      (typeof envelope.message.payload.content === 'string'
+        ? envelope.message.payload.content
+        : JSON.stringify(envelope.message.payload));
+    const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+    const causationId = activeStage
+      ? readPayloadString(activeStage, 'sap_exchange_id')
+      : undefined;
+    return this.aapBridge.createAsk({
+      task_id: envelope.message.task_id,
+      run_id: run.run_id,
+      from_role_id: fromRoleId,
+      to_role_id: envelope.delivery.recipient_role_id,
+      message_id: envelope.message.message_id,
+      delivery_id: envelope.delivery.delivery_id,
+      content,
+      ...(envelope.delivery.deadline_at ? { deadline_at: envelope.delivery.deadline_at } : {}),
+      ...(causationId ? { causation_id: causationId } : {}),
+      exchange_id: `aap_ask_${envelope.message.message_id}`,
+    });
   }
 
   failStage(input: FailTaskStageInput): TaskStageCommitResult {
@@ -947,6 +996,67 @@ export class TaskProcessor {
         updated_at: timestamp,
       },
       events: [taskBlocked],
+    });
+    return this.getTaskSnapshot(taskId);
+  }
+
+  /**
+   * Release a Mailbox wait at its local deadline without inventing a reply
+   * from the recipient. The Task becomes terminal with an explicit timeout
+   * error; a later Mailbox reply remains an auditable late message.
+   */
+  expireMailboxWait(taskId: string, reason: string): TaskSnapshot {
+    const aggregate = this.store.getTaskAggregate(taskId);
+    if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
+    if (aggregate.task.status === 'failed' && aggregate.task.error?.code === 'mailbox_timeout') {
+      return projectAggregate(aggregate, this.runsRoot);
+    }
+    assertTaskStatusTransition(aggregate.task.status, 'failed');
+    const runId =
+      readPayloadString(aggregate.runtime_state.diagnostics, 'mailbox_wait_run_id') ??
+      readPayloadString(aggregate.runtime_state.interrupt_state ?? {}, 'interrupted_run_id') ??
+      aggregate.runs.at(-1)?.run_id;
+    if (!runId || !aggregate.runs.some((run) => run.run_id === runId)) {
+      throw new Error(`Cannot expire mailbox wait for ${taskId}: no associated Run`);
+    }
+    const timestamp = this.now();
+    const taskFailed = this.createEvent(
+      'task.failed',
+      taskId,
+      taskId,
+      runId,
+      { code: 'mailbox_timeout', reason },
+    );
+    const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
+    this.store.commitState({
+      expected_task_revision: aggregate.task.revision,
+      task: {
+        ...aggregate.task,
+        status: 'failed',
+        error: { code: 'mailbox_timeout', message: reason },
+        revision: aggregate.task.revision + 1,
+        updated_at: timestamp,
+      },
+      runtime_state: {
+        ...runtimeWithoutCurrentRun,
+        resume_cursor: 'done',
+        cursor_input: { cursor: 'done' },
+        waiting_on: [],
+        interrupt_state: {
+          type: 'mailbox_timeout',
+          reason,
+          ...(aggregate.runtime_state.cursor_input?.cursor === 'mailbox_wait'
+            ? { delivery_ids: [...aggregate.runtime_state.cursor_input.delivery_ids] }
+            : {}),
+        },
+        diagnostics: {
+          ...aggregate.runtime_state.diagnostics,
+          mailbox_timeout: true,
+          mailbox_timeout_code: 'mailbox_timeout',
+        },
+        updated_at: timestamp,
+      },
+      events: [taskFailed],
     });
     return this.getTaskSnapshot(taskId);
   }
@@ -1458,6 +1568,11 @@ export class TaskProcessor {
   private requireSapBridge(): SapTaskBridge {
     if (!this.sapBridge) throw new Error('SAP bridge is not configured');
     return this.sapBridge;
+  }
+
+  private requireAapBridge(): AapMailboxBridge {
+    if (!this.aapBridge) throw new Error('AAP bridge is not configured');
+    return this.aapBridge;
   }
 
   private recoverInterruptedTask(aggregate: PersistedTaskAggregate): TaskSnapshot {

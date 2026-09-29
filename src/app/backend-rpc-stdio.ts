@@ -42,6 +42,7 @@ import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
 import {
   PersistentParticipantSessionRegistry,
+  AapMailboxBridge,
   SapTaskBridge,
   TaskExecutionLoop,
   TaskProcessor,
@@ -249,6 +250,7 @@ export async function createProductionBackendService(
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
     const sapBridge = new SapTaskBridge({ store: coordinationStore });
+    const aapBridge = new AapMailboxBridge({ store: coordinationStore });
     const mailboxService = new PersistentMailboxService(coordinationStore);
     const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const protocolCallJournal = new ProtocolCallJournal({
@@ -461,6 +463,7 @@ export async function createProductionBackendService(
       mailboxStore: coordinationStore,
       participantSessions,
       sapBridge,
+      aapBridge,
     });
     taskProcessor.recoverInterruptedTasks();
     // 工厂必须活到 run 结束：`snapshot(runId)` 要拿内存缓冲算聚合，写进 summary 的
@@ -545,6 +548,7 @@ export async function createProductionBackendService(
       new FileRunArtifactContentReader(runsRoot),
       new FileRunEventConsumptionSink(runsRoot),
       runTelemetryJsonlSink,
+      aapBridge,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();
