@@ -12,6 +12,15 @@
  * 审计文件可能被保留上限截断（`truncated: true` 标记后停写）。截断文件喂出的
  * 观测会被标成 `complete: false`，聚合结果不再冒充完整数据；与正源合并时，
  * 只要某个 Session 被任一完整来源覆盖过，它就是完整的。
+ *
+ * 盘上读取有两条通道，优先级固定：**账本 `driver-usage.jsonl` 在前，副本
+ * `driver-stream.jsonl` 在后**。账本是逐条同步追加的观测（见 driver-usage-jsonl-sink），
+ * 不受保留上限截断，所以同一个 run 有账本时不必再看副本——那份副本缺的正是尾。
+ * 升级前跑完的历史 run 只有副本，兜底路径因此必须留着。
+ *
+ * 完整性判据按通道给：账本没有上限，它缺尾只因「session 在终值到来前就没跑了」，而
+ * `cost` 只在 session 结束时来一次，于是「带 cost」就是「拿到终值」的判据；副本仍按
+ * 「整份文件未被截断」判定，保持历史行为不变。
  */
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -45,6 +54,91 @@ export interface TaskDriverUsage {
 
 interface MutableSessionUsage extends DriverSessionUsage {
   costObservedAt?: string;
+}
+
+/** 一次 usage 观测——折叠的最小单位：session 级累计占用，外加可能到来的终值成本。 */
+export type DriverUsageObservation = MutableSessionUsage;
+
+export const DRIVER_USAGE_RECORD_SCHEMA = 'newide.driver-usage-record.v1';
+
+/**
+ * `driver-usage.jsonl` 的一行。刻意只装 driver 侧：scaffold 侧的 proxy LLM 账本已经在
+ * `telemetry.jsonl`（schema `newide.token_usage.v1`）里逐条落盘且实测完好，两套口径各归
+ * 各的文件，join 发生在读的一侧——把两套写进同一个文件才会真的让人相加。
+ *
+ * `metric` 是必须的自描述：`context_tokens_used` 是**占用观测**，同 session 内重复
+ * update 取 max，跨 session 才求和；它和 billed tokens 不是同一个量，读的人不看这个字段
+ * 就会算错。
+ */
+export interface DriverUsageRecord {
+  schema_version: typeof DRIVER_USAGE_RECORD_SCHEMA;
+  recorded_at: string;
+  run_id: string;
+  task_id: string;
+  /** run 内单调序号，接收点分配；driver 自带的序号每次 invoke 重置，不能当去重键。 */
+  stream_sequence: number;
+  session_id: string;
+  role_id?: string;
+  metric: 'context_tokens_used';
+  context_tokens_used: number;
+  context_window_size?: number;
+  /** 只在 session 结束时出现一次；带它的行即该 session 的终值。 */
+  reported_cost?: DriverUsageCost;
+}
+
+/** 观测 → 账本行。折叠规则留给读的一侧，写只如实记录看到了什么。 */
+export function driverUsageRecordFromObservation(
+  observation: DriverUsageObservation,
+  identity: { run_id: string; task_id: string; stream_sequence: number; recorded_at: string },
+): DriverUsageRecord {
+  return {
+    schema_version: DRIVER_USAGE_RECORD_SCHEMA,
+    recorded_at: identity.recorded_at,
+    run_id: identity.run_id,
+    task_id: identity.task_id,
+    stream_sequence: identity.stream_sequence,
+    session_id: observation.session_id,
+    ...(observation.role_id ? { role_id: observation.role_id } : {}),
+    metric: 'context_tokens_used',
+    context_tokens_used: observation.context_tokens_used,
+    ...(observation.context_window_size !== undefined
+      ? { context_window_size: observation.context_window_size }
+      : {}),
+    ...(observation.reported_cost ? { reported_cost: observation.reported_cost } : {}),
+  };
+}
+
+/**
+ * 账本行 → 观测。字段缺失、schema 不认识或 `metric` 不是本口径的一律跳过：宁可少一个
+ * session，也不能把别的口径的数字折进 `context_tokens_used`。
+ */
+export function driverUsageObservationFromRecord(
+  record: Record<string, unknown>,
+): DriverUsageObservation | undefined {
+  if (record.schema_version !== DRIVER_USAGE_RECORD_SCHEMA) return undefined;
+  if (record.metric !== 'context_tokens_used') return undefined;
+  const sessionId = nonemptyString(record.session_id);
+  const used = finiteNonnegative(record.context_tokens_used);
+  if (!sessionId || used === undefined) return undefined;
+  const size = finiteNonnegative(record.context_window_size);
+  const roleId = nonemptyString(record.role_id);
+  const cost = asRecord(record.reported_cost);
+  const amount = finiteNonnegative(cost?.amount);
+  const currency = nonemptyString(cost?.currency);
+  const reportedCost = amount !== undefined && currency ? { amount, currency } : undefined;
+  return {
+    session_id: sessionId,
+    ...(roleId ? { role_id: roleId } : {}),
+    context_tokens_used: used,
+    ...(size !== undefined ? { context_window_size: size } : {}),
+    ...(reportedCost
+      ? {
+          reported_cost: reportedCost,
+          costObservedAt: nonemptyString(record.recorded_at) ?? '',
+        }
+      : {}),
+    complete: reportedCost !== undefined,
+  };
 }
 
 /**
@@ -97,8 +191,14 @@ export function mergeTaskDriverUsage(
 
 /**
  * Project durable ACP usage snapshots into one Task aggregate.
- * 回读 `<runsRoot>/<runId>/driver-stream.jsonl` 的兜底来源；`truncated: true`
- * 标记之后的观测全部缺失，因此该文件喂出的观测都标 `complete: false`。
+ *
+ * 逐个 run 目录读，账本优先：`driver-usage.jsonl` 有记录就不再碰那个 run 的
+ * `driver-stream.jsonl`——同一批观测，副本缺的正是尾（实测 council 11,943 行只到前
+ * 75 秒，五个角色一个终值都没有）。没有账本的 run（升级前跑的、或关掉开关的）走副本
+ * 兜底，那条路径的语义一字未改。
+ *
+ * 多个 run 目录可以属于同一个 task（council 的续 run），所以全部折叠进同一张表：
+ * `used` 取 max、cost 取观测时间最新的一次，跨 session 才求和。
  */
 export async function projectTaskDriverUsage(
   runsRoot: string,
@@ -108,31 +208,67 @@ export async function projectTaskDriverUsage(
   const runDirectories = await fs.readdir(runsRoot, { withFileTypes: true }).catch(() => []);
   for (const directory of runDirectories) {
     if (!directory.isDirectory()) continue;
-    const auditPath = path.join(runsRoot, directory.name, 'driver-stream.jsonl');
-    const audit = await fs.readFile(auditPath, 'utf8').catch(() => undefined);
-    if (!audit) continue;
-    // 截断标记是文件级事实：标记之后的观测没落盘，标记之前的观测也都缺「后续
-    // 更新」——`used` 是累计值，尾部丢了就可能偏小。所以整个文件喂出的观测都
-    // 标 complete: false，只把完整性判给进程内的正源。
-    const records = audit
-      .split('\n')
-      .filter((line) => line.trim())
-      .map((line) => parseJsonRecord(line));
-    const truncated = records.some((record) => record?.truncated === true);
-    for (const record of records) {
-      if (!record) continue;
-      if (record.truncated === true) continue;
-      if (record.task_id !== taskId) continue;
-      const observation = usageObservationFromDriverEvent(
-        asRecord(record.event) as unknown as DriverStreamEvent,
-        typeof record.recorded_at === 'string' ? record.recorded_at : '',
-        !truncated,
-      );
-      if (!observation) continue;
-      foldUsageObservation(sessions, observation);
-    }
+    const runDir = path.join(runsRoot, directory.name);
+    const ledger = await readUsageLedgerObservations(path.join(runDir, 'driver-usage.jsonl'), taskId);
+    const observations =
+      ledger.length > 0
+        ? ledger
+        : await readCappedStreamObservations(path.join(runDir, 'driver-stream.jsonl'), taskId);
+    for (const observation of observations) foldUsageObservation(sessions, observation);
   }
   return finalizeUsageSessions(sessions);
+}
+
+/** 逐条追加的账本：没有保留上限，所以只需按 task 过滤。 */
+async function readUsageLedgerObservations(
+  ledgerPath: string,
+  taskId: string,
+): Promise<MutableSessionUsage[]> {
+  const records = await readJsonLines(ledgerPath);
+  const observations: MutableSessionUsage[] = [];
+  for (const record of records) {
+    if (!record || record.task_id !== taskId) continue;
+    const observation = driverUsageObservationFromRecord(record);
+    if (observation) observations.push(observation);
+  }
+  return observations;
+}
+
+/**
+ * 回读 `<runsRoot>/<runId>/driver-stream.jsonl` 的兜底来源；`truncated: true`
+ * 标记之后的观测全部缺失，因此该文件喂出的观测都标 `complete: false`。
+ */
+async function readCappedStreamObservations(
+  auditPath: string,
+  taskId: string,
+): Promise<MutableSessionUsage[]> {
+  const records = await readJsonLines(auditPath);
+  // 截断标记是文件级事实：标记之后的观测没落盘，标记之前的观测也都缺「后续
+  // 更新」——`used` 是累计值，尾部丢了就可能偏小。所以整个文件喂出的观测都
+  // 标 complete: false，只把完整性判给进程内的正源。
+  const truncated = records.some((record) => record?.truncated === true);
+  const observations: MutableSessionUsage[] = [];
+  for (const record of records) {
+    if (!record) continue;
+    if (record.truncated === true) continue;
+    if (record.task_id !== taskId) continue;
+    const observation = usageObservationFromDriverEvent(
+      asRecord(record.event) as unknown as DriverStreamEvent,
+      typeof record.recorded_at === 'string' ? record.recorded_at : '',
+      !truncated,
+    );
+    if (observation) observations.push(observation);
+  }
+  return observations;
+}
+
+async function readJsonLines(filePath: string): Promise<Array<Record<string, unknown> | undefined>> {
+  const text = await fs.readFile(filePath, 'utf8').catch(() => undefined);
+  if (!text) return [];
+  return text
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) => parseJsonRecord(line));
 }
 
 /** 从一条 driver 事件提取 usage 观测；非 usage_update 或缺关键字段时返回 undefined。 */

@@ -689,6 +689,8 @@ async function runOneInstance(input: {
     row.token_usage = await resolveInstanceTokenUsage({
       summary,
       sessionId: row.session_id,
+      // 顺序有依赖：会话清单来自上面刚折好的 usage 账本，先解析账本再刮 transcript。
+      sessionIds: driverSessionIds(row.driver_usage, row.session_id),
       worktreePath: prepared.worktreePath,
     });
 
@@ -880,7 +882,18 @@ function readSummaryTokenUsage(summary: unknown): TokenUsage | undefined {
 
 function readSummaryDriverUsage(summary: unknown): TaskDriverUsage | undefined {
   if (!summary || typeof summary !== 'object') return undefined;
-  const obj = summary as { driver_usage?: unknown; token_usage?: unknown };
+  // 三个键名是三代产物，按新到旧认：`driver_context_usage` 是后端现在写的
+  // （run-terminal-output-writer 的 buildBackendSummary），`driver_usage` 与 `token_usage`
+  // 是旧块名，只为读得动历史 run 才留着。只认旧名的话，新 summary 里的成本会被当成
+  // 不存在，静默掉回文件兜底——这条路径曾长期无人发现。
+  const obj = summary as {
+    driver_context_usage?: unknown;
+    driver_usage?: unknown;
+    token_usage?: unknown;
+  };
+  if (isDriverStreamUsage(obj.driver_context_usage)) {
+    return obj.driver_context_usage;
+  }
   if (isDriverStreamUsage(obj.driver_usage)) {
     return obj.driver_usage;
   }
@@ -908,15 +921,37 @@ async function resolveInstanceDriverUsage(input: {
 async function resolveInstanceTokenUsage(input: {
   summary: unknown;
   sessionId?: string;
+  /** 这个 run 跑过的全部 driver 会话；council 每个角色一个，只刮 primary 会漏掉其余四个。 */
+  sessionIds?: readonly string[];
   worktreePath: string;
 }): Promise<TokenUsage> {
   const fromSummary = readSummaryTokenUsage(input.summary);
   if (fromSummary) return fromSummary;
   const scraped = await collectClaudeSessionUsage({
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    ...(input.sessionIds && input.sessionIds.length > 0
+      ? { sessionIds: input.sessionIds }
+      : {}),
     worktreePath: input.worktreePath,
   });
   return toAblationTokenUsage(scraped);
+}
+
+/**
+ * 汇总这个 run 见过的 driver 会话 id，primary 在前。
+ *
+ * 会话清单以 usage 账本折出来的 `sessions` 为准，而不是 summary 的 `session_id`：council
+ * 四个角色各占一个 session，summary 只留得下 primary 一个，实测一次四角色 run 有三分之三
+ * 的 token 从刮 transcript 这条路漏掉。账本还有一层好处——summary 缺失时（run 死在终态
+ * 之前）它照样齐全。
+ */
+function driverSessionIds(usage: TaskDriverUsage | undefined, primary?: string): string[] {
+  const ids: string[] = [];
+  if (primary) ids.push(primary);
+  for (const session of usage?.sessions ?? []) {
+    if (session.session_id && !ids.includes(session.session_id)) ids.push(session.session_id);
+  }
+  return ids;
 }
 
 function summarizeTiming(rows: InstanceRow[]): {
