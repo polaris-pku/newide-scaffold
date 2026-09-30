@@ -125,23 +125,47 @@ export async function stageCouncilArtifacts(
   await fs.mkdir(workspace, { recursive: true });
   for (const artifact of artifacts) {
     if (!isMaterializableFileArtifact(artifact)) continue;
-    const targetPath = artifact.content?.target_path;
-    if (!targetPath) continue;
-    if (!/^[A-Za-z0-9_-]+$/.test(artifact.artifact_id)) {
-      throw new Error(`Invalid Council artifact id: ${artifact.artifact_id}`);
-    }
-    const relative = targetPath.replaceAll('\\', '/');
-    if (
-      path.posix.isAbsolute(relative) ||
-      path.win32.isAbsolute(relative) ||
-      relative.split('/').includes('..')
-    ) {
-      throw new Error(`Council artifact target escapes workspace: ${targetPath}`);
-    }
-    const target = path.join(workspace, 'inputs', artifact.artifact_id, relative);
+    const target = councilArtifactStagePath(workspace, artifact);
+    if (!target) continue;
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, await readArtifactBytes(artifact));
   }
+}
+
+/**
+ * 契约产物落在执行者工作区的相对路径：`inputs/<artifact_id>/<target_path>`。
+ *
+ * 拼法只有这一处：**落盘与指令文案必须同源**。此前 plan_first 给执行者的指令只说
+ * 「staged under inputs/」，不给文件名，执行者得自己 Glob 递归通配 `inputs/` 去猜；
+ * 实测它确实是这样猜出来的。那样一来「按 Plan 执行」就取决于模型愿不愿意去找——
+ * 一旦 `inputs/` 下有多个产物、或它没去找，Plan 会被静默漏读，而 run 照样报 completed。
+ *
+ * 无效 id 与越界 target_path 在这里抛错：调用方拿到的每个字符串都是真会落盘的路径。
+ */
+export function councilArtifactStageRelativePath(artifact: ArtifactRef): string | undefined {
+  const targetPath = artifact.content?.target_path;
+  if (!targetPath) return undefined;
+  if (!/^[A-Za-z0-9_-]+$/.test(artifact.artifact_id)) {
+    throw new Error(`Invalid Council artifact id: ${artifact.artifact_id}`);
+  }
+  const relative = targetPath.replaceAll('\\', '/');
+  if (
+    path.posix.isAbsolute(relative) ||
+    path.win32.isAbsolute(relative) ||
+    relative.split('/').includes('..')
+  ) {
+    throw new Error(`Council artifact target escapes workspace: ${targetPath}`);
+  }
+  return path.posix.join('inputs', artifact.artifact_id, relative);
+}
+
+/** 上面那条相对路径在 `workspace` 下的绝对落点。 */
+export function councilArtifactStagePath(
+  workspace: string,
+  artifact: ArtifactRef,
+): string | undefined {
+  const relative = councilArtifactStageRelativePath(artifact);
+  return relative ? path.join(workspace, ...relative.split('/')) : undefined;
 }
 
 async function isGitWorkspace(workspace: string): Promise<boolean> {
