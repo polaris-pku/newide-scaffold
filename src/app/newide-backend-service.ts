@@ -109,7 +109,13 @@ import {
   FileDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
-import { TaskDriverUsageAccumulator, type TaskDriverUsage } from './driver-usage-projector';
+import { NoopDriverUsageSink, type DriverUsageSink } from './driver-usage-jsonl-sink';
+import {
+  TaskDriverUsageAccumulator,
+  driverUsageRecordFromObservation,
+  usageObservationFromDriverEvent,
+  type TaskDriverUsage,
+} from './driver-usage-projector';
 import { projectDriverStreamLifecycleEvent } from './driver-stream-projection';
 import {
   createUnavailableSystemStatusService,
@@ -291,6 +297,15 @@ export class NewideBackendService {
      */
     private readonly runTelemetryJsonlSink: TelemetrySink = new NoopTelemetrySink(),
     private readonly aapBridge?: AapMailboxBridge,
+    /**
+     * driver usage 观测的独立账本。默认空转，生产注入按 run 落文件的 sink。
+     *
+     * 与 `driverStreamAuditWriter` 的区别是这份只装 usage 观测，且**不受保留上限截断**：
+     * 事件副本写满 8 MiB 就停，实测一次 council 因此只剩前 75 秒的观测，报表报出
+     * `driver_sessions=1`（真值 5）。账本极小（同一次 run 一百多条），逐条同步追加，
+     * 所以它可以是成本与占用的正源，而不必等终态 summary 出生。
+     */
+    private readonly driverUsageSink: DriverUsageSink = new NoopDriverUsageSink(),
   ) {}
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
@@ -1776,17 +1791,54 @@ export class NewideBackendService {
     identity: { run_id: string; task_id: string },
     event: DriverStreamEvent,
   ): void {
-    // usage 观测在这里进正源（进程内累加），文件回读只是兜底。
-    this.driverUsageFor(identity.task_id).observe(event);
     // run 级单调序号：driver 自带的 event.sequence 每次 invoke 重置，多 invoke 下
-    // 不唯一。引用（payload_ref）与对账需要 run 内唯一的键，在接收点统一分配，
-    // 落盘信封与投影 payload 各带一份。
+    // 不唯一。引用（payload_ref）、账本行与投影 payload 需要 run 内唯一的键，在接收点
+    // 统一分配，各带一份。
     const streamSequence = this.nextDriverStreamSequence(identity.run_id);
+    // usage 观测在这里进正源（进程内累加），并同步落一份不受保留上限影响的账本。
+    // 序号要在写账本前定好，所以先取号；两条通道共用同一个时间戳与同一个提取器，
+    // 口径因此不可能分叉。
+    const recordedAt = event.created_at ?? new Date().toISOString();
+    this.driverUsageFor(identity.task_id).observe(event, recordedAt);
+    this.writeDriverUsageRecord(identity, event, recordedAt, streamSequence);
     void this.driverStreamAuditWriter
       .append(identity.run_id, identity.task_id, event, streamSequence)
       .catch(() => undefined);
     const projected = projectDriverStreamLifecycleEvent(event, streamSequence);
     if (projected) this.appendDomainEvent(identity, projected);
+  }
+
+  /**
+   * 每个 usage 观测一行，落 `<run>/driver-usage.jsonl`；非 usage 事件直接跳过。
+   *
+   * 记的是**观测**而不是聚合结果：聚合只能在 run 结尾出生，而 council 恰恰死在结尾
+   * ——summary.json 没写出来，进程内正源随之消失，成本只能从截断副本里重建。逐条追加
+   * 则写下即完整，进程随后怎么被杀都不影响已在盘上的数字，报表因此可以直读这个文件，
+   * 不再依赖 summary 的出生时序。
+   *
+   * 完整性判据交给读的一侧（带 `cost` 即拿到终值）：写的时候无从知道这个 session 还会
+   * 不会有后续 update，在这里虚报完整就是把病灶换个地方重演。
+   */
+  private writeDriverUsageRecord(
+    identity: { run_id: string; task_id: string },
+    event: DriverStreamEvent,
+    recordedAt: string,
+    streamSequence: number,
+  ): void {
+    const observation = usageObservationFromDriverEvent(event, recordedAt, true);
+    if (!observation) return;
+    try {
+      this.driverUsageSink.emit(
+        driverUsageRecordFromObservation(observation, {
+          run_id: identity.run_id,
+          task_id: identity.task_id,
+          stream_sequence: streamSequence,
+          recorded_at: recordedAt,
+        }),
+      );
+    } catch {
+      // 落盘是观测：同步抛出也只丢这一条信号，不影响 run。
+    }
   }
 
   private nextDriverStreamSequence(runId: string): number {

@@ -36,6 +36,11 @@ import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
 import { FileRunAuditWriter } from './run-audit-writer';
 import { FileDriverStreamAuditWriter } from './driver-stream-audit-writer';
+import {
+  FileRunDriverUsageJsonlSink,
+  NoopDriverUsageSink,
+  type DriverUsageSink,
+} from './driver-usage-jsonl-sink';
 import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
@@ -520,6 +525,14 @@ export async function createProductionBackendService(
     )
       ? new FileRunTelemetryJsonlSink(runsRoot)
       : new NoopTelemetrySink();
+    // 一次 run 一份 driver-usage.jsonl：driver 侧 usage 观测逐条同步追加，不受
+    // driver-stream.jsonl 的保留上限截断。关掉开关时换成空转 sink，生产行为与接线前
+    // 逐位一致：不建文件、不写盘。
+    const driverUsageSink: DriverUsageSink = readDriverUsageJsonlEnabled(
+      env.NEWIDE_DRIVER_USAGE_JSONL,
+    )
+      ? new FileRunDriverUsageJsonlSink(runsRoot)
+      : new NoopDriverUsageSink();
     // terminalWriter 的 usage 正源回调要引用 service，而 service 尚在构造中：用可变
     // 持有对象让回调在 finalize 时（构造早已完成）取到进程内累加器，截断缺尾由此补全。
     const serviceHolder: { service?: NewideBackendService } = {};
@@ -549,6 +562,7 @@ export async function createProductionBackendService(
       new FileRunEventConsumptionSink(runsRoot),
       runTelemetryJsonlSink,
       aapBridge,
+      driverUsageSink,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();
@@ -984,6 +998,23 @@ export function readTelemetryJsonlEnabled(value: string | undefined): boolean {
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
   throw new Error(`Invalid NEWIDE_TELEMETRY_JSONL: ${value}. Expected 0/1/true/false.`);
+}
+
+/**
+ * NEWIDE_DRIVER_USAGE_JSONL 解析：默认 true；"0"/"false" 关闭。
+ *
+ * 与 `NEWIDE_TELEMETRY_JSONL` 同形，管的是 driver 侧 usage 账本
+ * （`<state-root>/runs/<run_id>/driver-usage.jsonl`）。这条路径是同步追加，写的是每 run
+ * 一两百行的小文件，成本可以忽略；开关留着，是因为「怀疑埋点本身在干扰被测 run」时
+ * 需要一个能一键退回接线前状态的对照手段。关闭路径必须干净：换空转 sink，不建文件、
+ * 不写盘。
+ */
+export function readDriverUsageJsonlEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_DRIVER_USAGE_JSONL: ${value}. Expected 0/1/true/false.`);
 }
 
 export function readCouncilAuctionEnabled(value: string | undefined): boolean {

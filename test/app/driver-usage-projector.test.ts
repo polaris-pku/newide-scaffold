@@ -76,6 +76,93 @@ describe('projectTaskDriverUsage', () => {
   });
 });
 
+describe('projectTaskDriverUsage 的账本优先', () => {
+  it('同一个 run 有账本时不读被截断的副本，终值与成本由此找回', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-driver-usage-'));
+    // 复刻实测现场：副本只剩截断前的一个观测，真正的终值在账本里。
+    await writeUsage(runsRoot, 'run_ledger', [
+      usage('task_ledger', 'session_a', 'role_a', 100, undefined, '2026-08-14T00:00:01Z'),
+      { task_id: 'task_ledger', recorded_at: '2026-08-14T00:00:02Z', truncated: true },
+    ]);
+    await writeLedger(runsRoot, 'run_ledger', [
+      ledgerRecord({ session_id: 'session_a', used: 68_645, cost: 1.663 }),
+    ]);
+
+    await expect(projectTaskDriverUsage(runsRoot, 'task_ledger')).resolves.toMatchObject({
+      context_tokens_used: 68_645,
+      reported_costs: [{ amount: 1.663, currency: 'USD' }],
+      complete: true,
+      sessions: [
+        {
+          session_id: 'session_a',
+          context_tokens_used: 68_645,
+          reported_cost: { amount: 1.663, currency: 'USD' },
+          complete: true,
+        },
+      ],
+    });
+  });
+
+  it('账本里带 cost 即判终值，缺 cost 的如实标缺尾', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-driver-usage-'));
+    await writeLedger(runsRoot, 'run_cost', [
+      ledgerRecord({ task: 'task_cost', session_id: 'session_done', used: 500, cost: 0.5 }),
+      // 第 5 个角色的会话在进程被杀前没等到 cost：数字照收，完整性不冒充。
+      ledgerRecord({ task: 'task_cost', session_id: 'session_killed', used: 400, sequence: 2 }),
+    ]);
+
+    const projected = await projectTaskDriverUsage(runsRoot, 'task_cost');
+    expect(projected.complete).toBe(false);
+    expect(projected.context_tokens_used).toBe(900);
+    expect(projected.sessions).toMatchObject([
+      { session_id: 'session_done', complete: true },
+      { session_id: 'session_killed', complete: false },
+    ]);
+  });
+
+  it('不认的 schema 与别的口径一律跳过，不折进 context_tokens_used', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-driver-usage-'));
+    await writeLedger(runsRoot, 'run_strict', [
+      { ...ledgerRecord({ task: 'task_strict', session_id: 'session_ok', used: 10, cost: 0.1 }) },
+      {
+        ...ledgerRecord({ task: 'task_strict', session_id: 'session_other_metric', used: 999 }),
+        metric: 'billed_tokens',
+      },
+      {
+        ...ledgerRecord({ task: 'task_strict', session_id: 'session_other_schema', used: 999 }),
+        schema_version: 'some-other-record.v9',
+      },
+      ledgerRecord({ task: 'task_other', session_id: 'session_other_task', used: 999 }),
+    ]);
+
+    const projected = await projectTaskDriverUsage(runsRoot, 'task_strict');
+    expect(projected.sessions.map((session) => session.session_id)).toEqual(['session_ok']);
+    expect(projected.context_tokens_used).toBe(10);
+  });
+
+  it('续 run 的账本与老 run 的副本可以混着折叠', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-driver-usage-'));
+    // 升级前跑的 run 只有副本；升级后的续 run 有账本。两条通道折叠进同一张表。
+    await writeUsage(runsRoot, 'run_old', [
+      usage('task_mixed', 'session_old', 'role_a', 120, 0.25, '2026-08-14T00:00:01Z'),
+    ]);
+    await writeLedger(runsRoot, 'run_new', [
+      ledgerRecord({ task: 'task_mixed', session_id: 'session_new', used: 30, cost: 0.5 }),
+    ]);
+
+    const projected = await projectTaskDriverUsage(runsRoot, 'task_mixed');
+    expect(projected).toMatchObject({
+      context_tokens_used: 150,
+      reported_costs: [{ amount: 0.75, currency: 'USD' }],
+      complete: true,
+    });
+    expect(projected.sessions.map((session) => session.session_id)).toEqual([
+      'session_new',
+      'session_old',
+    ]);
+  });
+});
+
 describe('TaskDriverUsageAccumulator', () => {
   it('folds stream events with the same cumulative-collapse semantics', () => {
     const accumulator = new TaskDriverUsageAccumulator();
@@ -229,5 +316,45 @@ function usageEvent(
         ...(cost !== undefined ? { cost: { amount: cost, currency: 'USD' } } : {}),
       },
     },
+  };
+}
+
+/**
+ * 写账本 `<runId>/driver-usage.jsonl`。`run_id` 由目录名盖章，与生产 sink 同规则：
+ * 文件本就按 run 分目录，行内 run_id 与目录不一致只会让读的人困惑。
+ */
+async function writeLedger(
+  runsRoot: string,
+  runId: string,
+  records: Record<string, unknown>[],
+): Promise<void> {
+  const runDir = path.join(runsRoot, runId);
+  await mkdir(runDir, { recursive: true });
+  const body = records.map((record) => JSON.stringify({ ...record, run_id: runId })).join('\n');
+  await writeFile(path.join(runDir, 'driver-usage.jsonl'), `${body}\n`, 'utf8');
+}
+
+function ledgerRecord(input: {
+  task?: string;
+  session_id: string;
+  role?: string;
+  used: number;
+  cost?: number;
+  sequence?: number;
+  recordedAt?: string;
+}): Record<string, unknown> {
+  return {
+    schema_version: 'newide.driver-usage-record.v1',
+    recorded_at: input.recordedAt ?? '2026-08-14T00:00:05Z',
+    task_id: input.task ?? 'task_ledger',
+    stream_sequence: input.sequence ?? 1,
+    session_id: input.session_id,
+    ...(input.role ? { role_id: input.role } : {}),
+    metric: 'context_tokens_used',
+    context_tokens_used: input.used,
+    context_window_size: 200_000,
+    ...(input.cost !== undefined
+      ? { reported_cost: { amount: input.cost, currency: 'USD' } }
+      : {}),
   };
 }
