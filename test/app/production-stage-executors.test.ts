@@ -418,6 +418,10 @@ describe('production stage executors', () => {
       input_artifact_refs: councilResult.synthesis?.artifact_refs,
     });
     expect(implementation?.driver_instruction).toContain('Implement the approved final Council Plan');
+    // 指令点名 staged 落点，执行者不必再自己 Glob 猜文件名（落点与落盘同源）。
+    expect(implementation?.driver_instruction).toContain(
+      `inputs/${councilResult.synthesis?.artifact_refs[0]}/final-plan.md`,
+    );
     expect(council.artifact_refs).toEqual(['artifact_role_primary_council_plan_execution']);
     expect(councilResult.plan_execution).toMatchObject({
       executor_role_id: 'role_primary',

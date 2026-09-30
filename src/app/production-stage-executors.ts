@@ -35,6 +35,7 @@ import {
   type EvidencePack,
 } from '../council';
 import {
+  councilArtifactStageRelativePath,
   councilRunWorkspaceRoot,
   prepareCouncilWorkspace,
   stageCouncilArtifacts,
@@ -917,6 +918,14 @@ async function executeFinalCouncilPlan(input: {
     ),
     'primary',
   );
+  // staged 落点在这里算一次，指令直接点名它；拼法来自 councilArtifactStageRelativePath，
+  // 与落盘同源（见该函数注释：不给文件名就等于把「按 Plan 执行」交给模型的自觉）。
+  const stagedPlanPaths = input.finalPlans
+    .filter((artifact) => isMaterializableFileArtifact(artifact))
+    .flatMap((artifact) => {
+      const relativePath = councilArtifactStageRelativePath(artifact);
+      return relativePath ? [relativePath] : [];
+    });
   await stageCouncilArtifacts(workspace, input.finalPlans);
   const workspaceBefore = await snapshotWorkspaceFiles(workspace);
   let phaseId = input.phaseId;
@@ -940,7 +949,10 @@ async function executeFinalCouncilPlan(input: {
     });
   };
   const implementationInstruction = [
-    'Implement the approved final Council Plan staged under inputs/.',
+    stagedPlanPaths.length > 0
+      ? `Implement the approved final Council Plan staged under inputs/: ${stagedPlanPaths.join(', ')}.`
+      : 'Implement the approved final Council Plan staged under inputs/.',
+    'Read the Plan file at that path in full before editing any product file.',
     'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
     'Use paths relative to the current workspace for every product file; never construct an absolute path.',
     'Do not stop after rewriting or summarizing the Plan; produce the concrete implementation artifacts.',
