@@ -5,12 +5,19 @@
  */
 import type { FrontendRunSnapshot } from '../coordinator/frontend-run-snapshot';
 import { SCHEMA_VERSION, createId } from '../core';
+import type { TaskResumeCursor } from '../persistence';
 import { projectRunEventSource, type RunEvent } from '../protocol/run-event';
 import type { RunSnapshot } from '../protocol/run-snapshot';
+import {
+  nodeCodeForCursor,
+  readCursorFromPayload,
+  stageForCursor,
+  type AppRunStage,
+} from './run-stage-mapping';
 
 export type AppRunMode = 'single_agent' | 'council';
 export type AppRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
-export type AppRunStage = 'executing' | 'council' | 'delivery' | 'intervention';
+export type { AppRunStage };
 
 export type AppRunEvent = RunEvent;
 
@@ -24,6 +31,12 @@ export interface AppRunSnapshot {
   current: {
     stage: AppRunStage;
     active_node_code: string;
+    /** 真实持久游标；`stage` 是它的粗粒度映射。存活期由 `handler.*` 事件推进。 */
+    cursor?: TaskResumeCursor;
+    /** 正在执行的 stage 调用；缺席表示此刻没有调用在跑（不编空串）。 */
+    invocation_id?: string;
+    /** 该 stage 调用的开始时间，与 `invocation_id` 同生共死。 */
+    stage_started_at?: string;
   };
   events: AppRunEvent[];
   snapshot?: FrontendRunSnapshot;
@@ -73,6 +86,49 @@ const EVENT_NODE_CODES: Readonly<Record<string, string>> = {
   'run.failed': 'N18',
 };
 
+/**
+ * 用一条事件推进存活期 `current`。
+ *
+ * `handler.started` / `handler.completed` 的载荷里带着真实游标与 invocation id
+ * （写入点：`TaskProcessor.startStage` / `advanceStageOnce`），而
+ * `NewideBackendService.mirrorTaskAuthorityEvent` 会把载荷原样透传进来。所以存活中的 run
+ * 也能给出与持久投影一致的真实游标，而不是停在创建时那个值——这正是两条投影路径过去
+ * 对同一个 run 的 `stage` 说法不一致的根因。
+ */
+function applyEventToCurrent(record: MutableRunRecord, event: AppRunEvent): void {
+  const startedCursor =
+    event.type === 'handler.started' ? readCursorFromPayload(event.payload.cursor) : undefined;
+  const advancedCursor =
+    event.type === 'handler.completed'
+      ? readCursorFromPayload(event.payload.next_cursor)
+      : undefined;
+  const cursor = startedCursor ?? advancedCursor;
+
+  if (startedCursor) {
+    const invocationId = nonEmptyString(event.payload.invocation_id);
+    if (invocationId) {
+      record.current.invocation_id = invocationId;
+      record.current.stage_started_at = event.created_at;
+    }
+  }
+  if (advancedCursor) {
+    // 与 `advanceStageOnce` 摘掉 active_stage 同义：游标推进即表示没有调用在跑。
+    delete record.current.invocation_id;
+    delete record.current.stage_started_at;
+  }
+  if (cursor) {
+    record.current.cursor = cursor;
+    record.current.stage = stageForCursor(cursor, record.status);
+  }
+  record.current.active_node_code =
+    EVENT_NODE_CODES[event.type] ??
+    (cursor ? nodeCodeForCursor(cursor, record.status) : record.current.active_node_code);
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 export class InMemoryRunRegistry {
   private readonly records = new Map<string, MutableRunRecord>();
 
@@ -93,8 +149,13 @@ export class InMemoryRunRegistry {
       ...input,
       status: 'running',
       current: {
-        stage: input.mode === 'council' ? 'council' : 'executing',
+        // 新建 run 的持久游标恒为 `select_agent`（`beginRun` 用 `cursor_input.cursor` 初始化），
+        // 所以这里从游标推 stage，而不是按 mode 猜——council 模式也是先走 select_agent，
+        // 过去按 mode 直接给 'council' 会让存活期与持久投影在 t=0 就不一致。
+        // 续跑（resume/restart）的初始游标只有协调层知道，由随后的 `handler.started` 校正。
+        stage: stageForCursor('select_agent', 'running'),
         active_node_code: 'N3',
+        cursor: 'select_agent',
       },
       events: [],
       listeners: new Set(),
@@ -124,7 +185,7 @@ export class InMemoryRunRegistry {
     };
     record.events.push(event);
     record.revision += 1;
-    record.current.active_node_code = EVENT_NODE_CODES[type] ?? record.current.active_node_code;
+    applyEventToCurrent(record, event);
     for (const listener of record.listeners) listener(event);
     return event;
   }
@@ -200,6 +261,8 @@ export class InMemoryRunRegistry {
       current: {
         stage: input.status === 'completed' ? 'delivery' : 'intervention',
         active_node_code: 'N18',
+        // 终态与 stage 机一致：所有终结路径都把游标推到 `done`（`finishRun` / `failStage`）。
+        cursor: 'done',
       },
       events: [...record.events, event],
       ...((input.status === 'completed' || input.status === 'failed') && input.snapshot
@@ -256,6 +319,16 @@ export class InMemoryRunRegistry {
     return this.clone(this.require(runId));
   }
 
+  /**
+   * 本进程是否持有该 run。
+   *
+   * 给需要「有就补挂观测、没有就保持缺席」的调用方用：它们不该靠捕获
+   * `RunNotFoundError` 来判断，那会把「没有这个 run」和「别处的错」混成一种。
+   */
+  has(runId: string): boolean {
+    return this.records.has(runId);
+  }
+
   listSnapshots(): AppRunSnapshot[] {
     return [...this.records.values()].map((record) => this.clone(record));
   }
@@ -271,10 +344,25 @@ export class InMemoryRunRegistry {
     return this.commitTerminal(runId, staged);
   }
 
-  subscribe(runId: string, listener: RunEventListener): () => void {
+  /**
+   * 订阅某 run 的事件。
+   *
+   * 注册后先**重放**已有事件再续流，让订阅者不必先拉快照。给了 `after_sequence` 时
+   * 只补该序号之后的事件——这是断线重连的水位：缺省（undefined）仍然全量重放，保持
+   * 既有行为不变。序号由本 registry 单调分配，所以水位就用在推流这一条通道上自洽。
+   */
+  subscribe(
+    runId: string,
+    listener: RunEventListener,
+    options: { after_sequence?: number } = {},
+  ): () => void {
     const record = this.require(runId);
     record.listeners.add(listener);
-    for (const event of record.events) listener(event);
+    const after = options.after_sequence;
+    for (const event of record.events) {
+      if (after !== undefined && event.sequence <= after) continue;
+      listener(event);
+    }
     return () => record.listeners.delete(listener);
   }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { RunNotFoundError, type AppRunEvent } from '../../src/app/run-registry';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../../src/rpc/json-rpc-dispatcher';
+import { JSON_RPC_ERROR_CODES } from '../../src/rpc/json-rpc-line-protocol';
 import { RunRpcMethods, type RunMethodsService } from '../../src/rpc/run-methods';
 
 describe('RunRpcMethods', () => {
@@ -74,6 +75,125 @@ describe('RunRpcMethods', () => {
     expect(output.map((line) => JSON.parse(line))[1]).toMatchObject({
       id: 2,
       error: { code: -32602, message: 'Invalid params' },
+    });
+  });
+
+  it('passes a reconnect watermark through to the subscription', async () => {
+    // 断线重连的水位必须原样传到注册表：`run.subscribe` 过去没有这个参数，
+    // 重连只能全量重放 + 靠 event_id 去重。
+    const output: string[] = [];
+    const calls: Array<[string, number | undefined]> = [];
+    const service = fakeService({
+      subscribe: (runId, _next, afterSequence) => {
+        calls.push([runId, afterSequence]);
+        return () => undefined;
+      },
+    });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, (method, params) => session.sendNotification(method, params)).register(
+      dispatcher,
+    );
+
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":1,"method":"run.subscribe","params":{"run_id":"run_1","after_sequence":7}}',
+    );
+
+    expect(calls).toEqual([['run_1', 7]]);
+    expect(JSON.parse(output[0]!)).toEqual({
+      jsonrpc: '2.0',
+      id: 1,
+      result: { subscribed: true },
+    });
+  });
+
+  it('resolves an externalized payload ref and reports an unresolvable one as unavailable', async () => {
+    // 超限字段只留引用不内联；取回口此前完全缺失，前端能看见引用却永远拿不到内容。
+    const output: string[] = [];
+    const service = fakeService({
+      getRunPayload: async (_runId, payloadRef) =>
+        payloadRef.endsWith('=42')
+          ? { payload_ref: payloadRef, event: { event_type: 'tool_call' } as never }
+          : undefined,
+    });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, (method, params) => session.sendNotification(method, params)).register(
+      dispatcher,
+    );
+
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":1,"method":"run.getPayload","params":{"run_id":"run_1","payload_ref":"driver-stream.jsonl#stream_sequence=42"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":2,"method":"run.getPayload","params":{"run_id":"run_1","payload_ref":"driver-stream.jsonl#stream_sequence=99"}}',
+    );
+    // 引用形状不对：参数校验就该拦下，而不是去读文件。
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":3,"method":"run.getPayload","params":{"run_id":"run_1","payload_ref":"nonsense"}}',
+    );
+
+    const responses = output.map((line) => JSON.parse(line));
+    expect(responses[0]).toEqual({
+      jsonrpc: '2.0',
+      id: 1,
+      result: {
+        payload_ref: 'driver-stream.jsonl#stream_sequence=42',
+        event: { event_type: 'tool_call' },
+      },
+    });
+    // 取不到时报错而不是返回空——前端才能区分它和「本来就没有引用」。
+    expect(responses[1]).toMatchObject({
+      id: 2,
+      error: { code: JSON_RPC_ERROR_CODES.PAYLOAD_REF_UNAVAILABLE },
+    });
+    expect(responses[2]).toMatchObject({
+      id: 3,
+      error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
+    });
+  });
+
+  it('requires a task id for the task scope and forwards the usage query', async () => {
+    const output: string[] = [];
+    const calls: Array<{ scope: string; scope_id?: string; run_id?: string }> = [];
+    const service = fakeService({
+      getRunUsage: async (input) => {
+        calls.push(input);
+        return { history: { scope: input.scope, runs_counted: 0, complete: false } } as never;
+      },
+    });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, (method, params) => session.sendNotification(method, params)).register(
+      dispatcher,
+    );
+
+    // task 作用域没有 scope_id：「这个任务的累计」无从谈起，参数校验就该拦下。
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":1,"method":"run.getUsage","params":{"scope":"task"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":2,"method":"run.getUsage","params":{"scope":"task","scope_id":"task_1","run_id":"run_1"}}',
+    );
+    // 未支持的作用域：role 需要 proxy 腿也按角色归属，summary 里没有。
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":3,"method":"run.getUsage","params":{"scope":"role","scope_id":"role_x"}}',
+    );
+
+    const responses = output.map((line) => JSON.parse(line));
+    expect(calls).toEqual([{ scope: 'task', scope_id: 'task_1', run_id: 'run_1' }]);
+    expect(responses[0]).toMatchObject({
+      id: 1,
+      error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
+    });
+    expect(responses[1]).toEqual({
+      jsonrpc: '2.0',
+      id: 2,
+      result: { history: { scope: 'task', runs_counted: 0, complete: false } },
+    });
+    expect(responses[2]).toMatchObject({
+      id: 3,
+      error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
     });
   });
 
@@ -228,6 +348,23 @@ function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService 
     },
     subscribe: () => () => undefined,
     cancelRun: async () => ({ cancelled: true }),
+    // 这两个与新增的 getRunPayload / getRunUsage 一样，只有被点到的用例才需要真实现；
+    // 摆出让这个 helper 与接口保持可赋值（此前缺 listRuns/restartRun，只是没人做类型检查）。
+    listRuns: async () => ({ runs: [] }),
+    restartRun: async (runId) => ({
+      run_id: `${runId}_restart`,
+      task_id: 'task_1',
+      restarted_from_run_id: runId,
+      status: 'running',
+    }),
+    // 这两个没有「合理的假值」——编一个假的用量历史比明确报错更容易误导用例作者，
+    // 所以默认抛错，要用它们的用例显式给 override。
+    getRunPayload: async () => {
+      throw new Error('getRunPayload fixture is not configured');
+    },
+    getRunUsage: async () => {
+      throw new Error('getRunUsage fixture is not configured');
+    },
     ...overrides,
   };
 }

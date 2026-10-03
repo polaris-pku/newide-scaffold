@@ -110,6 +110,31 @@ describe('InMemoryRunRegistry', () => {
     expect(seen).toEqual(['run.started', 'run.completed']);
   });
 
+  /**
+   * 断线重连的水位。
+   *
+   * 过去 `run.subscribe` 没有水位，重连只能全量重放 + 靠 `event_id` 去重——
+   * 对一个长 run 意味着把所有历史事件（含 driver chunk 洪流）重发一遍。
+   */
+  it('resumes a subscription from a sequence watermark', () => {
+    const registry = new InMemoryRunRegistry();
+    registry.create({ run_id: 'run_resume', task_id: 'task_resume', mode: 'single_agent' });
+    registry.appendEvent('run_resume', 'run.started', {});
+    registry.appendEvent('run_resume', 'handler.started', {
+      cursor: 'select_agent',
+      invocation_id: 'invocation_1',
+    });
+    const seen: number[] = [];
+
+    registry.subscribe('run_resume', (event) => seen.push(event.sequence), {
+      after_sequence: 1,
+    });
+    registry.appendEvent('run_resume', 'run.completed', {});
+
+    // 只补 1 之后的事件，再续流；已经收到过的不重复投递。
+    expect(seen).toEqual([2, 3]);
+  });
+
   it('aborts and records a running cancellation exactly once', () => {
     const registry = new InMemoryRunRegistry(() => '2026-07-11T08:00:00.000Z');
     const controller = new AbortController();
@@ -127,5 +152,78 @@ describe('InMemoryRunRegistry', () => {
     });
     expect(controller.signal.aborted).toBe(true);
     expect(registry.cancel('run_cancelled').events).toHaveLength(1);
+  });
+
+  /**
+   * 存活期 stage 必须随 `handler.*` 事件推进。
+   *
+   * 过去 `appendEvent` 只更新 `active_node_code`，`current.stage` 自 create 起就不动了，
+   * 于是同一个 run 在 registry（落盘 frontend-snapshot.json）与持久投影（run.getSnapshot）
+   * 两条路径上给出的 stage 不一致。这几条断言把两条路径的一致性钉住。
+   */
+  it('advances the live stage from handler events', () => {
+    const registry = new InMemoryRunRegistry(() => '2026-07-11T08:00:00.000Z');
+    registry.create({ run_id: 'run_stage', task_id: 'task_stage', mode: 'single_agent' });
+
+    expect(registry.getSnapshot('run_stage').current).toEqual({
+      stage: 'executing',
+      active_node_code: 'N3',
+      cursor: 'select_agent',
+    });
+
+    registry.appendEvent('run_stage', 'handler.started', {
+      cursor: 'execute_agent',
+      invocation_id: 'invocation_execute_agent_1',
+    });
+
+    expect(registry.getSnapshot('run_stage').current).toEqual({
+      stage: 'executing',
+      active_node_code: 'N8',
+      cursor: 'execute_agent',
+      invocation_id: 'invocation_execute_agent_1',
+      stage_started_at: '2026-07-11T08:00:00.000Z',
+    });
+
+    registry.appendEvent('run_stage', 'handler.completed', {
+      cursor: 'execute_agent',
+      invocation_id: 'invocation_execute_agent_1',
+      next_cursor: 'gate',
+    });
+
+    // 游标推进即表示没有调用在跑：invocation 必须被摘掉，而不是留着上一次的值。
+    expect(registry.getSnapshot('run_stage').current).toEqual({
+      stage: 'delivery',
+      active_node_code: 'N13',
+      cursor: 'gate',
+    });
+  });
+
+  it('starts council runs at the select_agent cursor rather than guessing from mode', () => {
+    // council 模式也是先走 select_agent 进市场选品，council 是后面从 execute_agent 进的。
+    // 按 mode 直接给 'council' 会让存活期与持久投影在 t=0 就不一致。
+    const registry = new InMemoryRunRegistry();
+    registry.create({ run_id: 'run_council', task_id: 'task_council', mode: 'council' });
+
+    expect(registry.getSnapshot('run_council').current).toMatchObject({
+      stage: 'executing',
+      active_node_code: 'N3',
+      cursor: 'select_agent',
+    });
+  });
+
+  it('ignores malformed cursor payloads instead of throwing', () => {
+    // 读路径宽容：一条脏载荷不该把存活 run 的注册表打挂。
+    const registry = new InMemoryRunRegistry();
+    registry.create({ run_id: 'run_dirty', task_id: 'task_dirty', mode: 'single_agent' });
+    registry.appendEvent('run_dirty', 'handler.started', {
+      cursor: 'not_a_cursor',
+      invocation_id: '',
+    });
+
+    expect(registry.getSnapshot('run_dirty').current).toMatchObject({
+      stage: 'executing',
+      active_node_code: 'N3',
+      cursor: 'select_agent',
+    });
   });
 });

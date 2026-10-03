@@ -3,4 +3,6 @@ export * from './coordination-state-store';
 export * from '../mailbox/mailbox-state-store';
 export * from './run-evidence-store';
 export * from './protocol-delivery-store';
+export * from './token-usage-ledger';
+export * from './sqlite-token-usage-ledger';
 export * from './sqlite-coordination-store';

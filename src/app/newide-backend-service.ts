@@ -53,7 +53,9 @@ import {
   type RunRequestStore,
 } from './run-request-store';
 import { projectRunSnapshot } from './run-snapshot-projector';
-import type { RunSnapshot } from '../protocol/run-snapshot';
+import { withAlignedTimeline } from './run-timeline-sequence';
+import { projectRunUsage } from './run-usage-projection';
+import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
 import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task-snapshot';
 import {
@@ -132,6 +134,17 @@ import type {
   RunArtifactContent,
   RunArtifactContentReader,
 } from './run-artifact-content-reader';
+import type { RunPayloadReader } from './run-payload-reader';
+import type {
+  RunUsageHistoryReader,
+  RunUsageHistoryScope,
+} from './run-usage-history';
+
+/** `run.getPayload` 的结果：引用本身 + 它指向的原始 driver 事件。 */
+export interface RunPayloadResult {
+  payload_ref: string;
+  event: DriverStreamEvent;
+}
 
 export interface RunCreateParams {
   prompt: string;
@@ -306,7 +319,58 @@ export class NewideBackendService {
      * 所以它可以是成本与占用的正源，而不必等终态 summary 出生。
      */
     private readonly driverUsageSink: DriverUsageSink = new NoopDriverUsageSink(),
+    /**
+     * 按 `payload_ref` 取回 driver 事件流原始行的读取口。
+     *
+     * 不注入时 `run.getPayload` 报「不可用」而不是返回空——外部被截断/缺失与
+     * 「引用本来就不存在」是两件事，前端要能区分。
+     */
+    private readonly runPayloadReader?: RunPayloadReader,
+    /**
+     * 跨 run 的用量历史读取口。用量没有持久累计点，历史只能扫 run 目录重放，
+     * 所以它是一个需要文件系统的窄端口，而不是投影器能算出来的东西。
+     */
+    private readonly runUsageHistoryReader?: RunUsageHistoryReader,
   ) {}
+
+  /**
+   * 面板用的用量查询：可选的「当前 run 实时用量」+ 必有的「按作用域的历史累计」。
+   *
+   * 两者刻意分块返回：前者是运行态现值，后者是重放出来的累计量，口径与时效都不同。
+   * `usage` 缺席表示本进程不持有该 run（或没传 `run_id`），不是「用量为 0」。
+   */
+  async getRunUsage(input: {
+    scope: RunUsageHistoryScope;
+    scope_id?: string;
+    run_id?: string;
+  }): Promise<{ usage?: RunUsage; history: RunUsageHistory }> {
+    if (!this.runUsageHistoryReader) {
+      throw new Error('Run usage history reader is not configured');
+    }
+    const history = await this.runUsageHistoryReader.read({
+      scope: input.scope,
+      ...(input.scope_id ? { scope_id: input.scope_id } : {}),
+    });
+    const usage = input.run_id ? this.getRunSnapshot(input.run_id).usage : undefined;
+    return { ...(usage ? { usage } : {}), history };
+  }
+
+  /**
+   * 按引用取回 driver 事件流的原始行。
+   *
+   * 返回 `undefined` 表示「引用解析得了、但那一行取不到」（文件被保留策略截断、
+   * 或 run 目录不存在）——调用方据此渲染「内容不可用」，而不是以为拿到了空数据。
+   */
+  async getRunPayload(
+    runId: string,
+    payloadRef: string,
+  ): Promise<RunPayloadResult | undefined> {
+    if (!this.runPayloadReader) {
+      throw new Error('Run payload reader is not configured');
+    }
+    const event = await this.runPayloadReader.read(runId, payloadRef);
+    return event ? { payload_ref: payloadRef, event } : undefined;
+  }
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
     if (!this.artifactContentReader) {
@@ -1575,46 +1639,69 @@ export class NewideBackendService {
   }
 
   getRunSnapshot(runId: string): RunSnapshot {
+    // 用量两条腿（proxy 事件、driver 占用累加器）都只在进程内，所以快照投影器
+    // （纯函数）拿不到它们，必须在这个组装点补挂。没有该 run 时保持缺席，不编 0。
+    const liveRun = this.registry.has(runId) ? this.registry.getSnapshot(runId) : undefined;
     const persisted = this.taskProcessor?.getRunSnapshot(runId);
     if (persisted) {
-      const liveProjection = this.terminalRuns.has(runId)
-        ? this.registry.getSnapshot(runId)
-        : undefined;
+      const liveProjection = this.terminalRuns.has(runId) ? liveRun : undefined;
       if (
         persisted.status !== 'running' &&
         liveProjection?.status === 'running'
       ) {
         const { final_output: _finalOutput, ...terminalizing } = persisted;
-        return {
-          ...terminalizing,
-          status: 'running',
-          current: {
-            ...persisted.current,
-            stage: 'delivery',
-            task_status: 'running',
+        return this.withLiveObservation(
+          {
+            ...terminalizing,
+            status: 'running',
+            current: {
+              ...persisted.current,
+              stage: 'delivery',
+              task_status: 'running',
+            },
+            ...(persisted.task
+              ? {
+                  task: {
+                    ...persisted.task,
+                    status: 'running',
+                  },
+                }
+              : {}),
+            ...(persisted.run
+              ? {
+                  run: {
+                    ...persisted.run,
+                    status: 'running',
+                    completed_at: undefined,
+                  },
+                }
+              : {}),
           },
-          ...(persisted.task
-            ? {
-                task: {
-                  ...persisted.task,
-                  status: 'running',
-                },
-              }
-            : {}),
-          ...(persisted.run
-            ? {
-                run: {
-                  ...persisted.run,
-                  status: 'running',
-                  completed_at: undefined,
-                },
-              }
-            : {}),
-        };
+          liveRun,
+        );
       }
-      return persisted;
+      return this.withLiveObservation(persisted, liveRun);
     }
-    return projectRunSnapshot(this.registry.getSnapshot(runId));
+    return this.withLiveObservation(projectRunSnapshot(this.registry.getSnapshot(runId)), liveRun);
+  }
+
+  /**
+   * 补挂只有本进程才知道的观测：timeline 序号对齐 + `usage` 块。
+   *
+   * 两件事都以「registry 确实持有该 run」为前提，拿不到就原样返回——不编数字、不编 0。
+   */
+  private withLiveObservation(
+    snapshot: RunSnapshot,
+    liveRun: AppRunSnapshot | undefined,
+  ): RunSnapshot {
+    if (!liveRun) return snapshot;
+    // 先对齐序号：快照 timeline 原本带的是 SQLite 行号，与推流通道不是一套号。
+    const aligned = withAlignedTimeline(snapshot, liveRun.events);
+    const usage = projectRunUsage({
+      timeline: liveRun.events,
+      driverUsage: this.getAccumulatedDriverUsage(snapshot.task_id),
+    });
+    return usage ? { ...aligned, usage } : aligned;
   }
 
   async waitForTerminal(runId: string): Promise<void> {
@@ -1660,8 +1747,16 @@ export class NewideBackendService {
     return { cancelled: true };
   }
 
-  subscribe(runId: string, listener: (event: AppRunEvent) => void): () => void {
-    return this.registry.subscribe(runId, listener);
+  subscribe(
+    runId: string,
+    listener: (event: AppRunEvent) => void,
+    afterSequence?: number,
+  ): () => void {
+    return this.registry.subscribe(
+      runId,
+      listener,
+      afterSequence === undefined ? {} : { after_sequence: afterSequence },
+    );
   }
 
   private isLiveRun(runId: string): boolean {

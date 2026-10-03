@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe('SqliteCoordinationStore', () => {
-  it('creates the v5 coordination and protocol delivery schema in WAL mode', () => {
+  it('creates the v6 coordination and protocol delivery schema in WAL mode', () => {
     const { databasePath, store } = createStore();
     store.close();
 
@@ -43,10 +43,14 @@ describe('SqliteCoordinationStore', () => {
         'outbox',
         'inbox',
         'journal',
+        'token_usage_ledger',
       ]),
     );
     expect(journalMode).toEqual({ journal_mode: 'wal' });
-    expect(migration).toEqual({ version: 5 });
+    expect(migration).toEqual({ version: 6 });
+
+    // 用量账本刻意不挂 tasks/runs 外键：任务是会被清理的，而累计用量必须活过清理。
+    expect(database.prepare('PRAGMA foreign_key_list(token_usage_ledger)').all()).toEqual([]);
 
     const runtimeColumns = database
       .prepare('PRAGMA table_info(task_runtime_states)')

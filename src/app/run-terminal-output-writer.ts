@@ -228,7 +228,13 @@ function resolveMemoryAblation(
     .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
 }
 
-function resolveTokenUsageFromTimeline(
+/**
+ * 从时间线里的 `proxy.llm_usage_recorded` 事件汇总 proxy 腿的计费用量。
+ *
+ * 导出是给运行快照的 `usage` 块复用：实时快照与终态 summary 必须用**同一个**口径，
+ * 各写一份必然漂移。
+ */
+export function resolveTokenUsageFromTimeline(
   timeline: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>,
 ):
   | {

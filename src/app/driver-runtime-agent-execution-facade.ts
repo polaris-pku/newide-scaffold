@@ -1074,6 +1074,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         driver_status: execution.status,
         driver_attempts: driverAttempts,
         driver_report: dispatched.cycle.buffer_snapshot.driver_return,
+        // 驱动自报的逐次调用用量：过去只到进程就被丢掉，这里落进阶段证据、
+        // 从而进入事件流与 run 目录，成为一条独立于上下文占用与 Claude 刮取的计费口径。
+        ...(execution.usage ? { driver_usage: { ...execution.usage } } : {}),
         dispatch_status: dispatched.status,
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],

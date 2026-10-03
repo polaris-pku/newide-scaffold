@@ -72,6 +72,8 @@ import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
+import { FileRunPayloadReader } from './run-payload-reader';
+import { FileRunUsageHistoryReader } from './run-usage-history';
 import {
   createRunLatency,
   FileRunEventConsumptionSink,
@@ -563,6 +565,8 @@ export async function createProductionBackendService(
       runTelemetryJsonlSink,
       aapBridge,
       driverUsageSink,
+      new FileRunPayloadReader(runsRoot),
+      new FileRunUsageHistoryReader(runsRoot),
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();

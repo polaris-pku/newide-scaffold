@@ -4,6 +4,24 @@ import { runEventSchema } from './run-event';
 
 const recordSchema = z.record(z.string(), z.unknown());
 const taskStatusSchema = z.enum(TASK_STATUSES);
+
+/**
+ * stage 机的持久游标。
+ *
+ * 与 `src/persistence` 的 `TaskResumeCursor` 是同一个词表，但**协议层自带一份字面量**：
+ * 前端契约不该依赖持久化层的类型（那边是存储实现，这边是对外承诺）。两处改动必须同步，
+ * 漏改的表现是投影时 zod 拒绝整个快照，而不是静默少一个字段。
+ */
+export const runCursorSchema = z.enum([
+  'select_agent',
+  'execute_agent',
+  'council',
+  'gate',
+  'deliver',
+  'mailbox_wait',
+  'done',
+]);
+
 const runOutcomeSchema = z
   .object({
     status: z.enum(['completed', 'verified', 'best_effort', 'failed', 'blocked', 'cancelled']),
@@ -39,6 +57,112 @@ export const councilOutcomeEvidenceSchema = z
   })
   .strict();
 
+/**
+ * 快照里的用量块。
+ *
+ * 三条口径**并排、互不相加**，所以这里刻意**不提供任何「总数」顶层字段**：任何单一
+ * 数字都必然漏掉或重复计算某一条腿，前端一定拿它当结论。要让使用者显式相加并自行
+ * 承担口径后果。每条都带 `metric` 自描述，读的人不看这个字段就会算错。
+ */
+export const runUsageTokensSchema = z
+  .object({
+    input_tokens: z.number().nonnegative(),
+    output_tokens: z.number().nonnegative(),
+    cache_creation_input_tokens: z.number().nonnegative(),
+    cache_read_input_tokens: z.number().nonnegative(),
+    total_input_tokens: z.number().nonnegative(),
+    total_tokens: z.number().nonnegative(),
+    call_count: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const runUsageStageMetricsSchema = z
+  .object({
+    /** 字段名自带范围：这一桶**只覆盖 proxy 腿**，不是该 stage 的总消耗。 */
+    metric: z.literal('proxy_billed_tokens'),
+    events: z.number().int().nonnegative(),
+    llm_calls: z.number().int().nonnegative(),
+    total_tokens: z.number().nonnegative(),
+    /**
+     * 该 stage 的 span 合计耗时。**缺席表示拿不到耗时**（实时快照没有 latency 数据），
+     * 不是「瞬间完成」——不编一个 0。
+     */
+    duration_ms: z.number().nonnegative().optional(),
+  })
+  .strict();
+
+export const runUsageSessionSchema = z
+  .object({
+    session_id: z.string().min(1),
+    role_id: z.string().min(1).optional(),
+    context_tokens_used: z.number().nonnegative(),
+    context_window_size: z.number().nonnegative().optional(),
+    reported_cost: z
+      .object({ amount: z.number().nonnegative(), currency: z.string().min(1) })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+export const runUsageSchema = z
+  .object({
+    /** 真正烧掉的计费流量，按来源拆。当前实时快照只填得上 `proxy` 腿。 */
+    billed: z
+      .object({
+        metric: z.literal('billed_tokens'),
+        by_source: z.record(z.string(), runUsageTokensSchema),
+      })
+      .strict()
+      .optional(),
+    /** driver 上下文占用快照；与 `billed` 不是同一个量，不可相加。 */
+    context: z
+      .object({
+        metric: z.literal('context_tokens_used'),
+        context_tokens_used: z.number().nonnegative(),
+        /** 观测是否可能缺尾；缺信号时为 false，绝不冒充完整数据。 */
+        complete: z.boolean(),
+        sessions: z.array(runUsageSessionSchema),
+      })
+      .strict()
+      .optional(),
+    /** 按 stage 分桶的 proxy 腿用量；`unattributed` / `driver_stream` 是已有桶名。 */
+    by_stage: z.record(z.string(), runUsageStageMetricsSchema).optional(),
+  })
+  .strict();
+
+/**
+ * 跨 run 的用量历史。
+ *
+ * 只声明实际支撑得住的 `task` / `system` 两个作用域：`role` 需要把 proxy 腿也按角色归属，
+ * 而 `summary` 里只有 driver 腿带 `role_id`；`agent` 则依赖从未被赋值的 `agent_id`。
+ * 与其给一个口径不完整的枚举值，不如少列两个。
+ */
+export const runUsageHistorySchema = z
+  .object({
+    scope: z.enum(['task', 'system']),
+    scope_id: z.string().min(1).optional(),
+    /** 统计时点。历史是重放出来的，必须让读的人知道它是哪一刻的快照。 */
+    as_of: z.string().min(1),
+    /** 在该作用域下找到的 run 数（含读不出用量的）。 */
+    runs_counted: z.number().int().nonnegative(),
+    /**
+     * 命中但读不出用量的 run 数。
+     *
+     * 它们**不贡献 0**——「缺 ≠ 0」。这个数是 `complete` 为 false 的原因，摆出来而不是
+     * 悄悄吞掉，读的人才知道总量偏低了多少个 run。
+     */
+    runs_without_usage: z.number().int().nonnegative(),
+    /** 只有 `runs_counted > 0` 且没有任何一个 run 缺用量时才为 true。 */
+    complete: z.boolean(),
+    billed: z
+      .object({
+        totals: runUsageTokensSchema,
+        by_source: z.record(z.string(), runUsageTokensSchema),
+      })
+      .strict(),
+  })
+  .strict();
+
 export const runSnapshotSchema = z
   .object({
     contract_version: z.literal('frontend-workflow.v0.1').optional(),
@@ -53,6 +177,23 @@ export const runSnapshotSchema = z
         stage: z.enum(['executing', 'council', 'delivery', 'intervention']),
         active_node_code: z.string().min(1),
         task_status: z.string().min(1).optional(),
+        /**
+         * 真实持久游标。`stage` 只是它的粗粒度映射（4 值），会把
+         * `select_agent` / `execute_agent` / `gate` 全压成 `executing`。
+         *
+         * 前端要显示「进行到哪一步」就用这个。保留 `stage` 是为了不打断既有消费方。
+         * 与 `resume_cursor` 同义：运行中是当前所在游标，终态是最后停下的那个。
+         */
+        cursor: runCursorSchema.optional(),
+        /**
+         * 当前正在执行的 stage 调用的 invocation id。
+         *
+         * **缺席表示此刻没有 stage 调用在跑**（stage 之间、或 run 已终态）——不编一个空串。
+         * 与 `cursor` 合起来才能判定「这个游标是正在跑还是刚跑完」。
+         */
+        invocation_id: z.string().min(1).optional(),
+        /** 当前 stage 调用的开始时间；与 `invocation_id` 同生共死。 */
+        stage_started_at: z.string().min(1).optional(),
       })
       .strict(),
     task: z
@@ -187,6 +328,7 @@ export const runSnapshotSchema = z
       })
       .strict()
       .optional(),
+    usage: runUsageSchema.optional(),
   })
   .strict()
   .superRefine((snapshot, context) => {
@@ -225,7 +367,10 @@ export const runSnapshotSchema = z
   });
 
 export type RunSnapshot = z.infer<typeof runSnapshotSchema>;
-
+export type RunUsage = z.infer<typeof runUsageSchema>;
+export type RunUsageHistory = z.infer<typeof runUsageHistorySchema>;
+export type RunUsageTokens = z.infer<typeof runUsageTokensSchema>;
+export type RunUsageStageMetrics = z.infer<typeof runUsageStageMetricsSchema>;
 export type FrontendWorkflowV01Snapshot = RunSnapshot & {
   contract_version: 'frontend-workflow.v0.1';
   current: RunSnapshot['current'] & { task_status: string };

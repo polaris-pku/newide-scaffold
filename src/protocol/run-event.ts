@@ -22,7 +22,16 @@ export const runEventSchema = z
     source: runEventSourceSchema,
     created_at: z.string().min(1),
     payload: z.record(z.string(), z.unknown()),
-    payload_ref: z.string().min(1).optional(),
+    /**
+     * 这里**刻意没有**顶层 `payload_ref`。
+     *
+     * 它曾经被声明过，但**从未被填充**：driver 流投影把引用写进了载荷内部，即
+     * `payload.payload_ref`（形如 `driver-stream.jsonl#stream_sequence=<n>`）。一个
+     * 「声明了但永不出现」的契约字段比没有更危险——读契约的人会去顶层找，找不到就
+     * 以为引用丢了。所以声明被删掉，真实位置写在这里。
+     *
+     * 取回接口：`run.getPayload`（按引用取回 `driver-stream.jsonl` 的原始行）。
+     */
     schema_version: z.string().min(1),
   })
   .strict();
