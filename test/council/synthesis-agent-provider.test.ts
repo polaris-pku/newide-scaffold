@@ -59,6 +59,8 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(requests[0]?.driver_instruction).toContain('council-plan.md');
     expect(requests[0]?.driver_instruction).not.toContain('invoke_driver');
     expect(requests[2]?.instruction).toContain('Review the staged Council Plan inputs');
+    expect(requests[2]?.instruction).toContain('isolated snapshot of the task repository');
+    expect(requests[2]?.instruction).toContain('Treat repository files as read-only');
     expect(requests[3]?.instruction).toContain('final-plan.md');
     expect(requests[3]?.instruction).toContain('Do not implement');
     expect(result.reviews).toHaveLength(2);

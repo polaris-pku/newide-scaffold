@@ -376,7 +376,12 @@ describe('Council bounded recovery', () => {
         async runAgent(request) {
           const result = completed(request);
           if (request.council_seat === 'reviewer') {
-            expect(await fs.readdir(request.workspace_path!)).not.toContain('private-source.txt');
+            expect(await fs.readFile(path.join(request.workspace_path!, 'private-source.txt'), 'utf8'))
+              .toBe('source code');
+            await fs.writeFile(
+              path.join(request.workspace_path!, 'private-source.txt'),
+              'reviewer-local mutation',
+            );
             const manifest = JSON.parse(
               await fs.readFile(path.join(request.workspace_path!, 'proposals.json'), 'utf8'),
             );
@@ -397,6 +402,7 @@ describe('Council bounded recovery', () => {
       { ...input, workspace_path: source },
       { artifact_mode: 'plan' },
     );
+    expect(await fs.readFile(path.join(source, 'private-source.txt'), 'utf8')).toBe('source code');
     expect(result.reviews.map((review) => review.verdict)).toEqual(['approve', 'approve']);
     expect(result.diagnostic_refs).toBeUndefined();
     expect(result.decision.reason).toContain('preserves compatibility');
