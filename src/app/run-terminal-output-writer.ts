@@ -18,6 +18,11 @@ import {
   type CollectClaudeSessionUsage,
 } from './run-token-usage-merge';
 import { collectClaudeSessionUsage } from '../telemetry';
+import type { TokenUsageLedgerStore } from '../persistence';
+import {
+  buildTokenUsageLedgerEntries,
+  readClaudeSessionLeg,
+} from './run-usage-ledger-entries';
 
 export interface RunTerminalOutputWriter {
   finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | void>;
@@ -90,6 +95,13 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
      * （只信文件回读，截断缺尾标 complete: false）。
      */
     private readonly accumulatedUsage?: (taskId: string) => TaskDriverUsage | undefined,
+    /**
+     * 用量账本。run 收尾时把这次 run 的两条计费腿作为**只追加行**落库，这样累计用量
+     * 不再依赖 `runs/<id>/summary.json` 那棵没有保留策略的目录树存活。
+     *
+     * 不注入时整步空转（单测与 example 零改动），行为与从前完全一致。
+     */
+    private readonly tokenUsageLedger?: TokenUsageLedgerStore,
   ) {}
 
   async finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | undefined> {
@@ -146,10 +158,49 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
     // Claude Code 的 session JSONL 刮取再并进来。放在这里而不是 B maintenance：
     // maintenance 由 buffer 触发，跑在 run 收尾之前，读不到 summary.json。
     await mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage);
+    await this.appendUsageLedger(snapshot, projected.timeline, summaryPath);
     return {
       artifact_ref: pathToFileURL(path.resolve(frontendSnapshotPath)).href,
       sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),
     };
+  }
+
+  /**
+   * 把这次 run 的计费腿作为只追加行写进账本。
+   *
+   * 读回 `summary.json` 而不是复用内存里那份：`driver_billed_usage` 是
+   * `mergeBilledTokenUsage` 刚刚才刮出来并写盘的（driver 腿从不进 run 事件流），
+   * 收尾前内存里根本没有它。落盘的那份正是账本要对齐的权威件。
+   *
+   * **失败只吞掉，不让 run 失败**——与本仓库观测层的既有纪律一致
+   * （`FileRunEventConsumptionSink`、`RunEventConsumptionRecorder.finish` 都是这个取向）。
+   * 而且这里的失败**不是静默的**：这个 run 之后会以「有 `handler.started`、账本里没有行」
+   * 的形式出现在 `runs_without_usage` 里，把 `complete` 拉成 false。写入失败会被看见。
+   */
+  private async appendUsageLedger(
+    snapshot: AppRunSnapshot,
+    timeline: Parameters<typeof buildTokenUsageLedgerEntries>[0]['timeline'],
+    summaryPath: string,
+  ): Promise<void> {
+    if (!this.tokenUsageLedger) return;
+    try {
+      const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+      // exactOptionalPropertyTypes：可选字段不能显式传 undefined，只能条件展开。
+      const driverBilledLeg = readClaudeSessionLeg(raw.token_usage);
+      const entries = buildTokenUsageLedgerEntries({
+        run_id: snapshot.run_id,
+        task_id: snapshot.task_id,
+        timeline,
+        ...(driverBilledLeg ? { driverBilledLeg } : {}),
+        ...(raw.driver_billed_usage !== undefined
+          ? { driverBilledUsage: raw.driver_billed_usage }
+          : {}),
+        recorded_at: new Date().toISOString(),
+      });
+      this.tokenUsageLedger.appendTokenUsage(entries);
+    } catch {
+      // 见上：不计入账本 ⇒ 该 run 会成为已知缺口，而不是被当成 0。
+    }
   }
 }
 

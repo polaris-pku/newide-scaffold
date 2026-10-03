@@ -31,6 +31,9 @@ export type TokenUsageSource = 'proxy' | 'claude_session_jsonl';
 /** 计费口径。名字自带范围，避免出现「总数」这种没有范围的字段。 */
 export type TokenUsageMetric = 'billed_tokens';
 
+/** 账本行的 schema 版本。放在端口层，让写入方（`src/app`）不必为了一个常量去依赖 SQLite 实现。 */
+export const TOKEN_USAGE_LEDGER_SCHEMA_VERSION = 'newide.token_usage_ledger.v1';
+
 /**
  * 无法归属角色时的 `role_id` 取值。
  *

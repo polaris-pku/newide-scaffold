@@ -27,8 +27,6 @@ import type {
   TokenUsageLedgerStore,
 } from './token-usage-ledger';
 
-export const TOKEN_USAGE_LEDGER_SCHEMA_VERSION = 'newide.token_usage_ledger.v1';
-
 export function migrateTokenUsageLedger(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS token_usage_ledger (
