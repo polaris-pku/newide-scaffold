@@ -142,4 +142,27 @@ describe('agent activity', () => {
     expect(now).toHaveBeenCalledTimes(1);
     expect(getAgentActivity('run_1', 'role_a')?.since).toBe('2026-10-03T00:00:00.000Z');
   });
+
+  it('gives every transition a higher seq, and does not reset it after clearing', () => {
+    beginAgentActivity({ run_id: 'run_1', role_id: 'role_a', kind: 'awaiting_llm' });
+    expect(getAgentActivity('run_1', 'role_a')?.seq).toBe(1);
+
+    beginAgentActivity({ run_id: 'run_1', role_id: 'role_a', kind: 'invoking_driver' });
+    expect(getAgentActivity('run_1', 'role_a')?.seq).toBe(2);
+
+    endAgentActivity({ run_id: 'run_1', role_id: 'role_a' });
+    // 清除后重新进入必须拿到更大的号：否则前端会把新状态当成过期更新丢掉。
+    beginAgentActivity({ run_id: 'run_1', role_id: 'role_a', kind: 'awaiting_llm' });
+    expect(getAgentActivity('run_1', 'role_a')?.seq).toBe(3);
+  });
+
+  it('counts seq per (run, role) independently', () => {
+    beginAgentActivity({ run_id: 'run_1', role_id: 'role_a', kind: 'awaiting_llm' });
+    beginAgentActivity({ run_id: 'run_1', role_id: 'role_b', kind: 'awaiting_llm' });
+    beginAgentActivity({ run_id: 'run_2', role_id: 'role_a', kind: 'awaiting_llm' });
+
+    expect(getAgentActivity('run_1', 'role_a')?.seq).toBe(1);
+    expect(getAgentActivity('run_1', 'role_b')?.seq).toBe(1);
+    expect(getAgentActivity('run_2', 'role_a')?.seq).toBe(1);
+  });
 });

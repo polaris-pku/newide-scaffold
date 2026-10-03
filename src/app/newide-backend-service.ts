@@ -25,6 +25,7 @@ import {
   type RestoreFileAnchorResult,
 } from '../checkpoint';
 import {
+  listAgentActivities,
   NoopTelemetrySink,
   releaseRunLlmUsageLedger,
   runWithLlmUsageLedger,
@@ -55,6 +56,7 @@ import {
 import { projectRunSnapshot } from './run-snapshot-projector';
 import { withAlignedTimeline } from './run-timeline-sequence';
 import { projectRunUsage } from './run-usage-projection';
+import { projectRunActivity } from './run-activity-projection';
 import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
 import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task-snapshot';
@@ -1686,9 +1688,10 @@ export class NewideBackendService {
   }
 
   /**
-   * 补挂只有本进程才知道的观测：timeline 序号对齐 + `usage` 块。
+   * 补挂只有本进程才知道的观测：timeline 序号对齐 + `usage` 块 + 在飞 `activity`。
    *
-   * 两件事都以「registry 确实持有该 run」为前提，拿不到就原样返回——不编数字、不编 0。
+   * 三件事都以「registry 确实持有该 run」为前提，拿不到就原样返回——不编数字、不编 0、
+   * 不编一个「空闲」。
    */
   private withLiveObservation(
     snapshot: RunSnapshot,
@@ -1701,7 +1704,13 @@ export class NewideBackendService {
       timeline: liveRun.events,
       driverUsage: this.getAccumulatedDriverUsage(snapshot.task_id),
     });
-    return usage ? { ...aligned, usage } : aligned;
+    // 在飞状态是内存里的，只有本进程持有的 run 才有；没有就是没有这个字段。
+    const activity = projectRunActivity(listAgentActivities(snapshot.run_id));
+    return {
+      ...aligned,
+      ...(usage ? { usage } : {}),
+      ...(activity ? { activity } : {}),
+    };
   }
 
   async waitForTerminal(runId: string): Promise<void> {

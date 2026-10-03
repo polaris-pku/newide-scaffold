@@ -41,6 +41,13 @@ export interface AgentActivity {
   /** 进入这个状态的时间（ISO）。陈旧判断交给读的人。 */
   since: string;
   round?: number;
+  /**
+   * 同一 `(run_id, role_id)` 内单调递增，从 1 开始。
+   *
+   * 给前端丢弃过期更新用：last-value 字段在推流通道上会乱序，只靠 `since` 判新旧是不够的
+   * ——同一毫秒内可以发生两次转移。计数器**不清零**：重新进入状态也要拿到更大的号。
+   */
+  seq: number;
 }
 
 /**
@@ -68,6 +75,11 @@ function activityKey(runId: string, roleId: string): string {
 }
 
 const activities = new Map<string, AgentActivity>();
+/**
+ * 每个键的转移计数。**刻意与 `activities` 分开**：状态被清除后计数还要留着，否则重新
+ * 进入会拿到一个不比上次大的 `seq`，前端就会把它当成过期更新丢掉。
+ */
+const sequences = new Map<string, number>();
 
 /** 写下一个状态点。没有 `run_id` 时整个调用是空转。 */
 export function beginAgentActivity(
@@ -75,13 +87,17 @@ export function beginAgentActivity(
   now: () => string = () => new Date().toISOString(),
 ): void {
   if (!input.run_id) return;
-  activities.set(activityKey(input.run_id, input.role_id), {
+  const key = activityKey(input.run_id, input.role_id);
+  const seq = (sequences.get(key) ?? 0) + 1;
+  sequences.set(key, seq);
+  activities.set(key, {
     run_id: input.run_id,
     role_id: input.role_id,
     kind: input.kind,
     ...(input.tool_name ? { tool_name: input.tool_name } : {}),
     ...(input.round !== undefined ? { round: input.round } : {}),
     since: now(),
+    seq,
   });
 }
 
@@ -148,4 +164,5 @@ export function isAgentActivityStale(
 /** 仅供测试：清空进程级状态，避免用例之间互相串。 */
 export function resetAgentActivities(): void {
   activities.clear();
+  sequences.clear();
 }

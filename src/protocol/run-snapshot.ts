@@ -163,6 +163,45 @@ export const runUsageHistorySchema = z
   })
   .strict();
 
+/**
+ * 在飞运行态：此刻**真正在动**的 agent 席位。
+ *
+ * **与 §4.2 草案的两处偏差，都需要知情：**
+ *
+ * 1. **草案里 `activity` 是单数对象，这里是列表。** council 一次会并发多个席位，而状态点
+ *    是按 `(run_id, role_id)` 索引的——单数对象只能挑一个席位报，等于随机丢掉另外三个。
+ *    所以每个元素自带 `role_id`。
+ * 2. **`state` 只声明了两个值。** 草案列了 6 个（`idle` / `thinking` / `tool_call` /
+ *    `delegating` / `waiting_human` / `unknown`），其余四个目前**没有写入点**。按草案自己
+ *    的原则（「不要设计永远不出现的枚举值」），有生产者了再加。`driver` 半边同理——它需要
+ *    §5(b) 的分流（状态类 driver 事件进协调事件流），是另一件事。
+ *
+ * **缺席语义**：`activity` 整个字段缺失 = 此刻没有覆盖到的在飞状态。**不给 `idle`**：进程
+ * 活着但不在状态点里，与「状态点漏了」从这一份数据上分不出来，报 `idle` 是在替读者下结论。
+ */
+export const runActivityEntrySchema = z
+  .object({
+    role_id: z.string().min(1),
+    state: z.enum(['thinking', 'delegating']),
+    since: z.string().min(1),
+    /** 同一 `(run, role)` 内单调递增；前端据此丢弃过期更新。 */
+    seq: z.number().int().positive(),
+    /** 停在这个状态太久：进程可能已经卡住，而不是「还在想」。 */
+    stale: z.boolean(),
+    round: z.number().int().nonnegative().optional(),
+    /** 工具名。`delegating` 时是 `invoke_driver`；取不到时缺席，不编。 */
+    tool_name: z.string().min(1).optional(),
+  })
+  .strict();
+
+export const runActivitySchema = z
+  .object({
+    /** 目前只有 `agent` 有生产者；`driver` 见上面的说明。 */
+    subject: z.literal('agent'),
+    agents: z.array(runActivityEntrySchema),
+  })
+  .strict();
+
 export const runSnapshotSchema = z
   .object({
     contract_version: z.literal('frontend-workflow.v0.1').optional(),
@@ -329,6 +368,8 @@ export const runSnapshotSchema = z
       .strict()
       .optional(),
     usage: runUsageSchema.optional(),
+    /** 只有本进程持有的 run 才有——在飞状态是内存里的，重启即失。 */
+    activity: runActivitySchema.optional(),
   })
   .strict()
   .superRefine((snapshot, context) => {
@@ -368,6 +409,8 @@ export const runSnapshotSchema = z
 
 export type RunSnapshot = z.infer<typeof runSnapshotSchema>;
 export type RunUsage = z.infer<typeof runUsageSchema>;
+export type RunActivity = z.infer<typeof runActivitySchema>;
+export type RunActivityEntry = z.infer<typeof runActivityEntrySchema>;
 export type RunUsageHistory = z.infer<typeof runUsageHistorySchema>;
 export type RunUsageTokens = z.infer<typeof runUsageTokensSchema>;
 export type RunUsageStageMetrics = z.infer<typeof runUsageStageMetricsSchema>;
