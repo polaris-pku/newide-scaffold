@@ -133,13 +133,13 @@ export const runUsageSchema = z
 /**
  * 跨 run 的用量历史。
  *
- * 只声明实际支撑得住的 `task` / `system` 两个作用域：`role` 需要把 proxy 腿也按角色归属，
- * 而 `summary` 里只有 driver 腿带 `role_id`；`agent` 则依赖从未被赋值的 `agent_id`。
- * 与其给一个口径不完整的枚举值，不如少列两个。
+ * `role` 从「不支持」变为支持，靠的不是 `summary`——它至今没有 proxy 腿的角色归属——
+ * 而是用量账本在**写入时**就把 `role_id` 记在每一行上。`agent` 仍然不支持：它依赖
+ * 从未被赋值的 `agent_id`。
  */
 export const runUsageHistorySchema = z
   .object({
-    scope: z.enum(['task', 'system']),
+    scope: z.enum(['task', 'system', 'role']),
     scope_id: z.string().min(1).optional(),
     /** 统计时点。历史是重放出来的，必须让读的人知道它是哪一刻的快照。 */
     as_of: z.string().min(1),

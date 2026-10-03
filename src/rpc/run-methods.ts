@@ -40,10 +40,10 @@ export interface RunMethodsService {
   /**
    * 面板用的用量查询：可选的当前 run 实时用量 + 按作用域的历史累计。
    *
-   * `task` 作用域必须给 `scope_id`——否则「这个任务的累计」无从谈起。
+   * `task` / `role` 作用域必须给 `scope_id`——否则「这个任务/角色的累计」无从谈起。
    */
   getRunUsage(input: {
-    scope: 'task' | 'system';
+    scope: 'task' | 'system' | 'role';
     scope_id?: string;
     run_id?: string;
   }): Promise<{ usage?: RunUsage; history: RunUsageHistory }>;
@@ -95,7 +95,7 @@ const payloadParamsSchema = z
  */
 const usageParamsSchema = z
   .object({
-    scope: z.enum(['task', 'system']),
+    scope: z.enum(['task', 'system', 'role']),
     scope_id: z.string().min(1).optional(),
     run_id: z.string().min(1).optional(),
   })
@@ -154,11 +154,11 @@ export class RunRpcMethods {
     });
     dispatcher.register('run.getUsage', async (params) => {
       const parsed = parseParams(usageParamsSchema, params);
-      if (parsed.scope === 'task' && parsed.scope_id === undefined) {
-        // 「这个任务的累计」没有任务就无从谈起——参数校验就拦下，不去扫目录。
+      if (parsed.scope !== 'system' && parsed.scope_id === undefined) {
+        // 「这个任务/角色的累计」没有它就没有主语——参数校验就拦下，不去查库。
         throw new JsonRpcMethodError(
           JSON_RPC_ERROR_CODES.INVALID_PARAMS,
-          'scope_id is required for task scope',
+          `scope_id is required for ${parsed.scope} scope`,
           { scope: parsed.scope },
         );
       }

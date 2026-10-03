@@ -39,8 +39,19 @@ export interface LedgerTimelineEvent {
 export interface TokenUsageLedgerEntryInput {
   run_id: string;
   task_id: string;
-  /** run 事件流投影后的时间线；proxy 计费腿从这里数。 */
-  timeline: readonly LedgerTimelineEvent[];
+  /**
+   * run 事件流投影后的时间线。给了它就能把 proxy 腿**按角色精确归集**。
+   *
+   * 与 `proxyLeg` 同时给出时以本字段为准：时间线是逐次调用的原始记录，比汇总更细。
+   */
+  timeline?: readonly LedgerTimelineEvent[];
+  /**
+   * `summary.token_usage.by_source.proxy`，**回填**已有 run 时用（那条路上没有时间线）。
+   *
+   * 它**不按角色**归集：summary 的 proxy 腿只有一个总数，没有角色细分，而编造归属比留空
+   * 更糟。所以回填出来的 proxy 行一律是未归属哨兵。
+   */
+  proxyLeg?: RunUsageTokens;
   /**
    * driver 计费腿的**权威总量**，即 `summary.token_usage.by_source.claude_session_jsonl`。
    * 缺席（或为 0）表示这次 run 没有 driver 计费数据，不写任何 driver 行——而不是写 0。
@@ -55,13 +66,22 @@ export function buildTokenUsageLedgerEntries(
   input: TokenUsageLedgerEntryInput,
 ): TokenUsageLedgerEntry[] {
   const entries: TokenUsageLedgerEntry[] = [];
-  for (const [roleId, tokens] of rollupProxyByRole(input.timeline)) {
+  for (const [roleId, tokens] of rollupProxy(input)) {
     entries.push(row(input, 'proxy', roleId, tokens));
   }
   for (const [roleId, tokens] of rollupDriverByRole(input)) {
     entries.push(row(input, 'claude_session_jsonl', roleId, tokens));
   }
   return entries;
+}
+
+/** proxy 腿：有时间线就按角色精确归集，没有就退回 summary 那个不带角色的总数。 */
+function rollupProxy(input: TokenUsageLedgerEntryInput): Map<string, RunUsageTokens> {
+  if (input.timeline !== undefined) return rollupProxyByRole(input.timeline);
+  if (input.proxyLeg && input.proxyLeg.total_tokens > 0) {
+    return new Map([[UNATTRIBUTED_ROLE_ID, { ...input.proxyLeg }]]);
+  }
+  return new Map();
 }
 
 function row(
@@ -164,7 +184,21 @@ function readDriverSessions(block: unknown): DriverSessionRow[] {
  * 让调用方少写一行，而不是写一行 0。
  */
 export function readClaudeSessionLeg(tokenUsage: unknown): RunUsageTokens | undefined {
-  const leg = asRecord(asRecord(tokenUsage)?.by_source)?.claude_session_jsonl;
+  return readLeg(tokenUsage, 'claude_session_jsonl');
+}
+
+/**
+ * 从 `summary.token_usage` 里取出 proxy 计费腿（`by_source.proxy`）。
+ *
+ * 回填时用。注意它**只有一个总数**，没有角色细分——所以回填出来的 proxy 行只能是
+ * 未归属哨兵（见 `TokenUsageLedgerEntryInput.proxyLeg`）。
+ */
+export function readProxyLeg(tokenUsage: unknown): RunUsageTokens | undefined {
+  return readLeg(tokenUsage, 'proxy');
+}
+
+function readLeg(tokenUsage: unknown, source: string): RunUsageTokens | undefined {
+  const leg = asRecord(asRecord(tokenUsage)?.by_source)?.[source];
   const record = asRecord(leg);
   if (!record) return undefined;
   const tokens: RunUsageTokens = {
@@ -205,9 +239,15 @@ function sumTokens(byRole: Map<string, RunUsageTokens>): RunUsageTokens {
   return total;
 }
 
-/** 只比总量：逐会话求和与权威腿相等才按角色写，细分字段的差异不影响这个判断。 */
+/**
+ * 逐会话求和与权威腿是否一致——**只比 `total_tokens`**。
+ *
+ * 不连 `call_count` 一起比，是因为这条守卫要保证的不变量只关于 token 总量：账本的求和
+ * 必须等于 `summary.token_usage` 的那条腿。调用次数是次要计数，逐会话的计数本来就来自
+ * 会话本身；把它的差异也当成「对不上」，会在总量明明正确时白白丢掉角色分解。
+ */
 function equalsTotals(left: RunUsageTokens, right: RunUsageTokens): boolean {
-  return left.total_tokens === right.total_tokens && left.call_count === right.call_count;
+  return left.total_tokens === right.total_tokens;
 }
 
 function emptyTokens(): RunUsageTokens {

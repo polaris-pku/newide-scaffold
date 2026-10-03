@@ -22,6 +22,7 @@ import type { TokenUsageLedgerStore } from '../persistence';
 import {
   buildTokenUsageLedgerEntries,
   readClaudeSessionLeg,
+  type LedgerTimelineEvent,
 } from './run-usage-ledger-entries';
 
 export interface RunTerminalOutputWriter {
@@ -179,7 +180,7 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
    */
   private async appendUsageLedger(
     snapshot: AppRunSnapshot,
-    timeline: Parameters<typeof buildTokenUsageLedgerEntries>[0]['timeline'],
+    timeline: readonly LedgerTimelineEvent[],
     summaryPath: string,
   ): Promise<void> {
     if (!this.tokenUsageLedger) return;

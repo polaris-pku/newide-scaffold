@@ -73,7 +73,7 @@ import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
 import { FileRunPayloadReader } from './run-payload-reader';
-import { FileRunUsageHistoryReader } from './run-usage-history';
+import { LedgerRunUsageHistoryReader } from './run-usage-history';
 import {
   createRunLatency,
   FileRunEventConsumptionSink,
@@ -572,7 +572,9 @@ export async function createProductionBackendService(
       aapBridge,
       driverUsageSink,
       new FileRunPayloadReader(runsRoot),
-      new FileRunUsageHistoryReader(runsRoot),
+      // 历史读账本而不是扫目录：目录树没有任何保留策略，往期一旦被清理，重算出来的
+      // 「累计」会变小。首次读会惰性回填一次目录树里已有的用量（幂等）。
+      new LedgerRunUsageHistoryReader(coordinationStore, runsRoot),
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();

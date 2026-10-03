@@ -153,7 +153,7 @@ describe('RunRpcMethods', () => {
     });
   });
 
-  it('requires a task id for the task scope and forwards the usage query', async () => {
+  it('requires a subject for task and role scopes and forwards the usage query', async () => {
     const output: string[] = [];
     const calls: Array<{ scope: string; scope_id?: string; run_id?: string }> = [];
     const service = fakeService({
@@ -175,13 +175,20 @@ describe('RunRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":2,"method":"run.getUsage","params":{"scope":"task","scope_id":"task_1","run_id":"run_1"}}',
     );
-    // 未支持的作用域：role 需要 proxy 腿也按角色归属，summary 里没有。
+    // role 现在**支持**了：账本在写入时就把 role_id 记在每一行上，不再受 summary 形状限制。
     await session.handleLine(
       '{"jsonrpc":"2.0","id":3,"method":"run.getUsage","params":{"scope":"role","scope_id":"role_x"}}',
     );
+    // 但它同样需要主语：没有 scope_id 的 role 查询照样是 INVALID_PARAMS。
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":4,"method":"run.getUsage","params":{"scope":"role"}}',
+    );
 
     const responses = output.map((line) => JSON.parse(line));
-    expect(calls).toEqual([{ scope: 'task', scope_id: 'task_1', run_id: 'run_1' }]);
+    expect(calls).toEqual([
+      { scope: 'task', scope_id: 'task_1', run_id: 'run_1' },
+      { scope: 'role', scope_id: 'role_x' },
+    ]);
     expect(responses[0]).toMatchObject({
       id: 1,
       error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
@@ -191,8 +198,13 @@ describe('RunRpcMethods', () => {
       id: 2,
       result: { history: { scope: 'task', runs_counted: 0, complete: false } },
     });
-    expect(responses[2]).toMatchObject({
+    expect(responses[2]).toEqual({
+      jsonrpc: '2.0',
       id: 3,
+      result: { history: { scope: 'role', runs_counted: 0, complete: false } },
+    });
+    expect(responses[3]).toMatchObject({
+      id: 4,
       error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
     });
   });

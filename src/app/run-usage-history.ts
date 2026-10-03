@@ -27,9 +27,26 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { RunUsageHistory, RunUsageTokens } from '../protocol/run-snapshot';
+import {
+  type TokenUsageLedgerEntry,
+  type TokenUsageLedgerQuery,
+  type TokenUsageLedgerStore,
+} from '../persistence';
+import {
+  buildTokenUsageLedgerEntries,
+  readClaudeSessionLeg,
+  readProxyLeg,
+} from './run-usage-ledger-entries';
 
-/** 可支撑的作用域。`role` / `agent` 见文末说明，暂不支持。 */
-export type RunUsageHistoryScope = 'task' | 'system';
+/**
+ * 可支撑的作用域。
+ *
+ * `role` 现在支持了，但**不是**因为 `summary` 有了角色归属——它仍然没有。原因是账本在
+ * **写入时**就把 `role_id` 记在每一行上（proxy 腿来自事件的归属域，driver 腿来自
+ * `session_id → role_id` 的 join）。这正是「落库」比「重算」多出来的东西：重算被
+ * `summary` 的形状限制住，落库只被「写入那一刻知道什么」限制住。
+ */
+export type RunUsageHistoryScope = 'task' | 'system' | 'role';
 
 export interface RunUsageHistoryQuery {
   scope: RunUsageHistoryScope;
@@ -246,4 +263,122 @@ function nonEmptyString(value: unknown): string | undefined {
 
 function readNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * 账本支撑的历史读路径。
+ *
+ * 与 `FileRunUsageHistoryReader` 的分工：那个**扫目录重算**，只在 run 目录还在时才成立，
+ * 保留为参考实现与回填来源；这个读账本，才是「往期被清掉也不影响」的那条路。
+ *
+ * 首次读之前做一次**惰性回填**：账本之前的历史只存在于 run 目录里，不回填就等于「切到
+ * 账本」把既有历史一次性变成 0。回填是幂等 upsert（`(run_id, role_id, source, metric)`
+ * 是主键），所以进程重启后重跑一遍也只是重写同样的行。
+ */
+export class LedgerRunUsageHistoryReader implements RunUsageHistoryReader {
+  private backfill: Promise<void> | undefined;
+
+  constructor(
+    private readonly ledger: TokenUsageLedgerStore,
+    private readonly runsRoot = '.newide/runs',
+    private readonly now: () => string = () => new Date().toISOString(),
+  ) {}
+
+  async read(query: RunUsageHistoryQuery): Promise<RunUsageHistory> {
+    await this.ensureBackfilled();
+    const ledgerQuery: TokenUsageLedgerQuery =
+      query.scope === 'system'
+        ? { scope: 'system' }
+        : {
+            scope: query.scope,
+            ...(query.scope_id !== undefined ? { scope_id: query.scope_id } : {}),
+          };
+    const aggregate = this.ledger.aggregateTokenUsage(ledgerQuery, this.now());
+    return {
+      scope: aggregate.scope,
+      ...(aggregate.scope_id !== undefined ? { scope_id: aggregate.scope_id } : {}),
+      as_of: aggregate.as_of,
+      runs_counted: aggregate.runs_counted,
+      runs_without_usage: aggregate.runs_without_usage,
+      complete: aggregate.complete,
+      billed: { totals: aggregate.totals, by_source: aggregate.by_source },
+    };
+  }
+
+  /**
+   * 回填失败**不抛给调用方**——否则 `run.getUsage` 会整个不可用，而账本里已有的那部分
+   * 本来是能读的。失败也不缓存，下一次读会重试。
+   *
+   * 代价要说清：回填失败期间，历史只反映账本里已有的 run，而 `complete` 可能仍报 true
+   * （它数的是同一个库里的 `handler.started`，不含那些只存在于目录树里的旧 run）。
+   */
+  private ensureBackfilled(): Promise<void> {
+    this.backfill ??= backfillTokenUsageLedger(this.runsRoot, this.ledger, this.now())
+      .then(() => undefined)
+      .catch(() => {
+        this.backfill = undefined;
+      });
+    return this.backfill;
+  }
+}
+
+export interface TokenUsageLedgerBackfillResult {
+  /** 读到 `summary.json` 的 run 数。 */
+  runs_scanned: number;
+  /** 没有 `task_id` 因而无法落行的 run 数——账本的 `task_id` 非空，这类只能跳过。 */
+  runs_skipped_without_task_id: number;
+  rows_written: number;
+}
+
+/**
+ * 把 run 目录里已有的用量一次性灌进账本。**幂等**，可以反复跑。
+ *
+ * 只搬 `summary.token_usage` 的两条腿：proxy 腿在 summary 里没有角色细分，所以回填出来的
+ * proxy 行一律是未归属哨兵（编造归属比留空更糟）；driver 腿能借
+ * `driver_billed_usage.sessions[]` 还原角色。**绝不碰 `driver_context_usage`**——那是上下文
+ * 占用，属于另一种口径。
+ */
+export async function backfillTokenUsageLedger(
+  runsRoot: string,
+  ledger: TokenUsageLedgerStore,
+  recordedAt: string,
+): Promise<TokenUsageLedgerBackfillResult> {
+  const entries = await fs.readdir(runsRoot, { withFileTypes: true }).catch(() => []);
+  const batch: TokenUsageLedgerEntry[] = [];
+  let runsScanned = 0;
+  let skipped = 0;
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const summary = await readJsonObject(path.join(runsRoot, entry.name, 'summary.json'));
+    if (!summary) continue;
+    runsScanned += 1;
+    const taskId = nonEmptyString(summary.task_id);
+    if (!taskId) {
+      skipped += 1;
+      continue;
+    }
+    const tokenUsage = summary.token_usage;
+    const proxyLeg = readProxyLeg(tokenUsage);
+    const driverBilledLeg = readClaudeSessionLeg(tokenUsage);
+    batch.push(
+      ...buildTokenUsageLedgerEntries({
+        run_id: nonEmptyString(summary.run_id) ?? entry.name,
+        task_id: taskId,
+        ...(proxyLeg ? { proxyLeg } : {}),
+        ...(driverBilledLeg ? { driverBilledLeg } : {}),
+        ...(summary.driver_billed_usage !== undefined
+          ? { driverBilledUsage: summary.driver_billed_usage }
+          : {}),
+        recorded_at: recordedAt,
+      }),
+    );
+  }
+
+  if (batch.length > 0) ledger.appendTokenUsage(batch);
+  return {
+    runs_scanned: runsScanned,
+    runs_skipped_without_task_id: skipped,
+    rows_written: batch.length,
+  };
 }

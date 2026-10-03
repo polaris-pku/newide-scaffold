@@ -66,15 +66,21 @@ export interface TokenUsageLedgerAggregate {
   scope: TokenUsageLedgerScope;
   scope_id?: string;
   as_of: string;
-  /** 账本里属于本 scope 的 run 数。 */
+  /**
+   * 本 scope 下找到的 run 数，**含读不出用量的**——与协议契约同义。
+   *
+   * 等于「账本里有行的 run」+「执行过但账本里没有行的 run」。只数前者会让这个字段与
+   * `runs_without_usage` 的语义对不上（一个是子集、一个是全体）。
+   */
   runs_counted: number;
   /**
-   * 本 scope 内**执行过但账本里没有用量**的 run 数——统计口径是「`events` 表里有事件的
-   * run 却不在账本里」，与目录扫描时代用 `audit.jsonl` 判「确实开跑过」是同一个语义，
-   * 只是判据换成了持久的表。
+   * 本 scope 内**执行过但账本里没有用量**的 run 数——统计口径是「`events` 表里有
+   * `handler.started` 的 run 却不在账本里」，与目录扫描时代用 `audit.jsonl` 判「确实开跑过」
+   * 是同一个语义，只是判据换成了持久的表。
    *
    * `role` scope 下这是**全局上界**：`events` 没有角色归属，无法判断某个缺席的 run 是否
-   * 属于该角色，所以报的是「整个库里有多少执行过的 run 缺席」。它只会偏大不会偏小。
+   * 属于该角色，所以报的是「整个库里有多少执行过的 run 缺席」。它只会偏大不会偏小，
+   * 于是 `runs_counted` 与 `complete` 在 role 下都偏保守。
    */
   runs_without_usage: number;
   /**

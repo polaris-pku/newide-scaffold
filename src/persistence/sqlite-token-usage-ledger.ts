@@ -131,7 +131,7 @@ export class SqliteTokenUsageLedger implements TokenUsageLedgerStore {
     const counted = this.database
       .prepare(`SELECT COUNT(DISTINCT run_id) AS n FROM token_usage_ledger ${where}`)
       .get(...params) as SqlRow | undefined;
-    const runsCounted = readNumber(counted, 'n');
+    const runsWithRows = readNumber(counted, 'n');
 
     const missing = this.database
       .prepare(
@@ -144,6 +144,11 @@ export class SqliteTokenUsageLedger implements TokenUsageLedgerStore {
       )
       .get(...(query.scope === 'task' ? [requireScopeId(query)] : [])) as SqlRow | undefined;
     const runsWithoutUsage = readNumber(missing, 'n');
+
+    // `runs_counted` 按协议契约是「该作用域下找到的 run 数（**含**读不出用量的）」，
+    // 所以它等于「有行的」+「执行过但没行的」。只数前者会让这个字段与文档不符，也会让
+    // `complete` 的两个输入看起来自相矛盾。
+    const runsCounted = runsWithRows + runsWithoutUsage;
 
     return {
       scope: query.scope,

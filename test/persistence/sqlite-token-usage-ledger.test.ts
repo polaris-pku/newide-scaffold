@@ -189,7 +189,7 @@ describe('SqliteTokenUsageLedger', () => {
 
     const aggregate = store.aggregateTokenUsage({ scope: 'system' }, 'T');
 
-    expect(aggregate.runs_counted).toBe(1);
+    expect(aggregate.runs_counted).toBe(2);
     expect(aggregate.runs_without_usage).toBe(1);
     expect(aggregate.complete).toBe(false);
     // 缺口不折算成 0：总量仍只有能读到的那一份。
@@ -248,7 +248,8 @@ describe('SqliteTokenUsageLedger', () => {
 
     const role = store.aggregateTokenUsage({ scope: 'role', scope_id: 'role_a' }, 'T');
 
-    expect(role.runs_counted).toBe(1);
+    // runs_counted 含读不出用量的 run，所以 role 下它是「有行的 1 + 全局缺席上界 1」。
+    expect(role.runs_counted).toBe(2);
     expect(role.runs_without_usage).toBe(1);
     expect(role.complete).toBe(false);
     // task scope 能精确过滤，所以它只看见自己那个 run。
