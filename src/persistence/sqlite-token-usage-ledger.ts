@@ -99,6 +99,16 @@ export class SqliteTokenUsageLedger implements TokenUsageLedgerStore {
 
   aggregateTokenUsage(query: TokenUsageLedgerQuery, asOf: string): TokenUsageLedgerAggregate {
     const { where, params } = scopeFilter(query);
+    // 缺口查询与作用域过滤共用同一个 scope_id：`task` 按 task_id，`run` 按 run_id。
+    // 分开算会让「有行的 run」与「缺口的 run」落在两个不同的作用域上。
+    const missingFilter =
+      query.scope === 'task'
+        ? 'AND task_id = ?'
+        : query.scope === 'run'
+          ? 'AND run_id = ?'
+          : '';
+    const missingParams: SQLInputValue[] =
+      query.scope === 'task' || query.scope === 'run' ? [requireScopeId(query)] : [];
     const totals = emptyTokens();
     const bySource: Record<string, RunUsageTokens> = {};
 
@@ -140,9 +150,9 @@ export class SqliteTokenUsageLedger implements TokenUsageLedgerStore {
          WHERE event_type = 'handler.started'
            AND run_id IS NOT NULL
            AND run_id NOT IN (SELECT run_id FROM token_usage_ledger)
-           ${query.scope === 'task' ? 'AND task_id = ?' : ''}`,
+           ${missingFilter}`,
       )
-      .get(...(query.scope === 'task' ? [requireScopeId(query)] : [])) as SqlRow | undefined;
+      .get(...missingParams) as SqlRow | undefined;
     const runsWithoutUsage = readNumber(missing, 'n');
 
     // `runs_counted` 按协议契约是「该作用域下找到的 run 数（**含**读不出用量的）」，
@@ -164,21 +174,26 @@ export class SqliteTokenUsageLedger implements TokenUsageLedgerStore {
 }
 
 /**
- * scope → WHERE 子句。`system` 无过滤；`task` / `role` 各自按列等值。
+ * scope → WHERE 子句。`system` 无过滤；`task` / `role` / `run` 各自按列等值。
  *
  * `role` 的 `runs_without_usage` 在 `aggregateTokenUsage` 里刻意**不**加过滤：
  * `events` 表没有角色归属，无法判断缺席的 run 是否属于该角色，所以那个数只能是全局上界。
  * 它偏大不会偏小，于是 `complete` 只会偏保守。
+ *
+ * `run` 必须按 `run_id` 过滤（而不是像 `role` 那样放着不管），否则单 run 查询会把整个库里
+ * 的缺席 run 全算进来，`complete` 永远 false——一个只对单个 run 提问的调用方会得到一个
+ * 关于整个库的答案。
  */
 function scopeFilter(query: TokenUsageLedgerQuery): { where: string; params: SQLInputValue[] } {
   if (query.scope === 'task') return { where: 'WHERE task_id = ?', params: [requireScopeId(query)] };
   if (query.scope === 'role') return { where: 'WHERE role_id = ?', params: [requireScopeId(query)] };
+  if (query.scope === 'run') return { where: 'WHERE run_id = ?', params: [requireScopeId(query)] };
   return { where: '', params: [] };
 }
 
 /**
- * `task` / `role` 必须有 `scope_id`。缺了就抛错，而不是退化成 `task_id = ''` 静默查空——
- * 那会让调用方以为「这个 scope 没有用量」，而真相是它压根没指定 scope。
+ * `task` / `role` / `run` 必须有 `scope_id`。缺了就抛错，而不是退化成 `task_id = ''` 静默查空
+ * ——那会让调用方以为「这个 scope 没有用量」，而真相是它压根没指定 scope。
  */
 function requireScopeId(query: TokenUsageLedgerQuery): string {
   if (query.scope_id === undefined) {

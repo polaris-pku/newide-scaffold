@@ -24,7 +24,7 @@
  * 失效模式，只不过发生在比口径更高的一层。判据是 `audit.jsonl` 的存在：它在
  * `startStage` 里写出，早于任何 executor，所以「有它」等价于「确实开跑过」。
  */
-import { promises as fs } from 'node:fs';
+import { promises as fs, readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { RunUsageHistory, RunUsageTokens } from '../protocol/run-snapshot';
 import {
@@ -45,17 +45,40 @@ import {
  * **写入时**就把 `role_id` 记在每一行上（proxy 腿来自事件的归属域，driver 腿来自
  * `session_id → role_id` 的 join）。这正是「落库」比「重算」多出来的东西：重算被
  * `summary` 的形状限制住，落库只被「写入那一刻知道什么」限制住。
+ *
+ * `run` 是单个 run 的用量。它与 `task` 的区别不是粒度而是**取数路径**：`run` 由
+ * `readRun`（同步）服务，用于把已收尾 run 的快照 `usage` 块从内存搬到持久层，见那里的注释。
  */
-export type RunUsageHistoryScope = 'task' | 'system' | 'role';
+export type RunUsageHistoryScope = 'task' | 'system' | 'role' | 'run';
 
 export interface RunUsageHistoryQuery {
   scope: RunUsageHistoryScope;
-  /** `task` 作用域必填；`system` 忽略。 */
+  /** `task` / `role` / `run` 必填；`system` 忽略。 */
   scope_id?: string;
+}
+
+/** 一个 run 的持久计费用量。两条腿分开，永不合并。 */
+export interface DurableRunUsage {
+  totals: RunUsageTokens;
+  by_source: Record<string, RunUsageTokens>;
 }
 
 export interface RunUsageHistoryReader {
   read(query: RunUsageHistoryQuery): Promise<RunUsageHistory>;
+  /**
+   * 单个 run 的持久计费用量；该 run 在持久层里没有用量时返回 `undefined`。
+   *
+   * **为什么是同步的**：它要服务的调用方是 `getRunSnapshot`，而快照投影是同步的
+   * （SQLite 是同步驱动）。为了这一条把整个快照投影改成 Promise 是拿契约去迁就实现。
+   *
+   * **不触发惰性回填**：回填是异步的，同步方法等不了。所以对「用量只存在于 run 目录、
+   * 还没进账本」的历史 run，这里会返回 `undefined`；先读过一次 `read`（会回填）之后就能
+   * 读到。这个顺序在 `getRunUsage` 里天然成立——它先 `await read` 再取快照。
+   *
+   * 返回 `undefined` 而不是全 0 的合计：**缺 ≠ 0**。账本里这个 run 没有行，与「这个 run
+   * 花了 0 token」是两件事，调用方必须能区分。
+   */
+  readRun(runId: string): DurableRunUsage | undefined;
 }
 
 /** 一条 run summary 里与用量有关的抽取结果；读不出用量时 `tokens` 为 undefined。 */
@@ -75,6 +98,20 @@ export class FileRunUsageHistoryReader implements RunUsageHistoryReader {
   async read(query: RunUsageHistoryQuery): Promise<RunUsageHistory> {
     const facts = await this.readAllSummaries();
     return aggregateUsageHistory(facts, query, this.now());
+  }
+
+  /**
+   * 同步读一个 run 的 `summary.json`。参考实现——生产走账本，这条路径依赖 run 目录还在。
+   *
+   * 用同步 IO 是刻意的：这个方法的契约就是同步（见 `RunUsageHistoryReader.readRun`）。
+   */
+  readRun(runId: string): DurableRunUsage | undefined {
+    const summary = readJsonObjectSync(path.join(this.runsRoot, runId, 'summary.json'));
+    if (!summary) return undefined;
+    const facts = runUsageSummaryFacts(runId, summary);
+    // 与 `readLeg` 同一条守卫：读不出、或读出来是个 0，都算**缺席**而不是「花了 0」。
+    if (!facts.tokens || facts.tokens.total_tokens === 0) return undefined;
+    return { totals: facts.tokens, by_source: facts.by_source ?? {} };
   }
 
   private async readAllSummaries(): Promise<RunUsageSummaryFacts[]> {
@@ -251,6 +288,21 @@ async function readJsonObject(filePath: string): Promise<Record<string, unknown>
   }
 }
 
+/** `readJsonObject` 的同步孪生：语义完全相同（读不出 → undefined，绝不折算成 0）。 */
+function readJsonObjectSync(filePath: string): Record<string, unknown> | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, { encoding: 'utf8' });
+  } catch {
+    return undefined;
+  }
+  try {
+    return asRecord(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -306,6 +358,20 @@ export class LedgerRunUsageHistoryReader implements RunUsageHistoryReader {
   }
 
   /**
+   * 单个 run 的持久用量，**同步**且**不回填**（理由见端口注释）。
+   *
+   * 一条按 `run_id` 的等值聚合：主键 `(run_id, role_id, source, metric)` 的前缀就是它，
+   * 所以这是索引命中，可以安全地挂在同步的快照投影路径上。
+   */
+  readRun(runId: string): DurableRunUsage | undefined {
+    const aggregate = this.ledger.aggregateTokenUsage({ scope: 'run', scope_id: runId }, this.now());
+    // `runs_counted` 会把「执行过但账本里没有行」的 run 也算进来，那种情况 `totals` 全是 0。
+    // 判据因此不能是 `runs_counted`，得是「到底有没有腿」——**缺 ≠ 0**。
+    if (Object.keys(aggregate.by_source).length === 0) return undefined;
+    return { totals: aggregate.totals, by_source: aggregate.by_source };
+  }
+
+  /**
    * 回填失败**不抛给调用方**——否则 `run.getUsage` 会整个不可用，而账本里已有的那部分
    * 本来是能读的。失败也不缓存，下一次读会重试。
    *
@@ -327,16 +393,37 @@ export interface TokenUsageLedgerBackfillResult {
   runs_scanned: number;
   /** 没有 `task_id` 因而无法落行的 run 数——账本的 `task_id` 非空，这类只能跳过。 */
   runs_skipped_without_task_id: number;
+  /**
+   * 账本里**已经有腿**、因而只补缺失那条腿（或整条都不补）的 run 数。
+   *
+   * 摆出来而不是悄悄跳过：这个数就是「回填与存活期写入谁先谁后」的观测。它长期为 0 意味着
+   * 账本之前的历史还没灌完；它迅速追平 `runs_scanned` 意味着回填已经没什么可做的了。
+   */
+  runs_already_in_ledger: number;
   rows_written: number;
 }
 
 /**
- * 把 run 目录里已有的用量一次性灌进账本。**幂等**，可以反复跑。
+ * 把 run 目录里已有的用量一次性灌进账本。**按腿幂等**，可以反复跑。
  *
  * 只搬 `summary.token_usage` 的两条腿：proxy 腿在 summary 里没有角色细分，所以回填出来的
  * proxy 行一律是未归属哨兵（编造归属比留空更糟）；driver 腿能借
  * `driver_billed_usage.sessions[]` 还原角色。**绝不碰 `driver_context_usage`**——那是上下文
  * 占用，属于另一种口径。
+ *
+ * **为什么必须逐腿检查「账本里是不是已经有了」**：幂等键是
+ * `(run_id, role_id, source, metric)`，而回填的 proxy 行是**未归属**的（`role_id = ''`）、
+ * 存活期写入的那一行带真实 `role_id`。两者主键不同，于是「再回填一次」不是覆盖而是**新增
+ * 一行**。实测这条路径把同一个 run 的 proxy 腿算成了两倍（110 → 220），而且触发条件正是最
+ * 常见的那个：跑完一个 run 之后重启后端，第一次读历史就会回填整个目录树。
+ *
+ * 因此判据是**腿**而不是 run：账本里已经有 `proxy` 行就不再补 proxy，已经有
+ * `claude_session_jsonl` 行就不再补 driver。只补缺的那条腿，两条都在就整条跳过。
+ *
+ * 已知残留：这个判据看的是「有没有腿」，不是「这条腿完不完整」。若某次写入在
+ * `appendTokenUsage` 中途崩掉（它不是事务），回填不会再补齐剩下那部分。两种失效模式里
+ * 选这个是刻意的——重复计会把总量**报大**且看不出来，补不全只会**报小**，而报小有
+ * `runs_without_usage` 这条已知缺口的通道在盯着。
  */
 export async function backfillTokenUsageLedger(
   runsRoot: string,
@@ -347,6 +434,7 @@ export async function backfillTokenUsageLedger(
   const batch: TokenUsageLedgerEntry[] = [];
   let runsScanned = 0;
   let skipped = 0;
+  let alreadyInLedger = 0;
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
@@ -358,12 +446,17 @@ export async function backfillTokenUsageLedger(
       skipped += 1;
       continue;
     }
+    const runId = nonEmptyString(summary.run_id) ?? entry.name;
+    const present = presentLedgerSources(ledger, runId, recordedAt);
+    if (present.size > 0) alreadyInLedger += 1;
     const tokenUsage = summary.token_usage;
-    const proxyLeg = readProxyLeg(tokenUsage);
-    const driverBilledLeg = readClaudeSessionLeg(tokenUsage);
+    const proxyLeg = present.has('proxy') ? undefined : readProxyLeg(tokenUsage);
+    const driverBilledLeg = present.has('claude_session_jsonl')
+      ? undefined
+      : readClaudeSessionLeg(tokenUsage);
     batch.push(
       ...buildTokenUsageLedgerEntries({
-        run_id: nonEmptyString(summary.run_id) ?? entry.name,
+        run_id: runId,
         task_id: taskId,
         ...(proxyLeg ? { proxyLeg } : {}),
         ...(driverBilledLeg ? { driverBilledLeg } : {}),
@@ -379,6 +472,25 @@ export async function backfillTokenUsageLedger(
   return {
     runs_scanned: runsScanned,
     runs_skipped_without_task_id: skipped,
+    runs_already_in_ledger: alreadyInLedger,
     rows_written: batch.length,
   };
+}
+
+/**
+ * 这个 run 在账本里**已经有哪几条腿**。
+ *
+ * 复用 `run` 作用域的聚合而不是新开一个存储端口：语义正好是「这个 run 的 by_source」，而
+ * 端口多一个方法就要多改一批测试替身。查询走主键前缀 `run_id`，是索引命中。
+ *
+ * 不吞错：查不出来就抛给调用方（`LedgerRunUsageHistoryReader.ensureBackfilled` 会在下次读
+ * 时重试）。这里刻意**不**降级成「当成空的」——那正好会退化成我们要修的那个重复计。
+ */
+function presentLedgerSources(
+  ledger: TokenUsageLedgerStore,
+  runId: string,
+  asOf: string,
+): Set<string> {
+  const aggregate = ledger.aggregateTokenUsage({ scope: 'run', scope_id: runId }, asOf);
+  return new Set(Object.keys(aggregate.by_source));
 }

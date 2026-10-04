@@ -8,8 +8,9 @@
  * `NewideBackendService.getRunSnapshot`，折叠逻辑放这里。
  *
  * 三条口径**互不相加**，一律不从时间线之外的来源编数字：
- * - `billed.by_source.*` —— 计费流量。实时快照只填得上 `proxy` 腿；driver 侧计费
- *   （`driver_billed_usage`）要等 run 收尾并入 `summary.json` 才存在。
+ * - `billed.by_source.*` —— 计费流量。存活期的 run 只填得上 `proxy` 腿；driver 侧计费
+ *   （`driver_billed_usage`）要等 run 收尾并入 `summary.json` 才存在。**收尾后的 run 从
+ *   账本取（`durable`）**，那一份带两条腿，而且进程重启后仍然在。
  * - `by_stage.*` —— 按 stage 分桶，**只覆盖 proxy 腿**，故 metric 名自带 `proxy`。
  * - `context` —— driver 上下文占用快照，`metric` 自描述，与 billed 不是同一个量。
  *
@@ -18,16 +19,30 @@
 import type { RunUsage, RunUsageTokens } from '../protocol/run-snapshot';
 import type { TaskDriverUsage } from './driver-usage-projector';
 import { resolveTokenUsageFromTimeline, summarizeRunConsumption } from './run-terminal-output-writer';
+import type { DurableRunUsage } from './run-usage-history';
 
 export interface RunUsageProjectionInput {
-  /** 存活期的 run 事件流（registry）。没有它就没有 proxy 腿与 by_stage。 */
-  timeline: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>;
+  /**
+   * 存活期的 run 事件流（registry）。**缺席表示本进程不持有该 run**，与「有一条空时间线」
+   * 是两件事：前者没有 proxy 腿可读，后者读出来是 0 条用量事件。缺省而不是空数组，就是为了
+   * 让这个区别在类型上就看得见。
+   */
+  timeline?: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>;
   /** 进程内 driver 上下文占用累加器；进程重启后为空。 */
   driverUsage?: TaskDriverUsage | undefined;
+  /**
+   * 已收尾 run 的持久计费用量（账本）。给了它就**压过**时间线那一条腿。
+   *
+   * 为什么持久的那份优先：它是 run 收尾时写死的权威件——proxy 腿与 driver 计费腿都在里面，
+   * 而存活期时间线永远只有 proxy 腿（driver 腿从不进事件流）。同一个 run 在「进程还持有它」
+   * 与「进程重启后读」两种情况下必须报同一个 `billed`，否则面板上这个 run 的数字会随后端
+   * 重启而变。**只有已收尾的 run 才该传它**：在跑的 run 账本里还没有行，而时间线是活的。
+   */
+  durable?: DurableRunUsage | undefined;
 }
 
 export function projectRunUsage(input: RunUsageProjectionInput): RunUsage | undefined {
-  const billed = projectBilled(input.timeline);
+  const billed = billedFromDurable(input.durable) ?? projectBilled(input.timeline);
   const byStage = projectByStage(input.timeline);
   const context = projectContext(input.driverUsage);
 
@@ -39,9 +54,28 @@ export function projectRunUsage(input: RunUsageProjectionInput): RunUsage | unde
   };
 }
 
+/**
+ * 账本的按腿合计 → 快照的 `billed` 块。
+ *
+ * 一条腿都没有时返回 `undefined`（而不是一个 `by_source: {}` 的块）：那会让前端把「没有
+ * 数据」读成「有数据且为零」。调用方要的就是这个区别。
+ */
+export function billedFromDurable(durable: DurableRunUsage | undefined): RunUsage['billed'] | undefined {
+  if (!durable) return undefined;
+  const bySource: Record<string, RunUsageTokens> = {};
+  for (const [source, totals] of Object.entries(durable.by_source)) {
+    // 拷贝而不是透传引用：账本聚合出来的对象会随下一次查询重建，但契约对象一旦发出去
+    // 就不该再被任何人从背后改。
+    bySource[source] = { ...totals };
+  }
+  if (Object.keys(bySource).length === 0) return undefined;
+  return { metric: 'billed_tokens', by_source: bySource };
+}
+
 function projectBilled(
   timeline: RunUsageProjectionInput['timeline'],
 ): RunUsage['billed'] | undefined {
+  if (!timeline) return undefined;
   const summary = resolveTokenUsageFromTimeline(timeline);
   if (!summary) return undefined;
   const bySource: Record<string, RunUsageTokens> = {};
@@ -54,6 +88,7 @@ function projectBilled(
 function projectByStage(
   timeline: RunUsageProjectionInput['timeline'],
 ): RunUsage['by_stage'] | undefined {
+  if (!timeline) return undefined;
   // 复用终态 summary 的同一个折叠函数：实时快照与 `summary.consumption` 必须同口径。
   const consumption = summarizeRunConsumption(timeline, undefined);
   const stages: NonNullable<RunUsage['by_stage']> = {};

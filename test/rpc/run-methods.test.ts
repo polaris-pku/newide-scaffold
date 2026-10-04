@@ -183,11 +183,19 @@ describe('RunRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":4,"method":"run.getUsage","params":{"scope":"role"}}',
     );
+    // run 作用域是单个 run 的**持久**用量（进程重启后仍然读得到），同样要主语。
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":5,"method":"run.getUsage","params":{"scope":"run","scope_id":"run_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":6,"method":"run.getUsage","params":{"scope":"run"}}',
+    );
 
     const responses = output.map((line) => JSON.parse(line));
     expect(calls).toEqual([
       { scope: 'task', scope_id: 'task_1', run_id: 'run_1' },
       { scope: 'role', scope_id: 'role_x' },
+      { scope: 'run', scope_id: 'run_1' },
     ]);
     expect(responses[0]).toMatchObject({
       id: 1,
@@ -205,6 +213,15 @@ describe('RunRpcMethods', () => {
     });
     expect(responses[3]).toMatchObject({
       id: 4,
+      error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
+    });
+    expect(responses[4]).toEqual({
+      jsonrpc: '2.0',
+      id: 5,
+      result: { history: { scope: 'run', runs_counted: 0, complete: false } },
+    });
+    expect(responses[5]).toMatchObject({
+      id: 6,
       error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
     });
   });

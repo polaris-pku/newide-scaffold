@@ -1,8 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import type { TaskDriverUsage } from '../../src/app/driver-usage-projector';
 import { projectRunUsage } from '../../src/app/run-usage-projection';
+import type { RunUsageTokens } from '../../src/protocol/run-snapshot';
 
 type TimelineItem = { type: string; payload: Record<string, unknown> };
+
+/** 一个只有 input 的合计；投影不做算术，所以用例里只关心搬对没搬对。 */
+function tokens(total: number): RunUsageTokens {
+  return {
+    input_tokens: total,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    total_input_tokens: total,
+    total_tokens: total,
+    call_count: 1,
+  };
+}
 
 function proxyUsage(input: {
   input_tokens: number;
@@ -133,5 +147,58 @@ describe('projectRunUsage', () => {
     });
 
     expect(usage).toBeUndefined();
+  });
+
+  it('lets the durable ledger leg win over the live timeline', () => {
+    // 已收尾的 run 用账本那一份：它是收尾时写死的权威件，**两条腿都在**；而存活期时间线
+    // 永远只有 proxy 腿（driver 计费从不进事件流）。同一个 run 在「进程还持有」与
+    // 「进程重启后读」两种情况下必须报同一个 `billed`，所以这里必须是账本压过时间线，
+    // 而不是「两个都报」或「时间线优先」。
+    const usage = projectRunUsage({
+      timeline: [proxyUsage({ input_tokens: 100, output_tokens: 10, stage_cursor: 'execute_agent' })],
+      durable: {
+        totals: { ...tokens(370), call_count: 2 },
+        by_source: {
+          proxy: { ...tokens(110), output_tokens: 10, total_tokens: 120 },
+          claude_session_jsonl: { ...tokens(250) },
+        },
+      },
+    });
+
+    expect(Object.keys(usage?.billed?.by_source ?? {}).sort()).toEqual([
+      'claude_session_jsonl',
+      'proxy',
+    ]);
+    // 账本的 proxy 腿（120）而不是时间线那条（110）——两者不同正是这条用例的意义。
+    expect(usage?.billed?.by_source.proxy?.total_tokens).toBe(120);
+    expect(usage?.billed?.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+    // 按 stage 分桶只有存活期时间线有，账本不提供它——两条腿各来自各自的来源。
+    expect(usage?.by_stage?.execute_agent?.total_tokens).toBe(110);
+  });
+
+  it('falls back to the timeline when the ledger has no legs', () => {
+    // 账本为空（写入失败被吞掉、或这个 run 还没进账本）：不能因此把数字变成缺席，
+    // 存活期时间线仍然能给出 proxy 腿。
+    const usage = projectRunUsage({
+      timeline: [proxyUsage({ input_tokens: 100, output_tokens: 10 })],
+      durable: { totals: { ...tokens(0), call_count: 0 }, by_source: {} },
+    });
+
+    expect(usage?.billed?.by_source.proxy?.total_tokens).toBe(110);
+  });
+
+  it('treats a missing timeline as absent rather than as an empty one', () => {
+    // 本进程不持有该 run 时 `timeline` 是**缺席**的。此时只有账本能说话；两样都没有就整个缺席。
+    expect(projectRunUsage({})).toBeUndefined();
+    expect(
+      projectRunUsage({ durable: { totals: { ...tokens(0) }, by_source: {} } }),
+    ).toBeUndefined();
+
+    const durableOnly = projectRunUsage({
+      durable: { totals: { ...tokens(250) }, by_source: { claude_session_jsonl: { ...tokens(250) } } },
+    });
+    expect(durableOnly?.billed?.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+    // 没有存活期时间线就没有按 stage 分桶——不编一个空对象出来。
+    expect(durableOnly?.by_stage).toBeUndefined();
   });
 });

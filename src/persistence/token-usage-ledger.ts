@@ -54,11 +54,19 @@ export interface TokenUsageLedgerEntry extends RunUsageTokens {
   schema_version: string;
 }
 
-export type TokenUsageLedgerScope = 'task' | 'system' | 'role';
+/**
+ * 可聚合的作用域。
+ *
+ * `run` 是后来补上的，补它的理由与 P5 立账本的理由是同一个：**单个 run 的用量此前只存在于
+ * 进程内存里**。`proxy.llm_usage_recorded` 不落 `coordination.sqlite`（它走 telemetry 通道），
+ * 所以进程重启后 `run.getSnapshot` 的 `usage` 整个消失——哪怕账本里这个 run 的行一直在。
+ * 一条按 `run_id` 的等值查询就能把那块补回来，主键前缀就是 `run_id`，是索引命中。
+ */
+export type TokenUsageLedgerScope = 'task' | 'system' | 'role' | 'run';
 
 export interface TokenUsageLedgerQuery {
   scope: TokenUsageLedgerScope;
-  /** `task` / `role` 必填；`system` 忽略。 */
+  /** `task` / `role` / `run` 必填；`system` 忽略。 */
   scope_id?: string;
 }
 
@@ -81,6 +89,10 @@ export interface TokenUsageLedgerAggregate {
    * `role` scope 下这是**全局上界**：`events` 没有角色归属，无法判断某个缺席的 run 是否
    * 属于该角色，所以报的是「整个库里有多少执行过的 run 缺席」。它只会偏大不会偏小，
    * 于是 `runs_counted` 与 `complete` 在 role 下都偏保守。
+   *
+   * `run` scope 下它是**精确**的 0 或 1：有没有那个 run 的 `handler.started` 是能直接查的。
+   * 于是 `complete` 在这里的含义是「这个 run 的用量确实进账了」——调用方必须据此决定是报
+   * 数字还是报缺席，而不是把 `totals` 里那堆 0 当成「这个 run 没花钱」。
    */
   runs_without_usage: number;
   /**

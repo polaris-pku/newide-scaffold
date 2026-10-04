@@ -260,4 +260,21 @@ describe('runUsageHistory', () => {
     expect(history.runs_counted).toBe(0);
     expect(history.complete).toBe(false);
   });
+
+  it('reads a single run synchronously for the snapshot projection', () => {
+    // 参考实现的 `readRun`：同步、不扫整棵树、读不出就是缺席。
+    const runsRoot = makeRunsRoot();
+    writeRunDir(runsRoot, 'run_a', {
+      summary: summaryWith({ run_id: 'run_a', task_id: 'task_1', total: 120 }),
+    });
+    writeRunDir(runsRoot, 'run_gap', { audit: true, request: { task_id: 'task_1' } });
+    const reader = new FileRunUsageHistoryReader(runsRoot, () => 'T');
+
+    expect(reader.readRun('run_a')?.totals.total_tokens).toBe(120);
+    expect(reader.readRun('run_a')?.by_source.proxy?.total_tokens).toBe(120);
+    // 执行过但没有 summary：缺席，不是全 0 的合计。
+    expect(reader.readRun('run_gap')).toBeUndefined();
+    // 目录不存在：同样是缺席，不抛。
+    expect(reader.readRun('run_absent')).toBeUndefined();
+  });
 });

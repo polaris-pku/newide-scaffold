@@ -106,7 +106,14 @@ export const runUsageSessionSchema = z
 
 export const runUsageSchema = z
   .object({
-    /** 真正烧掉的计费流量，按来源拆。当前实时快照只填得上 `proxy` 腿。 */
+    /**
+     * 真正烧掉的计费流量，按来源拆。
+     *
+     * **来源随 run 的生命周期变**：在跑的 run 只有 `proxy` 腿（driver 侧计费不进事件流）；
+     * 已收尾的 run 从用量账本取，于是 `claude_session_jsonl` 腿也在。同一个 run 的这两个
+     * 阶段报的是不同的腿集合，但**收尾之后**无论本进程还持不持有它，报的都是账本那一份
+     * ——否则前端的数字会随后端重启而变。
+     */
     billed: z
       .object({
         metric: z.literal('billed_tokens'),
@@ -136,10 +143,14 @@ export const runUsageSchema = z
  * `role` 从「不支持」变为支持，靠的不是 `summary`——它至今没有 proxy 腿的角色归属——
  * 而是用量账本在**写入时**就把 `role_id` 记在每一行上。`agent` 仍然不支持：它依赖
  * 从未被赋值的 `agent_id`。
+ *
+ * `run` 是单个 run 的持久用量。它存在的理由不是「粒度更细」，而是**进程重启后仍然读得到**：
+ * 在这之前单个 run 的用量只在存活期内存里，重启即消失。同一份数据也是 `run.getSnapshot`
+ * 的 `usage.billed` 在收尾之后的来源，两者必须报同一个数。
  */
 export const runUsageHistorySchema = z
   .object({
-    scope: z.enum(['task', 'system', 'role']),
+    scope: z.enum(['task', 'system', 'role', 'run']),
     scope_id: z.string().min(1).optional(),
     /** 统计时点。历史是重放出来的，必须让读的人知道它是哪一刻的快照。 */
     as_of: z.string().min(1),

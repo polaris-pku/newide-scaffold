@@ -15,6 +15,8 @@ import {
 } from '../../src/app/run-usage-history';
 import {
   SqliteCoordinationStore,
+  TOKEN_USAGE_LEDGER_SCHEMA_VERSION,
+  type CoordinationStateCommit,
   type TokenUsageLedgerEntry,
   type TokenUsageLedgerStore,
 } from '../../src/persistence';
@@ -42,6 +44,88 @@ function tokens(total: number, callCount = 1): RunUsageTokens {
     total_tokens: total,
     call_count: callCount,
   };
+}
+
+/**
+ * 播一个**确实开跑过**的 run：`handler.started` 由 `startStage` 写出、早于任何 executor，
+ * 所以它是「执行过」的持久判据——账本的缺口统计正是靠它。
+ */
+function seedExecutedRun(store: SqliteCoordinationStore, run_id: string, task_id: string): void {
+  const event = (suffix: string, event_type: string) => ({
+    event_id: `${run_id}_${suffix}`,
+    event_type,
+    subject_id: task_id,
+    run_id,
+    task_id,
+    payload: {},
+    created_at: 'T',
+    schema_version: 'v0',
+  });
+  store.commitState({
+    task: {
+      task_id,
+      status: 'created',
+      risk_level: 'medium',
+      spec: 'usage reader test',
+      completion_criteria: ['x'],
+      affected_paths: ['src/**'],
+      workspace_path: '/workspace',
+      warnings: [],
+      revision: 1,
+      created_at: 'T',
+      updated_at: 'T',
+      schema_version: 'v0',
+    },
+    run: {
+      run_id,
+      task_id,
+      status: 'created',
+      mode: 'single_agent',
+      workspace_path: '/workspace',
+      revision: 1,
+      created_at: 'T',
+      updated_at: 'T',
+      schema_version: 'v0',
+    },
+    runtime_state: {
+      task_id,
+      current_run_id: run_id,
+      resume_cursor: 'select_agent',
+      waiting_on: [],
+      artifact_refs: [],
+      diagnostics: {},
+      updated_at: 'T',
+      schema_version: 'v0',
+    },
+    events: [
+      event('created', 'task.created'),
+      event('started', 'handler.started'),
+    ],
+  } as CoordinationStateCommit);
+}
+
+function appendLedgerRow(
+  store: SqliteCoordinationStore,
+  spec: {
+    run_id: string;
+    task_id: string;
+    total: number;
+    source?: TokenUsageLedgerEntry['source'];
+    role_id?: string;
+  },
+): void {
+  store.appendTokenUsage([
+    {
+      run_id: spec.run_id,
+      task_id: spec.task_id,
+      role_id: spec.role_id ?? 'role_a',
+      source: spec.source ?? 'proxy',
+      metric: 'billed_tokens',
+      recorded_at: 'T',
+      schema_version: TOKEN_USAGE_LEDGER_SCHEMA_VERSION,
+      ...tokens(spec.total),
+    },
+  ]);
 }
 
 interface SummarySpec {
@@ -116,7 +200,52 @@ describe('backfillTokenUsageLedger', () => {
     expect(ledger.aggregateTokenUsage({ scope: 'system' }, 'T').totals.total_tokens).toBe(
       afterFirst,
     );
-    expect(second.rows_written).toBe(first.rows_written);
+    // 第二次**一行都不该写**。只断言「总量没变」是不够的：重复写一条主键相同但 role_id
+    // 不同的行会同时改变总量，而这里正是要钉住那条路径没有发生。
+    expect(second.rows_written).toBe(0);
+    expect(second.runs_already_in_ledger).toBe(1);
+    ledger.close();
+  });
+
+  it('does not double count a run the live path already wrote with role attribution', async () => {
+    // 这条是上面的补集，也是实测抓到的那条：存活期写入的 proxy 行带真实 `role_id`，
+    // 回填写的是未归属哨兵（`role_id = ''`），两者主键不同——于是「再回填一次」不是覆盖
+    // 而是**新增一行**，同一个 run 的 proxy 腿被算成两倍（110 → 220）。触发条件正是最常见
+    // 的那个：跑完一个 run 之后重启后端，第一次读历史就回填整棵目录树。
+    const runsRoot = await makeRunsRoot();
+    await writeRun(runsRoot, { run_id: 'run_1', task_id: 'task_1', proxy: 110 });
+    const ledger = new SqliteCoordinationStore(':memory:');
+    appendLedgerRow(ledger, { run_id: 'run_1', task_id: 'task_1', total: 110, role_id: 'role_a' });
+
+    expect(
+      ledger.aggregateTokenUsage({ scope: 'run', scope_id: 'run_1' }, 'T').totals.total_tokens,
+    ).toBe(110);
+
+    const result = await backfillTokenUsageLedger(runsRoot, ledger, 'T');
+
+    const after = ledger.aggregateTokenUsage({ scope: 'run', scope_id: 'run_1' }, 'T');
+    expect(after.totals.total_tokens).toBe(110);
+    expect(after.by_source.proxy?.call_count).toBe(1);
+    expect(result.rows_written).toBe(0);
+    expect(result.runs_already_in_ledger).toBe(1);
+    ledger.close();
+  });
+
+  it('fills only the leg the ledger is missing', async () => {
+    // 判据是**腿**而不是 run：已经在账本里的那条腿不补，缺的那条补上。
+    const runsRoot = await makeRunsRoot();
+    await writeRun(runsRoot, { run_id: 'run_1', task_id: 'task_1', proxy: 100, driverLeg: 250 });
+    const ledger = new SqliteCoordinationStore(':memory:');
+    // 存活期只写下了 proxy 腿（driver 腿要等收尾后从 session JSONL 刮出来，可能缺席）。
+    appendLedgerRow(ledger, { run_id: 'run_1', task_id: 'task_1', total: 100 });
+
+    const result = await backfillTokenUsageLedger(runsRoot, ledger, 'T');
+
+    const run = ledger.aggregateTokenUsage({ scope: 'run', scope_id: 'run_1' }, 'T');
+    expect(run.by_source.proxy?.total_tokens).toBe(100);
+    expect(run.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+    expect(result.rows_written).toBe(1);
+    expect(result.runs_already_in_ledger).toBe(1);
     ledger.close();
   });
 
@@ -276,6 +405,51 @@ describe('LedgerRunUsageHistoryReader', () => {
 
     await expect(reader.read({ scope: 'role' })).rejects.toThrow(/requires scope_id/);
     await expect(reader.read({ scope: 'task' })).rejects.toThrow(/requires scope_id/);
+    await expect(reader.read({ scope: 'run' })).rejects.toThrow(/requires scope_id/);
+    ledger.close();
+  });
+
+  it('reads one run back by id, and reports absence rather than zero', () => {
+    // 这条守的是「进程重启后单个 run 的用量还在」：`readRun` 是同步的（挂在同步的快照投影
+    // 上），所以它必须能在**不经过任何回填**的情况下直接答出一个已经落库的 run。
+    const ledger = new SqliteCoordinationStore(':memory:');
+    const reader = new LedgerRunUsageHistoryReader(ledger, '/nonexistent-runs-root', () => 'T');
+    seedExecutedRun(ledger, 'run_1', 'task_1');
+    appendLedgerRow(ledger, { run_id: 'run_1', task_id: 'task_1', total: 120 });
+    appendLedgerRow(ledger, {
+      run_id: 'run_1',
+      task_id: 'task_1',
+      total: 250,
+      source: 'claude_session_jsonl',
+      role_id: 'role_b',
+    });
+
+    const usage = reader.readRun('run_1');
+
+    expect(usage?.by_source.proxy?.total_tokens).toBe(120);
+    expect(usage?.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+    expect(usage?.totals.total_tokens).toBe(370);
+
+    // 账本里没有这个 run → 缺席，不是一个全 0 的合计。**缺 ≠ 0**。
+    expect(reader.readRun('run_never_seen')).toBeUndefined();
+    ledger.close();
+  });
+
+  it('reports absence for a run that executed but never got ledger rows', async () => {
+    // 「有 handler.started、账本里没有行」是**已知缺口**。`readRun` 在这里必须返回
+    // undefined——返回一个全 0 的合计会让调用方以为这个 run 花了 0 token。
+    const ledger = new SqliteCoordinationStore(':memory:');
+    seedExecutedRun(ledger, 'run_gap', 'task_gap');
+    const reader = new LedgerRunUsageHistoryReader(ledger, '/nonexistent-runs-root', () => 'T');
+
+    expect(reader.readRun('run_gap')).toBeUndefined();
+
+    // 而账本本身知道这是个缺口：`run` 作用域把「执行过」与「有行」分开报，不是都归成 0。
+    const gap = await reader.read({ scope: 'run', scope_id: 'run_gap' });
+    expect(gap.runs_counted).toBe(1);
+    expect(gap.runs_without_usage).toBe(1);
+    expect(gap.complete).toBe(false);
+    expect(gap.billed.totals.total_tokens).toBe(0);
     ledger.close();
   });
 });

@@ -257,6 +257,77 @@ describe('SqliteTokenUsageLedger', () => {
     store.close();
   });
 
+  it('answers about one run for the run scope, including its own gap', () => {
+    // 单 run 查询必须只谈那个 run：如果把整个库的缺口都算进来，`complete` 永远 false，
+    // 一个只问单个 run 的调用方会得到一个关于整个库的答案。
+    const store = new SqliteCoordinationStore(':memory:');
+    seedRun(store, 'run_1', 'task_1', true);
+    seedRun(store, 'run_2', 'task_2', true);
+    seedRun(store, 'run_other', 'task_other', true);
+    store.appendTokenUsage([
+      entry({ run_id: 'run_1', task_id: 'task_1', source: 'proxy', role_id: 'role_a', ...tokens(100) }),
+      entry({
+        run_id: 'run_1',
+        task_id: 'task_1',
+        source: 'claude_session_jsonl',
+        role_id: 'role_b',
+        ...tokens(250),
+      }),
+      entry({ run_id: 'run_2', task_id: 'task_2', role_id: 'role_a', ...tokens(40) }),
+    ]);
+
+    const run = store.aggregateTokenUsage({ scope: 'run', scope_id: 'run_1' }, 'T');
+
+    // 两条腿都按角色求和，且**不相加成一个数**——合并是消费方的事。
+    expect(run.by_source.proxy?.total_tokens).toBe(100);
+    expect(run.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+    expect(run.totals.total_tokens).toBe(350);
+    expect(run.scope_id).toBe('run_1');
+    // 另外两个 run 的缺口不许泄漏进来。
+    expect(run.runs_counted).toBe(1);
+    expect(run.runs_without_usage).toBe(0);
+    expect(run.complete).toBe(true);
+    store.close();
+  });
+
+  it('reports a run that executed without ledger rows as its own gap', () => {
+    const store = new SqliteCoordinationStore(':memory:');
+    seedRun(store, 'run_1', 'task_1', true);
+    seedRun(store, 'run_2', 'task_2', true);
+    store.appendTokenUsage([entry({ run_id: 'run_2', task_id: 'task_2', ...tokens(40) })]);
+
+    const run = store.aggregateTokenUsage({ scope: 'run', scope_id: 'run_1' }, 'T');
+
+    expect(run.runs_counted).toBe(1);
+    expect(run.runs_without_usage).toBe(1);
+    expect(run.complete).toBe(false);
+    // 缺口**不折算成 0**：一条腿都没有，而不是「两条腿都是 0」。
+    expect(run.by_source).toEqual({});
+    expect(run.totals.total_tokens).toBe(0);
+    store.close();
+  });
+
+  it('counts nothing for a run that never advanced past creation', () => {
+    const store = new SqliteCoordinationStore(':memory:');
+    // 只有 task.created、没有 handler.started：从未开跑过，不是缺口也不是用量。
+    seedRun(store, 'run_idle', 'task_idle', false);
+
+    const run = store.aggregateTokenUsage({ scope: 'run', scope_id: 'run_idle' }, 'T');
+
+    expect(run.runs_counted).toBe(0);
+    expect(run.runs_without_usage).toBe(0);
+    expect(run.complete).toBe(false);
+    store.close();
+  });
+
+  it('refuses the run scope without a scope_id instead of silently querying everything', () => {
+    const store = new SqliteCoordinationStore(':memory:');
+    expect(() => store.aggregateTokenUsage({ scope: 'run' }, 'T')).toThrow(
+      /run scope requires scope_id/,
+    );
+    store.close();
+  });
+
   it('survives task deletion because it has no cascade', () => {
     // 这一条守的就是本轮的目的：任务是会被清理的，累计用量必须活过清理。
     const databasePath = tempDatabasePath();

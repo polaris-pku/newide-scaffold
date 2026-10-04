@@ -55,7 +55,7 @@ import {
 } from './run-request-store';
 import { projectRunSnapshot } from './run-snapshot-projector';
 import { withAlignedTimeline } from './run-timeline-sequence';
-import { projectRunUsage } from './run-usage-projection';
+import { billedFromDurable, projectRunUsage } from './run-usage-projection';
 import { projectRunActivity } from './run-activity-projection';
 import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
@@ -142,6 +142,7 @@ import type {
 } from './run-artifact-content-reader';
 import type { RunPayloadReader } from './run-payload-reader';
 import type {
+  DurableRunUsage,
   RunUsageHistoryReader,
   RunUsageHistoryScope,
 } from './run-usage-history';
@@ -333,17 +334,28 @@ export class NewideBackendService {
      */
     private readonly runPayloadReader?: RunPayloadReader,
     /**
-     * 跨 run 的用量历史读取口。用量没有持久累计点，历史只能扫 run 目录重放，
-     * 所以它是一个需要文件系统的窄端口，而不是投影器能算出来的东西。
+     * 用量读取口。两个用途，时效不同：
+     *
+     * - `read`（异步）供 `run.getUsage` 的按作用域历史累计；
+     * - `readRun`（同步）供 `getRunSnapshot` 给**已收尾**的 run 补 `usage.billed`——那份
+     *   数据以前只活在进程内存里，重启即消失（`proxy.llm_usage_recorded` 不落 SQLite）。
+     *
+     * 不注入时两者都缺席，`run.getUsage` 报「不可用」而不是编一个 0。
      */
     private readonly runUsageHistoryReader?: RunUsageHistoryReader,
   ) {}
 
   /**
-   * 面板用的用量查询：可选的「当前 run 实时用量」+ 必有的「按作用域的历史累计」。
+   * 面板用的用量查询：可选的「当前 run 用量」+ 必有的「按作用域的历史累计」。
    *
-   * 两者刻意分块返回：前者是运行态现值，后者是重放出来的累计量，口径与时效都不同。
-   * `usage` 缺席表示本进程不持有该 run（或没传 `run_id`），不是「用量为 0」。
+   * 两者刻意分块返回：前者是单个 run 的现值，后者是累计量，口径与时效都不同。
+   *
+   * `usage` 缺席表示**这个 run 在内存里没有、在账本里也没有**（或没传 `run_id`），不是
+   * 「用量为 0」。已收尾的 run 即使本进程不持有它，也会从账本补上 `billed`。
+   *
+   * `scope: 'run'` 给的是同一个 run 的**持久**那份，与 `usage` 同源；两者都读得到时数值
+   * 必然相同（同一个账本），差别只在 `history` 还带 `runs_counted` / `complete` 这类
+   * 关于「这份数据完不完整」的元信息。
    */
   async getRunUsage(input: {
     scope: RunUsageHistoryScope;
@@ -1694,19 +1706,29 @@ export class NewideBackendService {
   /**
    * 补挂只有本进程才知道的观测：timeline 序号对齐 + `usage` 块 + 在飞 `activity`。
    *
-   * 三件事都以「registry 确实持有该 run」为前提，拿不到就原样返回——不编数字、不编 0、
-   * 不编一个「空闲」。
+   * 三件事里只有 `usage` 的计费腿**有持久来源**，所以它分两段：在跑的 run 用存活期时间线，
+   * 已收尾的 run 用账本（`readDurableRunUsage`）。另外两件都以「registry 确实持有该 run」为
+   * 前提，拿不到就原样返回——不编数字、不编 0、不编一个「空闲」。
    */
   private withLiveObservation(
     snapshot: RunSnapshot,
     liveRun: AppRunSnapshot | undefined,
   ): RunSnapshot {
-    if (!liveRun) return snapshot;
+    const durableUsage = this.readDurableRunUsage(snapshot);
+    if (!liveRun) {
+      // 本进程不持有该 run（进程重启、或这个 run 是别的进程跑的）。此时唯一还能补的是
+      // 账本里那一份计费用量——存活期时间线缺席，所以 `by_stage` 与 `context` 照旧缺席。
+      const billed = billedFromDurable(durableUsage);
+      // 与既有的 `usage` 合并而不是整个替换：账本只对 `billed` 说话，别把将来可能挂上去的
+      // 其它块顺手抹掉。
+      return billed ? { ...snapshot, usage: { ...snapshot.usage, billed } } : snapshot;
+    }
     // 先对齐序号：快照 timeline 原本带的是 SQLite 行号，与推流通道不是一套号。
     const aligned = withAlignedTimeline(snapshot, liveRun.events);
     const usage = projectRunUsage({
       timeline: liveRun.events,
       driverUsage: this.getAccumulatedDriverUsage(snapshot.task_id),
+      ...(durableUsage ? { durable: durableUsage } : {}),
     });
     // 在飞状态是内存里的，只有本进程持有的 run 才有；没有就是没有这个字段。
     // agent 半边来自进程级状态点，driver 半边从同一条存活期事件流里折出来（含 chunk，
@@ -1719,6 +1741,25 @@ export class NewideBackendService {
       ...(usage ? { usage } : {}),
       ...(activity ? { activity } : {}),
     };
+  }
+
+  /**
+   * 已收尾 run 的持久计费用量；在跑的 run 一律返回 `undefined`。
+   *
+   * 两条判据都不能省：
+   *
+   * 1. **只对已收尾的 run 读账本。** 账本的行是 run 收尾时写的，在跑的 run 本来就没有行；
+   *    而「账本恰好有一行」只可能来自上一次同 id 的收尾，不该覆盖正在累积的存活期时间线。
+   * 2. **读失败就当缺席。** 账本是观测，读不出来不该让 `run.getSnapshot` 整个失败——这与
+   *    本仓库观测层的既有纪律一致（写入侧同样是吞错 + 留下可见缺口）。
+   */
+  private readDurableRunUsage(snapshot: RunSnapshot): DurableRunUsage | undefined {
+    if (snapshot.status === 'running') return undefined;
+    try {
+      return this.runUsageHistoryReader?.readRun(snapshot.run_id);
+    } catch {
+      return undefined;
+    }
   }
 
   async waitForTerminal(runId: string): Promise<void> {

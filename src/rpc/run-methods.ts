@@ -38,12 +38,13 @@ export interface RunMethodsService {
    */
   getRunPayload(runId: string, payloadRef: string): Promise<RunPayloadResult | undefined>;
   /**
-   * 面板用的用量查询：可选的当前 run 实时用量 + 按作用域的历史累计。
+   * 面板用的用量查询：可选的当前 run 用量 + 按作用域的历史累计。
    *
-   * `task` / `role` 作用域必须给 `scope_id`——否则「这个任务/角色的累计」无从谈起。
+   * `task` / `role` / `run` 作用域必须给 `scope_id`——否则「这个任务/角色/run 的累计」
+   * 无从谈起。
    */
   getRunUsage(input: {
-    scope: 'task' | 'system' | 'role';
+    scope: 'task' | 'system' | 'role' | 'run';
     scope_id?: string;
     run_id?: string;
   }): Promise<{ usage?: RunUsage; history: RunUsageHistory }>;
@@ -90,12 +91,13 @@ const payloadParamsSchema = z
 /**
  * 用量查询参数。
  *
- * 作用域只列得出 `task` / `system`：`role` 需要 proxy 腿也按角色归属，而 `summary`
- * 里只有 driver 腿带 `role_id`；`agent` 依赖从未被赋值的 `agent_id`。
+ * 作用域列得出 `task` / `system` / `role` / `run`：`role` 由账本在写入时记下的 `role_id`
+ * 支撑（`summary` 里只有 driver 腿带角色）；`run` 是单个 run 的持久用量，进程重启后仍然
+ * 读得到。`agent` 仍然不支持，它依赖从未被赋值的 `agent_id`。
  */
 const usageParamsSchema = z
   .object({
-    scope: z.enum(['task', 'system', 'role']),
+    scope: z.enum(['task', 'system', 'role', 'run']),
     scope_id: z.string().min(1).optional(),
     run_id: z.string().min(1).optional(),
   })
