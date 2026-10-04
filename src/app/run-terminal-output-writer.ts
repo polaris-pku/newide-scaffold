@@ -285,6 +285,17 @@ function resolveMemoryAblation(
  *
  * 导出是给运行快照的 `usage` 块复用：实时快照与终态 summary 必须用**同一个**口径，
  * 各写一份必然漂移。
+ *
+ * **口径含 cache**：`total_input_tokens = input + cache_creation + cache_read`，
+ * `total_tokens = total_input_tokens + output`。这与 `summarizeRunConsumption`（按 stage 分桶）
+ * 和用量账本的行（`run-usage-ledger-entries.ts` 的 `rollupProxy`）是**同一套算术**——它们
+ * 是同一个量的三份拷贝，任何一份偏小都会让面板上两个数字对不上。
+ *
+ * 这段曾经把 cache 写死 0、`total_tokens` 只数 input+output，理由是「三个
+ * `recordProxyLlmUsage` 调用点都不传 cache，所以今天数值相同」。那是**靠巧合相等**：
+ * 一旦有调用点开始传 cache，summary / 账本 / 按 stage 分桶三处就会给出三个不同的
+ * 「这一轮花了多少」。现在改成读 payload 里的 cache 字段——今天的行为一模一样
+ * （没有生产者传），但不再依赖那个巧合。
  */
 export function resolveTokenUsageFromTimeline(
   timeline: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>,
@@ -317,20 +328,25 @@ export function resolveTokenUsageFromTimeline(
   if (usageEvents.length === 0) return undefined;
   let input = 0;
   let output = 0;
+  let cacheCreation = 0;
+  let cacheRead = 0;
   for (const event of usageEvents) {
     const nextInput = Number(event.payload.input_tokens ?? 0);
     const nextOutput = Number(event.payload.output_tokens ?? 0);
     if (!Number.isFinite(nextInput) || !Number.isFinite(nextOutput)) continue;
     input += nextInput;
     output += nextOutput;
+    cacheCreation += Number(event.payload.cache_creation_input_tokens ?? 0);
+    cacheRead += Number(event.payload.cache_read_input_tokens ?? 0);
   }
+  const totalInput = input + cacheCreation + cacheRead;
   const proxy = {
     input_tokens: input,
     output_tokens: output,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-    total_input_tokens: input,
-    total_tokens: input + output,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+    total_input_tokens: totalInput,
+    total_tokens: totalInput + output,
     call_count: usageEvents.length,
   };
   return {

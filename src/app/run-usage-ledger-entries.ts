@@ -105,11 +105,12 @@ function row(
 /**
  * proxy 腿按 `role_id` 归集。
  *
- * 口径与 `summarizeRunConsumption` 一致：`total_tokens = input + cache_creation +
- * cache_read + output`（**含 cache**）。注意 `resolveTokenUsageFromTimeline` 只数
- * input/output 并把 cache 写死 0——当前三个 `recordProxyLlmUsage` 调用点都不传 cache
- * （`litellm-*` 三个 adapter 都只给 input/output），所以两者今天数值相同；一旦有调用点
- * 开始传 cache，那一边就会变成**偏小的**那条。
+ * 口径与 `summarizeRunConsumption`（按 stage 分桶）和 `resolveTokenUsageFromTimeline`
+ * （summary 的 `token_usage` 与快照的 `usage.billed`）一致：`total_tokens = input +
+ * cache_creation + cache_read + output`（**含 cache**）。这三处是同一个量的三份拷贝，
+ * 所以算术只有一套。此前 `resolveTokenUsageFromTimeline` 把 cache 写死 0、只数
+ * input+output，靠「没有生产者传 cache」与这里数值相同——那是一个随时会被打破的巧合，
+ * 已改为读 payload 里的 cache 字段。
  */
 function rollupProxyByRole(
   timeline: readonly LedgerTimelineEvent[],
