@@ -9,12 +9,15 @@
  * `coordination.sqlite` + 同一个 `TaskProcessor`，只换一个干净的 `InMemoryRunRegistry`。
  * 那正是重启之后生产进程的样子（持久层还在，内存全没了）。
  *
- * 三条断言守三件不同的事：
+ * 四条断言守四件不同的事：
  * 1. 重启后 `usage.billed` 仍在，且与重启前**逐字段相同**——同一个 run 的数字不许随后端
  *    重启而变；
  * 2. 在飞状态（`activity`）**仍然缺席**——那是真的只属于持有它的进程，不该假装持久；
- * 3. 账本为空时 `usage` 缺席而不是全 0——**缺 ≠ 0**。
+ * 3. 账本为空时 `usage` 缺席而不是全 0——**缺 ≠ 0**；
+ * 4. 用量只存在于 run 目录、账本里还没有行的 run（账本上线之前的**全部**历史）也必须报得
+ *    出来，而且答案不取决于「有没有人先读过一次历史」。
  */
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,6 +58,26 @@ async function waitFor(predicate: () => boolean, label: string, attempts = 2000)
 }
 
 /**
+ * 等到「终态已定」**且**「终态产物已落盘」。
+ *
+ * 只等持久状态变成 `completed` 是不够的：那个状态由游标推进写在 `runAuthorityLoop` 的
+ * **前半段**（`advanceStage`），而终态产物与账本行是后半段 `finalize` 的事。等前者会稳定地
+ * 抢在 `finalize` 之前——这个竞态在本文件里骗过一次（让「账本为空」看起来像产品缺陷），而
+ * 对本轮的**目录兜底**同样致命：summary 还没写，兜底当然读不到，于是「用量缺席」的断言会
+ * 因为空转而变绿。
+ */
+async function waitForTerminalRun(
+  runsRoot: string,
+  runId: string,
+  isTerminal: () => boolean,
+): Promise<void> {
+  await waitFor(
+    () => isTerminal() && existsSync(path.join(runsRoot, runId, 'summary.json')),
+    'run terminal with its artifacts on disk',
+  );
+}
+
+/**
  * 这个 run 在账本里是不是已经有腿了。
  *
  * 用持久层直接问（而不是用被测的那个读者），免得把断言做成循环论证。
@@ -62,6 +85,48 @@ async function waitFor(predicate: () => boolean, label: string, attempts = 2000)
 function ledgerHasRows(store: SqliteCoordinationStore, runId: string): boolean {
   const aggregate = store.aggregateTokenUsage({ scope: 'run', scope_id: runId }, 'T');
   return Object.keys(aggregate.by_source).length > 0;
+}
+
+/**
+ * 一条单 agent 的 stage 装配：三个用例共用。
+ *
+ * 抽出来是因为它们之间唯一的差别就是「`execute_agent` 里要不要记一笔 LLM 用量」——把整组
+ * executor 抄三遍会让真正的变量埋没在噪声里。
+ */
+function singleAgentExecutors(onExecuteAgent?: () => Promise<void>): TaskExecutionLoopExecutors {
+  return {
+    select_agent: {
+      execute: async () => ({ winner_agent_id: ROLE, evidence: { winner_agent_id: ROLE } }),
+    },
+    execute_agent: {
+      execute: async () => {
+        await onExecuteAgent?.();
+        return {
+          changeset_ref: 'artifact_primary_changeset',
+          expected_sha256: 'd'.repeat(64),
+          agent_id: ROLE,
+          session_id: 'session_primary',
+          evidence: { response: 'done' },
+        };
+      },
+    },
+    council: {
+      execute: async () => {
+        throw new Error('single_agent run must not reach the Council stage');
+      },
+    },
+    gate: { execute: async () => ({ evidence: { status: 'skipped' } }) },
+    deliver: {
+      execute: async (context) => ({
+        final_output: {
+          artifact_ref: context.cursor_input.changeset_ref,
+          sha256: context.cursor_input.expected_sha256,
+          workspace_path: '/workspace/result.ts',
+        },
+        evidence: { files_written: ['result.ts'] },
+      }),
+    },
+  };
 }
 
 /**
@@ -121,45 +186,14 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
     const store = new SqliteCoordinationStore(path.join(runsRoot, 'coordination.sqlite'));
     const processor = new TaskProcessor(store);
 
-    const executors: TaskExecutionLoopExecutors = {
-      select_agent: {
-        execute: async () => ({ winner_agent_id: ROLE, evidence: { winner_agent_id: ROLE } }),
-      },
-      execute_agent: {
-        execute: async () => {
-          // proxy 用量只进存活期事件流 + telemetry 文件，**不落 SQLite**——所以重启后
-          // 唯一的持久来源是 run 收尾时写下的账本行。
-          await recordProxyLlmUsage({ input_tokens: 100, output_tokens: 10, model: 'fake-model' });
-          return {
-            changeset_ref: 'artifact_primary_changeset',
-            expected_sha256: 'd'.repeat(64),
-            agent_id: ROLE,
-            session_id: 'session_primary',
-            evidence: { response: 'done' },
-          };
-        },
-      },
-      council: {
-        execute: async () => {
-          throw new Error('single_agent run must not reach the Council stage');
-        },
-      },
-      gate: { execute: async () => ({ evidence: { status: 'skipped' } }) },
-      deliver: {
-        execute: async (context) => ({
-          final_output: {
-            artifact_ref: context.cursor_input.changeset_ref,
-            sha256: context.cursor_input.expected_sha256,
-            workspace_path: '/workspace/result.ts',
-          },
-          evidence: { files_written: ['result.ts'] },
-        }),
-      },
-    };
     const loop = new TaskExecutionLoop({
       processor,
       evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
-      executors,
+      // proxy 用量只进存活期事件流 + telemetry 文件，**不落 SQLite**——所以重启后
+      // 唯一的持久来源是 run 收尾时写下的账本行。
+      executors: singleAgentExecutors(async () => {
+        await recordProxyLlmUsage({ input_tokens: 100, output_tokens: 10, model: 'fake-model' });
+      }),
     });
 
     const serviceBefore = buildService({
@@ -249,40 +283,10 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
     const store = new SqliteCoordinationStore(path.join(runsRoot, 'coordination.sqlite'));
     const processor = new TaskProcessor(store);
 
-    const executors: TaskExecutionLoopExecutors = {
-      select_agent: {
-        execute: async () => ({ winner_agent_id: ROLE, evidence: { winner_agent_id: ROLE } }),
-      },
-      execute_agent: {
-        execute: async () => ({
-          changeset_ref: 'artifact_primary_changeset',
-          expected_sha256: 'd'.repeat(64),
-          agent_id: ROLE,
-          session_id: 'session_primary',
-          evidence: { response: 'done' },
-        }),
-      },
-      council: {
-        execute: async () => {
-          throw new Error('single_agent run must not reach the Council stage');
-        },
-      },
-      gate: { execute: async () => ({ evidence: { status: 'skipped' } }) },
-      deliver: {
-        execute: async (context) => ({
-          final_output: {
-            artifact_ref: context.cursor_input.changeset_ref,
-            sha256: context.cursor_input.expected_sha256,
-            workspace_path: '/workspace/result.ts',
-          },
-          evidence: { files_written: ['result.ts'] },
-        }),
-      },
-    };
     const loop = new TaskExecutionLoop({
       processor,
       evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
-      executors,
+      executors: singleAgentExecutors(),
     });
     // 反向对照：一个**空账本**。这里的 run 完全没有 LLM 用量，账本里也不会有它的行。
     const emptyLedger = new SqliteCoordinationStore(':memory:');
@@ -304,9 +308,10 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
         mode: 'single_agent',
       });
       const runId = created.current_run?.run_id ?? '';
-      await waitFor(
+      await waitForTerminalRun(
+        runsRoot,
+        runId,
         () => processor.getRunSnapshot(runId)?.status === 'completed',
-        'task-loop run terminal',
       );
 
       // 一行 LLM 调用都没有 → 没有 proxy 腿 → 整个 `usage` 缺席，不是一个 0。
@@ -315,6 +320,93 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
       resetAgentActivities();
       await service.close().catch(() => undefined);
       for (const open of [emptyLedger, store]) {
+        try {
+          open.close();
+        } catch {
+          // 清理尽力而为。
+        }
+      }
+      await rm(runsRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(
+        () => undefined,
+      );
+    }
+  }, 30_000);
+
+  it('reads a run from before the ledger existed out of its own summary', async () => {
+    // 这条守的是**读的顺序**，也是账本上线那一刻的真实状态。
+    //
+    // 账本的行是 run 收尾时写的，所以「账本里有行」只对账本之后跑过的 run 成立；账本之前的
+    // 历史只活在 `runs/<id>/summary.json` 里。实测本机 41 个状态库、292 个 run：`runs` 表里
+    // 的 run 一个都没有账本行（`token_usage_ledger` 表在这些库里都还不存在），而 208 个 run
+    // 有 summary.json。回填能把它们搬进账本，但回填是异步的、快照是同步的——曾经因此「这个
+    // run 花了多少」取决于**有没有人先读过一次历史**：先读 `run.getUsage` 就有数字，直接读
+    // 快照就没有。同一个 run 的用量随读的顺序而变是不能接受的。
+    resetAgentActivities();
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'durable-usage-preledger-'));
+    const store = new SqliteCoordinationStore(path.join(runsRoot, 'coordination.sqlite'));
+    const processor = new TaskProcessor(store);
+    const loop = new TaskExecutionLoop({
+      processor,
+      evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
+      executors: singleAgentExecutors(async () => {
+        await recordProxyLlmUsage({ input_tokens: 100, output_tokens: 10, model: 'fake-model' });
+      }),
+    });
+    // 读取口指向一个**空账本**、目录指向真实的 runsRoot：这就是「升级之后、回填之前」。
+    const preLedger = new SqliteCoordinationStore(':memory:');
+    const serviceBefore = buildService({
+      runsRoot,
+      store,
+      processor,
+      loop,
+      registry: new InMemoryRunRegistry(),
+      reader: new LedgerRunUsageHistoryReader(preLedger, runsRoot, () => 'T'),
+    });
+
+    try {
+      const created = await serviceBefore.createTask({
+        spec: 'a run from before the usage ledger existed',
+        role_id: ROLE,
+        completion_criteria: ['usage is readable without a backfill'],
+        workspace_path: process.cwd(),
+        mode: 'single_agent',
+      });
+      const taskId = created.current_run?.task_id ?? '';
+      const runId = created.current_run?.run_id ?? '';
+      await waitFor(() => ledgerHasRows(store, runId), 'run finalized into the usage ledger');
+
+      // 前提要钉死：产物里**确实有**用量。否则下面的断言会因为「本来就没有」而空转——
+      // 那正是这条用例要防的失效模式。
+      const summary = JSON.parse(
+        await readFile(path.join(runsRoot, runId, 'summary.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(summary.token_usage).toBeDefined();
+
+      // ——— 重启：同一个持久层，一个**干净的 registry** ———
+      //
+      // 这一步不能省，而且第一版就是漏了它才让反向对照漏过去：进程还持有该 run 时，
+      // `usage.billed` 可以从存活期 timeline 折出来，兜底读不读得到根本看不出来。只有
+      // registry 空了，答案才**只能**来自持久层——那恰好也是面板连上一个新后端进程时的样子。
+      const serviceAfter = buildService({
+        runsRoot,
+        store,
+        processor,
+        loop,
+        registry: new InMemoryRunRegistry(),
+        reader: new LedgerRunUsageHistoryReader(preLedger, runsRoot, () => 'T'),
+      });
+
+      // 一条历史读都没发生过，答案必须由这一条读自己给出。
+      const snapshot = serviceAfter.getRunSnapshot(runId);
+      expect(snapshot.usage?.billed?.by_source.proxy?.total_tokens).toBe(110);
+
+      // 顺序不能改变答案：触发一次历史读（会把整棵目录树回填进账本）之后必须同值。
+      await serviceAfter.getRunUsage({ scope: 'task', scope_id: taskId, run_id: runId });
+      expect(serviceAfter.getRunSnapshot(runId).usage?.billed).toEqual(snapshot.usage?.billed);
+    } finally {
+      resetAgentActivities();
+      await serviceBefore.close().catch(() => undefined);
+      for (const open of [preLedger, store]) {
         try {
           open.close();
         } catch {

@@ -350,8 +350,10 @@ export class NewideBackendService {
    *
    * 两者刻意分块返回：前者是单个 run 的现值，后者是累计量，口径与时效都不同。
    *
-   * `usage` 缺席表示**这个 run 在内存里没有、在账本里也没有**（或没传 `run_id`），不是
-   * 「用量为 0」。已收尾的 run 即使本进程不持有它，也会从账本补上 `billed`。
+   * `usage` 缺席表示**这个 run 在内存里没有、在持久层里也没有**（或没传 `run_id`），不是
+   * 「用量为 0」。已收尾的 run 即使本进程不持有它也会被补上：账本里有行就用账本，账本里
+   * 还没有行（账本上线之前的 run）就用该 run 自己的 `summary.json`。两条来源同值，见
+   * `LedgerRunUsageHistoryReader.readRun`。
    *
    * `scope: 'run'` 给的是同一个 run 的**持久**那份，与 `usage` 同源；两者都读得到时数值
    * 必然相同（同一个账本），差别只在 `history` 还带 `runs_counted` / `complete` 这类

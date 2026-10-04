@@ -133,6 +133,8 @@ interface SummarySpec {
   task_id?: string;
   proxy?: number;
   driverLeg?: number;
+  /** 写一个**全是 0** 的 `token_usage`：它与「根本没有这个键」都必须算**缺席**。 */
+  zeroUsage?: boolean;
   driverSessions?: Array<{ session_id: string; role_id?: string; total: number }>;
   contextOnlySessions?: Array<{ session_id: string; role_id: string; context_tokens_used: number }>;
 }
@@ -148,12 +150,19 @@ async function writeRun(runsRoot: string, spec: SummarySpec): Promise<void> {
     JSON.stringify({
       run_id: spec.run_id,
       ...(spec.task_id === undefined ? {} : { task_id: spec.task_id }),
-      ...(Object.keys(bySource).length > 0
+      ...(Object.keys(bySource).length > 0 || spec.zeroUsage
         ? {
             token_usage: {
               schema_version: 'newide.token_usage.v1',
               source: 'mixed',
-              ...tokens((spec.proxy ?? 0) + (spec.driverLeg ?? 0)),
+              // 顶层合计 = 各 source 桶之和（实测 186 份真实 summary、7 个字段无一例外）。
+              // 这条不变量正是「账本按行求和」与「summary 顶层」给出同一个数的前提；造一个
+              // 违反它的替身会让兜底路径与回填路径**看起来**不同值——那是替身的缺陷，
+              // 不是产品的。
+              ...tokens(
+                (spec.proxy ?? 0) + (spec.driverLeg ?? 0),
+                (spec.proxy ? 1 : 0) + (spec.driverLeg ? 1 : 0),
+              ),
               sources: Object.keys(bySource),
               by_source: bySource,
             },
@@ -435,7 +444,39 @@ describe('LedgerRunUsageHistoryReader', () => {
     ledger.close();
   });
 
-  it('reports absence for a run that executed but never got ledger rows', async () => {
+  it('answers for a run whose usage only exists in its own summary, without a backfill', async () => {
+    // 这条钉的是**读的顺序**。
+    //
+    // 快照投影是同步的，所以已收尾 run 的 `usage.billed` 只能走 `readRun`；而 `readRun` 曾经
+    // 只看账本。于是对「用量还在 run 目录里、账本里还没有行」的 run，同一个 run 的用量会随
+    // **有没有人先读过一次历史**而变：先读 `run.getUsage`（会回填）就有，直接读快照就没有。
+    //
+    // 这不是罕见状态，而是**升级后的全部历史**：实测本机 41 个状态库、292 个 run，`runs` 表
+    // 里的 run 一个都没有账本行（`token_usage_ledger` 表在这些库里都还不存在），而其中 208 个
+    // 有 `summary.json`。账本之前的历史全在目录里。
+    const runsRoot = await makeRunsRoot();
+    await writeRun(runsRoot, { run_id: 'run_1', task_id: 'task_1', proxy: 110, driverLeg: 40 });
+    const ledger = new SqliteCoordinationStore(':memory:');
+    const reader = new LedgerRunUsageHistoryReader(ledger, runsRoot, () => 'T');
+
+    // 刻意**不调用** `reader.read`：答案是这一条读自己算出来的，不是别人回填剩下的。
+    const before = reader.readRun('run_1');
+
+    expect(before?.by_source.proxy?.total_tokens).toBe(110);
+    expect(before?.by_source.claude_session_jsonl?.total_tokens).toBe(40);
+
+    // 回填之后必须仍是同一个数——两条取数路径**同值**，顺序无关。
+    await reader.read({ scope: 'task', scope_id: 'task_1' });
+    expect(reader.readRun('run_1')).toEqual(before);
+
+    // 账本在前：目录被清掉之后，答案必须还在账本里（`.newide/runs` 没有任何保留策略）。
+    // 这条同时是**「账本优先」的对照**——把顺序倒过来，这里就只剩一个读不到的目录。
+    await rm(path.join(runsRoot, 'run_1'), { recursive: true, force: true });
+    expect(reader.readRun('run_1')).toEqual(before);
+    ledger.close();
+  });
+
+  it('reports absence for a run that executed but has no usage anywhere', async () => {
     // 「有 handler.started、账本里没有行」是**已知缺口**。`readRun` 在这里必须返回
     // undefined——返回一个全 0 的合计会让调用方以为这个 run 花了 0 token。
     const ledger = new SqliteCoordinationStore(':memory:');
@@ -443,6 +484,17 @@ describe('LedgerRunUsageHistoryReader', () => {
     const reader = new LedgerRunUsageHistoryReader(ledger, '/nonexistent-runs-root', () => 'T');
 
     expect(reader.readRun('run_gap')).toBeUndefined();
+
+    // 兜底路径不许**编**数字：目录在、summary 也在，只是没有可读的用量时，答案同样是缺席。
+    // 这两格是上面那条回退的反向对照——没有它们，「兜底只在真读得到时才开口」只是一句声明。
+    const runsRoot = await makeRunsRoot();
+    await writeRun(runsRoot, { run_id: 'run_no_usage', task_id: 'task_gap' });
+    await writeRun(runsRoot, { run_id: 'run_zero_usage', task_id: 'task_gap', zeroUsage: true });
+    const withDirectory = new LedgerRunUsageHistoryReader(ledger, runsRoot, () => 'T');
+
+    expect(withDirectory.readRun('run_no_usage')).toBeUndefined();
+    // 全 0 的 `token_usage` 与「没有这个键」是同一件事：都读不出用量。**缺 ≠ 0**。
+    expect(withDirectory.readRun('run_zero_usage')).toBeUndefined();
 
     // 而账本本身知道这是个缺口：`run` 作用域把「执行过」与「有行」分开报，不是都归成 0。
     const gap = await reader.read({ scope: 'run', scope_id: 'run_gap' });

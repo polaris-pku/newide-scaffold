@@ -71,9 +71,9 @@ export interface RunUsageHistoryReader {
    * **为什么是同步的**：它要服务的调用方是 `getRunSnapshot`，而快照投影是同步的
    * （SQLite 是同步驱动）。为了这一条把整个快照投影改成 Promise 是拿契约去迁就实现。
    *
-   * **不触发惰性回填**：回填是异步的，同步方法等不了。所以对「用量只存在于 run 目录、
-   * 还没进账本」的历史 run，这里会返回 `undefined`；先读过一次 `read`（会回填）之后就能
-   * 读到。这个顺序在 `getRunUsage` 里天然成立——它先 `await read` 再取快照。
+   * **不依赖任何别的读先跑过**：回填是异步的，同步方法等不了，所以实现不能靠「别人回填过
+   * 我就读得到」。答案必须由这一条读**自己**给出——账本在前，run 目录自己的 `summary.json`
+   * 兜底（同步），见 `LedgerRunUsageHistoryReader.readRun`。
    *
    * 返回 `undefined` 而不是全 0 的合计：**缺 ≠ 0**。账本里这个 run 没有行，与「这个 run
    * 花了 0 token」是两件事，调用方必须能区分。
@@ -329,12 +329,22 @@ function readNumber(value: unknown): number {
  */
 export class LedgerRunUsageHistoryReader implements RunUsageHistoryReader {
   private backfill: Promise<void> | undefined;
+  /**
+   * 账本里没有这个 run 的腿时的**同步兜底**。
+   *
+   * 它存在是因为 `readRun` 是同步的而回填是异步的：没有它，「这个 run 花了多少」就取决于
+   * **有没有人先读过一次历史**——先读 `run.getUsage`（会回填）就有数字，直接读快照就没有。
+   * 同一个 run 的用量随**读的顺序**而变是不能接受的，所以那一格必须由这一条读自己填。
+   */
+  private readonly summaryFallback: FileRunUsageHistoryReader;
 
   constructor(
     private readonly ledger: TokenUsageLedgerStore,
     private readonly runsRoot = '.newide/runs',
     private readonly now: () => string = () => new Date().toISOString(),
-  ) {}
+  ) {
+    this.summaryFallback = new FileRunUsageHistoryReader(runsRoot, now);
+  }
 
   async read(query: RunUsageHistoryQuery): Promise<RunUsageHistory> {
     await this.ensureBackfilled();
@@ -358,16 +368,38 @@ export class LedgerRunUsageHistoryReader implements RunUsageHistoryReader {
   }
 
   /**
-   * 单个 run 的持久用量，**同步**且**不回填**（理由见端口注释）。
+   * 单个 run 的持久用量：**账本在前，run 目录自己的 `summary.json` 兜底**。
    *
    * 一条按 `run_id` 的等值聚合：主键 `(run_id, role_id, source, metric)` 的前缀就是它，
    * 所以这是索引命中，可以安全地挂在同步的快照投影路径上。
+   *
+   * **为什么必须有兜底**：账本的行是 run **收尾时**写的，所以「账本里有行」只对账本上线之后
+   * 跑过的 run 成立；账本之前的历史只活在 `runs/<id>/summary.json` 里（实测：本地 41 个状态库、
+   * 292 个 run，`token_usage_ledger` 表一个都不存在，而 208 个 run 有 summary）。回填能把它们
+   * 搬进账本，但回填是异步的、`readRun` 是同步的——只读账本就等于让「这个 run 花了多少」
+   * 取决于**有没有人先读过一次历史**。这不只是不好看：前端的 run 详情先于历史面板打开时，
+   * 同一个 run 会先报「没有用量」、再报出一个数。
+   *
+   * 顺序刻意是账本在前：账本的行在 run 目录被清掉之后仍然在，而且 `appendUsageLedger` 写下的
+   * 正是**同一份** summary 的两条腿（外加角色归属）。所以两条路给出同一个数，差别只在「目录
+   * 还在不在」——兜底因此只是把账本上线之前的窗口补上，不是第二套口径。
+   *
+   * 兜底是一次**同步读单个文件**，只在账本里没有这个 run 的腿时才发生；一旦回填过（任何一次
+   * `read` 都会把整棵目录树灌进去）就不再走这条路。实测全部 510 个 `summary.json` 里最大的
+   * 一个 57 KB、中位数 12 KB，所以挂在同步快照路径上不构成负担。
+   *
+   * 兜底的边界要说清：它只在 run 目录还在时成立。账本上线**之前**跑完、目录又已经被清掉的
+   * run，这里永远给不出数字——数据是真的没了。那种缺口由 `read` 的 `runs_without_usage` /
+   * `complete` 报出来（它按事件表里的 `handler.started` 数 run，不看目录），而不是在这里
+   * 编一个 0。
    */
   readRun(runId: string): DurableRunUsage | undefined {
     const aggregate = this.ledger.aggregateTokenUsage({ scope: 'run', scope_id: runId }, this.now());
     // `runs_counted` 会把「执行过但账本里没有行」的 run 也算进来，那种情况 `totals` 全是 0。
     // 判据因此不能是 `runs_counted`，得是「到底有没有腿」——**缺 ≠ 0**。
-    if (Object.keys(aggregate.by_source).length === 0) return undefined;
+    if (Object.keys(aggregate.by_source).length === 0) {
+      return this.summaryFallback.readRun(runId);
+    }
     return { totals: aggregate.totals, by_source: aggregate.by_source };
   }
 
