@@ -120,7 +120,7 @@ import {
   usageObservationFromDriverEvent,
   type TaskDriverUsage,
 } from './driver-usage-projector';
-import { projectDriverStreamLifecycleEvent } from './driver-stream-projection';
+import { driverStreamChannel, projectDriverStreamLifecycleEvent } from './driver-stream-projection';
 import {
   createUnavailableSystemStatusService,
   type SystemStatusService,
@@ -1881,14 +1881,54 @@ export class NewideBackendService {
     }
   }
 
-  private appendDomainEvent(identity: { run_id: string; task_id: string }, event: Event): void {
-    if (event.event_type === 'run.completed' || event.event_type === 'run.failed') return;
-    if (event.run_id && event.run_id !== identity.run_id) return;
-    if (event.task_id && event.task_id !== identity.task_id) return;
+  /**
+   * 把事件追加进进程内 registry（推流通道与存活期快照的来源）。
+   *
+   * 返回是否真的追加了：调用方要靠这个答案决定后续动作，而「这条事件归谁」的判据
+   * 必须只有一份——两条通道对同一条事件不许给出不同结论。
+   */
+  private appendDomainEvent(identity: { run_id: string; task_id: string }, event: Event): boolean {
+    if (event.event_type === 'run.completed' || event.event_type === 'run.failed') return false;
+    if (event.run_id && event.run_id !== identity.run_id) return false;
+    if (event.task_id && event.task_id !== identity.task_id) return false;
     this.registry.appendEvent(identity.run_id, event.event_type, event.payload, {
       event_id: event.event_id,
       created_at: event.created_at,
     });
+    return true;
+  }
+
+  /**
+   * 把一条**已经进过 registry** 的事件补写进协调事件流（SQLite）。
+   *
+   * 为什么需要这一层：driver 事件流的投影此前只进进程内 registry 与审计文件
+   * （`audit.jsonl` / `driver-stream.jsonl`），**不进协调事件流**。于是进程重启后，
+   * 同一个 run 的持久 timeline 里 driver 那一段整个消失，只剩阶段事件——前端在
+   * 重启前看得到「正在跑哪个工具」，重启后同一份快照里什么都没有。
+   *
+   * 为什么吞错：这条路径跑在 driver stderr 的解析回调里（`emitEvent` → 订阅者）。
+   * driver 状态是观测，不该因为一次写库失败（run 已终态、revision 冲突、库忙）
+   * 改变 run 的结局——与 `CommandDriverTransport.emitEvent`、
+   * `FileRunEventConsumptionSink` 是同一条纪律。代价是可见的：事件已经在
+   * `audit.jsonl` 上，丢的只是「持久 timeline 里的 driver 状态」这一块的完整性。
+   *
+   * 只写 `coordination` 通道（见 `driver-stream-projection.ts` 的分流表）；片段类
+   * 写进来是量级事故，不是信息保全。
+   */
+  private persistRunEvent(identity: { run_id: string; task_id: string }, event: Event): void {
+    const processor = this.taskProcessor;
+    if (!processor) return;
+    try {
+      processor.recordRunEvent(identity.run_id, {
+        ...event,
+        // 投影事件的 run_id / task_id 取决于 driver 侧信封，可能缺席。缺席时用本次 run
+        // 的身份补齐——`appendDomainEvent` 已经确认它要么属于本 run、要么没有署名。
+        run_id: identity.run_id,
+        task_id: identity.task_id,
+      });
+    } catch {
+      // 见方法注释：观测失败不改 run 结局。
+    }
   }
 
   private appendDriverStreamEvent(
@@ -1909,7 +1949,15 @@ export class NewideBackendService {
       .append(identity.run_id, identity.task_id, event, streamSequence)
       .catch(() => undefined);
     const projected = projectDriverStreamLifecycleEvent(event, streamSequence);
-    if (projected) this.appendDomainEvent(identity, projected);
+    if (!projected) return;
+    // 先看 registry 收没收下：收下了才谈别的通道。两条通道对「这条事件归谁」的判据
+    // 只有 appendDomainEvent 那一处，所以不会出现「registry 拒收但 SQLite 收下」。
+    if (!this.appendDomainEvent(identity, projected)) return;
+    // 分流（driver-stream-projection.ts 的 DRIVER_STREAM_CHANNELS）：状态类同时进协调
+    // 事件流，让 driver 状态在进程重启后仍可读；片段类只留审计文件与进程内 registry。
+    if (driverStreamChannel(projected.event_type) === 'coordination') {
+      this.persistRunEvent(identity, projected);
+    }
   }
 
   /**
