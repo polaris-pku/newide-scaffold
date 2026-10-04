@@ -24,7 +24,7 @@ import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { NoopDriverStreamAuditWriter } from '../../src/app/driver-stream-audit-writer';
-import { shouldPushRunEvent } from '../../src/app/driver-stream-projection';
+import { isStreamFragment } from '../../src/app/driver-stream-projection';
 import type { DriverStreamEvent } from '../../src/driver/contract';
 
 const RUN_ID = 'run_push_channel';
@@ -73,6 +73,8 @@ interface PushFixture {
   runsRoot: string;
   /** 放行 runner 桩去发 driver 事件：先订阅、后发，才能验到「实时推流」而不是只有重放。 */
   release: () => void;
+  /** 让 runner 返回终态结果——要在用例里读落盘产物时用（helper 的 finally 也会调，重复调用无副作用）。 */
+  finish: () => void;
 }
 
 async function withService(run: (fixture: PushFixture) => Promise<void>): Promise<void> {
@@ -111,7 +113,7 @@ async function withService(run: (fixture: PushFixture) => Promise<void>): Promis
       workspace_path: process.cwd(),
       task_id: TASK_ID,
     });
-    await run({ service, runsRoot, release });
+    await run({ service, runsRoot, release, finish: () => finish(completedResult()) });
   } finally {
     finish(completedResult());
     await waitFor(() => service.getSnapshot(RUN_ID).status === 'completed', 'run terminal');
@@ -160,10 +162,11 @@ describe('推流通道（决策 B）', () => {
       const types = pushed.map((event) => event.type);
       expect(types).toContain('driver.turn_started');
       expect(types.filter((type) => type.endsWith('_chunk'))).toEqual([]);
-      // 反过来：registry 里片段还在——过滤是推流通道的策略，不是把事件删掉。
-      expect(service.getSnapshot(RUN_ID).events.map((event) => event.type)).toContain(
-        'driver.agent_thought_chunk',
-      );
+      // 快照 timeline 与推流走**同一条判据**：片段有它自己的有界保留（存活期折叠要用），
+      // 但不在状态 timeline 上——否则每个重 run 的 timeline.json / result.json 又会到 13–18 MB。
+      const retained = service.getSnapshot(RUN_ID).events.map((event) => event.type);
+      expect(retained).toContain('driver.turn_started');
+      expect(retained).not.toContain('driver.agent_thought_chunk');
       subscription.unsubscribe();
     });
   }, 20_000);
@@ -181,6 +184,33 @@ describe('推流通道（决策 B）', () => {
       expect(types).toContain('driver.agent_thought_chunk');
       expect(types.filter((type) => type === 'driver.agent_thought_chunk')).toHaveLength(2);
       unsubscribe();
+    });
+  }, 20_000);
+
+  it('keeps fragments out of the terminal artifacts too (the 13–18 MB regression guard)', async () => {
+    await withService(async ({ service, release, finish, runsRoot }) => {
+      const live: AppRunEvent[] = [];
+      const unsubscribe = service.subscribe(RUN_ID, (event) => live.push(event));
+      release();
+      await waitFor(() => live.length > 0, 'push observed');
+      unsubscribe();
+
+      // 终态产物是从 registry 快照投出来的：片段留在快照 timeline 里的话，
+      // `timeline.json` / `frontend-snapshot.json` / `result.json` 会各自被撑到十几 MB（实测）。
+      finish();
+      await waitFor(() => service.getSnapshot(RUN_ID).status === 'completed', 'run terminal');
+
+      const timeline = JSON.parse(
+        await readFile(path.join(runsRoot, RUN_ID, 'timeline.json'), 'utf8'),
+      ) as Array<{ type: string }>;
+      expect(timeline.map((event) => event.type)).toContain('driver.turn_started');
+      expect(timeline.filter((event) => event.type.endsWith('_chunk'))).toEqual([]);
+
+      const result = JSON.parse(
+        await readFile(path.join(runsRoot, RUN_ID, 'result.json'), 'utf8'),
+      ) as { timeline: Array<{ type: string }> };
+      expect(result.timeline.map((event) => event.type)).toContain('driver.turn_started');
+      expect(result.timeline.filter((event) => event.type.endsWith('_chunk'))).toEqual([]);
     });
   }, 20_000);
 
@@ -207,15 +237,15 @@ describe('推流通道（决策 B）', () => {
   }, 20_000);
 
   it('classifies every driver type through one table (drift guard)', () => {
-    expect(shouldPushRunEvent('driver.turn_started')).toBe(true);
-    expect(shouldPushRunEvent('driver.tool_completed')).toBe(true);
-    expect(shouldPushRunEvent('driver.phase')).toBe(true);
-    expect(shouldPushRunEvent('driver.agent_thought_chunk')).toBe(false);
-    expect(shouldPushRunEvent('driver.stderr')).toBe(false);
-    expect(shouldPushRunEvent('driver.session_update_unknown')).toBe(false);
-    // 非 driver 事件一律照发。
-    expect(shouldPushRunEvent('handler.started')).toBe(true);
-    expect(shouldPushRunEvent('proxy.llm_usage_recorded')).toBe(true);
+    expect(isStreamFragment('driver.turn_started')).toBe(false);
+    expect(isStreamFragment('driver.tool_completed')).toBe(false);
+    expect(isStreamFragment('driver.phase')).toBe(false);
+    expect(isStreamFragment('driver.agent_thought_chunk')).toBe(true);
+    expect(isStreamFragment('driver.stderr')).toBe(true);
+    expect(isStreamFragment('driver.session_update_unknown')).toBe(true);
+    // 非 driver 事件一律不算片段（表外类型走 coordination 默认通道）。
+    expect(isStreamFragment('handler.started')).toBe(false);
+    expect(isStreamFragment('proxy.llm_usage_recorded')).toBe(false);
   });
 });
 

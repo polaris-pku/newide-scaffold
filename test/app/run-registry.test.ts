@@ -227,3 +227,129 @@ describe('InMemoryRunRegistry', () => {
     });
   });
 });
+
+/**
+ * 片段的有界保留（§7.7）。
+ *
+ * 实测每个重 run 的 `timeline.json` / `frontend-snapshot.json` / `result.json` 各到
+ * 13–18 MB，全部由 driver 片段撑起；同一份片段还在内存里被永久保留。现在它们不进
+ * `events`（因而不进快照 timeline 与那三份产物），只按 role 留最近 32 条供存活期折叠
+ * 判断活性。**投递不受影响**——`audit.jsonl` 是逐条拿到的。
+ */
+describe('InMemoryRunRegistry —— 片段的有界保留', () => {
+  const CAP = 32;
+
+  function registry() {
+    let eventNumber = 0;
+    return new InMemoryRunRegistry(
+      () => '2026-07-11T08:00:00.000Z',
+      () => `run_event_${++eventNumber}`,
+    );
+  }
+
+  function fragment(roleId: string, index: number) {
+    return { role_id: roleId, stream_sequence: index };
+  }
+
+  it('keeps fragments out of the state timeline but still delivers them', () => {
+    const target = registry();
+    const delivered: string[] = [];
+    target.create({ run_id: 'run_frag', task_id: 'task_frag', mode: 'single_agent' });
+    target.subscribe('run_frag', (event) => delivered.push(event.type));
+
+    target.appendEvent('run_frag', 'driver.turn_started', { role_id: 'role_a' });
+    target.appendEvent('run_frag', 'driver.agent_thought_chunk', fragment('role_a', 1));
+
+    expect(target.getSnapshot('run_frag').events.map((event) => event.type)).toEqual([
+      'driver.turn_started',
+    ]);
+    // 投递与保留是两件事：审计文件的订阅者拿得到每一条。
+    expect(delivered).toEqual(['driver.turn_started', 'driver.agent_thought_chunk']);
+  });
+
+  it('caps retained fragments per role', () => {
+    const target = registry();
+    target.create({ run_id: 'run_cap', task_id: 'task_cap', mode: 'single_agent' });
+
+    for (let index = 1; index <= CAP + 5; index += 1) {
+      target.appendEvent('run_cap', 'driver.agent_thought_chunk', fragment('role_a', index));
+    }
+
+    const retained = target.listRetainedEvents('run_cap');
+    expect(retained).toHaveLength(CAP);
+    // 留最新的一段：第 1..5 条被挤掉，最后一条是 CAP+5。
+    expect(retained[0]?.payload.stream_sequence).toBe(6);
+    expect(retained[retained.length - 1]?.payload.stream_sequence).toBe(CAP + 5);
+    // 快照 timeline 里一条片段都没有。
+    expect(target.getSnapshot('run_cap').events).toEqual([]);
+  });
+
+  it('never lets a chatty seat evict a quiet seat’s last fragment', () => {
+    // 这是全局环形缓冲会出的错：话多的席位把安静席位的最后一条挤掉，于是安静席位的
+    // `last_event_at` 回退到更早的协调事件上，一个 5 秒前还在流片段的席位被报成「卡住」。
+    const target = registry();
+    target.create({ run_id: 'run_seats', task_id: 'task_seats', mode: 'single_agent' });
+
+    target.appendEvent('run_seats', 'driver.agent_thought_chunk', fragment('role_quiet', 1));
+    for (let index = 1; index <= CAP * 4; index += 1) {
+      target.appendEvent('run_seats', 'driver.agent_thought_chunk', fragment('role_chatty', index));
+    }
+
+    const retained = target.listRetainedEvents('run_seats');
+    expect(retained.filter((event) => event.payload.role_id === 'role_quiet')).toHaveLength(1);
+    expect(retained.filter((event) => event.payload.role_id === 'role_chatty')).toHaveLength(CAP);
+  });
+
+  it('never drops non-fragment events', () => {
+    const target = registry();
+    target.create({ run_id: 'run_keep', task_id: 'task_keep', mode: 'single_agent' });
+
+    for (let index = 0; index < 200; index += 1) {
+      target.appendEvent('run_keep', 'driver.agent_message_chunk', fragment('role_a', index));
+    }
+    target.appendEvent('run_keep', 'handler.started', { cursor: 'execute_agent' });
+    target.appendEvent('run_keep', 'driver.turn_completed', { role_id: 'role_a' });
+
+    expect(target.getSnapshot('run_keep').events.map((event) => event.type)).toEqual([
+      'handler.started',
+      'driver.turn_completed',
+    ]);
+  });
+
+  it('returns retained events in sequence order across both sources', () => {
+    const target = registry();
+    target.create({ run_id: 'run_order', task_id: 'task_order', mode: 'single_agent' });
+
+    target.appendEvent('run_order', 'handler.started', { cursor: 'execute_agent' });
+    target.appendEvent('run_order', 'driver.agent_thought_chunk', fragment('role_a', 1));
+    target.appendEvent('run_order', 'driver.turn_started', { role_id: 'role_a' });
+    target.appendEvent('run_order', 'driver.agent_thought_chunk', fragment('role_a', 2));
+
+    // 两个来源各自有序，拼接后必须重排：`activity` 的折叠是 last-wins。
+    expect(target.listRetainedEvents('run_order').map((event) => event.sequence)).toEqual([
+      1, 2, 3, 4,
+    ]);
+    expect(target.listRetainedEvents('run_order').map((event) => event.type)).toEqual([
+      'handler.started',
+      'driver.agent_thought_chunk',
+      'driver.turn_started',
+      'driver.agent_thought_chunk',
+    ]);
+  });
+
+  it('keeps allocated sequences unique after fragments stopped entering events', () => {
+    const target = registry();
+    target.create({ run_id: 'run_seq', task_id: 'task_seq', mode: 'single_agent' });
+    const seen: number[] = [];
+    target.subscribe('run_seq', (event) => seen.push(event.sequence));
+
+    target.appendEvent('run_seq', 'handler.started', {});
+    target.appendEvent('run_seq', 'driver.agent_thought_chunk', fragment('role_a', 1));
+    target.appendEvent('run_seq', 'handler.completed', {});
+
+    // 序号来自显式计数器，不是 `events.length + 1`——否则片段占的号会被重复分配，
+    // 而 `after_sequence` 水位正是建立在这个号上。
+    expect(seen).toEqual([1, 2, 3]);
+    expect(new Set(seen).size).toBe(seen.length);
+  });
+});

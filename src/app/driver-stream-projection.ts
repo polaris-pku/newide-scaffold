@@ -99,20 +99,27 @@ export function driverStreamChannel(eventType: string): DriverStreamChannel {
 }
 
 /**
- * 推流通道（`run.event` / `task.subscribe`）要不要发这条事件。
+ * 这条**已投影**的事件类型是不是「可合并的流式片段」。
  *
- * **与落库共用同一张表**，因为是同一条判据：「片段类 = 可合并、高频、体量大」。两处各写一份
- * 必然会漂移，而漂移的方向恰好最糟：只在一处生效时，片段要么灌进 SQLite，要么灌进前端。
+ * **一条判据，三个消费方**（都读 `DRIVER_STREAM_CHANNELS` 这同一张表，任何一个消费方
+ * 都不该自己另判一遍——漂移的方向恰好最糟：只在一处生效时，片段要么灌进 SQLite、
+ * 要么灌进前端、要么灌进快照 timeline）：
  *
- * 片段类不进推流通道的代价要写清楚，它是一处**契约变更**（2026-10-03 拍板）：今天渲染
- * driver 思考流的前端会看不到片段。这是刻意的——要看思考流必须开**独立的合并通道**
- * （§4.4 / D4：片段是 last-value 语义，逐条推给前端既贵又不可用）。片段本身没丢：
- * `audit.jsonl`（无保留上限）与 `driver-stream.jsonl`（8 MiB 上限）都照写，`payload_ref` 可回取。
+ * | 消费方 | 片段 | 状态类 |
+ * |---|---|---|
+ * | 协调事件流（SQLite 持久 timeline） | 不进（§7.4 P5） | 进 |
+ * | 推流通道（`run.event` / `task.subscribe`） | 不发（§7.6 决策 B，2026-10-03 拍板） | 发 |
+ * | 存活期内存（registry 的 `events` 与快照 timeline） | 只留有界一段（§7.7） | 全留 |
  *
- * 非 `driver.*` 的类型一律返回 true：表的默认通道是 `coordination`。
+ * 片段不进推流与快照的代价要写清楚，它是一处**契约变更**：今天渲染 driver 思考流的前端
+ * 会看不到片段。这是刻意的——要看思考流必须开**独立的合并通道**（§4.4 / D4：片段是
+ * last-value 语义，逐条推给前端既贵又不可用）。**片段本身没丢**：`audit.jsonl`（无保留
+ * 上限）与 `driver-stream.jsonl`（8 MiB 上限）都照写，`payload_ref` 可回取。
+ *
+ * 非 `driver.*` 的类型一律返回 false：表的默认通道是 `coordination`。
  */
-export function shouldPushRunEvent(eventType: string): boolean {
-  return driverStreamChannel(eventType) === 'coordination';
+export function isStreamFragment(eventType: string): boolean {
+  return driverStreamChannel(eventType) === 'stream_only';
 }
 
 export function projectDriverStreamLifecycleEvent(

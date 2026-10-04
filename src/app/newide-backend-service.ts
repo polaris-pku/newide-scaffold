@@ -122,8 +122,8 @@ import {
 } from './driver-usage-projector';
 import {
   driverStreamChannel,
+  isStreamFragment,
   projectDriverStreamLifecycleEvent,
-  shouldPushRunEvent,
 } from './driver-stream-projection';
 import {
   createUnavailableSystemStatusService,
@@ -1712,7 +1712,7 @@ export class NewideBackendService {
     // agent 半边来自进程级状态点，driver 半边从同一条存活期事件流里折出来（含 chunk，
     // 所以 `last_event_at` 能反映「driver 还在动」）。
     const activity = projectRunActivity(listAgentActivities(snapshot.run_id), {
-      driver_events: liveRun.events,
+      driver_events: this.registry.listRetainedEvents(snapshot.run_id),
     });
     return {
       ...aligned,
@@ -1767,7 +1767,7 @@ export class NewideBackendService {
   /**
    * 订阅某 run 的推流通道。
    *
-   * **片段类 driver 事件不发**（`shouldPushRunEvent`，见 `driver-stream-projection.ts`）：
+   * **片段类 driver 事件不发**（`isStreamFragment`，见 `driver-stream-projection.ts`）：
    * 它们是可合并的高频流式片段（实测一个 council run 可达 1.6 万条），逐条推给前端既贵又
    * 不可用——要看思考流该走独立的合并通道。状态类 driver 事件照发，所以「在跑哪个 turn /
    * 哪个工具」在订阅通道上仍然完整。
@@ -1783,7 +1783,7 @@ export class NewideBackendService {
     return this.registry.subscribe(
       runId,
       (event) => {
-        if (shouldPushRunEvent(event.type)) listener(event);
+        if (!isStreamFragment(event.type)) listener(event);
       },
       afterSequence === undefined ? {} : { after_sequence: afterSequence },
     );
@@ -1808,12 +1808,12 @@ export class NewideBackendService {
   /**
    * 把事件推给 `task.subscribe` 的监听者。
    *
-   * 与 `subscribe` 同一条判据：片段类不发（`shouldPushRunEvent`）。这里的调用方是两条
+   * 与 `subscribe` 同一条判据：片段类不发（`isStreamFragment`）。这里的调用方是两条
    * registry 订阅（task-loop 与 legacy），它们同时要写 `audit.jsonl`——**审计要全量，
    * 推流只发状态类**，所以过滤放在这一层而不是 registry 的投递里。
    */
   private notifyTaskListeners(taskId: string, event: AppRunEvent): void {
-    if (!shouldPushRunEvent(event.type)) return;
+    if (isStreamFragment(event.type)) return;
     for (const listener of this.taskListeners.get(taskId) ?? []) listener(event);
   }
 

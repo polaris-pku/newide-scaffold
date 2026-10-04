@@ -13,7 +13,7 @@ import { IntegrationV0CoordinatorRunner } from '../../src/coordinator/coordinato
 import { runSnapshotSchema } from '../../src/protocol/run-snapshot';
 
 describe('NewideBackendService', () => {
-  it('projects raw driver chunks into the state timeline alongside lifecycle events', async () => {
+  it('keeps fragments off the state timeline while state-class driver events stay on it', async () => {
     let finish: ((result: IntegrationV0Result) => void) | undefined;
     const runnerResult = new Promise<IntegrationV0Result>((resolve) => {
       finish = resolve;
@@ -52,19 +52,13 @@ describe('NewideBackendService', () => {
 
     await service.createRun({ prompt: 'Stream progress', workspace_path: process.cwd() });
 
+    // 分流之后：**状态类** driver 事件进状态 timeline，**片段**不进（§7.6 决策 B / §7.7）。
+    // 片段曾经在这里，代价是每个重 run 的 timeline.json / frontend-snapshot.json /
+    // result.json 各到 13–18 MB（实测）；它们仍然逐条落在 audit.jsonl 上。
     expect(service.getSnapshot('run_stream')).toMatchObject({
       status: 'running',
       events: [
         { type: 'run.started' },
-        {
-          type: 'driver.agent_message_chunk',
-          source: 'driver',
-          payload: {
-            session_id: 'session_stream',
-            event_sequence: 1,
-            content: { type: 'text', text: 'working' },
-          },
-        },
         {
           type: 'driver.turn_started',
           source: 'driver',
@@ -75,6 +69,9 @@ describe('NewideBackendService', () => {
         },
       ],
     });
+    expect(
+      service.getSnapshot('run_stream').events.filter((event) => event.type.endsWith('_chunk')),
+    ).toEqual([]);
 
     finish?.(completedResult('run_stream', 'task_stream'));
     // 收尾要写 4 份终态文件并刮一次 Claude 计费目录，100ms 的默认预算在负载下会误报。
