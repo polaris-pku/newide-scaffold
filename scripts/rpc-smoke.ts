@@ -84,11 +84,19 @@ if (usesTemporaryRunner) {
   backendInput = input;
   backendOutput = localOutput;
 } else {
-  child = spawn('pnpm', ['backend:rpc'], {
-    cwd: process.cwd(),
-    env: backendEnv,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  // 直接起 node，不走 `pnpm backend:rpc`：Windows 上 `spawn('pnpm')` 是 **ENOENT**
+  // （`pnpm` 是 .cmd 垫片，不经 shell 起不来）——指定 `RPC_SMOKE_ACP_RUNNER_DIR` 走外部
+  // runner 的那条路因此在 Windows 上根本起不了后端。与 `src/app/backend-rpc-stdio.ts`
+  // 起 driver 时同一条约定：调 node，别调包管理器。
+  child = spawn(
+    process.execPath,
+    ['--import', 'tsx', path.join('src', 'app', 'backend-rpc-entry.ts')],
+    {
+      cwd: process.cwd(),
+      env: backendEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
   backendInput = child.stdin;
   backendOutput = child.stdout;
   childClosed = new Promise<number | null>((resolve) => {
