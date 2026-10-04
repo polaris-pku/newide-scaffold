@@ -98,6 +98,23 @@ export function driverStreamChannel(eventType: string): DriverStreamChannel {
   return DRIVER_STREAM_CHANNELS[eventType] ?? DEFAULT_DRIVER_STREAM_CHANNEL;
 }
 
+/**
+ * 推流通道（`run.event` / `task.subscribe`）要不要发这条事件。
+ *
+ * **与落库共用同一张表**，因为是同一条判据：「片段类 = 可合并、高频、体量大」。两处各写一份
+ * 必然会漂移，而漂移的方向恰好最糟：只在一处生效时，片段要么灌进 SQLite，要么灌进前端。
+ *
+ * 片段类不进推流通道的代价要写清楚，它是一处**契约变更**（2026-10-03 拍板）：今天渲染
+ * driver 思考流的前端会看不到片段。这是刻意的——要看思考流必须开**独立的合并通道**
+ * （§4.4 / D4：片段是 last-value 语义，逐条推给前端既贵又不可用）。片段本身没丢：
+ * `audit.jsonl`（无保留上限）与 `driver-stream.jsonl`（8 MiB 上限）都照写，`payload_ref` 可回取。
+ *
+ * 非 `driver.*` 的类型一律返回 true：表的默认通道是 `coordination`。
+ */
+export function shouldPushRunEvent(eventType: string): boolean {
+  return driverStreamChannel(eventType) === 'coordination';
+}
+
 export function projectDriverStreamLifecycleEvent(
   event: DriverStreamEvent,
   streamSequence?: number,
