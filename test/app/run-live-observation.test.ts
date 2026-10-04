@@ -309,6 +309,9 @@ describe('withLiveObservation —— task-loop 路径（持久快照 + 存活期
         total_tokens: 110,
         call_count: 1,
       });
+      // 而且必须说清「还差哪条腿」：driver 计费腿要等收尾刮 session JSONL 才出生，所以运行中
+      // 只可能有 proxy 腿。实测一次真实 run 里缺的那条是总量的 96%。
+      expect(snapshot.usage?.billed?.pending_sources).toEqual(['claude_session_jsonl']);
 
       // ② P5 × B6：driver 事件现在同时存在于 SQLite timeline 与存活期 registry，
       // 两条通道对同一个 `event_id` 必须是同一个 `sequence`（对齐模块存在的理由）。

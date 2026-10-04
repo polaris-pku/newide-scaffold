@@ -16,10 +16,19 @@
  *
  * 一条都没有时整个 `usage` 缺席——不编一个 0 出来。
  */
-import type { RunUsage, RunUsageTokens } from '../protocol/run-snapshot';
+import type { RunSnapshot, RunUsage, RunUsageTokens } from '../protocol/run-snapshot';
+import type { TokenUsageSource } from '../persistence';
 import type { TaskDriverUsage } from './driver-usage-projector';
 import { resolveTokenUsageFromTimeline, summarizeRunConsumption } from './run-terminal-output-writer';
 import type { DurableRunUsage } from './run-usage-history';
+
+/**
+ * driver 计费腿的来源名。
+ *
+ * 用 `satisfies` 挂在账本那一层的取值域上：这个名字在两处必须一致——「还差哪条腿」（这里）
+ * 与「账本里有哪条腿」（`src/persistence`）讲的是同一批腿。
+ */
+export const DRIVER_BILLED_SOURCE = 'claude_session_jsonl' satisfies TokenUsageSource;
 
 export interface RunUsageProjectionInput {
   /**
@@ -39,19 +48,57 @@ export interface RunUsageProjectionInput {
    * 重启而变。**只有已收尾的 run 才该传它**：在跑的 run 账本里还没有行，而时间线是活的。
    */
   durable?: DurableRunUsage | undefined;
+  /**
+   * 这个 run 此刻**注定还没到**的计费腿，由组装点按 run 状态算（见 `pendingBilledSources`）
+   * ——投影本身不认识「状态」这个概念。缺席与空数组同义：都不加 `pending_sources`。
+   */
+  pendingSources?: readonly string[] | undefined;
+}
+
+/**
+ * 某个状态的 run 里「注定还没到」的计费腿。
+ *
+ * driver 计费腿**只在收尾时出生**：`finalize` 从 Claude 的 session JSONL 刮出来、写进
+ * `summary.json`，再进账本。所以运行中的 run 无论跑了多久，`billed` 里都只可能有 proxy 腿。
+ * 实测一次真实 run：proxy 3,308、driver 计费 80,933——缺的那条是总量的 **96%**。面板要把
+ * 「还没到」与「没花」分开，靠的就是这个名单。
+ *
+ * 返回空数组表示「该到的都到了」（已收尾的 run）。收尾之后某条腿仍然缺席时，成因在
+ * `summary.json` 的 `driver_billed_merge` 里（§7.9），**不**在这里报——那是「为什么没有」，
+ * 这是「还没到时候」。
+ */
+export function pendingBilledSources(status: RunSnapshot['status']): string[] {
+  return status === 'running' ? [DRIVER_BILLED_SOURCE] : [];
 }
 
 export function projectRunUsage(input: RunUsageProjectionInput): RunUsage | undefined {
   const billed = billedFromDurable(input.durable) ?? projectBilled(input.timeline);
   const byStage = projectByStage(input.timeline);
   const context = projectContext(input.driverUsage);
+  const billedWithPending =
+    billed === undefined ? undefined : withPendingSources(billed, input.pendingSources);
 
-  if (!billed && !byStage && !context) return undefined;
+  if (!billedWithPending && !byStage && !context) return undefined;
   return {
-    ...(billed ? { billed } : {}),
+    ...(billedWithPending ? { billed: billedWithPending } : {}),
     ...(context ? { context } : {}),
     ...(byStage ? { by_stage: byStage } : {}),
   };
+}
+
+/**
+ * 把「还没到」的腿挂上去。
+ *
+ * **只报真的缺席的那些**：腿要是已经在了（账本两条腿齐了、而调用方仍然传了名单），说它
+ * pending 就是在撒谎。这条判据不是防御性空转——同一个组装点既服务在跑的 run 也服务已收尾
+ * 的 run，名单与账本各自由不同的事实算出来。
+ */
+function withPendingSources(
+  billed: NonNullable<RunUsage['billed']>,
+  pending: readonly string[] | undefined,
+): RunUsage['billed'] {
+  const missing = (pending ?? []).filter((source) => billed.by_source[source] === undefined);
+  return missing.length > 0 ? { ...billed, pending_sources: missing } : billed;
 }
 
 /**

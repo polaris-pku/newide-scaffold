@@ -118,6 +118,19 @@ export const runUsageSchema = z
       .object({
         metric: z.literal('billed_tokens'),
         by_source: z.record(z.string(), runUsageTokensSchema),
+        /**
+         * 此刻**注定还没到**、因而缺席的腿。
+         *
+         * 这一位存在的理由是一个 96%：driver 计费腿由 run **收尾**时的刮取写进
+         * `summary.json`，所以运行中的 run 无论跑多久都只可能有 `proxy` 腿——实测一次真实
+         * run 里，缺的那条腿是总量 84,241 里的 80,933。没有这一位，前端只能把
+         * `by_source.proxy` 读成「这个 run 花了这么多」，而那是真相的 **4%**。
+         *
+         * 它不是错误信号，是**时态**信号：这个数现在偏小，偏多少要等收尾。
+         * 已收尾的 run 不出现它——那时候该到的都到了；某条腿仍然缺席时，成因在
+         * `summary.json` 的 `driver_billed_merge` 里（见 §7.9），不是这里。
+         */
+        pending_sources: z.array(z.string().min(1)).optional(),
       })
       .strict()
       .optional(),

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { TaskDriverUsage } from '../../src/app/driver-usage-projector';
-import { projectRunUsage } from '../../src/app/run-usage-projection';
+import { pendingBilledSources, projectRunUsage } from '../../src/app/run-usage-projection';
 import type { RunUsageTokens } from '../../src/protocol/run-snapshot';
 
 type TimelineItem = { type: string; payload: Record<string, unknown> };
@@ -211,6 +211,44 @@ describe('projectRunUsage', () => {
     // 数值一个不少——规范化只动键序，不动任何数字。
     expect(usage?.billed?.by_source.proxy?.total_tokens).toBe(100);
     expect(usage?.billed?.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+  });
+
+  it('marks the driver leg as pending while the run is still running', () => {
+    // 96% 的那条腿（实测一次真实 run：proxy 3,308 / driver 80,933）由**收尾**时的刮取写出来，
+    // 所以运行中的 run 只可能有 proxy 腿。没有这一位，前端会把 `by_source.proxy` 读成
+    // 「这个 run 花了这么多」——那是真相的 4%。
+    const usage = projectRunUsage({
+      timeline: [proxyUsage({ input_tokens: 100, output_tokens: 10 })],
+      pendingSources: pendingBilledSources('running'),
+    });
+
+    expect(usage?.billed?.pending_sources).toEqual(['claude_session_jsonl']);
+    expect(pendingBilledSources('running')).toEqual(['claude_session_jsonl']);
+    // 已收尾的 run 不该说还有腿没到：那时候该到的都到了（没到的成因在 `driver_billed_merge`）。
+    expect(pendingBilledSources('completed')).toEqual([]);
+    expect(pendingBilledSources('failed')).toEqual([]);
+  });
+
+  it('never claims a leg is pending once it is actually there', () => {
+    // 名单与账本各自由不同的事实算出来：账本两条腿齐了、名单还说缺 driver 腿时，
+    // 报它 pending 就是撒谎。这条判据让「还没到」永远只在真的缺席时出现。
+    const usage = projectRunUsage({
+      durable: {
+        totals: tokens(350),
+        by_source: { proxy: tokens(100), claude_session_jsonl: tokens(250) },
+      },
+      pendingSources: ['claude_session_jsonl'],
+    });
+
+    expect(usage?.billed?.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+    expect(usage?.billed).not.toHaveProperty('pending_sources');
+
+    // 而同一个 run 在「只有 proxy 腿」的时刻确实报得出来——否则上面那句可能是空转。
+    const stillMissing = projectRunUsage({
+      durable: { totals: tokens(100), by_source: { proxy: tokens(100) } },
+      pendingSources: ['claude_session_jsonl'],
+    });
+    expect(stillMissing?.billed?.pending_sources).toEqual(['claude_session_jsonl']);
   });
 
   it('treats a missing timeline as absent rather than as an empty one', () => {

@@ -55,7 +55,7 @@ import {
 } from './run-request-store';
 import { projectRunSnapshot } from './run-snapshot-projector';
 import { withAlignedTimeline } from './run-timeline-sequence';
-import { billedFromDurable, projectRunUsage } from './run-usage-projection';
+import { billedFromDurable, pendingBilledSources, projectRunUsage } from './run-usage-projection';
 import { projectRunActivity } from './run-activity-projection';
 import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
@@ -1731,6 +1731,8 @@ export class NewideBackendService {
       timeline: liveRun.events,
       driverUsage: this.getAccumulatedDriverUsage(snapshot.task_id),
       ...(durableUsage ? { durable: durableUsage } : {}),
+      // 「还没到」的腿按 run 状态算：driver 计费腿是收尾时刮出来的，运行中注定没有。
+      pendingSources: pendingBilledSources(snapshot.status),
     });
     // 在飞状态是内存里的，只有本进程持有的 run 才有；没有就是没有这个字段。
     // agent 半边来自进程级状态点，driver 半边从同一条存活期事件流里折出来（含 chunk，

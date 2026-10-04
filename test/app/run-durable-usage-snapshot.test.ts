@@ -263,6 +263,11 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
       // 「形状合法」——多一个字段或少一个字段都会在真正的消费方那里炸，不会在单测里炸。
       expect(runSnapshotSchema.safeParse(live).success).toBe(true);
       expect(runSnapshotSchema.safeParse(restarted).success).toBe(true);
+      // ⑤ 已收尾的 run 不再说「还有腿没到」：那时候该到的都到了；某条腿仍然缺席的成因在
+      // `summary.json` 的 `driver_billed_merge` 里，不是这里。运行中才报 pending，那一条由
+      // `run-live-observation` 的 task-loop 用例钉住。
+      expect(restarted.usage?.billed?.pending_sources).toBeUndefined();
+      expect(live.usage?.billed?.pending_sources).toBeUndefined();
     } finally {
       resetAgentActivities();
       await serviceBefore.close().catch(() => undefined);
