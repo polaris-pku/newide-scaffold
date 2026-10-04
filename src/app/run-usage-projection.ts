@@ -69,7 +69,34 @@ export function billedFromDurable(durable: DurableRunUsage | undefined): RunUsag
     bySource[source] = { ...totals };
   }
   if (Object.keys(bySource).length === 0) return undefined;
-  return { metric: 'billed_tokens', by_source: bySource };
+  return { metric: 'billed_tokens', by_source: canonicalBySource(bySource) };
+}
+
+/**
+ * `by_source` 的键序规范化：字典序。
+ *
+ * 为什么这不是「好看」而是契约的一部分：同一个 run 的 `billed` 有**两条取数路径**——账本
+ * （`GROUP BY` 出来的顺序，实测恰好是字典序，但那是索引的巧合）与 run 目录自己的
+ * `summary.json`（写入时的顺序）。实测同一个真实 run（662,716 token、两条腿）：回填前后
+ * **数值逐字段相同、键序相反**（`proxy,claude_session_jsonl` ↔ `claude_session_jsonl,proxy`）。
+ *
+ * 对象键序在 JSON 语义上无关，但后果是两个：① 一个按键序渲染腿列表的前端会看到同一个 run
+ * 的腿在回填前后换位；② 「两条路径同值」这件事只能靠 `toEqual` 断言，`JSON.stringify` 一比
+ * 就**假红**——本轮的端到端探针就是这么红的。
+ *
+ * 选字典序而不是某个「语义顺序」：任何语义顺序都是要额外维护的策略，而字典序两类来源都
+ * 算得出来。
+ *
+ * 只有一个调用点**不需要**它：`projectBilled`（存活期时间线那条路）。`resolveTokenUsageFromTimeline`
+ * 的返回类型写着 `sources: ['proxy']`——那里的 `by_source` 按构造只有一条腿，排序是恒等。
+ * 所以别把那一处当成漏了；真的出现第二条腿时（类型会先变）再补。
+ *
+ * `by_stage` 也不做这件事——它只有一条来源（run 自己的 timeline），顺序本来就是确定的。
+ */
+export function canonicalBySource<T>(bySource: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(
+    Object.entries(bySource).sort(([left], [right]) => left.localeCompare(right)),
+  );
 }
 
 function projectBilled(
@@ -82,6 +109,8 @@ function projectBilled(
   for (const [source, totals] of Object.entries(summary.by_source)) {
     bySource[source] = toTokens(totals);
   }
+  // 这里不做键序规范化：`resolveTokenUsageFromTimeline` 的返回类型是 `sources: ['proxy']`，
+  // 按构造只有一条腿（见 `canonicalBySource` 的注释）。
   return { metric: 'billed_tokens', by_source: bySource };
 }
 

@@ -158,6 +158,10 @@ describe('runUsageHistory', () => {
     expect(history.billed.totals.total_tokens).toBe(300);
     expect(history.billed.by_source.proxy?.total_tokens).toBe(100);
     expect(history.billed.by_source.claude_session_jsonl?.total_tokens).toBe(200);
+    // 键序同样规范化：上面的 `by_source` 是 proxy 在前，报出去必须是字典序——否则
+    // 「快照的 by_source」与「历史的 by_source」会是两个形状（它们会出现在同一次
+    // `run.getUsage` 响应里）。
+    expect(Object.keys(history.billed.by_source)).toEqual(['claude_session_jsonl', 'proxy']);
   });
 
   it('skips directories that never advanced past run creation', async () => {

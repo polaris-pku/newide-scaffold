@@ -37,6 +37,7 @@ import {
   readClaudeSessionLeg,
   readProxyLeg,
 } from './run-usage-ledger-entries';
+import { canonicalBySource } from './run-usage-projection';
 
 /**
  * 可支撑的作用域。
@@ -176,7 +177,8 @@ export function aggregateUsageHistory(
     runs_without_usage: runsWithoutUsage,
     // 一个 run 都没有，或有人没有用量，都不能声称完整。
     complete: matched.length > 0 && runsWithoutUsage === 0,
-    billed: { totals, by_source: bySource },
+    // 键序规范化与快照那条路一致：同一个值不许因为走的是账本还是目录而改变形状。
+    billed: { totals, by_source: canonicalBySource(bySource) },
   };
 }
 
@@ -363,7 +365,9 @@ export class LedgerRunUsageHistoryReader implements RunUsageHistoryReader {
       runs_counted: aggregate.runs_counted,
       runs_without_usage: aggregate.runs_without_usage,
       complete: aggregate.complete,
-      billed: { totals: aggregate.totals, by_source: aggregate.by_source },
+      // 账本 `GROUP BY` 出来的顺序实测恰好是字典序，但那是索引的巧合；显式规范化之后
+      // 「快照的 by_source」与「历史的 by_source」才是同一个形状。
+      billed: { totals: aggregate.totals, by_source: canonicalBySource(aggregate.by_source) },
     };
   }
 

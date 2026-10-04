@@ -187,6 +187,32 @@ describe('projectRunUsage', () => {
     expect(usage?.billed?.by_source.proxy?.total_tokens).toBe(110);
   });
 
+  it('reports by_source in one canonical key order, not in the order the source gave it', () => {
+    // 同一个 run 的 `billed` 有两条取数路径：账本（SQL `GROUP BY`）与 run 目录自己的
+    // `summary.json`（写入时的顺序）。实测同一个真实 run（662,716 token、两条腿）：回填前后
+    // **数值逐字段相同、键序相反**（`proxy,claude_session_jsonl` ↔ `claude_session_jsonl,proxy`）。
+    // JSON 的对象键序在语义上无关，但有两个后果：按键序渲染腿列表的前端会看到腿在回填
+    // 前后换位；而「两条路径同值」只能靠 `toEqual` 断言、`JSON.stringify` 一比就假红。
+    const usage = projectRunUsage({
+      durable: {
+        totals: tokens(350),
+        // 刻意按**非字典序**摆：proxy 在前。规范化要能把它翻过来。
+        by_source: {
+          proxy: { ...tokens(100) },
+          claude_session_jsonl: { ...tokens(250) },
+        },
+      },
+    });
+
+    expect(Object.keys(usage?.billed?.by_source ?? {})).toEqual([
+      'claude_session_jsonl',
+      'proxy',
+    ]);
+    // 数值一个不少——规范化只动键序，不动任何数字。
+    expect(usage?.billed?.by_source.proxy?.total_tokens).toBe(100);
+    expect(usage?.billed?.by_source.claude_session_jsonl?.total_tokens).toBe(250);
+  });
+
   it('treats a missing timeline as absent rather than as an empty one', () => {
     // 本进程不持有该 run 时 `timeline` 是**缺席**的。此时只有账本能说话；两样都没有就整个缺席。
     expect(projectRunUsage({})).toBeUndefined();

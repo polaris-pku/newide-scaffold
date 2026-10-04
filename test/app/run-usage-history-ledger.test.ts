@@ -408,6 +408,33 @@ describe('LedgerRunUsageHistoryReader', () => {
     ledger.close();
   });
 
+  it('canonicalises the key order of whatever aggregate the store hands back', async () => {
+    // 账本 `GROUP BY` 出来的顺序实测恰好是字典序，但那是索引的巧合，不是契约。这条用例用
+    // 一个**故意乱序**的存储替身把「这里显式规范化」钉住——否则它只是一句声明，而查询计划
+    // 一变，同一个值的键序就会跟着变（同一个 run 的用量在回填前后换位）。
+    const ordered: TokenUsageLedgerStore = {
+      appendTokenUsage: () => undefined,
+      aggregateTokenUsage: (query, asOf) => ({
+        scope: query.scope,
+        ...(query.scope_id === undefined ? {} : { scope_id: query.scope_id }),
+        as_of: asOf,
+        runs_counted: 1,
+        runs_without_usage: 0,
+        complete: true,
+        totals: tokens(300),
+        by_source: { proxy: tokens(100), claude_session_jsonl: tokens(200) },
+      }),
+    };
+    const reader = new LedgerRunUsageHistoryReader(ordered, await makeRunsRoot(), () => 'T');
+
+    const history = await reader.read({ scope: 'task', scope_id: 'task_1' });
+
+    expect(Object.keys(history.billed.by_source)).toEqual(['claude_session_jsonl', 'proxy']);
+    // 数值一个不少——规范化只动键序。
+    expect(history.billed.by_source.proxy?.total_tokens).toBe(100);
+    expect(history.billed.by_source.claude_session_jsonl?.total_tokens).toBe(200);
+  });
+
   it('refuses a scope that has no subject', async () => {
     const ledger = new SqliteCoordinationStore(':memory:');
     const reader = new LedgerRunUsageHistoryReader(ledger, await makeRunsRoot(), () => 'T');
