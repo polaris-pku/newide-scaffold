@@ -141,10 +141,12 @@ describe('mergeBilledTokenUsage', () => {
     ]);
   });
 
-  it('leaves the file untouched when the scrape returns nothing', async () => {
+  it('leaves the token numbers untouched when the scrape returns nothing, but records why', async () => {
+    // 数字不动（没有可加的），**但结局要落盘**：在此之前「刮取跑了但什么都没刮到」与
+    // 「这次 run 根本没有 driver 用量」在 summary.json 上完全一样，账面上少掉的部分无从审计。
     const runsRoot = await makeRunsRoot();
     const summaryPath = await writeSummary(runsRoot, 'run_empty', PROXY_TOKEN_USAGE);
-    const before = await readFile(summaryPath, 'utf8');
+    const before = JSON.parse(await readFile(summaryPath, 'utf8')) as Record<string, unknown>;
 
     const result = await mergeBilledTokenUsage(summaryPath, async () => emptyTokenUsageSummary());
 
@@ -153,7 +155,50 @@ describe('mergeBilledTokenUsage', () => {
       total_tokens_before: 1500,
       total_tokens_after: 1500,
     });
-    expect(await readFile(summaryPath, 'utf8')).toBe(before);
+    const written = JSON.parse(await readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+    expect(written.token_usage).toEqual(before.token_usage);
+    expect(written.driver_billed_merge).toEqual({
+      status: 'skipped_no_session_usage',
+      total_tokens_before: 1500,
+      total_tokens_after: 1500,
+    });
+  });
+
+  it('records scrape_failed instead of throwing when the scraper blows up', async () => {
+    // 刮取依赖外部目录（Claude 的 session jsonl），失败是常态。这条路径跑在终态写盘上，
+    // 抛出去会把已完成的 run 变成 TERMINAL_OUTPUT_FAILED。
+    const runsRoot = await makeRunsRoot();
+    const summaryPath = await writeSummary(runsRoot, 'run_boom', PROXY_TOKEN_USAGE);
+
+    const result = await mergeBilledTokenUsage(summaryPath, async () => {
+      throw new Error('claude session jsonl unavailable');
+    });
+
+    expect(result).toEqual({
+      status: 'scrape_failed',
+      total_tokens_before: 1500,
+      total_tokens_after: 1500,
+    });
+    const written = JSON.parse(await readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+    expect(written.driver_billed_merge).toEqual({
+      status: 'scrape_failed',
+      total_tokens_before: 1500,
+      total_tokens_after: 1500,
+    });
+    // 失败不改变已有数字：proxy 那一腿留着。
+    expect((written.token_usage as { total_tokens: number }).total_tokens).toBe(1500);
+  });
+
+  it('records skipped_no_worktree so a missing driver leg is explainable', async () => {
+    const runsRoot = await makeRunsRoot();
+    const summaryPath = await writeSummary(runsRoot, 'run_nowt_status', PROXY_TOKEN_USAGE, {
+      worktree_path: undefined,
+    });
+
+    await mergeBilledTokenUsage(summaryPath, async () => CLAUDE_SCRAPED);
+
+    const written = JSON.parse(await readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+    expect(written.driver_billed_merge).toMatchObject({ status: 'skipped_no_worktree' });
   });
 
   it('scrapes every driver session the run reported, not just the primary one', async () => {

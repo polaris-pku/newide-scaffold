@@ -15,7 +15,7 @@
  * 2. 在飞状态（`activity`）**仍然缺席**——那是真的只属于持有它的进程，不该假装持久；
  * 3. 账本为空时 `usage` 缺席而不是全 0——**缺 ≠ 0**。
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -193,6 +193,15 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
       const live = serviceBefore.getRunSnapshot(runId);
       expect(live.status).toBe('completed');
       expect(live.usage?.billed?.by_source.proxy?.total_tokens).toBe(110);
+
+      // driver 腿的刮取结局必须留在真实产物里。这个 run 没有 worktree_path（gate 没有
+      // materialize），所以 driver 腿**注定**拿不到——而那正是要能说出口的事：
+      // 「没有 driver 用量」与「刮取没跑」在此之前长得一模一样。
+      const summary = JSON.parse(
+        await readFile(path.join(runsRoot, runId, 'summary.json'), 'utf8'),
+      ) as Record<string, unknown>;
+      expect(summary.driver_billed_merge).toMatchObject({ status: 'skipped_no_worktree' });
+      expect(summary.token_usage).toBeDefined();
 
       // ——— 重启：同一个持久层，一个干净的 registry，另一个读取口实例 ———
       const serviceAfter = buildService({

@@ -154,16 +154,45 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
       ...fallbackWrites,
       fs.writeFile(frontendSnapshotPath, serializedSnapshot, 'utf-8'),
     ]);
-    await mergeSummaryExtras(summaryPath, { driverUsage: tokenUsage, consumption });
+    await this.bestEffort('summary extras', () =>
+      mergeSummaryExtras(summaryPath, { driverUsage: tokenUsage, consumption }),
+    );
     // driver 侧真实 coding agent 的计费 token 不进事件流，只能等 summary 落盘后从
     // Claude Code 的 session JSONL 刮取再并进来。放在这里而不是 B maintenance：
     // maintenance 由 buffer 触发，跑在 run 收尾之前，读不到 summary.json。
-    await mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage);
+    await this.bestEffort('driver billed scrape', () =>
+      mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage),
+    );
     await this.appendUsageLedger(snapshot, projected.timeline, summaryPath);
     return {
       artifact_ref: pathToFileURL(path.resolve(frontendSnapshotPath)).href,
       sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),
     };
+  }
+
+  /**
+   * 跑一个**观测性**的终态附加步骤：失败只丢这一块，不让 run 变成 `TERMINAL_OUTPUT_FAILED`。
+   *
+   * 为什么需要这一层：`finalize` 的失败会一路走到 `persistTerminal` 的 catch，把已经完成的
+   * run 重写成 `failed`——那是给「核心产物（`result.json` / `summary.json` / `timeline.json` /
+   * `frontend-snapshot.json`）写不出来」准备的语义，不该被追加观测的失败触发。而这两步恰好
+   * 是最容易失败的两步：刮 Claude 的 session JSONL 依赖外部目录，重写 `summary.json` 在
+   * Windows 上会撞 EBUSY/EPERM（与仓库里 SQLite `-wal` 那类清理失败同源）。
+   *
+   * `summarizeRunConsumption` 的文档把这条纪律写得很明白（「任何一步都不抛错——它跑在终态
+   * 写盘路径上」），`appendUsageLedger` 也照做了；这里只是把同一条纪律补给它上面的两步。
+   *
+   * 失败**写 stderr**：`appendUsageLedger` 的失败有一个派生的可见面（`runs_without_usage`），
+   * 这两步没有——刮取失败现在至少留在 `summary.json` 的 `driver_billed_merge` 里，但连
+   * summary 都写不动时，只剩这一行日志。
+   */
+  private async bestEffort(label: string, action: () => Promise<unknown>): Promise<void> {
+    try {
+      await action();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[terminal-output] ${label} failed for a run: ${message}\n`);
+    }
   }
 
   /**
@@ -199,8 +228,11 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
         recorded_at: new Date().toISOString(),
       });
       this.tokenUsageLedger.appendTokenUsage(entries);
-    } catch {
+    } catch (error) {
       // 见上：不计入账本 ⇒ 该 run 会成为已知缺口，而不是被当成 0。
+      // 顺带留一行日志：派生信号（`runs_without_usage`）只说明「有 run 缺席」，说不出是哪一次。
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[terminal-output] usage ledger append failed: ${message}\n`);
     }
   }
 }

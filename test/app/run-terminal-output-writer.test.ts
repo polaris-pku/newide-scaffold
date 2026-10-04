@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   FileRunTerminalOutputWriter,
   summarizeRunConsumption,
@@ -410,6 +410,71 @@ describe('FileRunTerminalOutputWriter', () => {
       errors: [],
       final_output: { status: 'completed' },
     });
+  });
+
+  it('does not let a failing driver billed scrape fail the run', async () => {
+    // 刮 Claude 的 session JSONL 是**观测**。它抛错时如果一路传出去，`finalize` 就会失败，
+    // 而 `persistTerminal` 的 catch 会把已经完成的 run 重写成 `failed`
+    // （`TERMINAL_OUTPUT_FAILED`）——一个观测步骤毁掉 run 的结局。这条用例钉住它。
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_scrape');
+    await mkdir(runDir, { recursive: true });
+    // 预置 summary.json：`finalize` 的首写是 `wx` 只建不改，所以这份会留下来；而
+    // worktree_path 必须在——没有它 `mergeBilledTokenUsage` 会在刮取**之前**就跳过，
+    // 这条用例就空转了。
+    await writeFile(
+      path.join(runDir, 'summary.json'),
+      JSON.stringify({ worktree_path: '/tmp/worktree' }),
+      'utf-8',
+    );
+    const writer = new FileRunTerminalOutputWriter(runsRoot, undefined, async () => {
+      throw new Error('claude session jsonl unavailable');
+    });
+
+    await expect(
+      writer.finalize({
+        ...failedSnapshot(),
+        run_id: 'run_scrape',
+        status: 'completed',
+      }),
+    ).resolves.toBeDefined();
+
+    // 而且失败的原因必须留在产物里：「这次 run 没有 driver 腿」与「刮取失败了」是两件事。
+    await expect(readJson(path.join(runDir, 'summary.json'))).resolves.toMatchObject({
+      driver_billed_merge: { status: 'scrape_failed' },
+    });
+  });
+
+  it('does not let an unusable summary file fail the run, but reports it', async () => {
+    // 这条覆盖的是**文件层**的失败（上面那条覆盖刮取层的失败），两条都不该改动 run 的结局。
+    // 预置一份坏掉的 summary.json：首写 `wx` 只建不改，所以它不会被覆盖，于是追加观测的两步
+    // 都会栽在它上面——`mergeSummaryExtras` 的 `JSON.parse` 抛 SyntaxError，而它只容忍 ENOENT。
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_corrupt');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, 'summary.json'), 'not json', 'utf-8');
+    const writer = new FileRunTerminalOutputWriter(runsRoot);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    try {
+      await expect(
+        writer.finalize({ ...failedSnapshot(), run_id: 'run_corrupt', status: 'completed' }),
+      ).resolves.toBeDefined();
+
+      // 吞掉不等于静默：失败必须被报出来，否则这条守卫就是在替读者隐瞒。
+      expect(stderr.mock.calls.map((call) => String(call[0])).join('')).toContain(
+        'summary extras failed',
+      );
+      // 核心产物照旧由内存那份写出，所以 run 的真实结局没有被补充观测改写。
+      await expect(readJson(path.join(runDir, 'result.json'))).resolves.toMatchObject({
+        run_id: 'run_corrupt',
+        status: 'completed',
+      });
+    } finally {
+      stderr.mockRestore();
+    }
   });
 });
 
