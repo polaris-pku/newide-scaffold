@@ -88,10 +88,13 @@ describe('projectRunActivity', () => {
   });
 
   it('produces output the protocol schema accepts (drift guard)', () => {
-    const projected = projectRunActivity([
-      activity({ role_id: 'role_a', round: 0 }),
-      activity({ role_id: 'role_b', kind: 'invoking_driver', tool_name: 'invoke_driver', seq: 2 }),
-    ]);
+    const projected = projectRunActivity(
+      [
+        activity({ role_id: 'role_a', round: 0 }),
+        activity({ role_id: 'role_b', kind: 'invoking_driver', tool_name: 'invoke_driver', seq: 2 }),
+      ],
+      { now: new Date('2026-10-03T00:00:00.000Z') },
+    );
 
     // 投影与 schema 分居两个模块，用一次 parse 把两边钉在一起。
     expect(runActivitySchema.parse(projected)).toEqual(projected);
@@ -106,3 +109,115 @@ describe('projectRunActivity', () => {
     ).toBe(false);
   });
 });
+
+describe('projectRunActivity —— driver 半边挂进对应席位', () => {
+  it('attaches the driver state to the seat that is driving it', () => {
+    const projected = projectRunActivity(
+      [
+        activity({ role_id: 'role_a', kind: 'invoking_driver', tool_name: 'invoke_driver' }),
+        activity({ role_id: 'role_b', kind: 'awaiting_llm', seq: 2 }),
+      ],
+      {
+        now: new Date('2026-10-03T00:00:10.000Z'),
+        driver_events: [
+          driverEvent('driver.turn_started', 'role_a', '2026-10-03T00:00:00.000Z'),
+          driverEvent('driver.tool_started', 'role_a', '2026-10-03T00:00:05.000Z', {
+            tool_call_id: 'tc_1',
+            tool_name: 'Edit',
+            kind: 'edit',
+            title: 'Edit src/a.ts',
+          }),
+        ],
+      },
+    );
+
+    expect(projected?.agents[0]).toMatchObject({
+      role_id: 'role_a',
+      state: 'delegating',
+      driver: {
+        state: 'tool_running',
+        since: '2026-10-03T00:00:05.000Z',
+        last_event_at: '2026-10-03T00:00:05.000Z',
+        stale: false,
+        tool_call_id: 'tc_1',
+        tool_name: 'Edit',
+        tool_kind: 'edit',
+        tool_title: 'Edit src/a.ts',
+      },
+    });
+    // 没在驱动 driver 的席位不该凭空多出一个 driver 字段。
+    expect(projected?.agents[1]).not.toHaveProperty('driver');
+  });
+
+  it('omits the driver half without a live event stream, but keeps the agent half', () => {
+    const projected = projectRunActivity([
+      activity({ role_id: 'role_a', kind: 'invoking_driver', tool_name: 'invoke_driver' }),
+    ]);
+
+    expect(projected?.agents[0]?.state).toBe('delegating');
+    expect(projected?.agents[0]).not.toHaveProperty('driver');
+  });
+
+  it('clears the driver half as soon as the seat goes back to thinking (§4.2 父子一致性)', () => {
+    const driverEvents = [
+      driverEvent('driver.turn_started', 'role_a', '2026-10-03T00:00:00.000Z'),
+      driverEvent('driver.tool_started', 'role_a', '2026-10-03T00:00:05.000Z', {
+        tool_call_id: 'tc_1',
+        tool_name: 'Edit',
+      }),
+    ];
+    const now = new Date('2026-10-03T00:00:10.000Z');
+
+    // 委派中：driver 半边在。
+    const delegating = projectRunActivity(
+      [activity({ role_id: 'role_a', kind: 'invoking_driver', tool_name: 'invoke_driver' })],
+      { now, driver_events: driverEvents },
+    );
+    expect(delegating?.agents[0]?.driver).toMatchObject({ tool_name: 'Edit' });
+
+    // 同一批事件、同一个席位，只是 agent 回到自主思考：必须整组消失，
+    // 而不是把上一次的工具名残留在「思考中」旁边。
+    const thinking = projectRunActivity([activity({ role_id: 'role_a', kind: 'awaiting_llm' })], {
+      now,
+      driver_events: driverEvents,
+    });
+    expect(thinking?.agents[0]?.state).toBe('thinking');
+    expect(thinking?.agents[0]).not.toHaveProperty('driver');
+  });
+
+  it('ignores driver events for a seat that has no in-flight state point', () => {
+    const projected = projectRunActivity([activity({ role_id: 'role_a' })], {
+      driver_events: [driverEvent('driver.turn_started', 'role_ghost', '2026-10-03T00:00:01.000Z')],
+    });
+
+    expect(projected?.agents).toHaveLength(1);
+    expect(projected?.agents[0]).not.toHaveProperty('driver');
+  });
+
+  it('produces a driver half the protocol schema accepts (drift guard)', () => {
+    const projected = projectRunActivity(
+      [activity({ role_id: 'role_a', kind: 'invoking_driver', tool_name: 'invoke_driver' })],
+      {
+        now: new Date('2026-10-03T00:00:10.000Z'),
+        driver_events: [
+          driverEvent('driver.turn_started', 'role_a', '2026-10-03T00:00:00.000Z'),
+          driverEvent('driver.tool_progress', 'role_a', '2026-10-03T00:00:09.000Z', {
+            tool_call_id: 'tc_1',
+            status: 'in_progress',
+          }),
+        ],
+      },
+    );
+
+    expect(runActivitySchema.parse(projected)).toEqual(projected);
+  });
+});
+
+function driverEvent(
+  type: string,
+  roleId: string,
+  createdAt: string,
+  payload: Record<string, unknown> = {},
+): { type: string; payload: Record<string, unknown>; created_at: string } {
+  return { type, payload: { role_id: roleId, ...payload }, created_at: createdAt };
+}

@@ -1705,7 +1705,11 @@ export class NewideBackendService {
       driverUsage: this.getAccumulatedDriverUsage(snapshot.task_id),
     });
     // 在飞状态是内存里的，只有本进程持有的 run 才有；没有就是没有这个字段。
-    const activity = projectRunActivity(listAgentActivities(snapshot.run_id));
+    // agent 半边来自进程级状态点，driver 半边从同一条存活期事件流里折出来（含 chunk，
+    // 所以 `last_event_at` 能反映「driver 还在动」）。
+    const activity = projectRunActivity(listAgentActivities(snapshot.run_id), {
+      driver_events: liveRun.events,
+    });
     return {
       ...aligned,
       ...(usage ? { usage } : {}),

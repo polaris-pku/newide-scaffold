@@ -164,20 +164,61 @@ export const runUsageHistorySchema = z
   .strict();
 
 /**
- * 在飞运行态：此刻**真正在动**的 agent 席位。
+ * driver 侧的在飞状态：这个席位**此刻**在驱动哪个 turn / 哪个工具。
  *
- * **与 §4.2 草案的两处偏差，都需要知情：**
+ * 从存活期事件流折出来（`src/app/run-driver-activity.ts`），所以它和 agent 半边一样是
+ * **本进程持有该 run 时**才有的观察——进程重启后 driver 状态的持久记录在 `timeline` 上
+ * （§7.4），不在这个字段里。
+ *
+ * `state` 三个值都有真实生产者，且都是**观测到的**（不是补出来的）：
+ * `turn_running` ← `driver.turn_started`；`tool_running` ← `driver.tool_started` /
+ * `driver.tool_progress`；`disconnected` ← `driver.disconnected`（实测它不是正常收尾：
+ * 24 个含 `disconnect` 的 run 没有一个同时有 turn 事件）。
+ *
+ * `turn_completed` / `turn_failed` **不映射成状态**，它们让这个字段消失：那一轮 invoke
+ * 已经结束，结局（`stop_reason` / `reason`）本来就在事件流里，在状态里再说一遍只是同一件
+ * 事说两遍。所以字段缺席 = 此刻没有在跑的 driver 调用，而不是「driver 空闲」。
+ *
+ * `since` 是当前状态的起点；`last_event_at` 是**任意** driver 事件的最近时间（含 chunk），
+ * `stale` 只看后者——片段一直在流就说明 driver 活着，哪怕它在同一个工具上待了很久。
+ */
+export const runDriverActivitySchema = z
+  .object({
+    state: z.enum(['turn_running', 'tool_running', 'disconnected']),
+    since: z.string().min(1),
+    last_event_at: z.string().min(1),
+    /** 很久没有任何 driver 事件：可能卡住了，而不是「还在想」。 */
+    stale: z.boolean(),
+    /**
+     * 工具身份与标题，**刻意只有这四个**：`raw_input` / `raw_output` / `content` /
+     * `locations` 不进契约（§4.2 的 D3——隐私与体积，不是技术限制）。要全文按需拉取。
+     */
+    tool_call_id: z.string().min(1).optional(),
+    /** 只在 `_meta.claudeCode.toolName` 存在时有值（ACP 把 `_meta` 声明在顶层，真实环境可能取不到）。 */
+    tool_name: z.string().min(1).optional(),
+    tool_kind: z.string().min(1).optional(),
+    tool_title: z.string().min(1).optional(),
+  })
+  .strict();
+
+/**
+ * 在飞运行态：此刻**真正在动**的 agent 席位，每个席位带上它自己的 driver 半边。
+ *
+ * **与 §4.2 草案的偏差，都需要知情：**
  *
  * 1. **草案里 `activity` 是单数对象，这里是列表。** council 一次会并发多个席位，而状态点
  *    是按 `(run_id, role_id)` 索引的——单数对象只能挑一个席位报，等于随机丢掉另外三个。
  *    所以每个元素自带 `role_id`。
  * 2. **`state` 只声明了两个值。** 草案列了 6 个（`idle` / `thinking` / `tool_call` /
  *    `delegating` / `waiting_human` / `unknown`），其余四个目前**没有写入点**。按草案自己
- *    的原则（「不要设计永远不出现的枚举值」），有生产者了再加。`driver` 半边同理——它需要
- *    §5(b) 的分流（状态类 driver 事件进协调事件流），是另一件事。
+ *    的原则（「不要设计永远不出现的枚举值」），有生产者了再加。
+ * 3. **driver 半边挂在每个席位内部**（`agents[].driver`），而不是平铺成第二级列表。理由：
+ *    driver 事件本来就被 facade 盖上调用它的 `role_id`，所以「哪个席位的 driver」是事实而
+ *    不是推断；挂进席位也让 `subject: 'agent'` 继续成立（这个块讲的就是 agent）。
  *
- * **缺席语义**：`activity` 整个字段缺失 = 此刻没有覆盖到的在飞状态。**不给 `idle`**：进程
- * 活着但不在状态点里，与「状态点漏了」从这一份数据上分不出来，报 `idle` 是在替读者下结论。
+ * **缺席语义**：`activity` 整个字段缺失 = 此刻没有覆盖到的在飞状态；`agents[].driver`
+ * 缺失 = 这个席位此刻没有在跑的 driver 调用。**不给 `idle`**：进程活着但不在状态点里，
+ * 与「状态点漏了」从这一份数据上分不出来，报 `idle` 是在替读者下结论。
  */
 export const runActivityEntrySchema = z
   .object({
@@ -189,8 +230,20 @@ export const runActivityEntrySchema = z
     /** 停在这个状态太久：进程可能已经卡住，而不是「还在想」。 */
     stale: z.boolean(),
     round: z.number().int().nonnegative().optional(),
-    /** 工具名。`delegating` 时是 `invoke_driver`；取不到时缺席，不编。 */
+    /**
+     * **agent 循环自己**在调的工具。`delegating` 时是 `invoke_driver`——注意它与下面
+     * `driver.tool_name` 不是一回事：那个是 driver 子进程内部在跑的工具名。
+     * 取不到时缺席，不编。
+     */
     tool_name: z.string().min(1).optional(),
+    /**
+     * 这个席位此刻在驱动的 turn / 工具；没有在跑的 driver 调用时缺席。
+     *
+     * **父子一致性**：只在 `state === 'delegating'` 时出现。这不只是约定——投影是按这个
+     * 判据挂的（见 `run-activity-projection.ts`），所以 agent 一回到自主思考，它整组消失，
+     * 不会把上一次的工具名残留下来。
+     */
+    driver: runDriverActivitySchema.optional(),
   })
   .strict();
 
@@ -411,6 +464,7 @@ export type RunSnapshot = z.infer<typeof runSnapshotSchema>;
 export type RunUsage = z.infer<typeof runUsageSchema>;
 export type RunActivity = z.infer<typeof runActivitySchema>;
 export type RunActivityEntry = z.infer<typeof runActivityEntrySchema>;
+export type RunDriverActivity = z.infer<typeof runDriverActivitySchema>;
 export type RunUsageHistory = z.infer<typeof runUsageHistorySchema>;
 export type RunUsageTokens = z.infer<typeof runUsageTokensSchema>;
 export type RunUsageStageMetrics = z.infer<typeof runUsageStageMetricsSchema>;
