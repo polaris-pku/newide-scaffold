@@ -7,7 +7,10 @@
  *    活着，哪怕在同一个工具上待了很久；
  * 3. **turn 收尾不是状态**——`turn_completed` / `turn_failed` 让状态消失，而不是变成某个
  *    「空闲」值；
- * 4. **`disconnected` 是状态**（实测它是异常而不是正常收尾），且不被后续 phase/chunk 冲掉；
+ * 4. **`disconnected` 只在「没跑完一轮就掉线」时报**——干净跑完一轮之后进程正常退出的那一次
+ *    只是 invoke 的尾巴（2026-10-04 的第一次真实 run：每次 invoke 都是
+ *    `turn_completed` → `disconnect`，`code: 0`），报成状态会让面板在两次 invoke 之间闪一下
+ *    「掉线」；且它不被后续 phase/chunk 冲掉；
  * 5. **部分更新要叠加**——`tool_progress` 不能把 `tool_started` 带出来的名字冲掉，但换了
  *    工具就不能把上一个工具的名字带过来。
  */
@@ -155,6 +158,70 @@ describe('projectDriverActivityByRole', () => {
       event('driver.turn_started', '2026-10-03T00:00:31.000Z'),
     ]).get('role_a');
     expect(restarted).toMatchObject({ state: 'turn_running', since: '2026-10-03T00:00:31.000Z' });
+  });
+
+  it('does not turn a clean per-invoke exit into a disconnected state', () => {
+    // 2026-10-04 的第一次真实 run：47 秒里两次 invoke，每次都是
+    // `turn_completed` → `disconnect`（`code: 0`，进程正常退出）。把那条尾巴报成状态，
+    // 面板就会在两次委派之间闪一下「driver 掉线」——上一次 invoke 的结局落在了新一次
+    // delegating 的窗口里。
+    const folded = fold([
+      event('driver.turn_started', T0),
+      event('driver.tool_started', '2026-10-03T00:00:01.000Z', { tool_call_id: 'tc_1' }),
+      event('driver.tool_completed', '2026-10-03T00:00:02.000Z', { tool_call_id: 'tc_1' }),
+      event('driver.turn_completed', '2026-10-03T00:00:03.000Z'),
+      event('driver.disconnected', '2026-10-03T00:00:04.000Z', { code: 0 }),
+    ]);
+
+    expect(folded.size).toBe(0);
+  });
+
+  it('still reports a disconnect that ends an invoke which never finished a turn', () => {
+    // 另一半：真实掉线（这一轮没跑完）不许被上面那条规则吞掉。实测 74 次 disconnect 里
+    // 72 次是这一种——全部报不出来就等于把最常见的异常信号删掉了。
+    expect(
+      fold([
+        event('driver.turn_started', T0),
+        event('driver.disconnected', '2026-10-03T00:00:01.000Z', { code: 0 }),
+      ]).get('role_a'),
+    ).toMatchObject({ state: 'disconnected', since: '2026-10-03T00:00:01.000Z' });
+
+    // 失败收尾也一样不算干净：`turn_failed` 之后的掉线仍然要报。
+    expect(
+      fold([
+        event('driver.turn_started', T0),
+        event('driver.turn_failed', '2026-10-03T00:00:01.000Z'),
+        event('driver.disconnected', '2026-10-03T00:00:02.000Z'),
+      ]).get('role_a'),
+    ).toMatchObject({ state: 'disconnected' });
+
+    // 而「干净收尾过」**不能**跨越一次新的 invoke 继续生效：新的 `turn_started` 必须把
+    // 「跑完过一轮」归零，否则后面真正掉线的那一次会被上一次的干净收尾闭嘴。
+    //
+    // 这条断言是**反向对照逼出来的**：原来那版把「干净收尾」和「掉线」写在一起，于是中间那条
+    // 掉线顺手把标记清了，撤掉 `turn_started` 的归零也照样绿——那条对照什么都没证明。
+    const acrossInvokes = fold([
+      event('driver.turn_started', T0),
+      event('driver.turn_completed', '2026-10-03T00:00:01.000Z'),
+      event('driver.turn_started', '2026-10-03T00:00:02.000Z'),
+      event('driver.disconnected', '2026-10-03T00:00:03.000Z'),
+    ]);
+    expect(acrossInvokes.get('role_a')).toMatchObject({
+      state: 'disconnected',
+      since: '2026-10-03T00:00:03.000Z',
+    });
+
+    const afterCleanExit = fold([
+      event('driver.turn_started', T0),
+      event('driver.turn_completed', '2026-10-03T00:00:01.000Z'),
+      event('driver.disconnected', '2026-10-03T00:00:02.000Z', { code: 0 }),
+      event('driver.turn_started', '2026-10-03T00:00:03.000Z'),
+      event('driver.disconnected', '2026-10-03T00:00:04.000Z', { code: 0 }),
+    ]);
+    expect(afterCleanExit.get('role_a')).toMatchObject({
+      state: 'disconnected',
+      since: '2026-10-03T00:00:04.000Z',
+    });
   });
 
   it('treats chunks as liveness so a long tool call is not reported stale while it streams', () => {

@@ -183,8 +183,10 @@ export const runUsageHistorySchema = z
  *
  * `state` 三个值都有真实生产者，且都是**观测到的**（不是补出来的）：
  * `turn_running` ← `driver.turn_started`；`tool_running` ← `driver.tool_started` /
- * `driver.tool_progress`；`disconnected` ← `driver.disconnected`（实测它不是正常收尾：
- * 24 个含 `disconnect` 的 run 没有一个同时有 turn 事件）。
+ * `driver.tool_progress`；`disconnected` ← `driver.disconnected`，但**只在这一轮没跑完就掉线
+ * 时报**：实测 74 次 `disconnect` 里 72 次之前没有任何 `turn_completed`（那才是「起来又掉了」）。
+ * 干完一轮之后进程正常退出的那一次只是这次 invoke 的尾巴——报出来会让面板在两次 invoke
+ * 之间闪一下「掉线」，所以它只清状态。退出码区分不了：74 次里 72 次是 `code: 0`。
  *
  * `turn_completed` / `turn_failed` **不映射成状态**，它们让这个字段消失：那一轮 invoke
  * 已经结束，结局（`stop_reason` / `reason`）本来就在事件流里，在状态里再说一遍只是同一件
