@@ -25,6 +25,13 @@ export interface AgentTaskRequest {
   task_id?: string;
   /** 本次执行所属 run；进程内调用留档（CallJournalPort）的 journal 外键前提 */
   run_id?: string;
+  /**
+   * 面向**观测**的 run：在飞状态点（`agent-activity`）按它归集。
+   *
+   * council 下每次席位执行都有自己的执行身份（`${run_id}_${phaseId}`），而面板看的是任务
+   * 那个 run；缺省等于 `run_id`。
+   */
+  activity_run_id?: string;
   /** 本次执行的工作区（绝对路径）；Session 绑定键 (task, workspace, role) 之一 */
   workspace_path?: string;
   /** Driver 调用 ID，写入 AgentContextSnapshot.driver_calls 供溯源 */

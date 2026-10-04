@@ -214,7 +214,11 @@ export class Agent {
     const role_id = this.memory.role_id;
     // 在飞状态点：`agent.llm_round` 要等这次调用**结束**才落盘，所以「正在等 LLM」只能
     // 在这里先写下来。没有 run_id 时整个状态点空转（不编假键）。
-    const run_id = this.currentTask?.run_id;
+    //
+    // 用 `activity_run_id` 优先：council 下每次席位执行的身份是 `${run_id}_${phaseId}`
+    // （相位隔离需要），而面板按**任务那个 run** 读状态——按执行身份写就等于写了一份谁也
+    // 看不见的状态。两者在单 agent 路径上是同一个值。
+    const run_id = this.currentTask?.activity_run_id ?? this.currentTask?.run_id;
     const response = await withAgentActivity(
       { run_id, role_id, kind: 'awaiting_llm', round },
       () =>

@@ -38,6 +38,15 @@ export interface AgentExecutionRequest {
   mailbox_delivery_id?: string;
   input_artifact_refs: ArtifactId[];
   context_policy: string;
+  /**
+   * 这次执行在**面板/观测**那一侧属于哪个 run。
+   *
+   * 与 `run_id` 分开是因为它们在 council 下真的不同：每个席位每一相位都拿
+   * `${run_id}_${phaseId}`（`createId('council_phase')`）当执行身份——相位之间必须隔离，
+   * 否则信箱幂等键、driver 会话记账会互相撞车——而面板看的是**任务那个 run**。
+   * 在飞状态（`activity`）按这个字段归集；缺它就退回 `run_id`（单 agent 路径两者相同）。
+   */
+  activity_run_id?: RunId;
   /** RFC §1.2 memory ablation; applied by production Agent execution facade. */
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   schema_version: SchemaVersion;

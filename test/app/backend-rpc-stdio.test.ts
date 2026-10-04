@@ -29,6 +29,7 @@ import {
   type ToolCallingClient,
 } from '../../src/memory';
 import { SqliteCoordinationStore } from '../../src/persistence';
+import { listAgentActivities } from '../../src/telemetry';
 import type { BackendBRuntime } from '../../src/app/production-b-runtime';
 import {
   BMemoryMaintenanceRunner,
@@ -676,7 +677,22 @@ import { join } from 'node:path';
       const unsubscribe = service.subscribe(councilCreated.run_id, (event) =>
         notifications.push(event),
       );
+      // 议会阶段一度是面板的盲区：席位执行拿 `${run_id}_${phaseId}` 当**执行身份**
+      // （相位之间要隔离信箱幂等键与 driver 记账），而在飞状态被写进了那个 key——面板按
+      // run id 读，于是整段议会（一次 run 里最长的一段）看不见，尽管 199 条 driver 事件
+      // 一条不少地流着。这里在下游按住不变量：**一个 run 的在飞状态只许挂在它自己的 run id 上**。
+      const observedActivityKeys = new Set<string>();
+      const activityPoll = setInterval(() => {
+        for (const activity of listAgentActivities()) {
+          observedActivityKeys.add(`${activity.run_id}|${activity.role_id}|${activity.kind}`);
+        }
+      }, 10);
       const councilSnapshot = await waitForTerminal(service, councilCreated.run_id);
+      clearInterval(activityPoll);
+      expect(observedActivityKeys.size).toBeGreaterThan(0);
+      expect(
+        [...observedActivityKeys].every((key) => key.startsWith(`${councilCreated.run_id}|`)),
+      ).toBe(true);
       unsubscribe();
       expect(councilSnapshot.status).toBe('completed');
       const externalCouncilSnapshot = service.getRunSnapshot(councilCreated.run_id);
