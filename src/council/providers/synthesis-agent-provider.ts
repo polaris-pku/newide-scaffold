@@ -237,10 +237,11 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       diagnosticRefs,
       REVIEW_ATTEMPTS,
       async () => {
-        await prepareCouncilWorkspace(
-          options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
-          reviewerWorkspace,
-        );
+        // A plan reviewer needs the same repository baseline as the authors in
+        // order to validate file paths, APIs, and tests instead of reviewing
+        // prose in isolation. The snapshot is a separate Council worktree/copy,
+        // so reviewer tools cannot mutate the user's source workspace.
+        await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
         await stageCouncilArtifacts(reviewerWorkspace, candidateArtifacts);
         await writeProposalManifest(reviewerWorkspace, proposals, candidateArtifacts);
       },
@@ -1486,9 +1487,10 @@ function buildReviewerInstruction(
     return [
       `Review the staged Council Plan inputs for: ${question}.`,
       `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
-      'Read proposals.json for proposal summaries and the exact mapping from proposal_id to staged input files. Read only those files inside this workspace; do not inspect parent directories, run state, market ledgers, other sessions or driver streams.',
+      'This workspace contains an isolated snapshot of the task repository plus the staged proposal inputs. Inspect the repository files needed to verify each Plan against the actual codebase.',
+      'Read proposals.json for proposal summaries and the exact mapping from proposal_id to staged input files. Stay inside this workspace; do not inspect parent directories, run state, market ledgers, other sessions or driver streams.',
       'Compare scope, implementation feasibility, unnecessary changes, risks, and verification coverage.',
-      'Do not modify product files.',
+      'Treat repository files as read-only: do not modify product files. Only reviews.json is an allowed review deliverable.',
       `Write exactly one review per proposal to the relative path ${REVIEW_FILE} at the root of the current role workspace; never construct an absolute path. The file must contain {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. That file is the review deliverable — a summary in the Driver report is not a substitute for it.`,
       'Then return the normal structured Driver report.',
     ].join(' ');
