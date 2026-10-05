@@ -289,6 +289,14 @@ export const runSnapshotSchema = z
     task_id: z.string().min(1),
     mode: z.enum(['single_agent', 'council']),
     status: z.enum(['running', 'completed', 'failed', 'cancelled']),
+    /**
+     * 这个 Run **实际**使用的 driver。
+     *
+     * 取自 `agent.execution_completed` 事件里落下的 `diagnostics.driver_id`——那是真跑的
+     * 那一个，不是配置里的默认值（`roles` 会把执行的 role 映射到别的 driver）。
+     * 还没有任何 agent 执行完成时缺席，不编一个默认值。
+     */
+    driver_id: z.string().min(1).optional(),
     quality: runOutcomeSchema.optional(),
     current: z
       .object({

@@ -14,6 +14,7 @@ import {
   type Timestamp,
 } from '../core';
 import type { AppRunMode } from './run-registry';
+import type { PersistedDriverConfig } from '../driver';
 import { runSnapshotSchema, type RunSnapshot } from '../protocol/run-snapshot';
 
 export interface PersistedRunRequest {
@@ -25,6 +26,13 @@ export interface PersistedRunRequest {
   session_id?: string;
   task_request?: TaskCreateRequest;
   mode: AppRunMode;
+  /**
+   * 该 Run 创建时**冻结**的 driver 配置投影。
+   *
+   * 冻结而不是每次调用重新解析，是「改动只影响新 Run」的实现：在飞 Run 用自己那一份。
+   * 缺省（老 run）表示当时还是写死的单 driver。
+   */
+  driver_config?: PersistedDriverConfig;
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   project_id?: string;
   client_task_id?: string;
@@ -70,6 +78,11 @@ export class FileRunRequestStore implements RunRequestStore {
   constructor(
     private readonly runsRoot = '.newide/runs',
     private readonly now: () => Timestamp = () => new Date().toISOString(),
+    /**
+     * 进程启动时解析并冻结的 driver 配置；缺省不写 `driver_config`
+     * （测试与历史路径保持原样）。
+     */
+    private readonly driverConfig?: PersistedDriverConfig,
   ) {}
 
   async save(request: Omit<PersistedRunRequest, 'schema_version' | 'created_at'>): Promise<void> {
@@ -77,6 +90,7 @@ export class FileRunRequestStore implements RunRequestStore {
     await fs.mkdir(runDir, { recursive: true });
     const persisted: PersistedRunRequest = {
       schema_version: SCHEMA_VERSION,
+      ...(this.driverConfig ? { driver_config: this.driverConfig } : {}),
       ...request,
       created_at: this.now(),
     };

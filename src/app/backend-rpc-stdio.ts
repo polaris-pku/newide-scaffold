@@ -16,7 +16,7 @@ import {
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
-import { createDriverRegistry, loadDriverConfig } from '../driver';
+import { createDriverRegistry, loadDriverConfig, projectDriverConfigForRun } from '../driver';
 import {
   LiteLLMToolCallingClient,
   type LlmClient,
@@ -558,7 +558,9 @@ export async function createProductionBackendService(
         (taskId) => serviceHolder.service?.getAccumulatedDriverUsage(taskId),
         coordinationStore,
       ),
-      new FileRunRequestStore(runsRoot),
+      // 第三个参数是进程启动时冻结的 driver 配置：写进每个新 Run 的 request.json，
+      // 使「配置改动只影响新 Run」有据可依。
+      new FileRunRequestStore(runsRoot, undefined, projectDriverConfigForRun(driverConfig)),
       taskProcessor,
       mailboxService,
       mailboxRecovery,

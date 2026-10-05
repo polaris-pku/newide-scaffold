@@ -265,6 +265,50 @@ describe('NewideBackendService run restart', () => {
       await rm(runsRoot, { recursive: true, force: true });
     }
   });
+
+  it('freezes the driver config into every new request.json', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'run-request-driver-'));
+    const driverConfig = {
+      default_driver: 'claude',
+      drivers: { claude: 'claude', codex: 'codex' },
+      roles: { reviewer: 'codex' },
+    };
+    const store = new FileRunRequestStore(runsRoot, undefined, driverConfig);
+    try {
+      await store.save({
+        run_id: 'run_driver',
+        task_id: 'task_driver',
+        prompt: 'Route by role',
+        workspace_path: '/tmp/workspace-driver',
+        mode: 'single_agent',
+      });
+
+      // 冻结的是创建时那一份：在飞 Run 不重新读配置，改动只影响新 Run
+      await expect(store.load('run_driver')).resolves.toMatchObject({
+        driver_config: driverConfig,
+      });
+    } finally {
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('omits driver_config when no config was injected', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'run-request-no-driver-'));
+    const store = new FileRunRequestStore(runsRoot);
+    try {
+      await store.save({
+        run_id: 'run_plain',
+        task_id: 'task_plain',
+        prompt: 'No driver config',
+        workspace_path: '/tmp/workspace-plain',
+        mode: 'single_agent',
+      });
+
+      await expect(store.load('run_plain')).resolves.not.toHaveProperty('driver_config');
+    } finally {
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 async function requestPersisted(runsRoot: string, runId: string): Promise<void> {

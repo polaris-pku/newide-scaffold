@@ -219,3 +219,33 @@ function assertReferencesResolve(config: DriverConfig, sourcePath?: string): voi
 
   if (errors.length > 0) throw new DriverConfigError(errors);
 }
+
+/**
+ * 冻结进 Run 的配置投影。
+ *
+ * 刻意**不是**整份 {@link DriverConfig}：只留审计与回显需要的三个字段，这样以后档案
+ * schema 增删字段时，历史 `request.json` 不会因为形状变化而读不出来。
+ */
+export interface PersistedDriverConfig {
+  /** 未被显式映射的 role 当时落到哪个 driver。 */
+  default_driver: string;
+  /** driver_id → A 侧 agent。 */
+  drivers: Record<string, string>;
+  /** role_id → driver_id。 */
+  roles?: Record<string, string>;
+}
+
+/**
+ * 把配置投影成可冻结的形式。
+ *
+ * 「配置改动只影响新 Run」靠的就是这份快照：在飞 Run 用它自己那一份，不重新读配置。
+ */
+export function projectDriverConfigForRun(config: DriverConfig): PersistedDriverConfig {
+  return {
+    default_driver: config.default_driver,
+    drivers: Object.fromEntries(
+      Object.entries(config.drivers).map(([driverId, profile]) => [driverId, profile.agent]),
+    ),
+    ...(config.roles ? { roles: { ...config.roles } } : {}),
+  };
+}

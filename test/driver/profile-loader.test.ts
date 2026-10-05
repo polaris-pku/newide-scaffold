@@ -21,6 +21,7 @@ import {
   mergeDriverConfigLayers,
   parseDriverConfig,
   parseDriverConfigLayer,
+  projectDriverConfigForRun,
   resolveRoleDriver,
   type DriverConfig,
 } from '../../src/driver';
@@ -234,6 +235,37 @@ describe('mergeDriverConfigLayers', () => {
 
     expect(resolveRoleDriver(config, 'any-role').profile.capabilities).toEqual({
       supports_tool_events: true,
+    });
+  });
+});
+
+describe('projectDriverConfigForRun', () => {
+  it('keeps only the auditable shape, not the whole profile', () => {
+    const config = parseDriverConfig({
+      default_driver: 'claude',
+      drivers: {
+        claude: { agent: 'claude', runtime: { env: { ANTHROPIC_BASE_URL: 'https://x.example' } } },
+        codex: { agent: 'codex', credentials: { env: ['OPENAI_API_KEY'] } },
+      },
+      roles: { reviewer: 'codex' },
+    });
+
+    expect(projectDriverConfigForRun(config)).toEqual({
+      default_driver: 'claude',
+      drivers: { claude: 'claude', codex: 'codex' },
+      roles: { reviewer: 'codex' },
+    });
+  });
+
+  it('omits roles when the config has none', () => {
+    const config = parseDriverConfig({
+      default_driver: 'claude',
+      drivers: { claude: { agent: 'claude' } },
+    });
+
+    expect(projectDriverConfigForRun(config)).toEqual({
+      default_driver: 'claude',
+      drivers: { claude: 'claude' },
     });
   });
 });

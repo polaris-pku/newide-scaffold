@@ -1046,6 +1046,33 @@ describe('TaskProcessor', () => {
     store.close();
   });
 
+  it('exposes the driver that actually ran, not the configured default', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({
+      task_id: 'task_processor',
+      run_id: 'run_processor',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+    });
+
+    // 还没有 agent 执行完成时缺席，不编一个默认值
+    expect(projectRun(store, 'task_processor', 'run_processor').driver_id).toBeUndefined();
+
+    processor.recordRunEvent(
+      'run_processor',
+      event('event_driver_done', 'agent.execution_completed', {
+        agent_id: 'role_reviewer',
+        session_id: 'session_driver',
+        diagnostics: { driver_id: 'driver_codex' },
+      }),
+    );
+
+    // 取的是事件里落下的真跑值：role 被 roles 映射到 codex，而不是 default_driver
+    expect(projectRun(store, 'task_processor', 'run_processor').driver_id).toBe('driver_codex');
+    store.close();
+  });
+
   it('blocks interrupted active runs once and saves a resumable full checkpoint', () => {
     const { processor, store } = createProcessor();
     processor.beginRun({
