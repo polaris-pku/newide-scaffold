@@ -288,7 +288,10 @@ export function mergeTokenUsageSummaries(
   const by_source: RunTokenUsageSummary['by_source'] = {};
   for (const part of usable) {
     for (const source of part.sources.length > 0 ? part.sources : [part.source]) {
-      if (source !== 'proxy' && source !== 'claude_session_jsonl') continue;
+      // 只挡掉汇总态自己的合成标签（`unavailable` / `mixed`），**不再白名单具体腿名**：
+      // driver 计费腿的名字由 driver 档案声明，白名单会让新 driver 的那条腿在合并时
+      // 被静默丢掉——那正是「口径被写坏」的形态。
+      if (source === 'unavailable' || source === 'mixed' || source.length === 0) continue;
       const slice = part.by_source[source] ?? {
         input_tokens: part.input_tokens,
         output_tokens: part.output_tokens,
@@ -314,10 +317,9 @@ export function mergeTokenUsageSummaries(
     }
   }
 
-  const sources = (Object.keys(by_source) as Array<keyof typeof by_source>).filter(
-    (key): key is 'proxy' | 'claude_session_jsonl' => by_source[key] !== undefined,
-  );
-  sources.sort();
+  const sources = Object.keys(by_source)
+    .filter((key) => by_source[key] !== undefined)
+    .sort();
   const input_tokens = sources.reduce((sum, key) => sum + (by_source[key]?.input_tokens ?? 0), 0);
   const output_tokens = sources.reduce((sum, key) => sum + (by_source[key]?.output_tokens ?? 0), 0);
   const cache_creation_input_tokens = sources.reduce(

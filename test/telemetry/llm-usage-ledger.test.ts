@@ -94,6 +94,47 @@ describe('llm-usage-ledger', () => {
     expect(merged.by_source.claude_session_jsonl?.total_tokens).toBe(34);
   });
 
+  it('keeps a driver-declared source instead of silently dropping it', () => {
+    // 这条守的是「口径被写坏」的具体形态：合并时若按字面量白名单过滤 source，
+    // 换 driver 之后那条计费腿会**静默消失**——总量凭空变小，且不报错。
+    const proxy = toRunTokenUsageSummary([
+      {
+        input_tokens: 10,
+        output_tokens: 5,
+        source: 'proxy',
+        recorded_at: '2026-01-01T00:00:00.000Z',
+      },
+    ]);
+    const codex = toRunTokenUsageSummary([
+      {
+        input_tokens: 20,
+        output_tokens: 8,
+        source: 'codex_jsonl',
+        recorded_at: '2026-01-01T00:00:00.000Z',
+      },
+    ]);
+
+    const merged = mergeTokenUsageSummaries([proxy, codex]);
+
+    expect(merged.by_source.codex_jsonl?.total_tokens).toBe(28);
+    expect(merged.total_tokens).toBe(15 + 28);
+    expect(merged.sources).toContain('codex_jsonl');
+  });
+
+  it('still drops the summary labels that are not real legs', () => {
+    // `unavailable` / `mixed` 是汇总态自己的合成标签，不是可加总的腿。
+    const synthetic = toRunTokenUsageSummary([
+      {
+        input_tokens: 7,
+        output_tokens: 3,
+        source: 'mixed',
+        recorded_at: '2026-01-01T00:00:00.000Z',
+      },
+    ]);
+
+    expect(mergeTokenUsageSummaries([synthetic]).by_source).toEqual({});
+  });
+
   it('attributes usage from the ambient scope and groups it by stage and role', async () => {
     resetLlmUsageDropCounters();
     const sink = new InMemoryTelemetrySink();

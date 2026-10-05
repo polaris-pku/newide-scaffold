@@ -29,6 +29,7 @@ import { TaskRpcMethods } from '../rpc/task-methods';
 import { MailboxRpcMethods } from '../rpc/mailbox-methods';
 import { MemoryRpcMethods } from '../rpc/memory-methods';
 import { FileRunEvidenceStore, SqliteCoordinationStore } from '../persistence';
+import { DEFAULT_DRIVER_BILLED_SOURCE } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
 import { ProtocolCallJournal } from './protocol-call-journal';
 import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
@@ -590,6 +591,9 @@ export async function createProductionBackendService(
       // 历史读账本而不是扫目录：目录树没有任何保留策略，往期一旦被清理，重算出来的
       // 「累计」会变小。首次读会惰性回填一次目录树里已有的用量（幂等）。
       new LedgerRunUsageHistoryReader(coordinationStore, runsRoot),
+      // driver 计费腿的名字按档案解析，缺省仍是历史名 claude_session_jsonl。
+      driverConfig.drivers[driverConfig.default_driver]?.billing?.source ??
+        DEFAULT_DRIVER_BILLED_SOURCE,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();

@@ -17,18 +17,19 @@
  * 一条都没有时整个 `usage` 缺席——不编一个 0 出来。
  */
 import type { RunSnapshot, RunUsage, RunUsageTokens } from '../protocol/run-snapshot';
-import type { TokenUsageSource } from '../persistence';
+import { DEFAULT_DRIVER_BILLED_SOURCE, type TokenUsageSource } from '../persistence';
 import type { TaskDriverUsage } from './driver-usage-projector';
 import { resolveTokenUsageFromTimeline, summarizeRunConsumption } from './run-terminal-output-writer';
 import type { DurableRunUsage } from './run-usage-history';
 
 /**
- * driver 计费腿的来源名。
+ * driver 计费腿的**缺省**来源名。
  *
- * 用 `satisfies` 挂在账本那一层的取值域上：这个名字在两处必须一致——「还差哪条腿」（这里）
- * 与「账本里有哪条腿」（`src/persistence`）讲的是同一批腿。
+ * 零配置（单个 `acp-external` + claude）时就是它——账本、事件流、`summary.json` 里
+ * 已经全是这个名字，换一个会让新旧 run 对不上账。真正生效的名字由组装点从 driver
+ * 档案（`DriverProfile.billing.source`）解析后传进 `pendingBilledSources`。
  */
-export const DRIVER_BILLED_SOURCE = 'claude_session_jsonl' satisfies TokenUsageSource;
+export const DRIVER_BILLED_SOURCE = DEFAULT_DRIVER_BILLED_SOURCE satisfies TokenUsageSource;
 
 export interface RunUsageProjectionInput {
   /**
@@ -66,9 +67,15 @@ export interface RunUsageProjectionInput {
  * 返回空数组表示「该到的都到了」（已收尾的 run）。收尾之后某条腿仍然缺席时，成因在
  * `summary.json` 的 `driver_billed_merge` 里（§7.9），**不**在这里报——那是「为什么没有」，
  * 这是「还没到时候」。
+ *
+ * @param driverBilledSource 本部署实际使用的 driver 计费腿名。由组装点从 driver 档案
+ *   解析后传入；缺省是历史名 `claude_session_jsonl`，也就是零配置时的取值。
  */
-export function pendingBilledSources(status: RunSnapshot['status']): string[] {
-  return status === 'running' ? [DRIVER_BILLED_SOURCE] : [];
+export function pendingBilledSources(
+  status: RunSnapshot['status'],
+  driverBilledSource: string = DRIVER_BILLED_SOURCE,
+): string[] {
+  return status === 'running' ? [driverBilledSource] : [];
 }
 
 export function projectRunUsage(input: RunUsageProjectionInput): RunUsage | undefined {
