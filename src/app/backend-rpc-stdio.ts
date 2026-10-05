@@ -302,6 +302,9 @@ export async function createProductionBackendService(
     );
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
+      // driver 可配置化：role 显式映射优先，否则落 default_driver。未配置任何档案时
+      // 这条解析恒等于上面那个 driver，行为与历史一致。
+      resolveDriver: (roleId) => driverRegistry.resolveForRole(roleId).handle,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),

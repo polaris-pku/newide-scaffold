@@ -92,6 +92,14 @@ import type {
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
   driver: DriverRuntimeHandle;
+  /**
+   * 按 B 侧 role 解析 driver。缺省时所有 role 都用 `driver`，即历史单 driver 行为。
+   *
+   * role 从 `invocationContext`（ALS）取——`execute_agent`、council 各席位、mailbox
+   * 投递都从同一个入口进，所以解析点只需收敛在这里一处，调用方不必各自叠一层。
+   * driver 是 per-role 的无状态工具：换 driver 不影响 B 侧记忆（它绑在 role_id 上）。
+   */
+  resolveDriver?: (roleId: string) => DriverRuntimeHandle;
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
@@ -165,11 +173,22 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly executionQueues = new Map<string, Promise<void>>();
   private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
-  private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
+  /** 按 role 解析 driver；未配置档案时恒为构造时那一个（历史行为）。 */
+  private readonly driverFor: (roleId: string) => DriverRuntimeHandle;
+  /**
+   * 每个 driver_id 各持一个 invoker。
+   *
+   * `createDriverRuntimeInvoker` 把 driver 闭包进去，并硬校验
+   * `input.source_driver === driver.driver_id`，所以不能共用一个。
+   */
+  private readonly driverInvokers = new Map<
+    string,
+    ReturnType<typeof createDriverRuntimeInvoker>
+  >();
   private readonly adpEndpoint?: AdpDriverEndpoint;
 
   constructor(private readonly options: DriverRuntimeAgentExecutionFacadeOptions) {
-    this.invokeDriverRuntime = createDriverRuntimeInvoker(options.driver);
+    this.driverFor = options.resolveDriver ?? (() => options.driver);
     if (options.adp) {
       this.adpEndpoint = new AdpDriverEndpoint({
         store: options.adp.store,
@@ -189,6 +208,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
 
   async ready(): Promise<void> {
     await this.manager;
+  }
+
+  /** 取（并按 driver_id 缓存）某个 driver 的 invoker。 */
+  private invokerFor(driver: DriverRuntimeHandle) {
+    const existing = this.driverInvokers.get(driver.driver_id);
+    if (existing) return existing;
+    const created = createDriverRuntimeInvoker(driver);
+    this.driverInvokers.set(driver.driver_id, created);
+    return created;
   }
 
   private createManager(): Promise<AgentManager> {
@@ -246,6 +274,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   ): Promise<string> {
     await this.ensureRole(input.role_id);
     throwIfAborted(options?.signal);
+    // 会话 provisioning 也必须按 role 选 driver：否则会把某个 agent 的会话发给另一个。
+    const driver = this.driverFor(input.role_id);
     const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
@@ -263,13 +293,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ? (event) => options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
       : undefined;
     let result = await runDriverPromptWithSignal(
-      this.options.driver, prompt, options?.signal, onDriverEvent,
+      driver, prompt, options?.signal, onDriverEvent,
     );
     if (isArtifactFreeRetryableFailure(result) && !/\bSESSION_READY\b/.test(result.response ?? '')) {
-      const sessionId = result.session_id && result.session_id !== this.options.driver.session_id && result.session_id !== 'session-unavailable'
+      const sessionId = result.session_id && result.session_id !== driver.session_id && result.session_id !== 'session-unavailable'
         ? result.session_id : undefined;
       result = await runDriverPromptWithSignal(
-        this.options.driver,
+        driver,
         { ...prompt, run_id: `${prompt.run_id}:retry`, ...(sessionId ? { session_id: sessionId } : {}) },
         options?.signal,
         onDriverEvent,
@@ -277,7 +307,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     }
     const usableSession =
       Boolean(result.session_id) &&
-      result.session_id !== this.options.driver.session_id &&
+      result.session_id !== driver.session_id &&
       result.session_id !== 'session-unavailable';
     // Claude Agent SDK can stream SESSION_READY then throw a DeepSeek 402 on a
     // follow-up (title / telemetry). The init turn already succeeded.
@@ -466,7 +496,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
       ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       call_id: createId('call'),
-      source_driver: this.options.driver.driver_id,
+      // 归属到本 role 实际会用的 driver，与真正下发的那一个保持一致。
+      source_driver: this.driverFor(runtimeRoleId).driver_id,
     };
     const inboundMailbox = input.mailbox_delivery_id
       ? this.requireInboundMailbox(input)
@@ -929,6 +960,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error('A C role execution can invoke the driver only once');
     }
     throwIfAborted(invocation.signal);
+    // 解析点收敛在这里：role 来自 ALS，任何进入 invoke_driver 的路径都经过它。
+    const driver = this.driverFor(invocation.role_id);
     try {
       const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
         task_instruction: invocation.driver_instruction,
@@ -950,14 +983,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         onLateResult?: (execution: DriverRunResult) => void;
       }) => {
         invocation.driver_attempts += 1;
-        return this.invokeDriverRuntime(
+        return this.invokerFor(driver)(
           {
             task_id: invocation.task_id,
             run_id: invocation.run_id,
             ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
             ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
             call_id: createId('call'),
-            source_driver: this.options.driver.driver_id,
+            source_driver: driver.driver_id,
             driver_context: driverInvocationContext,
           },
           invocation.signal || invocation.onDriverEvent || hooks
@@ -1120,6 +1153,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     mailboxOutcomes: readonly MailboxToolOutcome[],
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
+    // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
+    const driver = this.driverFor(input.role_id);
     const mailboxWait = mailboxOutcomes.find(
       (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
     );
@@ -1129,7 +1164,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       artifact_id: createId('artifact'),
       type: 'transcript',
       uri: `artifact://transcript/${encodeURIComponent(input.task_id)}/${encodeURIComponent(input.role_id)}`,
-      producer_id: this.options.driver.driver_id,
+      producer_id: driver.driver_id,
       task_id: input.task_id,
       metadata: { dispatch_status: dispatched.status, error: errorMessage },
       created_at,
@@ -1152,13 +1187,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       driver_run_result_id: createId('driver_result'),
       artifact_refs: [...workspaceArtifacts],
       transcript_ref: transcript,
-      session_id: input.session_id ?? this.options.driver.session_id,
+      session_id: input.session_id ?? driver.session_id,
       response: mailboxWait
         ? `Waiting for Mailbox reply from ${mailboxWait.to_role_id}.`
         : '',
       tool_events: [],
       diagnostics: {
-        driver_id: this.options.driver.driver_id,
+        driver_id: driver.driver_id,
         driver_status: mailboxWait ? 'not_invoked' : 'failed',
         dispatch_status: dispatched.status,
         ...(mailboxWait
