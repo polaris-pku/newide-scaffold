@@ -16,6 +16,7 @@ import {
   type ToolCallingClient,
 } from '../src/memory';
 import type { RunSnapshot } from '../src/protocol/run-snapshot';
+import type { RunEvent } from '../src/protocol/run-event';
 import { writeFakeAcpRunnerBuild } from '../test/fixtures/fake-acp-runner-build';
 
 interface JsonRpcMessage {
@@ -25,6 +26,14 @@ interface JsonRpcMessage {
   params?: unknown;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
+}
+
+/** `run.getEvents` 的响应形状（与 src/app 的 RunEventsResult 对齐，脚本内不引内部类型）。 */
+interface RunEventsPage {
+  events: RunEvent[];
+  after_sequence: number;
+  latest_sequence: number;
+  has_more: boolean;
 }
 
 type SmokeMode = 'single_agent' | 'council' | 'all';
@@ -128,6 +137,8 @@ let nextId = 1;
 const runIds: string[] = [];
 const taskIds: string[] = [];
 const generatedFiles: string[] = [];
+// 联调用样例报文：一次 smoke 里抓真实 JSON，前端照着比对，比口头描述省事。
+const samples: Record<string, unknown> = {};
 let backendExitError: Error | undefined;
 
 try {
@@ -166,6 +177,10 @@ try {
       ...(unknown ? { unknown_method_error: unknown.error?.code } : {}),
     })}\n`,
   );
+  const samplesPath = process.env.RPC_SMOKE_SAMPLES_PATH?.trim();
+  if (samplesPath) {
+    await fs.writeFile(samplesPath, `${JSON.stringify(samples, null, 2)}\n`, 'utf8');
+  }
 } finally {
   backendInput.end();
   const exitCode = await waitForBackendClose();
@@ -265,6 +280,85 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
     }
   }
   await assertRunFiles(created.run_id);
+  // run.getEvents —— 订阅的拉取孪生口：整份拉取必须与快照 timeline **同源**，增量拉取必须
+  // 严格按 `after_sequence` 水位切开。只读终态 run，两条通道的号在这条路上同源。
+  const events = await request<RunEventsPage>('run.getEvents', { run_id: created.run_id });
+  assert(
+    events.events.length === snapshot.timeline.length,
+    `${mode} getEvents full pull lost events (${events.events.length} vs ${snapshot.timeline.length})`,
+  );
+  assert(
+    events.events.every(
+      (event, index) => snapshot.timeline[index]?.event_id === event.event_id,
+    ),
+    `${mode} getEvents full pull diverged from the snapshot timeline`,
+  );
+  assert(
+    events.latest_sequence === events.events.at(-1)?.sequence,
+    `${mode} getEvents latest_sequence does not match the last event`,
+  );
+  const midWatermark = events.events.at(-1)?.sequence ?? 0;
+  const tail = await request<RunEventsPage>('run.getEvents', {
+    run_id: created.run_id,
+    after_sequence: midWatermark,
+  });
+  assert(
+    tail.events.length === 0 && tail.has_more === false,
+    `${mode} getEvents past the latest watermark must be empty`,
+  );
+  if (events.events.length > 2) {
+    const splitWatermark = events.events[Math.floor(events.events.length / 2)]?.sequence ?? 0;
+    const incremental = await request<RunEventsPage>('run.getEvents', {
+      run_id: created.run_id,
+      after_sequence: splitWatermark,
+    });
+    assert(
+      incremental.events.every((event) => event.sequence > splitWatermark) &&
+        incremental.events.length < events.events.length,
+      `${mode} getEvents incremental pull ignored the after_sequence watermark`,
+    );
+  }
+  const usage = await request<{ usage?: unknown; history: unknown }>('run.getUsage', {
+    scope: 'task',
+    scope_id: created.task_id,
+    run_id: created.run_id,
+  });
+  assert(usage.history !== undefined, `${mode} run.getUsage returned no history`);
+  if (Object.keys(samples).length === 0) {
+    const firstDriverEvent = events.events.find((event) => event.type.startsWith('driver.'));
+    samples.get_events = {
+      request: { method: 'run.getEvents', params: { run_id: created.run_id, after_sequence: 0 } },
+      result: {
+        events: (
+          firstDriverEvent ? [firstDriverEvent, ...events.events.slice(1, 3)] : events.events.slice(0, 3)
+        ).map((event) => ({
+          event_id: event.event_id,
+          sequence: event.sequence,
+          type: event.type,
+          source: event.source,
+          payload_keys: Object.keys(event.payload),
+          ...(event.payload.payload_ref ? { payload_ref: event.payload.payload_ref } : {}),
+        })),
+        after_sequence: events.after_sequence,
+        latest_sequence: events.latest_sequence,
+        has_more: events.has_more,
+      },
+    };
+    samples.get_usage = {
+      request: {
+        method: 'run.getUsage',
+        params: { scope: 'task', scope_id: created.task_id, run_id: created.run_id },
+      },
+      result: usage,
+    };
+    const completion = messages.find(
+      (message) =>
+        message.method === 'run.event' &&
+        (message.params as { run_id?: string }).run_id === created.run_id &&
+        (message.params as { event?: { type?: string } }).event?.type === 'run.completed',
+    );
+    if (completion) samples.run_event = completion;
+  }
   const notificationTypes = messages
     .filter(
       (message) =>

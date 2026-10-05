@@ -8,6 +8,7 @@ import path from 'node:path';
 import type {
   RunCreateParams,
   RunCreateResult,
+  RunEventsResult,
   RunListResult,
   RunPayloadResult,
   RunRestartResult,
@@ -37,6 +38,18 @@ export interface RunMethodsService {
    * 只留引用不内联；在那之前这个取回口一直缺失，前端能看见引用却永远拿不到内容。
    */
   getRunPayload(runId: string, payloadRef: string): Promise<RunPayloadResult | undefined>;
+  /**
+   * 增量拉取 timeline——订阅的拉取孪生口。
+   *
+   * 返回 `sequence > after_sequence` 的有序切片，序号与 `run.getSnapshot.timeline` 及
+   * `run.event` 推流**同源**（同一个对齐后的时间线，不另扫一遍库）。让纯轮询成为一等
+   * 公民路径：前端可以只用「拉快照 + 按水位补增量」而不建订阅。
+   */
+  getRunEvents(input: {
+    run_id: string;
+    after_sequence?: number;
+    limit?: number;
+  }): RunEventsResult;
   /**
    * 面板用的用量查询：可选的当前 run 用量 + 按作用域的历史累计。
    *
@@ -85,6 +98,21 @@ const payloadParamsSchema = z
       .string()
       .min(1)
       .regex(/^driver-stream\.jsonl#(stream_sequence|sequence)=\d+$/),
+  })
+  .strict();
+
+/**
+ * 增量拉取 timeline 的参数。
+ *
+ * `after_sequence` 与 `run.subscribe` 的水位是**同一个语义**（只回 `sequence` 严格大于它
+ * 的事件）；不给则从头给全量（等价水位 0）。`limit` 是软上限，被截断时 `has_more` 为
+ * true，轮询方据此继续拉。
+ */
+const eventsParamsSchema = z
+  .object({
+    run_id: z.string().min(1),
+    after_sequence: z.number().int().nonnegative().optional(),
+    limit: z.number().int().positive().max(500).optional(),
   })
   .strict();
 
@@ -153,6 +181,16 @@ export class RunRpcMethods {
         );
       }
       return result;
+    });
+    dispatcher.register('run.getEvents', (params) => {
+      const { run_id, after_sequence, limit } = parseParams(eventsParamsSchema, params);
+      return this.callWithRunError(() =>
+        this.service.getRunEvents({
+          run_id,
+          ...(after_sequence !== undefined ? { after_sequence } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+        }),
+      );
     });
     dispatcher.register('run.getUsage', async (params) => {
       const parsed = parseParams(usageParamsSchema, params);

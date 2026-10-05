@@ -107,6 +107,58 @@ describe('RunRpcMethods', () => {
     });
   });
 
+  it('forwards the getEvents watermark and limit, and maps run-not-found and bad limit', async () => {
+    // run.getEvents 是订阅的拉取孪生口：水位/上限要原样转发，未知 run 要报 -32004，
+    // 超限的 limit 参数校验就拦下（不把「你要 10 万条」透传到投影里）。
+    const output: string[] = [];
+    const calls: Array<{ run_id: string; after_sequence?: number; limit?: number }> = [];
+    const service = fakeService({
+      getRunEvents: (input) => {
+        if (input.run_id === 'missing') throw new RunNotFoundError(input.run_id);
+        calls.push(input);
+        return {
+          events: [{ event_id: 'e9', sequence: 9 } as never],
+          after_sequence: input.after_sequence ?? 0,
+          latest_sequence: 9,
+          has_more: false,
+        };
+      },
+    });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, (method, params) => session.sendNotification(method, params)).register(
+      dispatcher,
+    );
+
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":1,"method":"run.getEvents","params":{"run_id":"run_1","after_sequence":8,"limit":50}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":2,"method":"run.getEvents","params":{"run_id":"run_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":3,"method":"run.getEvents","params":{"run_id":"missing"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":4,"method":"run.getEvents","params":{"run_id":"run_1","limit":501}}',
+    );
+
+    expect(calls).toEqual([
+      { run_id: 'run_1', after_sequence: 8, limit: 50 },
+      { run_id: 'run_1' },
+    ]);
+    const responses = output.map((line) => JSON.parse(line));
+    expect(responses[0]).toMatchObject({
+      id: 1,
+      result: { events: [{ event_id: 'e9', sequence: 9 }], after_sequence: 8, latest_sequence: 9 },
+    });
+    expect(responses[2]).toMatchObject({
+      id: 3,
+      error: { code: JSON_RPC_ERROR_CODES.RUN_NOT_FOUND, data: { run_id: 'missing' } },
+    });
+    expect(responses[3]).toMatchObject({ id: 4, error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS } });
+  });
+
   it('resolves an externalized payload ref and reports an unresolvable one as unavailable', async () => {
     // 超限字段只留引用不内联；取回口此前完全缺失，前端能看见引用却永远拿不到内容。
     const output: string[] = [];
@@ -390,6 +442,9 @@ function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService 
     // 所以默认抛错，要用它们的用例显式给 override。
     getRunPayload: async () => {
       throw new Error('getRunPayload fixture is not configured');
+    },
+    getRunEvents: () => {
+      throw new Error('getRunEvents fixture is not configured');
     },
     getRunUsage: async () => {
       throw new Error('getRunUsage fixture is not configured');

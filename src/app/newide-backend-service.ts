@@ -58,6 +58,7 @@ import { withAlignedTimeline } from './run-timeline-sequence';
 import { billedFromDurable, pendingBilledSources, projectRunUsage } from './run-usage-projection';
 import { projectRunActivity } from './run-activity-projection';
 import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
+import type { RunEvent } from '../protocol/run-event';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
 import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task-snapshot';
 import {
@@ -151,6 +152,22 @@ import type {
 export interface RunPayloadResult {
   payload_ref: string;
   event: DriverStreamEvent;
+}
+
+/**
+ * `run.getEvents` 的结果：timeline 的一个 `sequence > after_sequence` 的有序切片。
+ *
+ * 字段都是为了让**纯轮询**自洽，不需要额外一次 `getSnapshot`：
+ * - `latest_sequence`：本 run 当前最大序号，轮询方拿它当下水位存起来（`events` 为空时
+ *   也能知道「没有新的」而不必再猜）。
+ * - `has_more`：给了 `limit` 且被截断时为 true，提示轮询方「还有，继续拉」而不是把
+ *   截断误读成「到底了」。
+ */
+export interface RunEventsResult {
+  events: RunEvent[];
+  after_sequence: number;
+  latest_sequence: number;
+  has_more: boolean;
 }
 
 export interface RunCreateParams {
@@ -390,6 +407,41 @@ export class NewideBackendService {
     }
     const event = await this.runPayloadReader.read(runId, payloadRef);
     return event ? { payload_ref: payloadRef, event } : undefined;
+  }
+
+  /**
+   * 增量拉取 timeline：订阅的**拉取孪生口**，让纯轮询成为一等公民路径。
+   *
+   * 存在理由：前端要「先 getSnapshot 对齐、再补增量」，但过去补增量只有 `run.subscribe`
+   * （推送）一条路。这个口把同一批事件用**同一个序号空间**按 `sequence` 差集发出去，
+   * 于是纯轮询与订阅可以互换而读到的号一致。
+   *
+   * **序号同源不是复制来的约定，是构造出来的**：直接取 `getRunSnapshot` 的 `timeline`——
+   * 那份已经被 `withAlignedTimeline` 对齐过（存活期）或回落到持久序号（重启后），与
+   * `run.event` 推流是同一套号。绝不自己另扫一遍 SQLite，否则两条通道又会各拿一套号。
+   *
+   * 过滤语义与 `run.subscribe` 的 `after_sequence` 水位**完全一致**（`sequence > after`），
+   * 因为这是它的孪生口，不是另一个东西。注意序号**非严格递增**（快照独有事件与前一个号
+   * 并列），所以 `events` 保留 timeline 的**数组顺序**（权威顺序），`sequence` 只用于
+   * 判缺与去重（去重键是 `event_id`）。并列号事件被同一个水位一起放过的边角，与
+   * `run.subscribe` 同构——孪生口的价值在于行为一致，不在于比订阅更聪明。
+   */
+  getRunEvents(input: {
+    run_id: string;
+    after_sequence?: number;
+    limit?: number;
+  }): RunEventsResult {
+    const after = input.after_sequence ?? 0;
+    const timeline = this.getRunSnapshot(input.run_id).timeline;
+    const candidates = timeline.filter((event) => event.sequence > after);
+    const limited =
+      input.limit === undefined ? candidates : candidates.slice(0, input.limit);
+    return {
+      events: limited,
+      after_sequence: after,
+      latest_sequence: timeline.reduce((max, event) => Math.max(max, event.sequence), 0),
+      has_more: limited.length < candidates.length,
+    };
   }
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {

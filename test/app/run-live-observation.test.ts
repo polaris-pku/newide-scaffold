@@ -329,6 +329,30 @@ describe('withLiveObservation —— task-loop 路径（持久快照 + 存活期
       for (const event of driverTimeline) {
         expect(liveSequence.get(event.event_id)).toBe(event.sequence);
       }
+
+      // ③ `run.getEvents` 是订阅的**拉取孪生口**：它必须吐出与 `getSnapshot` **同源**的序号
+      //    切片，而不是另扫一遍库——否则两条通道又会各拿一套号，正是对齐模块要消灭的东西。
+      const watermark = snapshot.timeline[Math.floor(snapshot.timeline.length / 2)]?.sequence ?? 0;
+      const page = service.getRunEvents({ run_id: runId, after_sequence: watermark });
+      expect(page.after_sequence).toBe(watermark);
+      expect(page.latest_sequence).toBe(
+        snapshot.timeline.reduce((max, event) => Math.max(max, event.sequence), 0),
+      );
+      expect(page.events).toEqual(snapshot.timeline.filter((event) => event.sequence > watermark));
+      // 截断：limit 只回前 N 条，`has_more` 告诉轮询方「还有，继续拉」，不能把截断读成到底。
+      if (page.events.length > 1) {
+        const capped = service.getRunEvents({
+          run_id: runId,
+          after_sequence: watermark,
+          limit: 1,
+        });
+        expect(capped.events).toEqual([page.events[0]]);
+        expect(capped.has_more).toBe(true);
+      }
+      // 水位追平 latest 之后再拉：事件为空，但 latest_sequence 仍报当前值（空批也要能自证「没新的」）。
+      const caught = service.getRunEvents({ run_id: runId, after_sequence: page.latest_sequence });
+      expect(caught.events).toEqual([]);
+      expect(caught.has_more).toBe(false);
     } finally {
       endAgentActivity({ run_id: entered?.run_id ?? '', role_id: ROLE });
       resetAgentActivities();
