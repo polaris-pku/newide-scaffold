@@ -9,9 +9,10 @@
  *   `execute_agent` 阶段只留下一个非零退出码。
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -205,6 +206,30 @@ describe('per-driver assembly', () => {
     await registry.shutdown();
 
     expect(captured.shutDown).toBe(2);
+  });
+
+  it('assembles the shipped example config end to end', () => {
+    // 示例不只是「能解析」：把它真的拿去装配，证明照抄它就能按 role 路由起来。
+    const examplePath = path.join(process.cwd(), '.agent', 'drivers.example.yaml');
+    const config = parseDriverConfig(
+      parseYaml(readFileSync(examplePath, 'utf-8')),
+      examplePath,
+    );
+
+    const { registry, captured } = buildRegistry(config, makeRunnerDir(), {
+      baseEnv: { ANTHROPIC_API_KEY: 'sk-anthropic', OPENAI_API_KEY: 'sk-openai' },
+    });
+
+    expect(registry.listDriverIds().sort()).toEqual(['claude', 'codex']);
+    expect(captured.transports.map((options) => options.env?.ACP_AGENT_ID)).toEqual([
+      'claude',
+      'codex',
+    ]);
+    // `roles: {reviewer: codex}` 生效
+    expect(registry.resolveForRole('reviewer').handle).toBe(registry.get('codex'));
+    expect(registry.resolveForRole('proposer').handle).toBe(registry.get('claude'));
+    // 计费腿名字随档案走，不是写死的 claude_session_jsonl
+    expect(registry.profileOf('codex').billing?.source).toBe('codex_jsonl');
   });
 });
 

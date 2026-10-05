@@ -8,9 +8,10 @@
  * - **悬空引用**：`default_driver` 或 `roles` 指向未定义的 driver 必须报错并给出候选。
  */
 
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -267,5 +268,43 @@ describe('projectDriverConfigForRun', () => {
       default_driver: 'claude',
       drivers: { claude: 'claude' },
     });
+  });
+});
+
+/**
+ * 随仓库发布的示例配置（`.agent/drivers.example.yaml`）是这份 schema 的活文档。
+ *
+ * 这两条的作用不同：第一条让示例**不能悄悄过期**（档案字段增删会先在这里红），
+ * 第二条钉住它**不会被当成生效配置加载**——否则照抄示例就会在用户没打算的时候
+ * 把部署切成多 driver。
+ */
+describe('shipped example config', () => {
+  const examplePath = join(process.cwd(), '.agent', 'drivers.example.yaml');
+
+  it('stays a valid, complete driver config', () => {
+    const config = parseDriverConfig(
+      parseYaml(readFileSync(examplePath, 'utf-8')),
+      examplePath,
+    );
+
+    expect(config.default_driver).toBe('claude');
+    expect(Object.keys(config.drivers).sort()).toEqual(['claude', 'codex']);
+    expect(resolveRoleDriver(config, 'reviewer').driver_id).toBe('codex');
+    expect(resolveRoleDriver(config, 'proposer').driver_id).toBe('claude');
+    // 示例必须示范到字段粒度：删掉这里任何一个字段，都应先在测试里红。
+    expect(config.drivers['codex']?.billing?.source).toBe('codex_jsonl');
+    expect(config.drivers['claude']?.credentials?.env).toEqual(['ANTHROPIC_API_KEY']);
+    expect(config.drivers['codex']?.limitations?.length).toBeGreaterThan(0);
+  });
+
+  it('is not picked up as a live config', () => {
+    const projectRoot = makeTempDir();
+    mkdirSync(join(projectRoot, '.agent'), { recursive: true });
+    copyFileSync(examplePath, join(projectRoot, '.agent', 'drivers.example.yaml'));
+
+    const config = loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+
+    expect(config.default_driver).toBe(LEGACY_DRIVER_ID);
+    expect(Object.keys(config.drivers)).toEqual([LEGACY_DRIVER_ID]);
   });
 });
