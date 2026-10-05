@@ -1,4 +1,6 @@
 export * from './contract';
+export * from './profile';
+export * from './profile-loader';
 export * from './abortable-driver-run';
 export * from './command-driver-transport';
 export * from './external-driver-runtime';
