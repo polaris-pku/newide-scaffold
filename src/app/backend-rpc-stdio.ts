@@ -16,7 +16,7 @@ import {
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
-import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
+import { createDriverRegistry, loadDriverConfig } from '../driver';
 import {
   LiteLLMToolCallingClient,
   type LlmClient,
@@ -102,6 +102,9 @@ export interface ProductionBackendServiceDependencies {
   gateExecutor?: IntegrationV0GateExecutor;
 }
 
+/** A 侧 runner 入口，相对 runner 检出目录。 */
+const DRIVER_RUNNER_ENTRY_RELATIVE = path.join('dist', 'src', 'driver', 'contract-runner.js');
+
 export async function createProductionBackendService(
   env: NodeJS.ProcessEnv = process.env,
   dependencies: ProductionBackendServiceDependencies = {},
@@ -129,7 +132,7 @@ export async function createProductionBackendService(
     throw new Error(`ACP driver runner has no driver:run script: ${runnerDir}`);
   }
 
-  const driverRunnerJs = path.join(runnerDir, 'dist', 'src', 'driver', 'contract-runner.js');
+  const driverRunnerJs = path.join(runnerDir, DRIVER_RUNNER_ENTRY_RELATIVE);
   if (!existsSync(driverRunnerJs)) {
     throw new Error(
       `ACP driver runner build missing: ${driverRunnerJs} (run pnpm --dir ${runnerDir} build)`,
@@ -144,23 +147,18 @@ export async function createProductionBackendService(
   const ephemeralAcpSessions =
     env.NEWIDE_EPHEMERAL_ACP_SESSIONS === '1' ||
     env.NEWIDE_EPHEMERAL_ACP_SESSIONS?.toLowerCase() === 'true';
-  const driver = new ExternalDriverRuntime({
-    driver_id: 'acp-external',
-    capabilities: {
-      supports_acp_extension: true,
-      supports_session_load: !ephemeralAcpSessions,
-      supports_tool_events: true,
-    },
-    transport: new CommandDriverTransport({
-      // Invoke node directly — Windows `spawn('pnpm'/'pnpm.cmd')` is unreliable without shell.
-      command: process.execPath,
-      args: [driverRunnerJs],
-      cwd: runnerDir,
-      env: {
+  // driver 可配置化：可用 driver 是一份数据体（默认 <repoRoot>/.agent/drivers.yaml），
+  // 每个档案各建一个 runtime。基础环境里**不含** ACP_AGENT_ID——它由档案的 agent 决定，
+  // 于是「换 driver」就是换 spawn 时的 agent，A 侧无需改动（进程本就是每次调用一次性）。
+  const driverConfig = loadDriverConfig({ projectRoot: repoRoot, env });
+  const driverRegistry = createDriverRegistry({
+    config: driverConfig,
+    runnerDir,
+    defaultEntryRelative: DRIVER_RUNNER_ENTRY_RELATIVE,
+    baseEnv: {
         ...driverEnv,
         COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
-        ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Offline evals execute the already-installed ACP adapter entrypoint
         // instead of letting npx resolve/download a package inside the jail.
@@ -201,18 +199,24 @@ export async function createProductionBackendService(
                 env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES,
             }
           : {}),
-      },
-      unsetEnv: [
-        'NEWIDE_B_DATABASE_URL',
-        ...MODEL_OVERRIDE_ENV.filter(
-          (key) => driverEnv[key] === undefined && env[key] === undefined,
-        ),
-      ],
-      inactivityTimeoutMs: readDriverTimeout(
-        env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
+    },
+    unsetEnv: [
+      'NEWIDE_B_DATABASE_URL',
+      ...MODEL_OVERRIDE_ENV.filter(
+        (key) => driverEnv[key] === undefined && env[key] === undefined,
       ),
-    }),
+    ],
+    defaultCapabilities: {
+      supports_acp_extension: true,
+      supports_session_load: !ephemeralAcpSessions,
+      supports_tool_events: true,
+    },
+    inactivityTimeoutMs: readDriverTimeout(
+      env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
+    ),
   });
+  // 未配置任何 driver 档案时，这里拿到的是唯一那个 acp-external，与历史装配一致。
+  const driver = driverRegistry.get(driverConfig.default_driver);
   let bRuntime: BackendBRuntime | undefined;
   let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
   let coordinationStore: SqliteCoordinationStore | undefined;
@@ -221,7 +225,7 @@ export async function createProductionBackendService(
     const failures: unknown[] = [];
     for (const close of [
       () => maintenanceScheduler?.stop(),
-      () => driver.shutdown(),
+      () => driverRegistry.shutdown(),
       () => memoryMaintenance?.waitForIdle(),
       () => bRuntime?.close(),
       () => coordinationStore?.close(),
