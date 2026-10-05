@@ -25,8 +25,27 @@
  */
 import type { RunUsageTokens } from '../protocol/run-snapshot';
 
-/** 用量来自哪条腿。两条腿互不相加：`claude_session_jsonl` 只记 driver 自己的计费。 */
-export type TokenUsageSource = 'proxy' | 'claude_session_jsonl';
+/**
+ * 用量来自哪条腿。
+ *
+ * **开放取值域**：driver 计费腿的名字由 driver 档案（`DriverProfile.billing.source`）声明，
+ * 所以这里**不能**收窄成字面量联合——一旦收窄，换 driver 就得改这个类型。已知取值列在
+ * {@link KNOWN_TOKEN_USAGE_SOURCES}，只作文档与默认值，**不是**白名单。
+ *
+ * proxy 腿与 driver 计费腿互不相加：driver 腿只记 driver 自己的计费。
+ */
+export type TokenUsageSource = string;
+
+/** 已知的用量腿名字。仅供文档与默认值使用；账本按写入方给的名字记账。 */
+export const KNOWN_TOKEN_USAGE_SOURCES = ['proxy', 'claude_session_jsonl'] as const;
+
+/**
+ * driver 计费腿的历史默认名。
+ *
+ * 零配置（单个 `acp-external` + claude）时就是它——历史 `summary.json`、账本行、事件流里
+ * 已经全是这个名字，所以缺省值必须与它一致，否则新旧 run 会对不上账。
+ */
+export const DEFAULT_DRIVER_BILLED_SOURCE = 'claude_session_jsonl';
 
 /** 计费口径。名字自带范围，避免出现「总数」这种没有范围的字段。 */
 export type TokenUsageMetric = 'billed_tokens';

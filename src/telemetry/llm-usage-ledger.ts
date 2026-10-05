@@ -19,7 +19,14 @@ import {
 import { getLlmUsageAttribution, type LlmUsageAttribution } from './llm-usage-attribution';
 import { emitTelemetry, type TelemetrySink } from './telemetry-sink';
 
-export type LlmUsageSource = 'proxy' | 'claude_session_jsonl';
+/**
+ * 用量来自哪条腿。
+ *
+ * 与账本那一侧同域，同为**开放取值域**：driver 计费腿的名字由 driver 档案声明
+ * （见 `src/persistence/token-usage-ledger.ts` 的 `TokenUsageSource`），所以不收窄成
+ * 字面量联合。
+ */
+export type LlmUsageSource = string;
 
 /**
  * 一条 LLM 用量记录。

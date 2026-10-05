@@ -27,31 +27,107 @@ import type {
   TokenUsageLedgerStore,
 } from './token-usage-ledger';
 
+const LEDGER_TABLE = 'token_usage_ledger';
+/** 重建迁移期间的临时表名。 */
+const LEDGER_REBUILD_TABLE = 'token_usage_ledger_rebuilt';
+
+const LEDGER_COLUMNS = [
+  'run_id',
+  'task_id',
+  'role_id',
+  'source',
+  'metric',
+  'input_tokens',
+  'output_tokens',
+  'cache_creation_input_tokens',
+  'cache_read_input_tokens',
+  'total_input_tokens',
+  'total_tokens',
+  'call_count',
+  'recorded_at',
+  'schema_version',
+] as const;
+
+/**
+ * 列定义。建表与重建迁移**共用同一份**，避免两处漂移出不同的表。
+ *
+ * `source` 只校验非空：它的取值域是开放的（driver 档案自己声明计费腿名字），
+ * 写死 `IN (...)` 就等于「换 driver 必须改 schema」。
+ */
+const LEDGER_COLUMN_DDL = `
+  run_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  role_id TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (length(source) > 0),
+  metric TEXT NOT NULL CHECK (metric IN ('billed_tokens')),
+  input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+  output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+  cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
+  cache_read_input_tokens INTEGER NOT NULL CHECK (cache_read_input_tokens >= 0),
+  total_input_tokens INTEGER NOT NULL CHECK (total_input_tokens >= 0),
+  total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+  call_count INTEGER NOT NULL CHECK (call_count >= 0),
+  recorded_at TEXT NOT NULL,
+  schema_version TEXT NOT NULL,
+  PRIMARY KEY (run_id, role_id, source, metric)
+`;
+
 export function migrateTokenUsageLedger(database: DatabaseSync): void {
+  relaxLegacySourceConstraint(database);
   database.exec(`
-    CREATE TABLE IF NOT EXISTS token_usage_ledger (
-      run_id TEXT NOT NULL,
-      task_id TEXT NOT NULL,
-      role_id TEXT NOT NULL,
-      source TEXT NOT NULL CHECK (source IN ('proxy', 'claude_session_jsonl')),
-      metric TEXT NOT NULL CHECK (metric IN ('billed_tokens')),
-      input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
-      output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
-      cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
-      cache_read_input_tokens INTEGER NOT NULL CHECK (cache_read_input_tokens >= 0),
-      total_input_tokens INTEGER NOT NULL CHECK (total_input_tokens >= 0),
-      total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
-      call_count INTEGER NOT NULL CHECK (call_count >= 0),
-      recorded_at TEXT NOT NULL,
-      schema_version TEXT NOT NULL,
-      PRIMARY KEY (run_id, role_id, source, metric)
-    );
+    CREATE TABLE IF NOT EXISTS ${LEDGER_TABLE} (${LEDGER_COLUMN_DDL});
 
     CREATE INDEX IF NOT EXISTS token_usage_ledger_by_task
-      ON token_usage_ledger(task_id);
+      ON ${LEDGER_TABLE}(task_id);
     CREATE INDEX IF NOT EXISTS token_usage_ledger_by_role
-      ON token_usage_ledger(role_id);
+      ON ${LEDGER_TABLE}(role_id);
   `);
+}
+
+/**
+ * 把旧库上写死的 `source` 取值约束换成开放域。
+ *
+ * 老库建表时是 `CHECK (source IN ('proxy', 'claude_session_jsonl'))`。**`CREATE TABLE
+ * IF NOT EXISTS` 永远不会改它**——所以老库一旦换 driver，第一次记账就撞约束失败，而且
+ * 撞的是「累计用量」这条最不该丢的路径。SQLite 不能 ALTER 掉一个 CHECK，只能整表重建。
+ *
+ * 判据取自 `sqlite_master.sql` 而不是版本号：这个库没有为账本维护 user_version，
+ * 而建表语句本身就带着「我是不是旧形状」的全部信息。
+ *
+ * **本函数刻意不开事务**：调用方 `SqliteCoordinationStore.migrate` 已经把整批迁移包在
+ * 一个 `BEGIN IMMEDIATE` 里，嵌套 BEGIN 会直接抛 `cannot start a transaction within a
+ * transaction`。原子性由调用方提供；下面的半成品兜底是给单独调用留的后路。
+ */
+function relaxLegacySourceConstraint(database: DatabaseSync): void {
+  const legacySql = readTableSql(database, LEDGER_TABLE);
+  const rebuiltSql = readTableSql(database, LEDGER_REBUILD_TABLE);
+
+  if (legacySql === undefined && rebuiltSql !== undefined) {
+    // 上一次重建死在 DROP 与 RENAME 之间。把半成品扶正——**不能丢**，那里面是全部历史用量。
+    database.exec(`ALTER TABLE ${LEDGER_REBUILD_TABLE} RENAME TO ${LEDGER_TABLE}`);
+    return;
+  }
+  if (rebuiltSql !== undefined) {
+    database.exec(`DROP TABLE ${LEDGER_REBUILD_TABLE}`);
+  }
+  if (legacySql === undefined || !legacySql.includes('CHECK (source IN (')) return;
+
+  const columns = LEDGER_COLUMNS.join(', ');
+  database.exec(`
+    CREATE TABLE ${LEDGER_REBUILD_TABLE} (${LEDGER_COLUMN_DDL});
+    INSERT INTO ${LEDGER_REBUILD_TABLE} (${columns}) SELECT ${columns} FROM ${LEDGER_TABLE};
+    DROP TABLE ${LEDGER_TABLE};
+    ALTER TABLE ${LEDGER_REBUILD_TABLE} RENAME TO ${LEDGER_TABLE};
+  `);
+}
+
+function readTableSql(database: DatabaseSync, table: string): string | undefined {
+  const row = database
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(table);
+  if (!row || typeof row !== 'object') return undefined;
+  const sql = Reflect.get(row, 'sql');
+  return typeof sql === 'string' ? sql : undefined;
 }
 
 export class SqliteTokenUsageLedger implements TokenUsageLedgerStore {
