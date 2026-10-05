@@ -521,6 +521,12 @@ export async function createProductionBackendService(
       coordination_durable: databasePath !== ':memory:',
       driver_provider_id: runnerPackageIdentity.name,
       driver_provider_version: runnerPackageIdentity.version,
+      // 「有哪些 driver 可用」的对外出口：逐档案带上 agent 与档案自报的限制。
+      driver_profiles: Object.entries(driverConfig.drivers).map(([driverId, profile]) => ({
+        driver_id: driverId,
+        agent: profile.agent,
+        ...(profile.limitations ? { limitations: profile.limitations } : {}),
+      })),
       b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
       b_embedding: bRuntime.embedding_info ?? {
         provider: 'host-managed repository',
