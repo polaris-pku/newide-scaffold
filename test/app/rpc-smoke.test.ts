@@ -42,7 +42,11 @@ describe('production RPC composition smoke script', () => {
 async function runSmoke(args: string[] = []): Promise<Record<string, unknown>> {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-rpc-smoke-'));
   try {
-    const child = spawn('pnpm', ['rpc:smoke', ...args], {
+    // 直接起 node，不走 `pnpm rpc:smoke`：Windows 上 `spawn('pnpm')` 是 **ENOENT**
+    // （`pnpm` 是 .cmd 垫片，不经 shell 起不来），于是这三条用例在 Windows 上长期红着、
+    // 被当成「既有环境性失败」记进基线——实际是**测试自己**起不来被测脚本。
+    // 参数与 `package.json` 的 `rpc:smoke` 一致，只是把 `pnpm` 换成 `process.execPath`。
+    const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/rpc-smoke.ts', ...args], {
       cwd: process.cwd(),
       env: { ...process.env, RPC_SMOKE_WORKSPACE: workspace },
       stdio: ['ignore', 'pipe', 'pipe'],

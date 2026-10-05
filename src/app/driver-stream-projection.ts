@@ -24,6 +24,104 @@ export const DRIVER_STREAM_REF_PREFIX = 'driver-stream.jsonl#sequence=';
 /** 载荷内联上限（JSON 序列化字节）。超限字段走 payload_ref，不进事件模型。 */
 export const PAYLOAD_INLINE_LIMIT_BYTES = 8 * 1024;
 
+/**
+ * 投影事件的两条去向。
+ *
+ * 两条通道的事件都会进进程内 registry 与 `audit.jsonl`（后者由
+ * `registry.subscribe` 无条件落盘）。区别只在于**是否同时进协调事件流**：
+ *
+ * - `coordination`：额外走 `TaskProcessor.recordRunEvent` → SQLite `events` 表。
+ *   持久快照的 `timeline` 因此带着 driver 状态，进程重启后仍读得到。
+ *   状态类——低频、是完整的转移、有状态价值。
+ * - `stream_only`：不进 SQLite，只留 `audit.jsonl` / `driver-stream.jsonl` 与进程内
+ *   registry。片段类——可合并、高频、体量大，逐条读出来不构成任何状态。
+ *
+ * 分界是**可合并性**，不是重要程度。
+ */
+export type DriverStreamChannel = 'coordination' | 'stream_only';
+
+/**
+ * 分流表 —— **唯一**一处决定 driver 投影事件去哪条通道。
+ *
+ * 为什么必须分：实测 `.newide/runs` 下 28 份 `driver-stream.jsonl` 共 41525 条，其中
+ * 片段类（3 个 chunk + stderr + tool_progress + 未知 session/update）占 **98.4% 的行 /
+ * 97.0% 的字节**（平均 ~1459 行 / ~1052 KB 每 run），而状态类全部加起来只有
+ * **663 行 / 903 KB（1.6% / 3.0%）**，平均 ~24 行 / ~32 KB 每 run。片段进 SQLite 是
+ * 纯损失：一次 council run 会多出约 1500 行事务与约 1 MB，而每行只是一条消息的一个
+ * 片段，单独看什么也不说明。
+ *
+ * 表覆盖投影器能**命名**的全部 20 个类型。漂移由
+ * `test/app/driver-stream-persistence.test.ts` 的全量枚举用例钉住（同一张表同时驱动
+ * 分类断言与真实 run 的事件注入）：新增一个投影分支而忘了在这里表态会红，表里出现
+ * 投影器产不出的陈旧类型也会红。表外的类型走 {@link DEFAULT_DRIVER_STREAM_CHANNEL}
+ * ——那是 driver 自己发的、投影器原样透传的 `driver.*` 名字（实测生产者：
+ * `driver.phase`、`driver.turn_cancel_requested`、`driver.turn_cancel_failed`、
+ * `driver.event_collection_failed`），按 driver 的命名惯例属于生命周期而非片段，
+ * 所以默认进协调事件流。
+ *
+ * 已知残余风险，写在这里以免下一个改的人以为它是安全的：**将来若出现一个高频的 `driver.*`
+ * 片段类型，默认值会让它灌进 SQLite**。处理方式是在这张表里显式表态为 `stream_only`。
+ */
+export const DRIVER_STREAM_CHANNELS: Readonly<Record<string, DriverStreamChannel>> = Object.freeze({
+  // ── turn / 会话生命周期：状态转移，低频 ──
+  'driver.turn_started': 'coordination',
+  'driver.turn_completed': 'coordination',
+  'driver.turn_failed': 'coordination',
+  'driver.interrupt_requested': 'coordination',
+  'driver.disconnected': 'coordination',
+  // ── 工具调用：started / completed / failed 是三个完整状态，progress 是它们的中间片段 ──
+  'driver.tool_started': 'coordination',
+  'driver.tool_completed': 'coordination',
+  'driver.tool_failed': 'coordination',
+  'driver.tool_progress': 'stream_only',
+  // ── 流式片段：一条消息被切成的若干片，可合并 ──
+  'driver.agent_message_chunk': 'stream_only',
+  'driver.agent_thought_chunk': 'stream_only',
+  'driver.user_message_chunk': 'stream_only',
+  'driver.stderr': 'stream_only',
+  // ── 会话状态：最后一次赋值即真相，低频 ──
+  'driver.plan_updated': 'coordination',
+  'driver.mode_changed': 'coordination',
+  'driver.available_commands_updated': 'coordination',
+  'driver.config_options_changed': 'coordination',
+  'driver.session_info_changed': 'coordination',
+  'driver.usage_updated': 'coordination',
+  // 协议侧未知 session/update 的兜底桶：名字本身就说明「不知道它是什么」，而它来自 ACP
+  // 的流式通道——按「不知道就别往 SQLite 写」处理，方向刻意选这一边。
+  'driver.session_update_unknown': 'stream_only',
+});
+
+const DEFAULT_DRIVER_STREAM_CHANNEL: DriverStreamChannel = 'coordination';
+
+/** 某个**已投影**的 driver 事件类型去哪条通道。未知类型按 §DRIVER_STREAM_CHANNELS 的说明。 */
+export function driverStreamChannel(eventType: string): DriverStreamChannel {
+  return DRIVER_STREAM_CHANNELS[eventType] ?? DEFAULT_DRIVER_STREAM_CHANNEL;
+}
+
+/**
+ * 这条**已投影**的事件类型是不是「可合并的流式片段」。
+ *
+ * **一条判据，三个消费方**（都读 `DRIVER_STREAM_CHANNELS` 这同一张表，任何一个消费方
+ * 都不该自己另判一遍——漂移的方向恰好最糟：只在一处生效时，片段要么灌进 SQLite、
+ * 要么灌进前端、要么灌进快照 timeline）：
+ *
+ * | 消费方 | 片段 | 状态类 |
+ * |---|---|---|
+ * | 协调事件流（SQLite 持久 timeline） | 不进（§7.4 P5） | 进 |
+ * | 推流通道（`run.event` / `task.subscribe`） | 不发（§7.6 决策 B，2026-10-03 拍板） | 发 |
+ * | 存活期内存（registry 的 `events` 与快照 timeline） | 只留有界一段（§7.7） | 全留 |
+ *
+ * 片段不进推流与快照的代价要写清楚，它是一处**契约变更**：今天渲染 driver 思考流的前端
+ * 会看不到片段。这是刻意的——要看思考流必须开**独立的合并通道**（§4.4 / D4：片段是
+ * last-value 语义，逐条推给前端既贵又不可用）。**片段本身没丢**：`audit.jsonl`（无保留
+ * 上限）与 `driver-stream.jsonl`（8 MiB 上限）都照写，`payload_ref` 可回取。
+ *
+ * 非 `driver.*` 的类型一律返回 false：表的默认通道是 `coordination`。
+ */
+export function isStreamFragment(eventType: string): boolean {
+  return driverStreamChannel(eventType) === 'stream_only';
+}
+
 export function projectDriverStreamLifecycleEvent(
   event: DriverStreamEvent,
   streamSequence?: number,

@@ -461,6 +461,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       // 进程内调用留档（B1）的 journal 外键与 Session 绑定键：与 invocationContext
       // 同源（workspace_path 已在上面 path.resolve 归一化）。
       run_id: input.run_id,
+      // 观测用的 run 与执行身份分开：council 下后者是 `${run_id}_${phaseId}`，而在飞状态
+      // 必须按面板看得见的那个 run 归集（否则议会阶段整段没有 `activity`）。
+      ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
       ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       call_id: createId('call'),
       source_driver: this.options.driver.driver_id,
@@ -1074,6 +1077,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         driver_status: execution.status,
         driver_attempts: driverAttempts,
         driver_report: dispatched.cycle.buffer_snapshot.driver_return,
+        // 驱动自报的逐次调用用量：过去只到进程就被丢掉，这里落进阶段证据、
+        // 从而进入事件流与 run 目录，成为一条独立于上下文占用与 Claude 刮取的计费口径。
+        ...(execution.usage ? { driver_usage: { ...execution.usage } } : {}),
         dispatch_status: dispatched.status,
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],

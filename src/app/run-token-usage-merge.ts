@@ -34,7 +34,9 @@ export type BilledTokenUsageMergeStatus =
   /** summary 里缺 worktree_path，无从定位 session JSONL。 */
   | 'skipped_no_worktree'
   /** 刮取没刮到任何东西。 */
-  | 'skipped_no_session_usage';
+  | 'skipped_no_session_usage'
+  /** 刮取本身抛了（session 目录不在、jsonl 正在被写、文件被占用）。 */
+  | 'scrape_failed';
 
 export interface BilledTokenUsageMergeResult {
   status: BilledTokenUsageMergeStatus;
@@ -43,7 +45,15 @@ export interface BilledTokenUsageMergeResult {
 }
 
 /**
- * 读回 `summary.json`，把 Claude Code session JSONL 里的计费 token 并进 `token_usage`。
+ * 读回 `summary.json`，把 Claude Code session JSONL 里的计费 token 并进 `token_usage`，
+ * **并把这次的结果写回 `summary.json` 的 `driver_billed_merge` 块**。
+ *
+ * 为什么结果必须落盘：driver 侧计费是几条口径里最大的一条，而它能不能进账取决于
+ * worktree 路径、`~/.claude` 下的 session 目录、jsonl 有没有写全——全是外部条件。在这之前
+ * 「这次 run 没有 driver 腿」与「刮取被跳过/失败」在产物上**长得一模一样**：返回值被调用方
+ * 丢掉（`run-terminal-output-writer.ts` 的 `finalize`），`summary.json` 里也没有任何痕迹。
+ * 于是账面上少掉的那部分 token 无从审计，只剩一个「这个 run 没用量」的结论。现在每种结局
+ * 都留一行状态。
  *
  * 幂等：driver 那一腿已经并过就直接跳过。`mergeTokenUsageSummaries` 是求和，收尾路径
  * 若被重入会把同一批 token 数两遍，所以不能只靠「结果不比现有大就不写」。
@@ -59,47 +69,77 @@ export async function mergeBilledTokenUsage(
   try {
     raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
   } catch {
+    // 连 summary 都读不到：这次的结果**没有地方可记**，所以这里不写盘。
+    // 返回 unchanged 而不是抛——「没跑到」与「跑了没数据」的区别由这个返回值承载。
     return { status: 'unchanged', total_tokens_before: 0, total_tokens_after: 0 };
   }
 
   const existing = isPopulatedRunTokenUsage(raw.token_usage) ? raw.token_usage : undefined;
   const before = existing?.total_tokens ?? 0;
-  // 幂等：driver 那一腿并过就不再并。`mergeTokenUsageSummaries` 是求和，收尾路径若被
-  // 重入，同一批 token 会被数两遍。
+  const outcome = await resolveBilledMerge({ raw, existing, before, collect });
+  // 状态与 token 数字**同一次写入**：分两次写会出现「数字更新了但状态还是旧的」那种半更新。
+  raw.driver_billed_merge = outcome.result;
+  if (outcome.merged) {
+    raw.token_usage = outcome.merged;
+    const driverBilled = buildDriverBilledUsage(outcome.merged, raw);
+    if (driverBilled) raw.driver_billed_usage = driverBilled;
+  }
+  await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
+  return outcome.result;
+}
+
+/**
+ * 决定这次合并的结局；写盘交给调用方。
+ *
+ * 刮取的异常在这里被吞成 `scrape_failed` 状态而**不外抛**：这条路径跑在终态写盘上，而
+ * 「Claude 的 session 目录读不到」是常态不是异常。观测失败只该少一块。
+ */
+async function resolveBilledMerge(input: {
+  raw: Record<string, unknown>;
+  existing: RunTokenUsageSummary | undefined;
+  before: number;
+  collect: CollectClaudeSessionUsage;
+}): Promise<{ result: BilledTokenUsageMergeResult; merged?: RunTokenUsageSummary }> {
+  const { raw, existing, before, collect } = input;
+  const noChange = (status: BilledTokenUsageMergeStatus): BilledTokenUsageMergeResult => ({
+    status,
+    total_tokens_before: before,
+    total_tokens_after: before,
+  });
+
+  // 幂等：driver 那一腿并过就不再并。`mergeTokenUsageSummaries` 是求和，收尾路径若重入，
+  // 同一批 token 会被数两遍。
   if (existing?.sources.includes('claude_session_jsonl')) {
-    return { status: 'already_merged', total_tokens_before: before, total_tokens_after: before };
+    return { result: noChange('already_merged') };
   }
   const worktreePath = nonEmptyString(raw.worktree_path);
-  if (!worktreePath) {
-    return { status: 'skipped_no_worktree', total_tokens_before: before, total_tokens_after: before };
-  }
+  if (!worktreePath) return { result: noChange('skipped_no_worktree') };
 
   const sessionId = nonEmptyString(raw.session_id);
   const sessionIds = collectDriverSessionIds(raw, sessionId);
-  const scraped = await collect({
-    worktreePath,
-    ...(sessionId ? { sessionId } : {}),
-    ...(sessionIds.length > 0 ? { sessionIds } : {}),
-  });
-  const usable = scraped.call_count > 0 || scraped.total_tokens > 0;
-  if (!usable) {
-    return {
-      status: 'skipped_no_session_usage',
-      total_tokens_before: before,
-      total_tokens_after: before,
-    };
+  let scraped: RunTokenUsageSummary;
+  try {
+    scraped = await collect({
+      worktreePath,
+      ...(sessionId ? { sessionId } : {}),
+      ...(sessionIds.length > 0 ? { sessionIds } : {}),
+    });
+  } catch {
+    return { result: noChange('scrape_failed') };
   }
+  const usable = scraped.call_count > 0 || scraped.total_tokens > 0;
+  if (!usable) return { result: noChange('skipped_no_session_usage') };
 
   const merged = mergeTokenUsageSummaries(existing ? [existing, scraped] : [scraped]);
-  if (merged.total_tokens <= before) {
-    return { status: 'unchanged', total_tokens_before: before, total_tokens_after: before };
-  }
-
-  raw.token_usage = merged;
-  const driverBilled = buildDriverBilledUsage(merged, raw);
-  if (driverBilled) raw.driver_billed_usage = driverBilled;
-  await fs.writeFile(summaryPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
-  return { status: 'merged', total_tokens_before: before, total_tokens_after: merged.total_tokens };
+  if (merged.total_tokens <= before) return { result: noChange('unchanged') };
+  return {
+    result: {
+      status: 'merged',
+      total_tokens_before: before,
+      total_tokens_after: merged.total_tokens,
+    },
+    merged,
+  };
 }
 
 /**

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION, type ArtifactRef } from '../core';
 import type { DriverPrompt, DriverRunResult } from './contract';
-import { ExternalDriverRuntime } from './external-driver-runtime';
+import { ExternalDriverRuntime, assertDriverRunResult } from './external-driver-runtime';
 
 const PROMPT: DriverPrompt = {
   task_id: 'task_external',
@@ -120,6 +120,43 @@ describe('ExternalDriverRuntime', () => {
 
     expect(interrupt).toHaveBeenCalledWith('user cancelled the run');
     expect(shutdown).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * 驱动自报的逐次调用用量必须被契约接受并原样保留。
+   *
+   * `parseDriverRunResult` 是 `JSON.parse` 后原样返回，所以这个字段一直在到达进程；
+   * 过去本仓契约没有声明它，于是没有任何代码读取，数据等于被丢掉。这条断言守的是
+   * 「契约既不拒绝、也不吞掉它」。
+   */
+  it('accepts and preserves the driver-reported token usage', () => {
+    const result: DriverRunResult = {
+      ...driverRunResult(),
+      usage: {
+        total_tokens: 1200,
+        input_tokens: 900,
+        output_tokens: 300,
+        cached_read_tokens: 100,
+      },
+    };
+
+    assertDriverRunResult(result, 'Test driver');
+
+    expect(result.usage).toEqual({
+      total_tokens: 1200,
+      input_tokens: 900,
+      output_tokens: 300,
+      cached_read_tokens: 100,
+    });
+  });
+
+  it('accepts a driver result that reports no usage at all', () => {
+    // 历史驱动可能一个用量字段都不给；缺用量绝不能把一次成功的调用判成畸形结果。
+    const result = driverRunResult();
+
+    assertDriverRunResult(result, 'Test driver');
+
+    expect(result.usage).toBeUndefined();
   });
 });
 

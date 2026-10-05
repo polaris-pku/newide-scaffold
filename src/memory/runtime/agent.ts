@@ -24,7 +24,7 @@ import type { AgentCompetitionClaim } from '../competition-types';
 import { createMockCompetitionClaimEvaluator } from '../adapters/mock-competition-claim-evaluator';
 import { ToolRegistry, type Tool, type ToolCallMessage, type ToolCallingClient } from './tool';
 import { createId, nowTimestamp } from '../../core';
-import { agentToolSpan, withRunLatencySpan } from '../../telemetry';
+import { agentToolSpan, withAgentActivity, withRunLatencySpan } from '../../telemetry';
 import { writePendingBuffer } from '../services/buffer-writer';
 import { buildAgentSystemPrompt } from '../prompts/agent-system-prompt';
 
@@ -212,12 +212,23 @@ export class Agent {
     // 不带 role_id 的话，council 一次跑的多个席位在耗时流水里就分不出谁是谁，也就
     // 对不上账本里按角色的 token。Agent 自己就知道角色，这里随手记上。
     const role_id = this.memory.role_id;
-    const response = await withRunLatencySpan('agent.llm_round', { role_id, round }, () =>
-      toolConfig.llm.completeWithTools({
-        messages: loopMessages,
-        tools: toolRegistry.toToolDefinitions(),
-        tool_choice: 'auto',
-      }),
+    // 在飞状态点：`agent.llm_round` 要等这次调用**结束**才落盘，所以「正在等 LLM」只能
+    // 在这里先写下来。没有 run_id 时整个状态点空转（不编假键）。
+    //
+    // 用 `activity_run_id` 优先：council 下每次席位执行的身份是 `${run_id}_${phaseId}`
+    // （相位隔离需要），而面板按**任务那个 run** 读状态——按执行身份写就等于写了一份谁也
+    // 看不见的状态。两者在单 agent 路径上是同一个值。
+    const run_id = this.currentTask?.activity_run_id ?? this.currentTask?.run_id;
+    const response = await withAgentActivity(
+      { run_id, role_id, kind: 'awaiting_llm', round },
+      () =>
+        withRunLatencySpan('agent.llm_round', { role_id, round }, () =>
+          toolConfig.llm.completeWithTools({
+            messages: loopMessages,
+            tools: toolRegistry.toToolDefinitions(),
+            tool_choice: 'auto',
+          }),
+        ),
     );
 
     this.loopRound++;
@@ -258,11 +269,20 @@ export class Agent {
           const args = JSON.parse(toolCall.function.arguments);
           // 只包工具本身，不含参数解析：解析失败时并没有工具在跑，记一条耗时只会
           // 往「工具慢」的方向误导。抛错也照记，失败往往正是耗时异常的原因。
-          const result = await withRunLatencySpan(
-            agentToolSpan(tool.name),
-            { role_id, round },
-            () => tool.execute(args),
-          );
+          const executeTool = () =>
+            withRunLatencySpan(agentToolSpan(tool.name), { role_id, round }, () =>
+              tool.execute(args),
+            );
+          // 第二个在飞状态点。driver 是整条链上最慢的一步，而 `agent.tool.invoke_driver`
+          // 同样要等它结束才落盘——「已委派给 driver、driver 正在跑」这段时间只能靠这里看见。
+          // 目前只给 invoke_driver 写：其余工具还没有对应的状态枚举，不硬塞进这两个里。
+          const result =
+            tool.name === 'invoke_driver'
+              ? await withAgentActivity(
+                  { run_id, role_id, kind: 'invoking_driver', tool_name: tool.name, round },
+                  executeTool,
+                )
+              : await executeTool();
 
           // 记录最后一次 invoke_driver 的返回
           if (tool.name === 'invoke_driver') {

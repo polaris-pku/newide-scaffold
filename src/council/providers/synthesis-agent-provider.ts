@@ -634,6 +634,10 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         {
           task_id: input.task_id,
           run_id: executionRunId,
+          // 面板看的是**任务那个 run**，而 `executionRunId` 在 council 下是
+          // `${run_id}_${phaseId}`（相位隔离要它）。在飞状态按前者归集，否则议会阶段——
+          // 一次 run 里最长的一段——在快照上整段看不见。
+          activity_run_id: input.run_id ?? executionRunId,
           role_id: participant.agent_id,
           participant_id: participant.participant_id,
           council_seat: participant.seat,

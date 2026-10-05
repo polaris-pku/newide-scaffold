@@ -8,9 +8,12 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
       ...structuredClone(input.projected_snapshot),
       status: input.status,
       current: {
-        ...input.projected_snapshot.current,
-        stage: input.current.stage,
-        active_node_code: input.current.active_node_code,
+        // 存活期 registry 的 current 才是实时的（由 `handler.*` 事件推进）；持久投影只在
+        // 快照被写下的那一刻新鲜。所以以 registry 为准，只沿用后者的 `task_status`。
+        ...input.current,
+        ...(input.projected_snapshot.current.task_status
+          ? { task_status: input.projected_snapshot.current.task_status }
+          : {}),
       },
       timeline: [...input.events],
       errors: input.error ? [{ ...input.error }] : [...input.projected_snapshot.errors],

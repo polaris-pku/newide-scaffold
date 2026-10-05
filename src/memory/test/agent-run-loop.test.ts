@@ -27,6 +27,9 @@ import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import type { AgentTaskRequest } from '../agent-types';
 import type { DriverReturn } from '../schemas';
 import {
+  getAgentActivity,
+  listAgentActivities,
+  resetAgentActivities,
   RunLatencyRecorder,
   runWithRunLatencyRecorder,
   type RunLatencySpan,
@@ -434,6 +437,62 @@ describe('Agent 轮次与工具调用 span', () => {
     ]);
     expect(toolSpans.every((span) => span.layer === 'agent' && span.round === 0)).toBe(true);
     expect(toolSpans.every((span) => span.role_id === 'role_tool_spans')).toBe(true);
+  });
+
+  it('在飞状态点在 LLM 调用与 invoke_driver 执行期间可见，结束后清空', async () => {
+    const { memory } = await createTestInfra('role_activity');
+    resetAgentActivities();
+    const seen: string[] = [];
+    const responses = [toolCallRound('invoke_driver'), textResponse('Task completed.')];
+    let callIndex = 0;
+    const llm: ToolCallingClient = {
+      completeWithTools: async () => {
+        // LLM 调用**进行中**：这是 `agent.llm_round` 那种事后 span 说不出来的东西。
+        seen.push(`llm:${getAgentActivity('run_activity', 'role_activity')?.kind}`);
+        const response = responses[callIndex++];
+        if (!response) throw new Error('no more mock responses');
+        return response;
+      },
+    };
+    const agent = new Agent(
+      memory,
+      createToolConfig(llm, [
+        createNamedTool(
+          'invoke_driver',
+          () => {
+            const activity = getAgentActivity('run_activity', 'role_activity');
+            seen.push(`driver:${activity?.kind}:${activity?.tool_name}`);
+          },
+          DRIVER_RETURN_STUB,
+        ),
+      ]),
+    );
+
+    await agent.executeTask(createTestTask({ run_id: 'run_activity' }));
+
+    // 第 1 轮 LLM 是 awaiting_llm；driver 执行期间翻成 invoking_driver；第 2 轮 LLM
+    // **又回到** awaiting_llm——这条同时证明了 driver 状态被清掉，没有漏进下一轮。
+    expect(seen).toEqual([
+      'llm:awaiting_llm',
+      'driver:invoking_driver:invoke_driver',
+      'llm:awaiting_llm',
+    ]);
+    // 结束即清空——留着就会让面板永远停在「思考中」。
+    expect(listAgentActivities('run_activity')).toEqual([]);
+  });
+
+  it('没有 run_id 时在飞状态点空转，不编造假键', async () => {
+    const { memory } = await createTestInfra('role_activity_no_run');
+    resetAgentActivities();
+    const agent = new Agent(
+      memory,
+      createToolConfig(createMockToolClient([textResponse('Task completed.')]), []),
+    );
+
+    // createTestTask 默认不带 run_id，于是状态点没有可索引的键。
+    await agent.executeTask(createTestTask());
+
+    expect(listAgentActivities()).toEqual([]);
   });
 
   it('工具抛错时照样记 span，并标出 ok=false 与错误信息', async () => {

@@ -18,6 +18,12 @@ import {
   type CollectClaudeSessionUsage,
 } from './run-token-usage-merge';
 import { collectClaudeSessionUsage } from '../telemetry';
+import type { TokenUsageLedgerStore } from '../persistence';
+import {
+  buildTokenUsageLedgerEntries,
+  readClaudeSessionLeg,
+  type LedgerTimelineEvent,
+} from './run-usage-ledger-entries';
 
 export interface RunTerminalOutputWriter {
   finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | void>;
@@ -90,6 +96,13 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
      * （只信文件回读，截断缺尾标 complete: false）。
      */
     private readonly accumulatedUsage?: (taskId: string) => TaskDriverUsage | undefined,
+    /**
+     * 用量账本。run 收尾时把这次 run 的两条计费腿作为**只追加行**落库，这样累计用量
+     * 不再依赖 `runs/<id>/summary.json` 那棵没有保留策略的目录树存活。
+     *
+     * 不注入时整步空转（单测与 example 零改动），行为与从前完全一致。
+     */
+    private readonly tokenUsageLedger?: TokenUsageLedgerStore,
   ) {}
 
   async finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | undefined> {
@@ -141,15 +154,86 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
       ...fallbackWrites,
       fs.writeFile(frontendSnapshotPath, serializedSnapshot, 'utf-8'),
     ]);
-    await mergeSummaryExtras(summaryPath, { driverUsage: tokenUsage, consumption });
+    await this.bestEffort('summary extras', () =>
+      mergeSummaryExtras(summaryPath, { driverUsage: tokenUsage, consumption }),
+    );
     // driver 侧真实 coding agent 的计费 token 不进事件流，只能等 summary 落盘后从
     // Claude Code 的 session JSONL 刮取再并进来。放在这里而不是 B maintenance：
     // maintenance 由 buffer 触发，跑在 run 收尾之前，读不到 summary.json。
-    await mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage);
+    await this.bestEffort('driver billed scrape', () =>
+      mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage),
+    );
+    await this.appendUsageLedger(snapshot, projected.timeline, summaryPath);
     return {
       artifact_ref: pathToFileURL(path.resolve(frontendSnapshotPath)).href,
       sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),
     };
+  }
+
+  /**
+   * 跑一个**观测性**的终态附加步骤：失败只丢这一块，不让 run 变成 `TERMINAL_OUTPUT_FAILED`。
+   *
+   * 为什么需要这一层：`finalize` 的失败会一路走到 `persistTerminal` 的 catch，把已经完成的
+   * run 重写成 `failed`——那是给「核心产物（`result.json` / `summary.json` / `timeline.json` /
+   * `frontend-snapshot.json`）写不出来」准备的语义，不该被追加观测的失败触发。而这两步恰好
+   * 是最容易失败的两步：刮 Claude 的 session JSONL 依赖外部目录，重写 `summary.json` 在
+   * Windows 上会撞 EBUSY/EPERM（与仓库里 SQLite `-wal` 那类清理失败同源）。
+   *
+   * `summarizeRunConsumption` 的文档把这条纪律写得很明白（「任何一步都不抛错——它跑在终态
+   * 写盘路径上」），`appendUsageLedger` 也照做了；这里只是把同一条纪律补给它上面的两步。
+   *
+   * 失败**写 stderr**：`appendUsageLedger` 的失败有一个派生的可见面（`runs_without_usage`），
+   * 这两步没有——刮取失败现在至少留在 `summary.json` 的 `driver_billed_merge` 里，但连
+   * summary 都写不动时，只剩这一行日志。
+   */
+  private async bestEffort(label: string, action: () => Promise<unknown>): Promise<void> {
+    try {
+      await action();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[terminal-output] ${label} failed for a run: ${message}\n`);
+    }
+  }
+
+  /**
+   * 把这次 run 的计费腿作为只追加行写进账本。
+   *
+   * 读回 `summary.json` 而不是复用内存里那份：`driver_billed_usage` 是
+   * `mergeBilledTokenUsage` 刚刚才刮出来并写盘的（driver 腿从不进 run 事件流），
+   * 收尾前内存里根本没有它。落盘的那份正是账本要对齐的权威件。
+   *
+   * **失败只吞掉，不让 run 失败**——与本仓库观测层的既有纪律一致
+   * （`FileRunEventConsumptionSink`、`RunEventConsumptionRecorder.finish` 都是这个取向）。
+   * 而且这里的失败**不是静默的**：这个 run 之后会以「有 `handler.started`、账本里没有行」
+   * 的形式出现在 `runs_without_usage` 里，把 `complete` 拉成 false。写入失败会被看见。
+   */
+  private async appendUsageLedger(
+    snapshot: AppRunSnapshot,
+    timeline: readonly LedgerTimelineEvent[],
+    summaryPath: string,
+  ): Promise<void> {
+    if (!this.tokenUsageLedger) return;
+    try {
+      const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+      // exactOptionalPropertyTypes：可选字段不能显式传 undefined，只能条件展开。
+      const driverBilledLeg = readClaudeSessionLeg(raw.token_usage);
+      const entries = buildTokenUsageLedgerEntries({
+        run_id: snapshot.run_id,
+        task_id: snapshot.task_id,
+        timeline,
+        ...(driverBilledLeg ? { driverBilledLeg } : {}),
+        ...(raw.driver_billed_usage !== undefined
+          ? { driverBilledUsage: raw.driver_billed_usage }
+          : {}),
+        recorded_at: new Date().toISOString(),
+      });
+      this.tokenUsageLedger.appendTokenUsage(entries);
+    } catch (error) {
+      // 见上：不计入账本 ⇒ 该 run 会成为已知缺口，而不是被当成 0。
+      // 顺带留一行日志：派生信号（`runs_without_usage`）只说明「有 run 缺席」，说不出是哪一次。
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[terminal-output] usage ledger append failed: ${message}\n`);
+    }
   }
 }
 
@@ -228,7 +312,24 @@ function resolveMemoryAblation(
     .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
 }
 
-function resolveTokenUsageFromTimeline(
+/**
+ * 从时间线里的 `proxy.llm_usage_recorded` 事件汇总 proxy 腿的计费用量。
+ *
+ * 导出是给运行快照的 `usage` 块复用：实时快照与终态 summary 必须用**同一个**口径，
+ * 各写一份必然漂移。
+ *
+ * **口径含 cache**：`total_input_tokens = input + cache_creation + cache_read`，
+ * `total_tokens = total_input_tokens + output`。这与 `summarizeRunConsumption`（按 stage 分桶）
+ * 和用量账本的行（`run-usage-ledger-entries.ts` 的 `rollupProxy`）是**同一套算术**——它们
+ * 是同一个量的三份拷贝，任何一份偏小都会让面板上两个数字对不上。
+ *
+ * 这段曾经把 cache 写死 0、`total_tokens` 只数 input+output，理由是「三个
+ * `recordProxyLlmUsage` 调用点都不传 cache，所以今天数值相同」。那是**靠巧合相等**：
+ * 一旦有调用点开始传 cache，summary / 账本 / 按 stage 分桶三处就会给出三个不同的
+ * 「这一轮花了多少」。现在改成读 payload 里的 cache 字段——今天的行为一模一样
+ * （没有生产者传），但不再依赖那个巧合。
+ */
+export function resolveTokenUsageFromTimeline(
   timeline: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>,
 ):
   | {
@@ -259,20 +360,25 @@ function resolveTokenUsageFromTimeline(
   if (usageEvents.length === 0) return undefined;
   let input = 0;
   let output = 0;
+  let cacheCreation = 0;
+  let cacheRead = 0;
   for (const event of usageEvents) {
     const nextInput = Number(event.payload.input_tokens ?? 0);
     const nextOutput = Number(event.payload.output_tokens ?? 0);
     if (!Number.isFinite(nextInput) || !Number.isFinite(nextOutput)) continue;
     input += nextInput;
     output += nextOutput;
+    cacheCreation += Number(event.payload.cache_creation_input_tokens ?? 0);
+    cacheRead += Number(event.payload.cache_read_input_tokens ?? 0);
   }
+  const totalInput = input + cacheCreation + cacheRead;
   const proxy = {
     input_tokens: input,
     output_tokens: output,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-    total_input_tokens: input,
-    total_tokens: input + output,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+    total_input_tokens: totalInput,
+    total_tokens: totalInput + output,
     call_count: usageEvents.length,
   };
   return {

@@ -8,12 +8,14 @@ import path from 'node:path';
 import type {
   RunCreateParams,
   RunCreateResult,
+  RunEventsResult,
   RunListResult,
+  RunPayloadResult,
   RunRestartResult,
 } from '../app/newide-backend-service';
 import { RunNotFoundError, type AppRunEvent } from '../app/run-registry';
 import { RunRequestNotFoundError } from '../app/run-request-store';
-import type { RunSnapshot } from '../protocol/run-snapshot';
+import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 import { JsonRpcMethodError } from './json-rpc-dispatcher';
 import type { JsonRpcDispatcher } from './json-rpc-dispatcher';
@@ -21,10 +23,44 @@ import type { JsonRpcDispatcher } from './json-rpc-dispatcher';
 export interface RunMethodsService {
   createRun(params: RunCreateParams): Promise<RunCreateResult>;
   getRunSnapshot(runId: string): RunSnapshot;
-  subscribe(runId: string, listener: (event: AppRunEvent) => void): () => void;
+  subscribe(
+    runId: string,
+    listener: (event: AppRunEvent) => void,
+    afterSequence?: number,
+  ): () => void;
   cancelRun(runId: string): Promise<{ cancelled: true }>;
   listRuns(): Promise<RunListResult>;
   restartRun(runId: string): Promise<RunRestartResult>;
+  /**
+   * 按 `payload_ref` 取回被外置的原始内容。
+   *
+   * 超过内联上限的字段（工具 `raw_input` / `raw_output` / content、长 stderr、大 chunk）
+   * 只留引用不内联；在那之前这个取回口一直缺失，前端能看见引用却永远拿不到内容。
+   */
+  getRunPayload(runId: string, payloadRef: string): Promise<RunPayloadResult | undefined>;
+  /**
+   * 增量拉取 timeline——订阅的拉取孪生口。
+   *
+   * 返回 `sequence > after_sequence` 的有序切片，序号与 `run.getSnapshot.timeline` 及
+   * `run.event` 推流**同源**（同一个对齐后的时间线，不另扫一遍库）。让纯轮询成为一等
+   * 公民路径：前端可以只用「拉快照 + 按水位补增量」而不建订阅。
+   */
+  getRunEvents(input: {
+    run_id: string;
+    after_sequence?: number;
+    limit?: number;
+  }): RunEventsResult;
+  /**
+   * 面板用的用量查询：可选的当前 run 用量 + 按作用域的历史累计。
+   *
+   * `task` / `role` / `run` 作用域必须给 `scope_id`——否则「这个任务/角色/run 的累计」
+   * 无从谈起。
+   */
+  getRunUsage(input: {
+    scope: 'task' | 'system' | 'role' | 'run';
+    scope_id?: string;
+    run_id?: string;
+  }): Promise<{ usage?: RunUsage; history: RunUsageHistory }>;
 }
 
 const createParamsSchema = z
@@ -40,6 +76,60 @@ const createParamsSchema = z
   })
   .strict();
 const runIdParamsSchema = z.object({ run_id: z.string().min(1) }).strict();
+/**
+ * 订阅参数。
+ *
+ * `after_sequence` 是断线重连的水位：只补该序号之后的事件。不给则全量重放
+ * （既有行为）。序号是本后端推流通道自己的单调序号，`run.getSnapshot` 返回的
+ * `event.sequence` 与它同源。
+ */
+const subscribeParamsSchema = z
+  .object({
+    run_id: z.string().min(1),
+    after_sequence: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+
+/** 外置载荷的引用形状：`<文件名>#<键>=<序号>`，由 driver 流投影生成。 */
+const payloadParamsSchema = z
+  .object({
+    run_id: z.string().min(1),
+    payload_ref: z
+      .string()
+      .min(1)
+      .regex(/^driver-stream\.jsonl#(stream_sequence|sequence)=\d+$/),
+  })
+  .strict();
+
+/**
+ * 增量拉取 timeline 的参数。
+ *
+ * `after_sequence` 与 `run.subscribe` 的水位是**同一个语义**（只回 `sequence` 严格大于它
+ * 的事件）；不给则从头给全量（等价水位 0）。`limit` 是软上限，被截断时 `has_more` 为
+ * true，轮询方据此继续拉。
+ */
+const eventsParamsSchema = z
+  .object({
+    run_id: z.string().min(1),
+    after_sequence: z.number().int().nonnegative().optional(),
+    limit: z.number().int().positive().max(500).optional(),
+  })
+  .strict();
+
+/**
+ * 用量查询参数。
+ *
+ * 作用域列得出 `task` / `system` / `role` / `run`：`role` 由账本在写入时记下的 `role_id`
+ * 支撑（`summary` 里只有 driver 腿带角色）；`run` 是单个 run 的持久用量，进程重启后仍然
+ * 读得到。`agent` 仍然不支持，它依赖从未被赋值的 `agent_id`。
+ */
+const usageParamsSchema = z
+  .object({
+    scope: z.enum(['task', 'system', 'role', 'run']),
+    scope_id: z.string().min(1).optional(),
+    run_id: z.string().min(1).optional(),
+  })
+  .strict();
 const emptyParamsSchema = z.object({}).strict();
 
 export class RunRpcMethods {
@@ -60,10 +150,12 @@ export class RunRpcMethods {
       return this.callWithRunError(() => this.service.getRunSnapshot(run_id));
     });
     dispatcher.register('run.subscribe', (params) => {
-      const { run_id } = parseParams(runIdParamsSchema, params);
+      const { run_id, after_sequence } = parseParams(subscribeParamsSchema, params);
       const unsubscribe = this.callWithRunError(() =>
-        this.service.subscribe(run_id, (event) =>
-          this.notify('run.event', { run_id: event.run_id, event }),
+        this.service.subscribe(
+          run_id,
+          (event) => this.notify('run.event', { run_id: event.run_id, event }),
+          after_sequence,
         ),
       );
       this.subscriptions.get(run_id)?.();
@@ -75,6 +167,46 @@ export class RunRpcMethods {
       this.subscriptions.get(run_id)?.();
       this.subscriptions.delete(run_id);
       return { unsubscribed: true };
+    });
+    dispatcher.register('run.getPayload', async (params) => {
+      const { run_id, payload_ref } = parseParams(payloadParamsSchema, params);
+      const result = await this.service.getRunPayload(run_id, payload_ref);
+      if (!result) {
+        // 「引用解析得了但那一行取不到」（文件被保留策略截断 / run 目录不存在）。
+        // 报错而不是返回空，前端才能区分它和「本来就没有引用」。
+        throw new JsonRpcMethodError(
+          JSON_RPC_ERROR_CODES.PAYLOAD_REF_UNAVAILABLE,
+          'Payload ref could not be resolved',
+          { run_id, payload_ref },
+        );
+      }
+      return result;
+    });
+    dispatcher.register('run.getEvents', (params) => {
+      const { run_id, after_sequence, limit } = parseParams(eventsParamsSchema, params);
+      return this.callWithRunError(() =>
+        this.service.getRunEvents({
+          run_id,
+          ...(after_sequence !== undefined ? { after_sequence } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+        }),
+      );
+    });
+    dispatcher.register('run.getUsage', async (params) => {
+      const parsed = parseParams(usageParamsSchema, params);
+      if (parsed.scope !== 'system' && parsed.scope_id === undefined) {
+        // 「这个任务/角色的累计」没有它就没有主语——参数校验就拦下，不去查库。
+        throw new JsonRpcMethodError(
+          JSON_RPC_ERROR_CODES.INVALID_PARAMS,
+          `scope_id is required for ${parsed.scope} scope`,
+          { scope: parsed.scope },
+        );
+      }
+      return this.service.getRunUsage({
+        scope: parsed.scope,
+        ...(parsed.scope_id ? { scope_id: parsed.scope_id } : {}),
+        ...(parsed.run_id ? { run_id: parsed.run_id } : {}),
+      });
     });
     dispatcher.register('run.cancel', (params) => {
       const { run_id } = parseParams(runIdParamsSchema, params);

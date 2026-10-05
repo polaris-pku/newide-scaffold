@@ -725,6 +725,30 @@ describe('SynthesisAgentCouncilProvider', () => {
       }),
     ).rejects.toThrow('observer unavailable');
   });
+
+  it('hands the facade the panel-visible run id alongside the phase-scoped execution id', async () => {
+    // 席位执行拿 `${run_id}_${phaseId}` 当执行身份（相位之间要隔离信箱幂等键与 driver 记账），
+    // 而面板按**任务那个 run** 读在飞状态。两个 id 都要传下去——只传执行身份时，议会阶段的
+    // 状态点会被写到谁也读不到的 key 上（一次真实 council run 里，整段 370 秒都是盲区）。
+    const requests: AgentExecutionRequest[] = [];
+    const provider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade: {
+        async runAgent(input) {
+          requests.push(input);
+          return completedExecution(input);
+        },
+      },
+    });
+
+    await provider.runCouncilRound(baseInput());
+
+    expect(requests.length).toBeGreaterThan(0);
+    for (const request of requests) {
+      expect(request.activity_run_id).toBe('run_observer');
+      expect(request.run_id).not.toBe('run_observer');
+      expect(request.run_id.startsWith('run_observer_')).toBe(true);
+    }
+  });
 });
 
 function baseInput() {

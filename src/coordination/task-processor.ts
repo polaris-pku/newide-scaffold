@@ -1273,6 +1273,12 @@ export class TaskProcessor {
     } = aggregate.task;
     const { error: _previousRunError, ...runWithoutError } = run;
     const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
+    // 终态必须摘掉 active_stage：它「存在」是「有一个 stage 调用在跑」的唯一依据，
+    // 读快照的前端据此显示「正在执行」。成功路径由 advanceStageOnce 摘、失败路径由
+    // failStage 摘，而这条「直接终结」（取消等）过去漏了——于是取消之后活跃标记会
+    // 永久残留，前端会一直显示还在执行。
+    const { active_stage: _activeStage, ...diagnosticsWithoutActiveStage } =
+      aggregate.runtime_state.diagnostics;
 
     const commit: CoordinationStateCommit = {
       expected_task_revision: aggregate.task.revision,
@@ -1304,7 +1310,7 @@ export class TaskProcessor {
         waiting_on: [],
         artifact_refs: artifactRefs,
         diagnostics: {
-          ...aggregate.runtime_state.diagnostics,
+          ...diagnosticsWithoutActiveStage,
           terminal_status: input.status,
           terminal_event_id: terminalEvent.event_id,
         },

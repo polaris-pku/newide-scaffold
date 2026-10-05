@@ -25,6 +25,7 @@ import {
   type RestoreFileAnchorResult,
 } from '../checkpoint';
 import {
+  listAgentActivities,
   NoopTelemetrySink,
   releaseRunLlmUsageLedger,
   runWithLlmUsageLedger,
@@ -53,7 +54,11 @@ import {
   type RunRequestStore,
 } from './run-request-store';
 import { projectRunSnapshot } from './run-snapshot-projector';
-import type { RunSnapshot } from '../protocol/run-snapshot';
+import { withAlignedTimeline } from './run-timeline-sequence';
+import { billedFromDurable, pendingBilledSources, projectRunUsage } from './run-usage-projection';
+import { projectRunActivity } from './run-activity-projection';
+import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
+import type { RunEvent } from '../protocol/run-event';
 import { projectTaskSnapshot, type TaskRunFact } from './task-snapshot-projector';
 import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task-snapshot';
 import {
@@ -116,7 +121,11 @@ import {
   usageObservationFromDriverEvent,
   type TaskDriverUsage,
 } from './driver-usage-projector';
-import { projectDriverStreamLifecycleEvent } from './driver-stream-projection';
+import {
+  driverStreamChannel,
+  isStreamFragment,
+  projectDriverStreamLifecycleEvent,
+} from './driver-stream-projection';
 import {
   createUnavailableSystemStatusService,
   type SystemStatusService,
@@ -132,6 +141,34 @@ import type {
   RunArtifactContent,
   RunArtifactContentReader,
 } from './run-artifact-content-reader';
+import type { RunPayloadReader } from './run-payload-reader';
+import type {
+  DurableRunUsage,
+  RunUsageHistoryReader,
+  RunUsageHistoryScope,
+} from './run-usage-history';
+
+/** `run.getPayload` 的结果：引用本身 + 它指向的原始 driver 事件。 */
+export interface RunPayloadResult {
+  payload_ref: string;
+  event: DriverStreamEvent;
+}
+
+/**
+ * `run.getEvents` 的结果：timeline 的一个 `sequence > after_sequence` 的有序切片。
+ *
+ * 字段都是为了让**纯轮询**自洽，不需要额外一次 `getSnapshot`：
+ * - `latest_sequence`：本 run 当前最大序号，轮询方拿它当下水位存起来（`events` 为空时
+ *   也能知道「没有新的」而不必再猜）。
+ * - `has_more`：给了 `limit` 且被截断时为 true，提示轮询方「还有，继续拉」而不是把
+ *   截断误读成「到底了」。
+ */
+export interface RunEventsResult {
+  events: RunEvent[];
+  after_sequence: number;
+  latest_sequence: number;
+  has_more: boolean;
+}
 
 export interface RunCreateParams {
   prompt: string;
@@ -306,7 +343,106 @@ export class NewideBackendService {
      * 所以它可以是成本与占用的正源，而不必等终态 summary 出生。
      */
     private readonly driverUsageSink: DriverUsageSink = new NoopDriverUsageSink(),
+    /**
+     * 按 `payload_ref` 取回 driver 事件流原始行的读取口。
+     *
+     * 不注入时 `run.getPayload` 报「不可用」而不是返回空——外部被截断/缺失与
+     * 「引用本来就不存在」是两件事，前端要能区分。
+     */
+    private readonly runPayloadReader?: RunPayloadReader,
+    /**
+     * 用量读取口。两个用途，时效不同：
+     *
+     * - `read`（异步）供 `run.getUsage` 的按作用域历史累计；
+     * - `readRun`（同步）供 `getRunSnapshot` 给**已收尾**的 run 补 `usage.billed`——那份
+     *   数据以前只活在进程内存里，重启即消失（`proxy.llm_usage_recorded` 不落 SQLite）。
+     *
+     * 不注入时两者都缺席，`run.getUsage` 报「不可用」而不是编一个 0。
+     */
+    private readonly runUsageHistoryReader?: RunUsageHistoryReader,
   ) {}
+
+  /**
+   * 面板用的用量查询：可选的「当前 run 用量」+ 必有的「按作用域的历史累计」。
+   *
+   * 两者刻意分块返回：前者是单个 run 的现值，后者是累计量，口径与时效都不同。
+   *
+   * `usage` 缺席表示**这个 run 在内存里没有、在持久层里也没有**（或没传 `run_id`），不是
+   * 「用量为 0」。已收尾的 run 即使本进程不持有它也会被补上：账本里有行就用账本，账本里
+   * 还没有行（账本上线之前的 run）就用该 run 自己的 `summary.json`。两条来源同值，见
+   * `LedgerRunUsageHistoryReader.readRun`。
+   *
+   * `scope: 'run'` 给的是同一个 run 的**持久**那份，与 `usage` 同源；两者都读得到时数值
+   * 必然相同（同一个账本），差别只在 `history` 还带 `runs_counted` / `complete` 这类
+   * 关于「这份数据完不完整」的元信息。
+   */
+  async getRunUsage(input: {
+    scope: RunUsageHistoryScope;
+    scope_id?: string;
+    run_id?: string;
+  }): Promise<{ usage?: RunUsage; history: RunUsageHistory }> {
+    if (!this.runUsageHistoryReader) {
+      throw new Error('Run usage history reader is not configured');
+    }
+    const history = await this.runUsageHistoryReader.read({
+      scope: input.scope,
+      ...(input.scope_id ? { scope_id: input.scope_id } : {}),
+    });
+    const usage = input.run_id ? this.getRunSnapshot(input.run_id).usage : undefined;
+    return { ...(usage ? { usage } : {}), history };
+  }
+
+  /**
+   * 按引用取回 driver 事件流的原始行。
+   *
+   * 返回 `undefined` 表示「引用解析得了、但那一行取不到」（文件被保留策略截断、
+   * 或 run 目录不存在）——调用方据此渲染「内容不可用」，而不是以为拿到了空数据。
+   */
+  async getRunPayload(
+    runId: string,
+    payloadRef: string,
+  ): Promise<RunPayloadResult | undefined> {
+    if (!this.runPayloadReader) {
+      throw new Error('Run payload reader is not configured');
+    }
+    const event = await this.runPayloadReader.read(runId, payloadRef);
+    return event ? { payload_ref: payloadRef, event } : undefined;
+  }
+
+  /**
+   * 增量拉取 timeline：订阅的**拉取孪生口**，让纯轮询成为一等公民路径。
+   *
+   * 存在理由：前端要「先 getSnapshot 对齐、再补增量」，但过去补增量只有 `run.subscribe`
+   * （推送）一条路。这个口把同一批事件用**同一个序号空间**按 `sequence` 差集发出去，
+   * 于是纯轮询与订阅可以互换而读到的号一致。
+   *
+   * **序号同源不是复制来的约定，是构造出来的**：直接取 `getRunSnapshot` 的 `timeline`——
+   * 那份已经被 `withAlignedTimeline` 对齐过（存活期）或回落到持久序号（重启后），与
+   * `run.event` 推流是同一套号。绝不自己另扫一遍 SQLite，否则两条通道又会各拿一套号。
+   *
+   * 过滤语义与 `run.subscribe` 的 `after_sequence` 水位**完全一致**（`sequence > after`），
+   * 因为这是它的孪生口，不是另一个东西。注意序号**非严格递增**（快照独有事件与前一个号
+   * 并列），所以 `events` 保留 timeline 的**数组顺序**（权威顺序），`sequence` 只用于
+   * 判缺与去重（去重键是 `event_id`）。并列号事件被同一个水位一起放过的边角，与
+   * `run.subscribe` 同构——孪生口的价值在于行为一致，不在于比订阅更聪明。
+   */
+  getRunEvents(input: {
+    run_id: string;
+    after_sequence?: number;
+    limit?: number;
+  }): RunEventsResult {
+    const after = input.after_sequence ?? 0;
+    const timeline = this.getRunSnapshot(input.run_id).timeline;
+    const candidates = timeline.filter((event) => event.sequence > after);
+    const limited =
+      input.limit === undefined ? candidates : candidates.slice(0, input.limit);
+    return {
+      events: limited,
+      after_sequence: after,
+      latest_sequence: timeline.reduce((max, event) => Math.max(max, event.sequence), 0),
+      has_more: limited.length < candidates.length,
+    };
+  }
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
     if (!this.artifactContentReader) {
@@ -1575,46 +1711,111 @@ export class NewideBackendService {
   }
 
   getRunSnapshot(runId: string): RunSnapshot {
+    // 用量两条腿（proxy 事件、driver 占用累加器）都只在进程内，所以快照投影器
+    // （纯函数）拿不到它们，必须在这个组装点补挂。没有该 run 时保持缺席，不编 0。
+    const liveRun = this.registry.has(runId) ? this.registry.getSnapshot(runId) : undefined;
     const persisted = this.taskProcessor?.getRunSnapshot(runId);
     if (persisted) {
-      const liveProjection = this.terminalRuns.has(runId)
-        ? this.registry.getSnapshot(runId)
-        : undefined;
+      const liveProjection = this.terminalRuns.has(runId) ? liveRun : undefined;
       if (
         persisted.status !== 'running' &&
         liveProjection?.status === 'running'
       ) {
         const { final_output: _finalOutput, ...terminalizing } = persisted;
-        return {
-          ...terminalizing,
-          status: 'running',
-          current: {
-            ...persisted.current,
-            stage: 'delivery',
-            task_status: 'running',
+        return this.withLiveObservation(
+          {
+            ...terminalizing,
+            status: 'running',
+            current: {
+              ...persisted.current,
+              stage: 'delivery',
+              task_status: 'running',
+            },
+            ...(persisted.task
+              ? {
+                  task: {
+                    ...persisted.task,
+                    status: 'running',
+                  },
+                }
+              : {}),
+            ...(persisted.run
+              ? {
+                  run: {
+                    ...persisted.run,
+                    status: 'running',
+                    completed_at: undefined,
+                  },
+                }
+              : {}),
           },
-          ...(persisted.task
-            ? {
-                task: {
-                  ...persisted.task,
-                  status: 'running',
-                },
-              }
-            : {}),
-          ...(persisted.run
-            ? {
-                run: {
-                  ...persisted.run,
-                  status: 'running',
-                  completed_at: undefined,
-                },
-              }
-            : {}),
-        };
+          liveRun,
+        );
       }
-      return persisted;
+      return this.withLiveObservation(persisted, liveRun);
     }
-    return projectRunSnapshot(this.registry.getSnapshot(runId));
+    return this.withLiveObservation(projectRunSnapshot(this.registry.getSnapshot(runId)), liveRun);
+  }
+
+  /**
+   * 补挂只有本进程才知道的观测：timeline 序号对齐 + `usage` 块 + 在飞 `activity`。
+   *
+   * 三件事里只有 `usage` 的计费腿**有持久来源**，所以它分两段：在跑的 run 用存活期时间线，
+   * 已收尾的 run 用账本（`readDurableRunUsage`）。另外两件都以「registry 确实持有该 run」为
+   * 前提，拿不到就原样返回——不编数字、不编 0、不编一个「空闲」。
+   */
+  private withLiveObservation(
+    snapshot: RunSnapshot,
+    liveRun: AppRunSnapshot | undefined,
+  ): RunSnapshot {
+    const durableUsage = this.readDurableRunUsage(snapshot);
+    if (!liveRun) {
+      // 本进程不持有该 run（进程重启、或这个 run 是别的进程跑的）。此时唯一还能补的是
+      // 账本里那一份计费用量——存活期时间线缺席，所以 `by_stage` 与 `context` 照旧缺席。
+      const billed = billedFromDurable(durableUsage);
+      // 与既有的 `usage` 合并而不是整个替换：账本只对 `billed` 说话，别把将来可能挂上去的
+      // 其它块顺手抹掉。
+      return billed ? { ...snapshot, usage: { ...snapshot.usage, billed } } : snapshot;
+    }
+    // 先对齐序号：快照 timeline 原本带的是 SQLite 行号，与推流通道不是一套号。
+    const aligned = withAlignedTimeline(snapshot, liveRun.events);
+    const usage = projectRunUsage({
+      timeline: liveRun.events,
+      driverUsage: this.getAccumulatedDriverUsage(snapshot.task_id),
+      ...(durableUsage ? { durable: durableUsage } : {}),
+      // 「还没到」的腿按 run 状态算：driver 计费腿是收尾时刮出来的，运行中注定没有。
+      pendingSources: pendingBilledSources(snapshot.status),
+    });
+    // 在飞状态是内存里的，只有本进程持有的 run 才有；没有就是没有这个字段。
+    // agent 半边来自进程级状态点，driver 半边从同一条存活期事件流里折出来（含 chunk，
+    // 所以 `last_event_at` 能反映「driver 还在动」）。
+    const activity = projectRunActivity(listAgentActivities(snapshot.run_id), {
+      driver_events: this.registry.listRetainedEvents(snapshot.run_id),
+    });
+    return {
+      ...aligned,
+      ...(usage ? { usage } : {}),
+      ...(activity ? { activity } : {}),
+    };
+  }
+
+  /**
+   * 已收尾 run 的持久计费用量；在跑的 run 一律返回 `undefined`。
+   *
+   * 两条判据都不能省：
+   *
+   * 1. **只对已收尾的 run 读账本。** 账本的行是 run 收尾时写的，在跑的 run 本来就没有行；
+   *    而「账本恰好有一行」只可能来自上一次同 id 的收尾，不该覆盖正在累积的存活期时间线。
+   * 2. **读失败就当缺席。** 账本是观测，读不出来不该让 `run.getSnapshot` 整个失败——这与
+   *    本仓库观测层的既有纪律一致（写入侧同样是吞错 + 留下可见缺口）。
+   */
+  private readDurableRunUsage(snapshot: RunSnapshot): DurableRunUsage | undefined {
+    if (snapshot.status === 'running') return undefined;
+    try {
+      return this.runUsageHistoryReader?.readRun(snapshot.run_id);
+    } catch {
+      return undefined;
+    }
   }
 
   async waitForTerminal(runId: string): Promise<void> {
@@ -1660,8 +1861,29 @@ export class NewideBackendService {
     return { cancelled: true };
   }
 
-  subscribe(runId: string, listener: (event: AppRunEvent) => void): () => void {
-    return this.registry.subscribe(runId, listener);
+  /**
+   * 订阅某 run 的推流通道。
+   *
+   * **片段类 driver 事件不发**（`isStreamFragment`，见 `driver-stream-projection.ts`）：
+   * 它们是可合并的高频流式片段（实测一个 council run 可达 1.6 万条），逐条推给前端既贵又
+   * 不可用——要看思考流该走独立的合并通道。状态类 driver 事件照发，所以「在跑哪个 turn /
+   * 哪个工具」在订阅通道上仍然完整。
+   *
+   * 过滤只在这一层（以及 `notifyTaskListeners`）：registry 仍然保留并投递全部事件，
+   * 因为 `audit.jsonl` 与存活期快照要的是完整记录，不是推流那份。
+   */
+  subscribe(
+    runId: string,
+    listener: (event: AppRunEvent) => void,
+    afterSequence?: number,
+  ): () => void {
+    return this.registry.subscribe(
+      runId,
+      (event) => {
+        if (!isStreamFragment(event.type)) listener(event);
+      },
+      afterSequence === undefined ? {} : { after_sequence: afterSequence },
+    );
   }
 
   private isLiveRun(runId: string): boolean {
@@ -1680,7 +1902,15 @@ export class NewideBackendService {
     return this.bMemoryService;
   }
 
+  /**
+   * 把事件推给 `task.subscribe` 的监听者。
+   *
+   * 与 `subscribe` 同一条判据：片段类不发（`isStreamFragment`）。这里的调用方是两条
+   * registry 订阅（task-loop 与 legacy），它们同时要写 `audit.jsonl`——**审计要全量，
+   * 推流只发状态类**，所以过滤放在这一层而不是 registry 的投递里。
+   */
   private notifyTaskListeners(taskId: string, event: AppRunEvent): void {
+    if (isStreamFragment(event.type)) return;
     for (const listener of this.taskListeners.get(taskId) ?? []) listener(event);
   }
 
@@ -1777,14 +2007,54 @@ export class NewideBackendService {
     }
   }
 
-  private appendDomainEvent(identity: { run_id: string; task_id: string }, event: Event): void {
-    if (event.event_type === 'run.completed' || event.event_type === 'run.failed') return;
-    if (event.run_id && event.run_id !== identity.run_id) return;
-    if (event.task_id && event.task_id !== identity.task_id) return;
+  /**
+   * 把事件追加进进程内 registry（推流通道与存活期快照的来源）。
+   *
+   * 返回是否真的追加了：调用方要靠这个答案决定后续动作，而「这条事件归谁」的判据
+   * 必须只有一份——两条通道对同一条事件不许给出不同结论。
+   */
+  private appendDomainEvent(identity: { run_id: string; task_id: string }, event: Event): boolean {
+    if (event.event_type === 'run.completed' || event.event_type === 'run.failed') return false;
+    if (event.run_id && event.run_id !== identity.run_id) return false;
+    if (event.task_id && event.task_id !== identity.task_id) return false;
     this.registry.appendEvent(identity.run_id, event.event_type, event.payload, {
       event_id: event.event_id,
       created_at: event.created_at,
     });
+    return true;
+  }
+
+  /**
+   * 把一条**已经进过 registry** 的事件补写进协调事件流（SQLite）。
+   *
+   * 为什么需要这一层：driver 事件流的投影此前只进进程内 registry 与审计文件
+   * （`audit.jsonl` / `driver-stream.jsonl`），**不进协调事件流**。于是进程重启后，
+   * 同一个 run 的持久 timeline 里 driver 那一段整个消失，只剩阶段事件——前端在
+   * 重启前看得到「正在跑哪个工具」，重启后同一份快照里什么都没有。
+   *
+   * 为什么吞错：这条路径跑在 driver stderr 的解析回调里（`emitEvent` → 订阅者）。
+   * driver 状态是观测，不该因为一次写库失败（run 已终态、revision 冲突、库忙）
+   * 改变 run 的结局——与 `CommandDriverTransport.emitEvent`、
+   * `FileRunEventConsumptionSink` 是同一条纪律。代价是可见的：事件已经在
+   * `audit.jsonl` 上，丢的只是「持久 timeline 里的 driver 状态」这一块的完整性。
+   *
+   * 只写 `coordination` 通道（见 `driver-stream-projection.ts` 的分流表）；片段类
+   * 写进来是量级事故，不是信息保全。
+   */
+  private persistRunEvent(identity: { run_id: string; task_id: string }, event: Event): void {
+    const processor = this.taskProcessor;
+    if (!processor) return;
+    try {
+      processor.recordRunEvent(identity.run_id, {
+        ...event,
+        // 投影事件的 run_id / task_id 取决于 driver 侧信封，可能缺席。缺席时用本次 run
+        // 的身份补齐——`appendDomainEvent` 已经确认它要么属于本 run、要么没有署名。
+        run_id: identity.run_id,
+        task_id: identity.task_id,
+      });
+    } catch {
+      // 见方法注释：观测失败不改 run 结局。
+    }
   }
 
   private appendDriverStreamEvent(
@@ -1805,7 +2075,15 @@ export class NewideBackendService {
       .append(identity.run_id, identity.task_id, event, streamSequence)
       .catch(() => undefined);
     const projected = projectDriverStreamLifecycleEvent(event, streamSequence);
-    if (projected) this.appendDomainEvent(identity, projected);
+    if (!projected) return;
+    // 先看 registry 收没收下：收下了才谈别的通道。两条通道对「这条事件归谁」的判据
+    // 只有 appendDomainEvent 那一处，所以不会出现「registry 拒收但 SQLite 收下」。
+    if (!this.appendDomainEvent(identity, projected)) return;
+    // 分流（driver-stream-projection.ts 的 DRIVER_STREAM_CHANNELS）：状态类同时进协调
+    // 事件流，让 driver 状态在进程重启后仍可读；片段类只留审计文件与进程内 registry。
+    if (driverStreamChannel(projected.event_type) === 'coordination') {
+      this.persistRunEvent(identity, projected);
+    }
   }
 
   /**

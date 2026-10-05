@@ -72,6 +72,8 @@ import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
+import { FileRunPayloadReader } from './run-payload-reader';
+import { LedgerRunUsageHistoryReader } from './run-usage-history';
 import {
   createRunLatency,
   FileRunEventConsumptionSink,
@@ -540,8 +542,14 @@ export async function createProductionBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
-      new FileRunTerminalOutputWriter(runsRoot, runLatency, undefined, (taskId) =>
-        serviceHolder.service?.getAccumulatedDriverUsage(taskId),
+      // 第 5 个参数是用量账本：run 收尾时把两条计费腿作为只追加行落库，使累计用量不再
+      // 依赖 runs/ 目录树存活。（第 3 个参数是 Claude session 刮取，用生产默认实现。）
+      new FileRunTerminalOutputWriter(
+        runsRoot,
+        runLatency,
+        undefined,
+        (taskId) => serviceHolder.service?.getAccumulatedDriverUsage(taskId),
+        coordinationStore,
       ),
       new FileRunRequestStore(runsRoot),
       taskProcessor,
@@ -563,6 +571,10 @@ export async function createProductionBackendService(
       runTelemetryJsonlSink,
       aapBridge,
       driverUsageSink,
+      new FileRunPayloadReader(runsRoot),
+      // 历史读账本而不是扫目录：目录树没有任何保留策略，往期一旦被清理，重算出来的
+      // 「累计」会变小。首次读会惰性回填一次目录树里已有的用量（幂等）。
+      new LedgerRunUsageHistoryReader(coordinationStore, runsRoot),
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();

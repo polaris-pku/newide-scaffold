@@ -20,6 +20,13 @@ import {
   type TaskResumeCursor,
 } from './coordination-state-store';
 import type {
+  TokenUsageLedgerAggregate,
+  TokenUsageLedgerEntry,
+  TokenUsageLedgerQuery,
+  TokenUsageLedgerStore,
+} from './token-usage-ledger';
+import { migrateTokenUsageLedger, SqliteTokenUsageLedger } from './sqlite-token-usage-ledger';
+import type {
   MailboxStateStore,
   PersistedMailboxDelivery,
   PersistedMailboxEnvelope,
@@ -88,16 +95,19 @@ export class SqliteCoordinationStore
     CoordinationStateStore,
     MailboxStateStore,
     ParticipantSessionPersistence,
-    ProtocolDeliveryStore
+    ProtocolDeliveryStore,
+    TokenUsageLedgerStore
 {
   private readonly database: DatabaseSync;
   private readonly protocolDelivery: SqliteProtocolDelivery;
+  private readonly tokenUsageLedger: SqliteTokenUsageLedger;
   private protocolTransactionActive = false;
 
   constructor(databasePath: string) {
     if (databasePath !== ':memory:') mkdirSync(path.dirname(databasePath), { recursive: true });
     this.database = new DatabaseSync(databasePath);
     this.protocolDelivery = new SqliteProtocolDelivery(this.database);
+    this.tokenUsageLedger = new SqliteTokenUsageLedger(this.database);
     try {
       this.configure();
       this.migrate();
@@ -216,6 +226,13 @@ export class SqliteCoordinationStore
   }
   archiveSettled(before: string, limit?: number) {
     return this.protocolDelivery.archiveSettled(before, limit);
+  }
+
+  appendTokenUsage(entries: readonly TokenUsageLedgerEntry[]): void {
+    this.tokenUsageLedger.appendTokenUsage(entries);
+  }
+  aggregateTokenUsage(query: TokenUsageLedgerQuery, asOf: string): TokenUsageLedgerAggregate {
+    return this.tokenUsageLedger.aggregateTokenUsage(query, asOf);
   }
 
   getTaskAggregate(taskId: string): PersistedTaskAggregate | undefined {
@@ -854,6 +871,11 @@ export class SqliteCoordinationStore
       this.database
         .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
         .run(5, new Date().toISOString());
+      // version 6: 用量账本表。只追加，且刻意不挂 tasks/runs 外键——累计用量必须活过任务清理。
+      migrateTokenUsageLedger(this.database);
+      this.database
+        .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(6, new Date().toISOString());
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
