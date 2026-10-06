@@ -12,6 +12,7 @@ import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler
 import {
   AgentBoardCouncilParticipantResolver,
   createCouncilStrategyProvider,
+  readCouncilProposalReplayDir,
   readCouncilReviewMode,
   readCouncilSeatAssignments,
   readCouncilStrategy,
@@ -405,6 +406,7 @@ export async function createProductionBackendService(
       readCouncilStrategy(env.NEWIDE_COUNCIL_STRATEGY),
       readCouncilReviewMode(env.NEWIDE_COUNCIL_REVIEW),
     );
+    const councilProposalReplayDir = readCouncilProposalReplayDir(env);
     const gateExecutor =
       dependencies.gateExecutor ??
       new ProductionGateExecutor({
@@ -494,6 +496,7 @@ export async function createProductionBackendService(
         runsRoot,
         councilRoot: path.join(stateRoot, 'council'),
         worktreesRoot: path.join(stateRoot, 'worktrees'),
+        ...(councilProposalReplayDir ? { councilProposalReplayDir } : {}),
       }),
     });
     const mailboxRecovery = mailboxService.replayPendingDeliveries();

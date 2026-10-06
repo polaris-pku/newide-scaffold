@@ -7,7 +7,7 @@ import type {
   AgentExecutionFacade,
   AgentExecutionRequest,
 } from '../../src/protocol/agent-execution';
-import type { CouncilParticipantBinding } from '../../src/council';
+import { applyCouncilProposalReplay, type CouncilParticipantBinding } from '../../src/council';
 import { councilRunDirName } from '../../src/council/council-workspace';
 import { SynthesisAgentCouncilProvider } from '../../src/council/providers/synthesis-agent-provider';
 import { SapTaskBridge } from '../../src/coordination';
@@ -68,6 +68,75 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(result.selected_artifact_refs).toEqual([
       `artifact_${COUNCIL_AGENTS.synthesizer}`,
     ]);
+  });
+
+  it('reuses frozen proposals so only the review and synthesis stages run', async () => {
+    const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-replay-'));
+    const replayDir = await writeFrozenPlanPack({
+      artifact_alpha: 'alpha plan\n',
+      artifact_beta: 'beta plan\n',
+    });
+    const requests: AgentExecutionRequest[] = [];
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        requests.push(input);
+        const proposalIds = input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [];
+        return {
+          agent_run_id: `agent_run_${input.role_id}`,
+          agent_id: input.role_id,
+          role_id: input.role_id,
+          context_pack_ref: `context_${input.role_id}`,
+          driver_run_result_id: `driver_result_${input.role_id}`,
+          artifact_refs:
+            input.council_seat === 'reviewer'
+              ? [reviewsArtifact(JSON.stringify(reviewPayload(proposalIds)))]
+              : [
+                  createArtifact(
+                    `artifact_${input.role_id}`,
+                    input.role_id,
+                    'file',
+                    input.council_seat === 'synthesizer' ? 'final-plan.md' : 'council-plan.md',
+                  ),
+                ],
+          transcript_ref: createArtifact(
+            `transcript_${input.role_id}`,
+            input.role_id,
+            'transcript',
+          ),
+          session_id: `session_${input.role_id}`,
+          response: `${input.role_id} completed`,
+          tool_events: [],
+          diagnostics: { driver_id: `driver_${input.role_id}` },
+          status: 'completed',
+          created_at: '2026-07-07T00:00:00.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade, councilRoot });
+
+    const replayed = await applyCouncilProposalReplay(baseInput(), replayDir);
+    const result = await provider.runCouncilRound(replayed, { artifact_mode: 'plan' });
+
+    // 两个提案者的 agent_id 已在冻结提案里，本轮因此不再生成提案。
+    expect(requests.map((request) => request.council_seat)).toEqual(['reviewer', 'synthesizer']);
+    expect(result.proposals.map((proposal) => proposal.proposal_id)).toEqual([
+      'proposal_a',
+      'proposal_b',
+    ]);
+    expect(result.proposals.map((proposal) => proposal.agent_id)).toEqual([
+      COUNCIL_AGENTS.proposerA,
+      COUNCIL_AGENTS.proposerB,
+    ]);
+    expect(result.decision.verdict).toBe('select');
+
+    // 评审者工作区里的方案文件与冻结包逐字节相同。
+    const staged = (await findFilesNamed(councilRoot, 'council-plan.md')).filter((file) =>
+      file.includes(`${path.sep}participant_reviewer_0${path.sep}`),
+    );
+    expect(staged).toHaveLength(2);
+    const bodies = await Promise.all(staged.map((file) => fs.readFile(file, 'utf-8')));
+    expect(bodies.sort()).toEqual(['alpha plan\n', 'beta plan\n']);
   });
 
   it('drops only the reviewer role when the review stage is disabled', async () => {
@@ -809,6 +878,38 @@ async function findFilesNamed(root: string, name: string): Promise<string[]> {
     else if (entry.name === name) found.push(full);
   }
   return found;
+}
+
+/** 冻结包：proposals.json + inputs/<artifact_id>/council-plan.md，与真实 pack 一致。 */
+async function writeFrozenPlanPack(plans: Record<string, string>): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-replay-pack-'));
+  const proposers = [COUNCIL_AGENTS.proposerA, COUNCIL_AGENTS.proposerB];
+  const proposals = Object.keys(plans).map((artifactId, index) => ({
+    proposal_id: index === 0 ? 'proposal_a' : 'proposal_b',
+    run_id: 'run_frozen',
+    task_id: 'task_frozen',
+    agent_id: proposers[index] ?? `agent_extra_${String(index)}`,
+    artifact_refs: [artifactId],
+    summary: `frozen summary for ${artifactId}`,
+    claims: [],
+    affected_paths: [],
+    assumptions: [],
+    known_risks: [],
+    completion_evidence: [],
+    created_at: '2026-10-04T00:00:00.000Z',
+    schema_version: SCHEMA_VERSION,
+  }));
+  await fs.writeFile(
+    path.join(root, 'proposals.json'),
+    JSON.stringify(proposals, null, 2),
+    'utf-8',
+  );
+  for (const [artifactId, body] of Object.entries(plans)) {
+    const dir = path.join(root, 'inputs', artifactId);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'council-plan.md'), body, 'utf-8');
+  }
+  return root;
 }
 
 function baseInput() {

@@ -1,5 +1,6 @@
 import type { ArtifactRef } from '../../core';
 import {
+  applyCouncilProposalReplay,
   reconcileCouncilOutcome,
   type CouncilExecutionOptions,
   type CouncilProvider,
@@ -13,6 +14,11 @@ import { isMaterializableFileArtifact, readArtifactBytes, sha256 } from '../arti
 
 export interface AutonomousCouncilHandlerOptions {
   councilProvider: CouncilProvider;
+  /**
+   * 冻结提案包目录。设置后本轮的提案与候选产物改用该包内容，提案者角色被跳过，
+   * 用于"同一份提案、只差评审"的对照实验；不设置时行为与原先逐字相同。
+   */
+  proposalReplayDir?: string;
 }
 
 export interface AutonomousCouncilExecution {
@@ -29,9 +35,13 @@ export class AutonomousCouncilHandler {
     input: CouncilRunRequest,
     options?: CouncilExecutionOptions,
   ): Promise<AutonomousCouncilExecution> {
-    const runResult = await this.options.councilProvider.runCouncilRound(input, options);
+    // 回放只替换提案与候选产物，question / evidence_pack / workspace_path 等逐字保留。
+    const roundInput = this.options.proposalReplayDir
+      ? await applyCouncilProposalReplay(input, this.options.proposalReplayDir)
+      : input;
+    const runResult = await this.options.councilProvider.runCouncilRound(roundInput, options);
     const artifacts = new Map(
-      [...(input.candidate_artifacts ?? []), ...runResult.generated_artifact_refs].map(
+      [...(roundInput.candidate_artifacts ?? []), ...runResult.generated_artifact_refs].map(
         (artifact) => [artifact.artifact_id, artifact],
       ),
     );

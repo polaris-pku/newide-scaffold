@@ -74,6 +74,11 @@ export interface ProductionStageExecutorDependencies {
   auctionEnabled?: boolean;
   /** 关闭竞标时指定的 primary role_id。 */
   primaryAgentId?: string;
+  /**
+   * 冻结提案包目录。设置后 Council 阶段改用该包内的提案与产物、跳过提案者角色，
+   * 用于"同一份提案、只差评审"的对照实验；默认不设置。
+   */
+  councilProposalReplayDir?: string;
 }
 
 interface ProductionSelectionState {
@@ -520,12 +525,18 @@ export function createProductionStageExecutors(
         primary_role_id: primary.agent_id ?? primary.role_id,
         candidate_artifact_refs: evidencePack.artifact_refs,
         ...(strategyName ? { strategy: strategyName } : {}),
+        ...(dependencies.councilProposalReplayDir
+          ? { proposal_replay_dir: dependencies.councilProposalReplayDir }
+          : {}),
       });
       const selector = new ArtifactSelector({
         mode: 'council',
         councilProvider: dependencies.councilProvider,
         councilHandler: new AutonomousCouncilHandler({
           councilProvider: dependencies.councilProvider,
+          ...(dependencies.councilProposalReplayDir
+            ? { proposalReplayDir: dependencies.councilProposalReplayDir }
+            : {}),
         }),
       });
       let selected;

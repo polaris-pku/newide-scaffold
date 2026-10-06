@@ -77,6 +77,12 @@ Synthesizer 选出 `final-plan.md`，再由原 Primary Agent 在同一 Session �
 "同流程、开/关评审"的对照实验，默认 `on`。批量测评脚本对应 `--review off`（仅
 `--mode council` 有效）。
 
+提案回放：设置 `NEWIDE_COUNCIL_REPLAY_DIR` 指向一次已完成 Council 运行的 synthesizer
+pack（含 `proposals.json` 与 `inputs/`）后，本轮不再生成提案——`agent_id` 已在冻结提案
+里的提案者被跳过，冻结的 `council-plan.md` 作为候选产物落到评审者工作区。这样开评审与
+关评审的两次运行共享同一份提案，差异只剩评审环节；未设置时行为与原先一致。批量测评
+脚本对应 `--replay-proposals <pack|含 {instance} 的模板>`。
+
 `.env.local`、ACP Client 的 `.env` 和 API key 均不得提交到 Git。
 
 ### Polaris Electron

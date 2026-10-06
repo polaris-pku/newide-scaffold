@@ -6,5 +6,6 @@ export * from './mock-council';
 export * from './council-run-output';
 export * from './plan-artifact';
 export * from './proposal-adapter';
+export * from './proposal-replay';
 export * from './providers/synthesis-agent-provider';
 export * from './strategy';

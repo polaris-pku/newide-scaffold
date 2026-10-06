@@ -14,6 +14,12 @@
  * `--review off` keeps everything about the Council round except the reviewer
  * role, so a reviewed arm and an unreviewed arm can be compared on identical
  * inputs; it is only valid together with `--mode council`.
+ *
+ * `--replay-proposals <dir|template>` reuses a completed Council run's frozen
+ * proposals (its synthesizer pack: proposals.json plus inputs/) instead of
+ * generating new ones, so both arms share byte-identical proposals and the only
+ * difference left is the review stage. `{instance}` in the value is replaced by
+ * the instance id.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, promises as fs, readFileSync } from 'node:fs';
@@ -79,6 +85,8 @@ interface InstanceRow {
   run_mode: EvaluationRunMode;
   /** Review setting of the Council arm this row ran under; absent in older batches. */
   review_mode?: AblationReviewMode;
+  /** 冻结提案包目录：该实例的提案并非本轮生成，而是从该包回放。 */
+  proposal_replay_dir?: string;
   instance_id: string;
   /** 1-based position within the arm; memory accumulates across the sequence. */
   instance_seq: number;
@@ -202,6 +210,14 @@ const reviewMode = parseReviewMode(readFlag('--review') ?? baseEnv.NEWIDE_COUNCI
 if (runMode !== 'council' && reviewMode === 'off') {
   throw new Error('--review off requires --mode council; single_agent has no review stage.');
 }
+// 提案回放：值可以是冻结包目录，也可以是 `{instance}` 占位符模板；集合目录会去
+// 找其中唯一的 Council synthesizer pack（council/*/cp_s0_*）。
+const replayProposalsTemplate = readFlag('--replay-proposals');
+if (replayProposalsTemplate && runMode !== 'council') {
+  throw new Error(
+    '--replay-proposals requires --mode council; single_agent has no Council proposals.',
+  );
+}
 // 全自动化测评：无人审核 → 晋升即批准（替代人工 reviewSkill）。
 // 晋升置信度门槛保持默认 0.95：用后验证回写（usage-feedback）会在任务间
 // 把 driver 上报的引用效果累计为经验置信度，真正常被复用且有效的经验
@@ -301,7 +317,7 @@ if (sandboxExtraRoBinds.size > 0) {
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
-log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode} review=${reviewMode}`);
+log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode} review=${reviewMode}${replayProposalsTemplate ? ` replay=${replayProposalsTemplate}` : ''}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
 log(
   `ACCEPTANCE_RUN_TIMEOUT_MS: ${unlimitedRunTimeout ? '0 (unlimited)' : String(runTimeoutMs)}`,
@@ -468,6 +484,7 @@ for (const ablation of ablations) {
   log(`state root: ${isolation.state_root}`);
   log(`pglite data dir: ${isolation.pglite_data_dir}`);
 
+  const replayStageDir = path.join(isolation.state_root, 'proposal-replay');
   const backendEnv: NodeJS.ProcessEnv = {
     ...baseEnv,
     NEWIDE_B_PGLITE_DATA_DIR: isolation.pglite_data_dir,
@@ -478,6 +495,8 @@ for (const ablation of ablations) {
       ? {
           NEWIDE_COUNCIL_STRATEGY: baseEnv.NEWIDE_COUNCIL_STRATEGY ?? 'plan_first',
           NEWIDE_COUNCIL_REVIEW: reviewMode,
+          // 每实例运行前把冻结包复制到这里；后端只在 Council 阶段读取它。
+          ...(replayProposalsTemplate ? { NEWIDE_COUNCIL_REPLAY_DIR: replayStageDir } : {}),
           NEWIDE_COUNCIL_SEATS:
             baseEnv.NEWIDE_COUNCIL_SEATS ??
             'role_fullstack_engineer,role_ts_engineer,role_code_reviewer,role_synthesis_engineer',
@@ -495,6 +514,10 @@ for (const ablation of ablations) {
   try {
     for (const [instanceIndex, instanceId] of instanceIds.entries()) {
       const instance = getInstanceOrThrow(instancesById, instanceId);
+      const replayPack = replayProposalsTemplate
+        ? await resolveProposalReplayPack(replayProposalsTemplate, instanceId)
+        : undefined;
+      if (replayPack) await stageProposalReplayPack(replayPack, replayStageDir);
       const row = await runOneInstance({
         ablation,
         armDir,
@@ -502,6 +525,7 @@ for (const ablation of ablations) {
         instance,
         instanceSeq: instanceIndex + 1,
         stateRoot: isolation.state_root,
+        ...(replayPack ? { proposalReplayDir: replayPack } : {}),
       });
       rows.push(row);
       await fs.writeFile(
@@ -510,7 +534,7 @@ for (const ablation of ablations) {
         'utf-8',
       );
       log(
-        `  ${instanceId} status=${row.status} snapshot=${row.snapshot_status ?? '-'} eval=${row.eval_run_dir ?? row.eval_error ?? '-'}`,
+        `  ${instanceId} status=${row.status} snapshot=${row.snapshot_status ?? '-'} eval=${row.eval_run_dir ?? row.eval_error ?? '-'}${replayPack ? ` replay=${replayPack}` : ''}`,
       );
     }
   } finally {
@@ -521,6 +545,7 @@ for (const ablation of ablations) {
     ablation,
     run_mode: runMode,
     review_mode: reviewMode,
+    ...(replayProposalsTemplate ? { proposal_replay_template: replayProposalsTemplate } : {}),
     state_root: isolation.state_root,
     pglite_data_dir: isolation.pglite_data_dir,
     total_count: rows.length,
@@ -562,6 +587,7 @@ const summary = {
   ablations: [...new Set([...ablations, ...mergedArms.map((arm) => arm.ablation)])],
   run_mode: runMode,
   review_mode: reviewMode,
+  ...(replayProposalsTemplate ? { proposal_replay_template: replayProposalsTemplate } : {}),
   model_name: modelName,
   b_embedding: {
     provider: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
@@ -597,12 +623,14 @@ async function runOneInstance(input: {
   instance: SweEvoInstance;
   instanceSeq: number;
   stateRoot: string;
+  proposalReplayDir?: string;
 }): Promise<InstanceRow> {
-  const { ablation, armDir, backend, instance, instanceSeq, stateRoot } = input;
+  const { ablation, armDir, backend, instance, instanceSeq, stateRoot, proposalReplayDir } = input;
   const row: InstanceRow = {
     ablation,
     run_mode: runMode,
     review_mode: reviewMode,
+    ...(proposalReplayDir ? { proposal_replay_dir: proposalReplayDir } : {}),
     instance_id: instance.instance_id,
     instance_seq: instanceSeq,
     repo: instance.repo,
@@ -1204,6 +1232,56 @@ function parseReviewMode(raw: string): AblationReviewMode {
   const normalized = raw.trim();
   if (normalized === 'on' || normalized === 'off') return normalized;
   throw new Error(`Invalid review mode "${raw}". Expected on|off.`);
+}
+
+/**
+ * 解析 `--replay-proposals`：`{instance}` 会替换为实例 id；指向含 proposals.json 的
+ * 冻结包时直接用；指向集合目录时要求其中恰好有一个 Council synthesizer pack，
+ * 多于一个就报错而不是猜。
+ */
+async function resolveProposalReplayPack(template: string, instanceId: string): Promise<string> {
+  const substituted = template.replaceAll('{instance}', instanceId);
+  const resolved = path.isAbsolute(substituted) ? substituted : path.resolve(repoRoot, substituted);
+  if (await fileExists(path.join(resolved, 'proposals.json'))) return resolved;
+  const packs: string[] = [];
+  for (const councilDir of await listSubdirectories(path.join(resolved, 'council'))) {
+    for (const pack of await listSubdirectories(councilDir)) {
+      if (!path.basename(pack).startsWith('cp_s0')) continue;
+      if (await fileExists(path.join(pack, 'proposals.json'))) packs.push(pack);
+    }
+  }
+  if (packs.length === 1) return packs[0]!;
+  if (packs.length === 0) {
+    throw new Error(
+      `--replay-proposals ${resolved} has no proposals.json and no Council synthesizer pack under council/*/cp_s0_*`,
+    );
+  }
+  throw new Error(
+    `--replay-proposals ${resolved} matches ${String(packs.length)} Council packs; pass the exact pack directory: ${packs.join(', ')}`,
+  );
+}
+
+async function stageProposalReplayPack(pack: string, target: string): Promise<void> {
+  await fs.rm(target, { recursive: true, force: true });
+  await fs.cp(pack, target, { recursive: true });
+}
+
+async function listSubdirectories(root: string): Promise<string[]> {
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => undefined);
+  if (!entries) return [];
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(root, entry.name))
+    .sort();
+}
+
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    await fs.access(file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function loadMergedArmReports(

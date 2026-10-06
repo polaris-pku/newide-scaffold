@@ -1,10 +1,44 @@
 import { createHash } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type ArtifactRef } from '../../src/core';
 import { AutonomousCouncilHandler } from '../../src/coordinator/handlers/autonomous-council-handler';
-import type { CouncilProvider, CouncilRunResult, Review } from '../../src/council';
+import type {
+  CouncilProvider,
+  CouncilRunRequest,
+  CouncilRunResult,
+  Review,
+} from '../../src/council';
 
 describe('AutonomousCouncilHandler', () => {
+  it('replays a frozen proposal pack and leaves the rest of the request untouched', async () => {
+    const pack = await writeFrozenPack({ artifact_alpha: 'alpha plan\n' });
+    let captured: CouncilRunRequest | undefined;
+    const handler = new AutonomousCouncilHandler({
+      councilProvider: {
+        async runCouncilRound(input) {
+          captured = input;
+          return runResult({
+            finalArtifact: artifact('artifact_synthesis', 'final.ts', 'verified\n'),
+            reviews: [],
+          });
+        },
+      },
+      proposalReplayDir: pack,
+    });
+
+    await handler.execute(request());
+
+    expect(captured?.question).toBe('Produce the final artifact.');
+    expect(captured?.run_id).toBe('run_001');
+    expect(captured?.proposals.map((proposal) => proposal.proposal_id)).toEqual(['proposal_a']);
+    expect(captured?.candidate_artifacts?.map((artifact) => artifact.artifact_id)).toEqual([
+      'artifact_alpha',
+    ]);
+  });
+
   it('uses a complete fallback when one file of the selected candidate is missing', async () => {
     const value = runResult({
       finalArtifact: artifact('synthesis_readable', 'main.ts', 'import "./missing";'),
@@ -200,6 +234,42 @@ describe('AutonomousCouncilHandler', () => {
     );
   });
 });
+
+/** 冻结包：proposals.json + inputs/<artifact_id>/<target_path>，与真实 pack 一致。 */
+async function writeFrozenPack(plans: Record<string, string>): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-replay-handler-'));
+  await fs.writeFile(
+    path.join(root, 'proposals.json'),
+    JSON.stringify(
+      [
+        {
+          proposal_id: 'proposal_a',
+          run_id: 'run_001',
+          task_id: 'task_001',
+          agent_id: 'agent_backend',
+          artifact_refs: Object.keys(plans),
+          summary: 'frozen proposal',
+          claims: [],
+          affected_paths: [],
+          assumptions: [],
+          known_risks: [],
+          completion_evidence: [],
+          created_at: '2026-10-04T00:00:00.000Z',
+          schema_version: SCHEMA_VERSION,
+        },
+      ],
+      null,
+      2,
+    ),
+    'utf-8',
+  );
+  for (const [artifactId, body] of Object.entries(plans)) {
+    const dir = path.join(root, 'inputs', artifactId);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'council-plan.md'), body, 'utf-8');
+  }
+  return root;
+}
 
 function request() {
   return {
