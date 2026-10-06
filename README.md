@@ -4,6 +4,50 @@
 production path now includes a real external Driver, persistent B role/persona/memory,
 durable Task/Run state, and Council proposal/review/synthesis/delivery.
 
+## 评审消融分支：Council 开 / 关评审对照
+
+> 本分支只服务一件事：在其余环节完全相同的前提下，比较 **有一次评审** 与 **没有评审** 的
+> Council 结果。`NEWIDE_COUNCIL_REVIEW` 与 `NEWIDE_COUNCIL_REPLAY_DIR` 默认都不生效，
+> 未设置时行为与分支基线 `7c085e6` 相同；除这两个开关及它们写进结果的留档字段
+> （`review_mode`、`proposal_replay_dir`）外，本分支没有其他运行时行为改动。做消融以外的
+> 功能开发不要基于本分支。
+
+| 臂 | 设置 | 提案 | 评审 |
+| --- | --- | --- | --- |
+| R（有评审） | 不设置 | 本轮生成 | 执行 reviewer |
+| R0-b（无评审，配对） | `NEWIDE_COUNCIL_REVIEW=off` + `NEWIDE_COUNCIL_REPLAY_DIR=<冻结包>` | 回放 R 的冻结包 | 不执行 reviewer |
+
+冻结包就是一次已完成 Council 的 synthesizer pack（`cp_s0_*`：`proposals.json` 与 `inputs/`）。
+回放时 `agent_id` 已在冻结提案里的提案者被跳过，冻结的 `council-plan.md` 原样落到评审者工作区，
+于是两臂共享同一份提案，差异只剩评审。缺 `proposals.json`、提案缺 `agent_id`、产物不是恰好一个
+落盘文件时直接报错，不猜。
+
+```bash
+# 臂 R：先跑，产出提案并留下冻结包
+pnpm eval:sweevo-ablation -- --subset <subset> --ablations B4 --mode council --review on --run-harness
+# 臂 R0-b：回放同 repeat 的 R 提案，关掉评审
+pnpm eval:sweevo-ablation -- --subset <subset> --ablations B4 --mode council --review off \
+  --replay-proposals '<exp>/runs/{instance}/repeat-N/A2/experiment/B4/state' --run-harness
+```
+
+`{instance}` 按实例替换，并在 `council/*/cp_s0_*` 下找唯一的 pack；多于一个报错。**顺序不能反**：
+R0-b 的冻结包来自 R。单任务直接跑时用同名的两个环境变量，见 `.env.example`。
+
+跑完必须核对（缺一即该次作废）：
+
+| 判据 | R | R0-b |
+| --- | --- | --- |
+| `role_code_reviewer` 是否有驱动会话 | 有 | **无** |
+| council 目录 | 含 `cp_r0_*` | 无 `cp_r0_*`；回放时提案者也无会话 |
+| `council.review.completed` | ≥1 | 0 |
+| `cp_s0/reviews.json` | 评审原文 | `[]` |
+| 两臂 `proposal_id` 集合与计划文件 sha256 | 配对时必须相等 | 同 |
+
+合成阶段照常执行（`council.synthesis.completed` → `final-plan.md` → primary 实现计划），无论评审
+开关如何；无评审时 `council quality` 恒为 `best_effort`（`verified` 需要至少一条评审，这是设计
+后果而非失败）。2026-10-06 本地双跑各 1 次已验证：`off` 侧 `review_count=0`、reviewer 无会话、
+合成与实现照常；`on` 侧 `review_count=2`、`quality=verified`。
+
 ## Quick Start
 
 只保留两个正式入口：后端 CLI 和 Polaris Electron。需要 Node.js `>=22.22.1`、
