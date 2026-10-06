@@ -72,6 +72,11 @@ Council 默认使用 `classic`，各角色直接产生候选实现。设置
 Synthesizer 选出 `final-plan.md`，再由原 Primary Agent 在同一 Session 和隔离 workspace
 中实施；Task/Run RPC、Gate 和交付入口不变。
 
+评审消融：设置 `NEWIDE_COUNCIL_REVIEW=off` 后，Council 只跑提案者与合成者，reviewer
+席位不执行、`reviews.json` 为空数组，席位映射、提案输入与合成契约都不变。该开关用于
+"同流程、开/关评审"的对照实验，默认 `on`。批量测评脚本对应 `--review off`（仅
+`--mode council` 有效）。
+
 `.env.local`、ACP Client 的 `.env` 和 API key 均不得提交到 Git。
 
 ### Polaris Electron

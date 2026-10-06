@@ -70,6 +70,79 @@ describe('SynthesisAgentCouncilProvider', () => {
     ]);
   });
 
+  it('drops only the reviewer role when the review stage is disabled', async () => {
+    const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-no-review-'));
+    const requests: AgentExecutionRequest[] = [];
+    const lifecycleEvents: string[] = [];
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        requests.push(input);
+        const targetPath =
+          input.council_seat === 'synthesizer' ? 'final-plan.md' : 'council-plan.md';
+        const proposalIds = input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [];
+        return {
+          agent_run_id: `agent_run_${input.role_id}`,
+          agent_id: input.role_id,
+          role_id: input.role_id,
+          context_pack_ref: `context_${input.role_id}`,
+          driver_run_result_id: `driver_result_${input.role_id}`,
+          artifact_refs:
+            input.council_seat === 'reviewer'
+              ? [reviewsArtifact(JSON.stringify(reviewPayload(proposalIds)))]
+              : [createArtifact(`artifact_${input.role_id}`, input.role_id, 'file', targetPath)],
+          transcript_ref: createArtifact(
+            `transcript_${input.role_id}`,
+            input.role_id,
+            'transcript',
+          ),
+          session_id: `session_${input.role_id}`,
+          response: `${input.role_id} completed`,
+          tool_events: [],
+          diagnostics: { driver_id: `driver_${input.role_id}` },
+          status: 'completed',
+          created_at: '2026-07-07T00:00:00.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({ agentExecutionFacade, councilRoot });
+
+    const result = await provider.runCouncilRound(baseInput(), {
+      artifact_mode: 'plan',
+      review_enabled: false,
+      onLifecycleEvent: (event) => lifecycleEvents.push(event.type),
+    });
+
+    // 席位映射与开评审时一致，只有 reviewer 角色没有真的跑。
+    expect(requests.map((request) => request.council_seat)).toEqual([
+      'proposer',
+      'proposer',
+      'synthesizer',
+    ]);
+    expect(result.participants.map((participant) => participant.seat)).toEqual([
+      'proposer',
+      'proposer',
+      'reviewer',
+      'synthesizer',
+    ]);
+    expect(lifecycleEvents).not.toContain('council.review.completed');
+    expect(result.reviews).toEqual([]);
+    expect(result.synthesis?.input_review_ids).toEqual([]);
+    expect(result.decision.verdict).toBe('select');
+    expect(result.selected_artifact_refs).toEqual([`artifact_${COUNCIL_AGENTS.synthesizer}`]);
+
+    const synthesizerRequest = requests[2];
+    expect(synthesizerRequest?.instruction).toContain(
+      'Write one executable final Plan to final-plan.md.',
+    );
+    expect(synthesizerRequest?.instruction).not.toContain('Resolve material review concerns');
+
+    // reviews.json 仍按空数组落盘，合成者的读取步骤与开评审时逐字相同。
+    const reviewFiles = await findFilesNamed(councilRoot, 'reviews.json');
+    expect(reviewFiles).toHaveLength(1);
+    expect((await fs.readFile(reviewFiles[0]!, 'utf-8')).trim()).toBe('[]');
+  });
+
   it('rejects product files emitted by a plan-first Council role', async () => {
     const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-plan-invalid-'));
     const agentExecutionFacade: AgentExecutionFacade = {
@@ -726,6 +799,17 @@ describe('SynthesisAgentCouncilProvider', () => {
     ).rejects.toThrow('observer unavailable');
   });
 });
+
+async function findFilesNamed(root: string, name: string): Promise<string[]> {
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const found: string[] = [];
+  for (const entry of entries) {
+    const full = path.join(root, entry.name);
+    if (entry.isDirectory()) found.push(...(await findFilesNamed(full, name)));
+    else if (entry.name === name) found.push(full);
+  }
+  return found;
+}
 
 function baseInput() {
   return {

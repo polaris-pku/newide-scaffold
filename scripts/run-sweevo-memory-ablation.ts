@@ -9,6 +9,11 @@
  *   pnpm eval:sweevo-ablation -- --subset v0-requests-3-prctx --mode council --ablations B0,B1,B2 --run-harness
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B0 --mode council --run-harness
+ *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B4 --mode council --review off --run-harness
+ *
+ * `--review off` keeps everything about the Council round except the reviewer
+ * role, so a reviewed arm and an unreviewed arm can be compared on identical
+ * inputs; it is only valid together with `--mode council`.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, promises as fs, readFileSync } from 'node:fs';
@@ -49,6 +54,8 @@ interface JsonRpcMessage {
 }
 
 type EvaluationRunMode = 'single_agent' | 'council';
+/** Review ablation for Council arms: 'off' removes the reviewer role. */
+type AblationReviewMode = 'on' | 'off';
 
 interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
@@ -70,6 +77,8 @@ interface TokenUsage extends RunTokenUsageSummary {
 interface InstanceRow {
   ablation: MemoryAblation;
   run_mode: EvaluationRunMode;
+  /** Review setting of the Council arm this row ran under; absent in older batches. */
+  review_mode?: AblationReviewMode;
   instance_id: string;
   /** 1-based position within the arm; memory accumulates across the sequence. */
   instance_seq: number;
@@ -187,6 +196,12 @@ const baseEnv: NodeJS.ProcessEnv = {
     : {}),
   ...(sweEvoRootRaw ? { NEWIDE_SWE_EVO_ROOT: path.resolve(repoRoot, sweEvoRootRaw) } : {}),
 };
+// 评审消融开关：显式 --review 优先，其次环境变量，最后默认 on。只有 council
+// 模式有评审阶段，single_agent 传 off 会静默失去意义，因此直接报错。
+const reviewMode = parseReviewMode(readFlag('--review') ?? baseEnv.NEWIDE_COUNCIL_REVIEW ?? 'on');
+if (runMode !== 'council' && reviewMode === 'off') {
+  throw new Error('--review off requires --mode council; single_agent has no review stage.');
+}
 // 全自动化测评：无人审核 → 晋升即批准（替代人工 reviewSkill）。
 // 晋升置信度门槛保持默认 0.95：用后验证回写（usage-feedback）会在任务间
 // 把 driver 上报的引用效果累计为经验置信度，真正常被复用且有效的经验
@@ -286,7 +301,7 @@ if (sandboxExtraRoBinds.size > 0) {
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
-log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode}`);
+log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode} review=${reviewMode}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
 log(
   `ACCEPTANCE_RUN_TIMEOUT_MS: ${unlimitedRunTimeout ? '0 (unlimited)' : String(runTimeoutMs)}`,
@@ -427,6 +442,8 @@ if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
 }
 const armReports: Array<{
   ablation: MemoryAblation;
+  run_mode: EvaluationRunMode;
+  review_mode: AblationReviewMode;
   state_root: string;
   pglite_data_dir: string;
   total_count: number;
@@ -460,6 +477,7 @@ for (const ablation of ablations) {
     ...(runMode === 'council'
       ? {
           NEWIDE_COUNCIL_STRATEGY: baseEnv.NEWIDE_COUNCIL_STRATEGY ?? 'plan_first',
+          NEWIDE_COUNCIL_REVIEW: reviewMode,
           NEWIDE_COUNCIL_SEATS:
             baseEnv.NEWIDE_COUNCIL_SEATS ??
             'role_fullstack_engineer,role_ts_engineer,role_code_reviewer,role_synthesis_engineer',
@@ -501,6 +519,8 @@ for (const ablation of ablations) {
 
   const armSummary = {
     ablation,
+    run_mode: runMode,
+    review_mode: reviewMode,
     state_root: isolation.state_root,
     pglite_data_dir: isolation.pglite_data_dir,
     total_count: rows.length,
@@ -541,6 +561,7 @@ const summary = {
   instance_ids: instanceIds,
   ablations: [...new Set([...ablations, ...mergedArms.map((arm) => arm.ablation)])],
   run_mode: runMode,
+  review_mode: reviewMode,
   model_name: modelName,
   b_embedding: {
     provider: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
@@ -581,6 +602,7 @@ async function runOneInstance(input: {
   const row: InstanceRow = {
     ablation,
     run_mode: runMode,
+    review_mode: reviewMode,
     instance_id: instance.instance_id,
     instance_seq: instanceSeq,
     repo: instance.repo,
@@ -1176,6 +1198,12 @@ function parseAblations(raw: string): MemoryAblation[] {
 function parseRunMode(raw: string): EvaluationRunMode {
   if (raw === 'single_agent' || raw === 'council') return raw;
   throw new Error(`Invalid --mode "${raw}". Expected single_agent|council.`);
+}
+
+function parseReviewMode(raw: string): AblationReviewMode {
+  const normalized = raw.trim();
+  if (normalized === 'on' || normalized === 'off') return normalized;
+  throw new Error(`Invalid review mode "${raw}". Expected on|off.`);
 }
 
 async function loadMergedArmReports(

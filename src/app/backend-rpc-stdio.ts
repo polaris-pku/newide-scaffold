@@ -12,6 +12,7 @@ import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler
 import {
   AgentBoardCouncilParticipantResolver,
   createCouncilStrategyProvider,
+  readCouncilReviewMode,
   readCouncilSeatAssignments,
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
@@ -402,6 +403,7 @@ export async function createProductionBackendService(
     const councilProvider = createCouncilStrategyProvider(
       baseCouncilProvider,
       readCouncilStrategy(env.NEWIDE_COUNCIL_STRATEGY),
+      readCouncilReviewMode(env.NEWIDE_COUNCIL_REVIEW),
     );
     const gateExecutor =
       dependencies.gateExecutor ??

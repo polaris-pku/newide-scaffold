@@ -222,64 +222,74 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       ...(input.candidate_artifacts ?? []),
       ...generatedResults.flatMap((result) => result.artifact_refs),
     ];
+    // Review ablation: 'off' keeps seats, workspaces and the synthesis contract
+    // exactly as they are and only removes the reviewer role from this round.
+    const reviewEnabled = options?.review_enabled !== false;
     const reviewerWorkspace = participantWorkspace(councilDir, reviewerParticipant);
     let parsedReviews: ParsedReview[] | undefined;
-    const reviewerExecution = await this.tryRunRole(
-      input,
-      executionRunId,
-      councilRunId,
-      reviewerParticipant,
-      buildReviewerInstruction(input.question, proposals, options?.artifact_mode),
-      proposals.flatMap((proposal) => proposal.artifact_refs),
-      'review',
-      reviewerWorkspace,
-      options,
-      diagnosticRefs,
-      REVIEW_ATTEMPTS,
-      async () => {
-        // A plan reviewer needs the same repository baseline as the authors in
-        // order to validate file paths, APIs, and tests instead of reviewing
-        // prose in isolation. The snapshot is a separate Council worktree/copy,
-        // so reviewer tools cannot mutate the user's source workspace.
-        await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
-        await stageCouncilArtifacts(reviewerWorkspace, candidateArtifacts);
-        await writeProposalManifest(reviewerWorkspace, proposals, candidateArtifacts);
-      },
-      async (result) => {
-        parsedReviews = await readReviews(result, reviewerWorkspace);
-        if (!coversEveryProposal(proposals, parsedReviews)) {
-          throw new CouncilRoleExecutionError(
-            'review',
-            reviewerParticipant,
-            'failed',
-            result.agent_run_id,
-            result.driver_run_result_id,
-            {
-              reason:
-                'Write reviews.json at the root of this workspace with exactly one structured review for each proposal in proposals.json.',
-              retryable: true,
-              session_id: result.session_id,
-            },
-          );
-        }
-      },
-    );
-    const reviewer = reviewerExecution?.result;
-    if (reviewer) generatedResults.push(reviewer);
-    const undelivered = reviewDeliveryFailure(
-      proposals,
-      reviewerParticipant,
-      reviewer,
-      parsedReviews,
-    );
-    if (undelivered) throw undelivered;
-    const reviews = buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews ?? []);
-    if (reviewer) {
+    let reviewer: AgentExecutionResult | undefined;
+    let reviewerPhaseId: string | undefined;
+    if (reviewEnabled) {
+      const reviewerExecution = await this.tryRunRole(
+        input,
+        executionRunId,
+        councilRunId,
+        reviewerParticipant,
+        buildReviewerInstruction(input.question, proposals, options?.artifact_mode),
+        proposals.flatMap((proposal) => proposal.artifact_refs),
+        'review',
+        reviewerWorkspace,
+        options,
+        diagnosticRefs,
+        REVIEW_ATTEMPTS,
+        async () => {
+          // A plan reviewer needs the same repository baseline as the authors in
+          // order to validate file paths, APIs, and tests instead of reviewing
+          // prose in isolation. The snapshot is a separate Council worktree/copy,
+          // so reviewer tools cannot mutate the user's source workspace.
+          await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
+          await stageCouncilArtifacts(reviewerWorkspace, candidateArtifacts);
+          await writeProposalManifest(reviewerWorkspace, proposals, candidateArtifacts);
+        },
+        async (result) => {
+          parsedReviews = await readReviews(result, reviewerWorkspace);
+          if (!coversEveryProposal(proposals, parsedReviews)) {
+            throw new CouncilRoleExecutionError(
+              'review',
+              reviewerParticipant,
+              'failed',
+              result.agent_run_id,
+              result.driver_run_result_id,
+              {
+                reason:
+                  'Write reviews.json at the root of this workspace with exactly one structured review for each proposal in proposals.json.',
+                retryable: true,
+                session_id: result.session_id,
+              },
+            );
+          }
+        },
+      );
+      reviewer = reviewerExecution?.result;
+      reviewerPhaseId = reviewerExecution?.phase_id;
+      if (reviewer) generatedResults.push(reviewer);
+      const undelivered = reviewDeliveryFailure(
+        proposals,
+        reviewerParticipant,
+        reviewer,
+        parsedReviews,
+      );
+      if (undelivered) throw undelivered;
+    }
+    const reviews = reviewEnabled
+      ? buildReviews(proposals, reviewerParticipant, reviewer, parsedReviews ?? [])
+      : [];
+    if (reviewEnabled && reviewer && reviewerPhaseId) {
       await emitLifecycle(options, {
         type: 'council.review.completed',
         payload: {
           council_run_id: councilRunId,
-          phase_id: reviewerExecution!.phase_id,
+          phase_id: reviewerPhaseId,
           phase: 'review',
           ...participantAuditPayload(reviewerParticipant),
           agent_run_id: reviewer.agent_run_id,
@@ -302,7 +312,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       executionRunId,
       councilRunId,
       synthesizerParticipant,
-      buildSynthesisInstruction(input.question, 1, options?.artifact_mode),
+      buildSynthesisInstruction(input.question, 1, options?.artifact_mode, reviewEnabled),
       proposals.flatMap((proposal) => proposal.artifact_refs),
       'synthesis',
       synthesizerWorkspace,
@@ -354,7 +364,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         .filter(isMaterializableFileArtifact)
         .map((artifact) => artifact.artifact_id) ?? [];
     const generatedArtifactRefs = generatedResults.flatMap((result) => result.artifact_refs);
-    const decision = buildDecision(input, synthesis, selectedArtifactRefs);
+    const decision = buildDecision(input, synthesis, selectedArtifactRefs, reviewEnabled);
 
     return {
       council_run_id: councilRunId,
@@ -1327,6 +1337,7 @@ function buildDecision(
   input: CouncilRoundInput,
   synthesis: CouncilSynthesis | undefined,
   selectedArtifactRefs: string[],
+  reviewEnabled = true,
 ): CouncilDecision {
   const hasSelection = selectedArtifactRefs.length > 0;
   return {
@@ -1337,8 +1348,13 @@ function buildDecision(
     selected_artifact_refs: selectedArtifactRefs,
     verdict: hasSelection ? 'select' : 'request_revision',
     reason: hasSelection
-      ? synthesis?.summary || 'Synthesis agent produced the selected final candidate artifact.'
-      : 'Synthesis was unavailable; Coordinator must select the best reviewed proposal.',
+      ? synthesis?.summary ||
+        (reviewEnabled
+          ? 'Synthesis agent produced the selected final candidate artifact.'
+          : 'Review stage disabled; synthesizer produced the selected final candidate artifact.')
+      : reviewEnabled
+        ? 'Synthesis was unavailable; Coordinator must select the best reviewed proposal.'
+        : 'Synthesis was unavailable and the review stage was disabled; Coordinator must select a proposal.',
     evidence_refs: [
       ...(synthesis ? [synthesis.synthesis_id] : []),
       ...(input.evidence_pack ? [input.evidence_pack.evidence_pack_id] : []),
@@ -1509,12 +1525,17 @@ function buildSynthesisInstruction(
   question: string,
   round: number,
   artifactMode: CouncilArtifactMode | undefined,
+  reviewEnabled = true,
 ): string {
   if (artifactMode === 'plan') {
     return [
       `Synthesis round ${String(round)} for: ${question}.`,
       'Read proposals.json, its listed input files, and reviews.json. Stay inside this workspace; do not inspect parent directories, run state, market ledgers, other sessions or driver streams.',
-      'Resolve material review concerns and write one executable final Plan to final-plan.md.',
+      // Review ablation: only the review sentence changes; the workspace layout and
+      // the remaining instruction stay byte-identical to the reviewed path.
+      reviewEnabled
+        ? 'Resolve material review concerns and write one executable final Plan to final-plan.md.'
+        : 'Write one executable final Plan to final-plan.md.',
       'Use the relative path final-plan.md in the current role workspace; never construct an absolute path.',
       'Do not implement the Plan or modify product files.',
       'The final Plan must identify affected files, ordered steps, risks, and verification.',
@@ -1525,7 +1546,9 @@ function buildSynthesisInstruction(
     'Read the staged proposal inputs and reviews.json in this isolated workspace.',
     'Implement the concrete final candidate changes in the repository workspace.',
     'Do not merely describe a decision; at least one materializable file change is required.',
-    'Explain the selected approach and how review concerns were addressed in the Driver report summary.',
+    reviewEnabled
+      ? 'Explain the selected approach and how review concerns were addressed in the Driver report summary.'
+      : 'Explain the selected approach in the Driver report summary.',
   ].join(' ');
 }
 

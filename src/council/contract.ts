@@ -253,6 +253,14 @@ export interface CouncilExecutionOptions {
   }) => SapResultDisposition | Promise<SapResultDisposition>;
   /** Internal strategy hint; it is not part of the public Task/Run RPC. */
   artifact_mode?: CouncilArtifactMode;
+  /**
+   * Internal strategy hint for the review ablation. When false the Council runs
+   * proposers and the synthesizer without executing the reviewer role; absent or
+   * true keeps the reviewer, so the default path is unchanged. Only the review
+   * stage is skipped — seats, proposal inputs and the synthesis contract stay
+   * as they are.
+   */
+  review_enabled?: boolean;
 }
 
 export type CouncilArtifactMode = 'implementation' | 'plan';

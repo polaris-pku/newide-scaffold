@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
 import type {
+  CouncilExecutionOptions,
   CouncilProvider,
   CouncilRunResult,
   CouncilRoundInput,
@@ -9,6 +10,7 @@ import type {
 } from '../../src/council';
 import {
   createCouncilStrategyProvider,
+  readCouncilReviewMode,
   readCouncilStrategy,
 } from '../../src/council';
 
@@ -78,6 +80,53 @@ describe('Council strategy boundary', () => {
     expect(provider.strategyName).toBe('plan_first');
     expect(artifactMode).toBe('plan');
     expect(output.outcome?.status).toBe('completed');
+  });
+
+  it('turns the review stage off while leaving the plan-first options otherwise intact', async () => {
+    const result = councilResult({ adaptive: true });
+    let captured: CouncilExecutionOptions | undefined;
+    const provider = createCouncilStrategyProvider(
+      {
+        async runCouncilRound(_input, options) {
+          captured = options;
+          return result;
+        },
+      },
+      'plan_first',
+      'off',
+    );
+
+    const output = await provider.runCouncilRound(baseInput());
+
+    expect(readCouncilReviewMode(undefined)).toBe('on');
+    expect(readCouncilReviewMode('off')).toBe('off');
+    expect(captured?.artifact_mode).toBe('plan');
+    expect(captured?.review_enabled).toBe(false);
+    expect(output.outcome?.status).toBe('completed');
+  });
+
+  it('leaves the options object untouched when the reviewer still runs', async () => {
+    const result = councilResult({ adaptive: true });
+    let captured: CouncilExecutionOptions | undefined;
+    const provider = createCouncilStrategyProvider(
+      {
+        async runCouncilRound(_input, options) {
+          captured = options;
+          return result;
+        },
+      },
+      'plan_first',
+      'on',
+    );
+
+    await provider.runCouncilRound(baseInput());
+
+    expect(captured?.artifact_mode).toBe('plan');
+    expect(captured !== undefined && 'review_enabled' in captured).toBe(false);
+  });
+
+  it('rejects an unknown review mode instead of silently keeping the reviewer', () => {
+    expect(() => readCouncilReviewMode('sometimes')).toThrow('NEWIDE_COUNCIL_REVIEW');
   });
 
   it('rejects an unknown strategy instead of silently falling back', () => {

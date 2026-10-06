@@ -9,6 +9,24 @@ import type {
 
 export type CouncilStrategyName = 'classic' | 'adaptive_lead' | 'plan_first';
 
+/**
+ * Review ablation switch. 'off' removes the reviewer role from every strategy
+ * without changing seats, proposal inputs or the synthesis contract, so a run
+ * with and a run without review can be compared on otherwise identical inputs.
+ */
+export type CouncilReviewMode = 'on' | 'off';
+
+/**
+ * Only the 'off' case is expressed: when the reviewer runs, the options object is
+ * forwarded untouched so the default path keeps the exact shape it had before.
+ */
+function withReviewMode(
+  reviewEnabled: boolean,
+  options?: CouncilExecutionOptions,
+): CouncilExecutionOptions | undefined {
+  return reviewEnabled ? options : { ...options, review_enabled: false };
+}
+
 export interface CouncilStrategy {
   readonly name: CouncilStrategyName;
   runCouncilRound(
@@ -24,13 +42,19 @@ export interface CouncilStrategy {
 export class ClassicCouncilStrategy implements CouncilStrategy {
   readonly name = 'classic' as const;
 
-  constructor(private readonly provider: CouncilProvider) {}
+  constructor(
+    private readonly provider: CouncilProvider,
+    private readonly reviewEnabled = true,
+  ) {}
 
   async runCouncilRound(
     input: CouncilRoundInput,
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
-    const result = await this.provider.runCouncilRound(input, options);
+    const result = await this.provider.runCouncilRound(
+      input,
+      withReviewMode(this.reviewEnabled, options),
+    );
     return withOutcome(result, buildOutcome(result));
   }
 }
@@ -43,13 +67,19 @@ export class ClassicCouncilStrategy implements CouncilStrategy {
 export class AdaptiveLeadCouncilStrategy implements CouncilStrategy {
   readonly name = 'adaptive_lead' as const;
 
-  constructor(private readonly provider: CouncilProvider) {}
+  constructor(
+    private readonly provider: CouncilProvider,
+    private readonly reviewEnabled = true,
+  ) {}
 
   async runCouncilRound(
     input: CouncilRoundInput,
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
-    const result = await this.provider.runCouncilRound(input, options);
+    const result = await this.provider.runCouncilRound(
+      input,
+      withReviewMode(this.reviewEnabled, options),
+    );
     const base = buildOutcome(result);
     const unresolved = adaptiveUnresolvedIssues(result);
     const warnings = [...base.warnings, ...unresolved.map((issue) => `adaptive_lead: ${issue}`)];
@@ -65,14 +95,17 @@ export class AdaptiveLeadCouncilStrategy implements CouncilStrategy {
 export class PlanFirstCouncilStrategy implements CouncilStrategy {
   readonly name = 'plan_first' as const;
 
-  constructor(private readonly provider: CouncilProvider) {}
+  constructor(
+    private readonly provider: CouncilProvider,
+    private readonly reviewEnabled = true,
+  ) {}
 
   async runCouncilRound(
     input: CouncilRoundInput,
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
     const result = await this.provider.runCouncilRound(input, {
-      ...options,
+      ...withReviewMode(this.reviewEnabled, options),
       artifact_mode: 'plan',
     });
     return withOutcome(result, buildOutcome(result));
@@ -97,13 +130,15 @@ export class StrategicCouncilProvider implements CouncilProvider {
 export function createCouncilStrategyProvider(
   provider: CouncilProvider,
   strategyName: CouncilStrategyName = readCouncilStrategy(),
+  reviewMode: CouncilReviewMode = readCouncilReviewMode(),
 ): StrategicCouncilProvider {
+  const reviewEnabled = reviewMode !== 'off';
   const strategy =
     strategyName === 'classic'
-      ? new ClassicCouncilStrategy(provider)
+      ? new ClassicCouncilStrategy(provider, reviewEnabled)
       : strategyName === 'adaptive_lead'
-        ? new AdaptiveLeadCouncilStrategy(provider)
-        : new PlanFirstCouncilStrategy(provider);
+        ? new AdaptiveLeadCouncilStrategy(provider, reviewEnabled)
+        : new PlanFirstCouncilStrategy(provider, reviewEnabled);
   return new StrategicCouncilProvider(strategy);
 }
 
@@ -119,6 +154,12 @@ export function readCouncilStrategy(value = process.env.NEWIDE_COUNCIL_STRATEGY)
   throw new Error(
     `Unsupported NEWIDE_COUNCIL_STRATEGY: ${normalized}. Expected classic, adaptive_lead, or plan_first.`,
   );
+}
+
+export function readCouncilReviewMode(value = process.env.NEWIDE_COUNCIL_REVIEW): CouncilReviewMode {
+  const normalized = value?.trim() || 'on';
+  if (normalized === 'on' || normalized === 'off') return normalized;
+  throw new Error(`Unsupported NEWIDE_COUNCIL_REVIEW: ${normalized}. Expected on or off.`);
 }
 
 export function reconcileCouncilOutcome(
