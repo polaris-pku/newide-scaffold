@@ -22,6 +22,11 @@ durable Task/Run state, and Council proposal/review/synthesis/delivery.
 于是两臂共享同一份提案，差异只剩评审。缺 `proposals.json`、提案缺 `agent_id`、产物不是恰好一个
 落盘文件时直接报错，不猜。
 
+回放模式下 **primary 出计划那一轮也整轮跳过**：不调用驱动、工作区只从任务工作区复制而不写入任何
+计划文件（避免那份会被丢弃的计划留在实现上下文里），实现轮另行新开 session。该轮在事件流里以
+`agent.execution_completed` + `proposal_replay_skip: true` 留痕，其绑定标注
+`driver_status: not_invoked`。于是分支点之前不再生成任何内容。
+
 ```bash
 # 臂 R：先跑，产出提案并留下冻结包
 pnpm eval:sweevo-ablation -- --subset <subset> --ablations B4 --mode council --review on --run-harness
@@ -42,6 +47,7 @@ R0-b 的冻结包来自 R。单任务直接跑时用同名的两个环境变量�
 | `council.review.completed` | ≥1 | 0 |
 | `cp_s0/reviews.json` | 评审原文 | `[]` |
 | 两臂 `proposal_id` 集合与计划文件 sha256 | 配对时必须相等 | 同 |
+| primary 计划轮 | 真的跑 | 跳过（`proposal_replay_skip: true`、`driver_status: not_invoked`） |
 
 合成阶段照常执行（`council.synthesis.completed` → `final-plan.md` → primary 实现计划），无论评审
 开关如何；无评审时 `council quality` 恒为 `best_effort`（`verified` 需要至少一条评审，这是设计

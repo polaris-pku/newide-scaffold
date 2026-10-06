@@ -247,6 +247,63 @@ export function createProductionStageExecutors(
       } else {
         await fs.mkdir(executionWorkspace, { recursive: true });
       }
+      // 提案回放：提案与最终计划都由冻结包提供，这一轮唯一的产物（primary 自己的计划）会被
+      // 回放替换掉，所以整轮不再调用驱动。工作区仍在上一步从任务工作区复制，但不写入任何
+      // 计划文件，于是实现轮看到的是干净仓库 + 冻结提案 + 最终计划，且从新 session 起跑。
+      if (planFirst && dependencies.councilProposalReplayDir) {
+        const primary = replayPrimaryBinding(context.cursor_input.winner_agent_id, {
+          run_id: context.run_id,
+          task_id: context.task_id,
+        });
+        const selection = await selectionState({
+          context,
+          mode: 'single_agent',
+          artifacts: [],
+          producerAgentId: primary.role_id,
+          response: primary.response,
+          // 该占位值只出现在 execute_agent 之后、council 覆盖之前的中间态；它带 replay: 前缀，
+          // 不会被当成真实会话（实现轮另开新 session）。
+          sessionId: primary.session_id,
+          driverId: String(primary.diagnostics.driver_id ?? primary.role_id),
+          runsRoot: dependencies.runsRoot,
+        });
+        await stateStore.update(
+          context.run_id,
+          context.task_id,
+          { primary: { result: primary }, selection },
+          context.restarted_from_run_id,
+        );
+        emit(context, 'agent.execution_completed', primary.agent_run_id, {
+          agent_id: primary.role_id,
+          role_id: primary.role_id,
+          status: primary.status,
+          response: primary.response,
+          artifact_refs: [],
+          transcript_ref: primary.transcript_ref.artifact_id,
+          context_pack_ref: primary.context_pack_ref,
+          driver_run_result_id: primary.driver_run_result_id,
+          diagnostics: primary.diagnostics,
+          proposal_replay_skip: true,
+          ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
+        });
+        return {
+          changeset_ref: selection.manifest_ref,
+          expected_sha256: selection.expected_sha256,
+          agent_id: primary.role_id,
+          evidence: {
+            status: primary.status,
+            agent_id: primary.role_id,
+            role_id: primary.role_id,
+            context_pack_ref: primary.context_pack_ref,
+            memory_buffer_ref: primary.memory_buffer_ref,
+            changeset_ref: selection.manifest_ref,
+            expected_sha256: selection.expected_sha256,
+            artifact_refs: [],
+            proposal_replay_skip: true,
+          },
+          artifact_refs: [],
+        };
+      }
       emit(context, 'agent.execution_requested', context.run_id, {
         role_id: context.cursor_input.winner_agent_id,
         workspace_path: executionWorkspace,
@@ -593,6 +650,10 @@ export function createProductionStageExecutors(
         primary.agent_id ??
         primary.role_id;
       let response = councilRunResult.decision.reason || primary.response;
+      // 提案回放模式下 primary 那一轮没有真的跑，它没有可续的会话：实现轮开新 session，
+      // 选择的 session 也用实现轮真正的会话，而不是回放绑定的占位值。
+      const proposalReplay = Boolean(dependencies.councilProposalReplayDir);
+      let sessionId = primary.session_id;
       if (strategyName === 'plan_first') {
         try {
           const finalPlans = assertCouncilPlanArtifacts(selectedArtifacts, 'final synthesis');
@@ -604,8 +665,9 @@ export function createProductionStageExecutors(
             attempt: 1,
             role_id: primary.role_id,
             agent_id: primary.agent_id ?? primary.role_id,
-            session_id: primary.session_id,
+            ...(proposalReplay ? {} : { session_id: primary.session_id }),
             input_artifact_refs: finalPlans.map((artifact) => artifact.artifact_id),
+            ...(proposalReplay ? { proposal_replay_fresh_session: true } : {}),
           });
           const implementation = await executeFinalCouncilPlan({
             context,
@@ -614,10 +676,12 @@ export function createProductionStageExecutors(
             dependencies,
             councilRunId: councilRunResult.council_run_id,
             phaseId: implementationPhaseId,
+            ...(proposalReplay ? { startFreshSession: true } : {}),
           });
           selectedArtifacts = implementation.artifact_refs;
           producerAgentId = primary.agent_id ?? primary.role_id;
           response = implementation.result.response;
+          sessionId = implementation.result.session_id;
           councilRunResult = await attachPlanExecution(
             councilRunResult,
             finalPlans,
@@ -636,7 +700,7 @@ export function createProductionStageExecutors(
         artifacts: selectedArtifacts,
         producerAgentId,
         response,
-        sessionId: primary.session_id,
+        sessionId,
         driverId: String(primary.diagnostics.driver_id ?? primary.role_id),
         runsRoot: dependencies.runsRoot,
         councilRunResult,
@@ -914,6 +978,49 @@ function councilStrategyName(provider: CouncilProvider): string | undefined {
   return (provider as CouncilProvider & { strategyName?: string }).strategyName;
 }
 
+/**
+ * 提案回放模式下被跳过的 primary 计划轮所留下的身份绑定。
+ *
+ * 下游只需要三样东西：角色身份、一个可信的 context pack 引用、以及"该轮没有真的调用
+ * driver"这一事实（`driver_status: 'not_invoked'` 是既有约定，写事件时会因此省略
+ * session_id）。`session_id` 带 `replay:` 前缀且不会被发给驱动——实现轮由
+ * `startFreshSession` 明确要求开新 session，因此它不会冒充任何真实会话。
+ */
+function replayPrimaryBinding(
+  roleId: string,
+  ids: { run_id: string; task_id: string },
+): AgentExecutionResult {
+  const suffix = ids.run_id;
+  return {
+    agent_run_id: `agent_run_replay_${suffix}`,
+    agent_id: roleId,
+    role_id: roleId,
+    context_pack_ref: `context_pack_replay_${suffix}`,
+    driver_run_result_id: `driver_result_replay_${suffix}`,
+    artifact_refs: [],
+    transcript_ref: {
+      artifact_id: `artifact_replay_${suffix}`,
+      type: 'transcript',
+      uri: `artifact://transcript/council-replay/${suffix}`,
+      producer_id: roleId,
+      task_id: ids.task_id,
+      created_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    },
+    session_id: `replay:proposal-replay:${suffix}`,
+    response: 'Proposal replay: the primary plan turn was skipped; the Council round reuses frozen proposals.',
+    tool_events: [],
+    diagnostics: {
+      driver_id: 'proposal-replay',
+      driver_status: 'not_invoked',
+      notes: ['primary plan turn skipped because NEWIDE_COUNCIL_REPLAY_DIR is set'],
+    },
+    status: 'completed',
+    created_at: nowTimestamp(),
+    schema_version: SCHEMA_VERSION,
+  };
+}
+
 async function executeFinalCouncilPlan(input: {
   context: TaskStageExecutionContext<'council'>;
   primary: AgentExecutionResult;
@@ -921,6 +1028,11 @@ async function executeFinalCouncilPlan(input: {
   dependencies: ProductionStageExecutorDependencies;
   councilRunId: string;
   phaseId: string;
+  /**
+   * 提案回放模式：primary 那一轮没有真的跑，它没有可续的会话，实现轮必须新开 session。
+   * 默认（未设置）逐字沿用 primary 的会话，与原先一致。
+   */
+  startFreshSession?: boolean;
 }): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[]; failed_attempts: number }> {
   const workspace = path.join(
     councilRunWorkspaceRoot(
@@ -941,6 +1053,11 @@ async function executeFinalCouncilPlan(input: {
   const workspaceBefore = await snapshotWorkspaceFiles(workspace);
   let phaseId = input.phaseId;
   let failedAttempts = 0;
+  // 实现轮实际使用的会话：默认续 primary 的会话；回放模式下第一轮为空（新会话），
+  // 第二轮续第一轮真正拿到的 session。
+  let implementationSession: string | undefined = input.startFreshSession
+    ? undefined
+    : input.primary.session_id;
   const recordFailure = (result: AgentExecutionResult, attempt: number, willRetry: boolean) => {
     failedAttempts += 1;
     emit(input.context, 'council.role.failed', phaseId, {
@@ -982,10 +1099,13 @@ async function executeFinalCouncilPlan(input: {
       phase_id: phaseId,
       attempt,
       role_id: input.primary.role_id,
-      session_id: input.primary.session_id,
+      ...(implementationSession ? { session_id: implementationSession } : {}),
       workspace_path: workspace,
       final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
       ...(attempt === 2 ? { recovery: 'single_agent_continuation' } : {}),
+      ...(input.startFreshSession && attempt === 1
+        ? { proposal_replay_fresh_session: true }
+        : {}),
     });
     return input.dependencies.agentExecutionFacade.runAgent(
       {
@@ -995,7 +1115,7 @@ async function executeFinalCouncilPlan(input: {
         instruction: retryInstruction,
         driver_instruction: retryInstruction,
         workspace_path: workspace,
-        session_id: input.primary.session_id,
+        ...(implementationSession ? { session_id: implementationSession } : {}),
         input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
         context_policy: 'council_plan_execution',
         schema_version: SCHEMA_VERSION,
@@ -1012,6 +1132,7 @@ async function executeFinalCouncilPlan(input: {
     );
   };
   let result = await runImplementation(1);
+  if (input.startFreshSession) implementationSession = result.session_id;
   let implementationArtifacts = implementationArtifactsFrom(result);
   if (shouldResumeFinalCouncilPlan(result, implementationArtifacts)) {
     recordFailure(result, 1, true);
@@ -1019,7 +1140,8 @@ async function executeFinalCouncilPlan(input: {
     emit(input.context, 'council.phase.started', phaseId, {
       council_run_id: input.councilRunId, phase_id: phaseId, phase: 'implementation', attempt: 2,
       agent_id: input.primary.agent_id ?? input.primary.role_id,
-      session_id: input.primary.session_id, recovery: 'same_session_continuation',
+      ...(implementationSession ? { session_id: implementationSession } : {}),
+      recovery: 'same_session_continuation',
       input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
     });
     result = await runImplementation(2);

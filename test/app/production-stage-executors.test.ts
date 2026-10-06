@@ -15,6 +15,7 @@ import {
   AgentBoardCouncilParticipantResolver,
   createCouncilStrategyProvider,
   SynthesisAgentCouncilProvider,
+  type CouncilProvider,
 } from '../../src/council';
 import type {
   AgentExecutionFacade,
@@ -24,6 +25,132 @@ import type {
 import type { AgentBoardListItem, AgentBoardQuery } from '../../src/memory';
 
 describe('production stage executors', () => {
+  it('skips the primary plan turn when proposal replay is configured', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'newide-proposal-replay-'));
+    const workspace = path.join(root, 'workspace');
+    await mkdir(workspace, { recursive: true });
+    const pack = path.join(root, 'frozen-pack');
+    await mkdir(path.join(pack, 'inputs', 'artifact_frozen_plan'), { recursive: true });
+    await writeFile(
+      path.join(pack, 'proposals.json'),
+      JSON.stringify({
+        proposals: [
+          {
+            proposal_id: 'proposal_frozen',
+            run_id: 'run_replay',
+            task_id: 'task_replay',
+            agent_id: 'role_primary',
+            artifact_refs: ['artifact_frozen_plan'],
+            summary: 'frozen proposal',
+            claims: [],
+            affected_paths: [],
+            assumptions: [],
+            known_risks: [],
+            completion_evidence: [],
+            created_at: nowTimestamp(),
+            schema_version: SCHEMA_VERSION,
+          },
+        ],
+      }),
+      'utf8',
+    );
+    await writeFile(
+      path.join(pack, 'inputs', 'artifact_frozen_plan', 'council-plan.md'),
+      '# Frozen plan\n',
+      'utf8',
+    );
+    const requests: AgentExecutionRequest[] = [];
+    const events: Event[] = [];
+    const executors = createProductionStageExecutors({
+      selectAgentHandler: {
+        execute: async (input) => ({
+          winner_agent_id: 'role_primary',
+          winner_bid_id: 'bid_replay',
+          ledger_ref: 'file:///market/ledger.json',
+          audit_ref: 'file:///market/audit.json',
+          ledger: {
+            ledger_id: 'ledger_replay',
+            task_id: input.task_id,
+            seed: input.seed,
+            policy_version: 'market-v0',
+            bids: [],
+            winner_bid_id: 'bid_replay',
+            winner_agent_id: 'role_primary',
+            created_at: nowTimestamp(),
+            schema_version: SCHEMA_VERSION,
+          },
+          audit: {
+            audit_id: 'audit_replay',
+            task_id: input.task_id,
+            winner_agent_id: 'role_primary',
+            winner_bid_id: 'bid_replay',
+            entries: [],
+            created_at: nowTimestamp(),
+            schema_version: SCHEMA_VERSION,
+          },
+          market_task: {
+            task_id: input.task_id,
+            task_description: input.task_description,
+            requirement_profile: {
+              persona_keywords: [],
+              preferred_skill_tags: [],
+              preferred_experience_tags: [],
+            },
+            context: { urgency: 0.5, exploration_level: 0.3 },
+          },
+        }),
+      },
+      agentExecutionFacade: {
+        async runAgent(input) {
+          requests.push(input);
+          return replayImplementationResult();
+        },
+      },
+      councilProvider: {
+        strategyName: 'plan_first',
+        async runCouncilRound() {
+          throw new Error('the Council must not run in this test');
+        },
+      } as unknown as CouncilProvider,
+      gateExecutor: {
+        execute: async () => ({ hook_point: 'task.completed', matched: false, gate_results: [] }),
+      },
+      bootstrapAgentIds: ['role_primary'],
+      runsRoot: path.join(root, 'runs'),
+      councilRoot: path.join(root, 'council'),
+      worktreesRoot: path.join(root, 'worktrees'),
+      councilProposalReplayDir: pack,
+    });
+
+    const executed = await executors.execute_agent.execute({
+      task_id: 'task_replay',
+      run_id: 'run_replay',
+      mode: 'council',
+      task_request: { spec: 'implement result.ts', completion_criteria: [] },
+      workspace_path: workspace,
+      on_event: (event: Event) => events.push(event),
+      cursor_input: { cursor: 'execute_agent', winner_agent_id: 'role_primary' },
+    });
+
+    // 计划轮整轮不调用驱动；给下游留的绑定明确标注"未调用 driver"。
+    expect(requests).toHaveLength(0);
+    expect(executed.session_id).toBeUndefined();
+    expect(executed.artifact_refs).toEqual([]);
+    const state = JSON.parse(
+      await readFile(path.join(root, 'runs', 'run_replay', 'production-stage-state.json'), 'utf8'),
+    ) as {
+      primary: {
+        result: { diagnostics: { driver_status?: string }; artifact_refs: unknown[]; session_id: string };
+      };
+    };
+    expect(state.primary.result.diagnostics.driver_status).toBe('not_invoked');
+    expect(state.primary.result.artifact_refs).toEqual([]);
+    expect(state.primary.result.session_id).toContain('replay:');
+    const completed = events.find((event) => event.event_type === 'agent.execution_completed')!;
+    expect(completed.payload).toMatchObject({ proposal_replay_skip: true, artifact_refs: [] });
+    expect(completed.payload).not.toHaveProperty('session_id');
+  });
+
   it('retries a missing primary Plan and resumes a B_BLOCKED final Plan execution', async () => {
     const events: Event[] = [];
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-plan-first-stages-'));
@@ -864,6 +991,26 @@ describe('production stage executors', () => {
     ).rejects.toThrow('no primaryAgentId');
   });
 });
+
+/** 回放用例里用不到驱动结果，给 facade 一个形状合法的返回值即可。 */
+function replayImplementationResult(): AgentExecutionResult {
+  return {
+    agent_run_id: 'agent_run_replay_test',
+    agent_id: 'role_primary',
+    role_id: 'role_primary',
+    context_pack_ref: 'context_pack_replay_test',
+    driver_run_result_id: 'driver_result_replay_test',
+    artifact_refs: [],
+    transcript_ref: transcriptArtifact('transcript_replay_test'),
+    session_id: 'session_replay_test',
+    response: 'not invoked',
+    tool_events: [],
+    diagnostics: { driver_id: 'acp-external' },
+    status: 'completed',
+    created_at: nowTimestamp(),
+    schema_version: SCHEMA_VERSION,
+  };
+}
 
 function fileArtifact(artifactId: string, targetPath: string, content: string): ArtifactRef {
   return {
