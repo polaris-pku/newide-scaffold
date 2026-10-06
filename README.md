@@ -27,32 +27,68 @@ durable Task/Run state, and Council proposal/review/synthesis/delivery.
 `agent.execution_completed` + `proposal_replay_skip: true` 留痕，其绑定标注
 `driver_status: not_invoked`。于是分支点之前不再生成任何内容。
 
+### 一、冻结 proposal：先跑臂 R（有评审）
+
 ```bash
-# 臂 R：先跑，产出提案并留下冻结包
+# 批量测评脚本（推荐：--replay-proposals 会解析 {instance} 模板）
 pnpm eval:sweevo-ablation -- --subset <subset> --ablations B4 --mode council --review on --run-harness
-# 臂 R0-b：回放同 repeat 的 R 提案，关掉评审
+
+# 或单任务直接跑（必须先 pnpm build，CLI 读 dist/newide.mjs）
+node dist/newide.mjs council run --workspace <ws> --state-root <state> \
+  --prompt-file <prompt.txt> --timeout-ms 2400000 --allow-degraded
+```
+
+两臂必须相同的设置：`NEWIDE_COUNCIL_STRATEGY=plan_first`、同一 `NEWIDE_COUNCIL_SEATS`、
+`NEWIDE_AUCTION_ENABLED=0`、`NEWIDE_PRIMARY_AGENT_ID=<proposer0>`、
+`ACP_DRIVER_RUNNER_DIR=<acp-client-prototype>`。
+
+臂 R 跑完后，冻结包就在 `<state>/council/<council_id>/cp_s0_<hash>/`，里面是
+`proposals.json` 与 `inputs/<artifact_id>/<council-plan.md>`。**这就是冻结 proposal**：
+原样保留、不要改动，臂 R0-b 直接读它。
+
+### 二、回放：再跑臂 R0-b（无评审）
+
+```bash
+NEWIDE_COUNCIL_REVIEW=off \
+NEWIDE_COUNCIL_REPLAY_DIR=<...>/council/<council_id>/cp_s0_<hash> \
+node dist/newide.mjs council run --workspace <ws2> --state-root <state2> \
+  --prompt-file <prompt.txt> --timeout-ms 2400000 --allow-degraded
+```
+
+批量脚本等价写法：
+
+```bash
 pnpm eval:sweevo-ablation -- --subset <subset> --ablations B4 --mode council --review off \
   --replay-proposals '<exp>/runs/{instance}/repeat-N/A2/experiment/B4/state' --run-harness
 ```
 
-`{instance}` 按实例替换，并在 `council/*/cp_s0_*` 下找唯一的 pack；多于一个报错。**顺序不能反**：
-R0-b 的冻结包来自 R。单任务直接跑时用同名的两个环境变量，见 `.env.example`。
+`{instance}` 按实例替换，并在 `council/*/cp_s0_*` 下找唯一的 pack，多于一个直接报错（不猜）。
 
-跑完必须核对（缺一即该次作废）：
+**顺序不能反**：R0-b 的冻结包来自臂 R。配对要求同一实例、同一 repeat、同一 workspace
+初始内容、同一 commit；每个 repeat 先跑 R、再跑 R0-b。`--review off` 或
+`--replay-proposals` 与 `--mode single_agent` 组合会直接报错，不会静默失效。
 
-| 判据 | R | R0-b |
+### 三、核验（缺一即该次作废）
+
+| 判据 | 臂 R | 臂 R0-b |
 | --- | --- | --- |
 | `role_code_reviewer` 是否有驱动会话 | 有 | **无** |
-| council 目录 | 含 `cp_r0_*` | 无 `cp_r0_*`；回放时提案者也无会话 |
+| council 目录 | 含 `cp_r0_*` | 无 `cp_r0_*`；提案者也无 `cp_p1_*` |
 | `council.review.completed` | ≥1 | 0 |
 | `cp_s0/reviews.json` | 评审原文 | `[]` |
-| 两臂 `proposal_id` 集合与计划文件 sha256 | 配对时必须相等 | 同 |
-| primary 计划轮 | 真的跑 | 跳过（`proposal_replay_skip: true`、`driver_status: not_invoked`） |
+| `proposal_id` 集合与 `proposals.json` sha256 | 基准 | 与 R **逐字节相同** |
+| `inputs/<artifact_id>/*.md` 的 sha256 | 基准 | 与 R **逐字节相同** |
+| primary 计划轮 | 真的跑 | 跳过：只有 1 个 `agent.execution_requested`，且 `phase=council_plan_execution`、无 `session_id`；留痕 `proposal_replay_skip: true` |
+| 合成与实现 | 正常 | 正常（`council.synthesis.completed` → `final-plan.md` → primary 实现落盘） |
 
-合成阶段照常执行（`council.synthesis.completed` → `final-plan.md` → primary 实现计划），无论评审
-开关如何；无评审时 `council quality` 恒为 `best_effort`（`verified` 需要至少一条评审，这是设计
-后果而非失败）。2026-10-06 本地双跑各 1 次已验证：`off` 侧 `review_count=0`、reviewer 无会话、
-合成与实现照常；`on` 侧 `review_count=2`、`quality=verified`。
+### 四、判读注意
+
+- 无评审侧 `council quality` 恒为 `best_effort`（`verified` 需要至少一条评审），这是设计后果。
+- 结论条件化在被回放的提案上：每个 repeat 用一份不同的提案抽样做区块，报告写明 n 与逐次配对差，
+  不要跨 repeat 合并成单一均值。
+- **不同 API / 模型下跑的两次不能配对比较**：token 与时长会整体漂移，那份差异不是评审造成的。
+- 2026-10-06 本地实测（同题、新 API）：R0-b `status=completed`、`verdict=select`、
+  `review_count=0`、`fallback_used=false`，冻结包三个 sha256 与臂 R 完全一致，`calc.py` 落盘实现。
 
 ## Quick Start
 
