@@ -2,6 +2,8 @@ export * from './contract';
 export * from './profile';
 export * from './profile-loader';
 export * from './driver-registry';
+export * from './driver-routing-file-store';
+export * from './driver-routing-service';
 export * from './abortable-driver-run';
 export * from './command-driver-transport';
 export * from './external-driver-runtime';

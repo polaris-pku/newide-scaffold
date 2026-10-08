@@ -18,12 +18,15 @@ import {
   DEFAULT_AGENT_ID,
   DriverConfigError,
   LEGACY_DRIVER_ID,
+  UI_DRIVER_ROUTING_FILE_NAME,
+  defaultDriverConfigLayers,
   loadDriverConfig,
   mergeDriverConfigLayers,
   parseDriverConfig,
   parseDriverConfigLayer,
   projectDriverConfigForRun,
   resolveRoleDriver,
+  uiDriverRoutingPath,
   type DriverConfig,
 } from '../../src/driver';
 
@@ -165,6 +168,107 @@ describe('layered loading', () => {
     });
 
     expect(config.default_driver).toBe(LEGACY_DRIVER_ID);
+  });
+});
+
+describe('UI routing overlay layer', () => {
+  it('appends drivers.ui.local.yaml as the last project layer with replace semantics', () => {
+    const layers = defaultDriverConfigLayers('/project', '/home');
+
+    expect(layers.at(-1)).toEqual({
+      path: join('/project', '.agent', UI_DRIVER_ROUTING_FILE_NAME),
+      rolesMode: 'replace',
+    });
+  });
+
+  it('overrides default_driver and replaces the whole role map', () => {
+    const projectRoot = makeTempDir();
+    writeYaml(projectRoot, join('.agent', 'drivers.yaml'), [
+      'version: 1',
+      'default_driver: claude',
+      'drivers:',
+      '  claude:',
+      '    agent: claude',
+      '  codex:',
+      '    agent: codex',
+      'roles:',
+      '  reviewer: codex',
+    ].join('\n'));
+    writeYaml(projectRoot, join('.agent', UI_DRIVER_ROUTING_FILE_NAME), [
+      'version: 1',
+      'default_driver: codex',
+      'roles:',
+      '  proposer: claude',
+    ].join('\n'));
+
+    const config = loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+
+    expect(config.default_driver).toBe('codex');
+    // 整表替换：UI 层没有 reviewer → 它不再被映射，回到 default（而不是被下层重新注入）
+    expect(config.roles).toEqual({ proposer: 'claude' });
+    expect(resolveRoleDriver(config, 'reviewer').driver_id).toBe('codex');
+    expect(resolveRoleDriver(config, 'proposer').driver_id).toBe('claude');
+  });
+
+  it('lets an empty UI role map clear lower-layer overrides', () => {
+    const projectRoot = makeTempDir();
+    writeYaml(projectRoot, join('.agent', 'drivers.yaml'), [
+      'version: 1',
+      'default_driver: claude',
+      'drivers:',
+      '  claude:',
+      '    agent: claude',
+      '  codex:',
+      '    agent: codex',
+      'roles:',
+      '  reviewer: codex',
+    ].join('\n'));
+    writeYaml(projectRoot, join('.agent', UI_DRIVER_ROUTING_FILE_NAME), [
+      'version: 1',
+      'default_driver: claude',
+      'roles: {}',
+    ].join('\n'));
+
+    const config = loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+
+    expect(config.roles).toEqual({});
+    expect(resolveRoleDriver(config, 'reviewer').driver_id).toBe('claude');
+  });
+
+  it('pre-validates a candidate layer without writing it to disk', () => {
+    const projectRoot = makeTempDir();
+    writeYaml(projectRoot, join('.agent', 'drivers.yaml'), [
+      'version: 1',
+      'default_driver: claude',
+      'drivers:',
+      '  claude:',
+      '    agent: claude',
+    ].join('\n'));
+    const uiPath = uiDriverRoutingPath(projectRoot);
+
+    // 预校验：引用悬空在写盘之前就被挡下，磁盘上仍然没有这份覆盖
+    expect(() =>
+      loadDriverConfig({
+        projectRoot,
+        homeDir: makeTempDir(),
+        env: {},
+        layerOverrides: {
+          [uiPath]: { version: 1, default_driver: 'ghost', roles: {} },
+        },
+      }),
+    ).toThrow(DriverConfigError);
+    expect(() =>
+      loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} }),
+    ).not.toThrow();
+
+    // `undefined` 覆盖表示「这一层不存在」：reset 的预校验走的就是这条
+    const withoutUi = loadDriverConfig({
+      projectRoot,
+      homeDir: makeTempDir(),
+      env: {},
+      layerOverrides: { [uiPath]: undefined },
+    });
+    expect(withoutUi.default_driver).toBe('claude');
   });
 });
 

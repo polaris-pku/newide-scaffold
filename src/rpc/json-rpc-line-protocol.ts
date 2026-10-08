@@ -55,6 +55,11 @@ export const JSON_RPC_ERROR_CODES = {
   MAILBOX_RECIPIENT_MISMATCH: -32012,
   MAILBOX_DELIVERY_STATE: -32013,
   APPLICATION_ERROR: -32020,
+  /** driver routing 的四条稳定业务错误：冲突 / 未知 driver / 不可选择 / 落盘失败。 */
+  DRIVER_CONFIG_CONFLICT: -32021,
+  DRIVER_NOT_FOUND: -32022,
+  DRIVER_NOT_SELECTABLE: -32023,
+  DRIVER_CONFIG_WRITE_FAILED: -32024,
 } as const;
 
 const requestSchema = z

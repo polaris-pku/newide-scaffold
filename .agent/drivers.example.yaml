@@ -10,9 +10,16 @@
 #   ~/.agent/drivers.local.yaml
 #   <repoRoot>/.agent/drivers.yaml
 #   <repoRoot>/.agent/drivers.local.yaml
+#   <repoRoot>/.agent/drivers.ui.local.yaml   (machine-managed; see below)
 # then environment overrides:
 #   NEWIDE_DRIVER   -> default_driver
 #   ACP_AGENT_ID    -> the `acp-external` profile's agent
+#
+# `drivers.ui.local.yaml` is written only by the backend `driver.updateRouting` /
+# `driver.resetRouting` JSON-RPC methods. It carries just `default_driver` and
+# `roles`, it owns the WHOLE role table (a role it does not list follows
+# `default_driver`), and `driver.resetRouting` deletes it. Never hand-edit it,
+# and put manual overrides in `drivers.local.yaml` instead.
 #
 # Delete every layer to keep the legacy single-driver behaviour: one
 # `acp-external` profile whose agent is `ACP_AGENT_ID ?? claude`.

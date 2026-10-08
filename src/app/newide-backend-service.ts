@@ -86,6 +86,7 @@ import type {
   SaveMailboxReplyResult,
 } from '../mailbox';
 import type { DriverStreamEvent } from '../driver/contract';
+import type { DriverRoutingPort } from '../driver';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
@@ -300,6 +301,11 @@ export class NewideBackendService {
    * 正源；文件回读退为截断/崩溃时的兜底。见 driver-usage-projector 的类文档。
    */
   private readonly driverUsageByTask = new Map<string, TaskDriverUsageAccumulator>();
+  /**
+   * driver routing 端口。Run 创建时用它冻结一份快照；RPC 层也据此注册 `driver.*` 方法。
+   * 缺省（测试与历史装配）时不做冻结，行为与接线前逐字段一致。
+   */
+  readonly driverRouting: DriverRoutingPort | undefined;
   private closing = false;
   private closePromise?: Promise<void>;
 
@@ -373,7 +379,16 @@ export class NewideBackendService {
      * 之后这个名字必须跟着变，否则面板会一直等一条永远不会来的腿。
      */
     private readonly driverBilledSource: string = DRIVER_BILLED_SOURCE,
-  ) {}
+    /**
+     * driver routing 端口。
+     *
+     * Run 创建时 `freezeForRun(run_id)` 复制当前 routing，写进 `request.json` 的
+     * `driver_config`；执行期的 facade 解析同一份，于是「保存只影响新 Run」有据可依。
+     */
+    driverRouting?: DriverRoutingPort,
+  ) {
+    this.driverRouting = driverRouting;
+  }
 
   /**
    * 面板用的用量查询：可选的「当前 run 用量」+ 必有的「按作用域的历史累计」。
@@ -993,6 +1008,8 @@ export class NewideBackendService {
     const controller = new AbortController();
     this.registry.create({ ...identity, mode, controller });
     this.runWorkspaces.set(identity.run_id, workspacePath);
+    // 在本 Run 的第一个阶段跑起来之前冻结 routing：此后无论 UI 怎么改，本 Run 都用这一份。
+    const driverConfig = this.driverRouting?.freezeForRun(identity.run_id);
     this.registry.subscribe(identity.run_id, (event) => {
       void this.auditWriter.append(event).catch(() => undefined);
       this.notifyTaskListeners(identity.task_id, event);
@@ -1023,6 +1040,7 @@ export class NewideBackendService {
       }
       await this.requestStore.save({
         ...identity,
+        ...(driverConfig ? { driver_config: driverConfig } : {}),
         prompt: params.prompt,
         workspace_path: workspacePath,
         mode,
@@ -1536,6 +1554,8 @@ export class NewideBackendService {
             }
             identity = created;
             settlePendingStart();
+            // legacy 路径同样在 Run 创建点冻结 routing：编排器与 facade 共用这一份投影。
+            const legacyDriverConfig = this.driverRouting?.freezeForRun(created.run_id);
             this.terminalRuns.set(created.run_id, terminalRun);
             this.runWorkspaces.set(created.run_id, workspacePath);
             this.registry.create({ ...created, mode, controller });
@@ -1594,6 +1614,7 @@ export class NewideBackendService {
               .save({
                 run_id: created.run_id,
                 task_id: created.task_id,
+                ...(legacyDriverConfig ? { driver_config: legacyDriverConfig } : {}),
                 prompt: params.prompt,
                 workspace_path: workspacePath,
                 mode,

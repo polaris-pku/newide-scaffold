@@ -1,0 +1,537 @@
+/**
+ * Role → Driver 路由领域服务（Role → Driver 配置接口）。
+ *
+ * 职责与核心逻辑：
+ * - 把「读配置、算有效映射、算 revision、热更新、Run 快照」收敛到一处，RPC 层只做参数
+ *   校验与错误映射，不碰文件；
+ * - **Phase 1 只允许改 mapping**：`updateRouting` / `resetRouting` 不重建 profile、不重建
+ *   runtime，只替换内存里的有效配置。因此 driver 句柄表在进程生命周期内稳定，运行中的
+ *   Run 不可能因为一次保存而换掉底层进程装配；
+ * - **Run 隔离**：Run 创建时 `freezeForRun(runId)` 复制一份当前投影，此后该 Run 的所有
+ *   解析（task-loop、legacy run、Council 各席位、mailbox 投递）都走这一份。解析链固定为
+ *   `Run snapshot → role mapping → default driver → runtime handle`，不会出现第一个席位用旧
+ *   映射、第二个席位用新映射；
+ * - **并发**：单进程内一个 update mutex 串行化写操作；跨进程靠 `expected_revision` + rename。
+ *   更新失败不改变内存配置、不影响在飞 Run。
+ */
+import path from 'node:path';
+
+import type { DriverRuntimeHandle } from './contract';
+import {
+  projectDriverConfigForRun,
+  resolveRoleDriver,
+  type DriverConfig,
+  type DriverConfigLayer,
+  type DriverProfile,
+  type PersistedDriverConfig,
+} from './profile';
+import {
+  DriverRoutingFileStore,
+  DriverRoutingFileError,
+  computeUiRoutingRevision,
+  effectiveUiRoutingDocument,
+  normalizeUiDriverRoutingDocument,
+} from './driver-routing-file-store';
+import { loadDriverConfig } from './profile-loader';
+import {
+  DRIVER_ROUTING_SCHEMA_VERSION,
+  driverRoutingSnapshotSchema,
+  type DriverRoutingDriver,
+  type DriverRoutingRole,
+  type DriverRoutingSnapshot,
+  type UpdateDriverRoutingInput,
+} from '../protocol/driver-routing';
+
+/**
+ * 本仓只能确认「档案已配置、runner 入口存在、凭据键齐备」，**无法确认 A 侧 agent CLI 是否
+ * 安装**（启动命令来自 A 侧 `${AGENT_ID}_CLI_COMMAND` 或 adapter 默认值）。所以每个 driver
+ * 的状态诚实降级为 `degraded` 并带上这个原因码，而不是写成可用。
+ */
+export const AGENT_CLI_READINESS_NOT_VERIFIABLE = 'AGENT_CLI_READINESS_NOT_VERIFIABLE';
+
+/** 配置里有这个 driver 档案，但进程内没有它的 runtime 句柄（理论不可达，仍如实标注）。 */
+export const DRIVER_RUNTIME_NOT_CONFIGURED = 'DRIVER_RUNTIME_NOT_CONFIGURED';
+
+/** 一个 driver 的可选择性投影；测试可注入以构造「不可选择」场景。 */
+export interface DriverRoutingDriverAvailability {
+  selectable: boolean;
+  status: 'configured' | 'degraded' | 'unavailable';
+  reason_code?: string;
+  limitations?: string[];
+}
+
+export type DriverRoutingErrorCode =
+  | 'revision_mismatch'
+  | 'driver_not_found'
+  | 'driver_not_selectable'
+  | 'write_failed';
+
+/** JSON-RPC 错误 data 的结构化内容；绝不承载 secret。 */
+export interface DriverRoutingErrorData {
+  reason: DriverRoutingErrorCode;
+  current_revision?: string;
+  field?: string;
+  driver_id?: string;
+  reason_code?: string;
+  limitations?: string[];
+  /** 写入失败的路径类别（不含绝对路径细节）。 */
+  path_category?: string;
+  /** 写入失败的系统错误摘要（只含错误码/我们自己的文案）。 */
+  error_summary?: string;
+}
+
+export class DriverRoutingError extends Error {
+  readonly data: DriverRoutingErrorData;
+
+  constructor(
+    readonly code: DriverRoutingErrorCode,
+    message: string,
+    data: DriverRoutingErrorData,
+  ) {
+    super(message);
+    this.name = 'DriverRoutingError';
+    this.data = data;
+  }
+}
+
+/**
+ * 服务真正需要的 runtime 句柄表；`DriverRegistry` 结构上满足它。
+ *
+ * 刻意只留两个方法：service 不需要 shutdown / 静态 resolveForRole——mapping 由它自己按
+ * 「快照优先」解析，避免 registry 内部那份启动期静态配置成为第二真相源。
+ */
+export interface DriverRuntimeRegistry {
+  listDriverIds(): string[];
+  get(driverId: string): DriverRuntimeHandle;
+}
+
+export interface DriverRoutingServiceOptions {
+  /** 项目根：决定 `<projectRoot>/.agent/drivers.ui.local.yaml`。 */
+  projectRoot: string;
+  /** runtime 句柄表。Phase 1 不在更新时重建。 */
+  registry: DriverRuntimeRegistry;
+  /** 环境变量；默认 `process.env`（`NEWIDE_DRIVER` / `ACP_AGENT_ID` 覆盖仍生效）。 */
+  env?: NodeJS.ProcessEnv;
+  /** 家目录；默认 `os.homedir()`。测试注入以避开真实 HOME。 */
+  homeDir?: string;
+  /**
+   * 「当前 B 侧可协作 role」提供者（active、非 retired、非 council_only）。
+   *
+   * 后端不维护静态 role 白名单；缺省时目录视为查不到，所有显式 role 都落 orphan_roles。
+   */
+  knownRoleIds?: () => Promise<readonly string[]>;
+  /** 覆盖默认的可选择性投影（测试缝）。 */
+  availabilityOf?: (driverId: string, profile: DriverProfile) => DriverRoutingDriverAvailability;
+}
+
+/** 只暴露 Run 冻结所需的端口，供 `NewideBackendService` 注入。 */
+export interface RunDriverRoutingPort {
+  freezeForRun(runId: string): PersistedDriverConfig;
+}
+
+/**
+ * 对外的 driver routing 端口。
+ *
+ * `NewideBackendService` 只用 `freezeForRun`；RPC 组装点还需要读写三项。做成接口而不是
+ * 直接依赖 `DriverRoutingService` 类，是为了让测试可以只桩出用到的方法。
+ */
+export interface DriverRoutingPort extends RunDriverRoutingPort {
+  getSnapshot(): Promise<DriverRoutingSnapshot>;
+  updateRouting(input: UpdateDriverRoutingInput): Promise<DriverRoutingSnapshot>;
+  resetRouting(expectedRevision: string): Promise<DriverRoutingSnapshot>;
+}
+
+export class DriverRoutingService implements DriverRoutingPort {
+  private readonly projectRoot: string;
+  private readonly registry: DriverRuntimeRegistry;
+  private readonly fileStore: DriverRoutingFileStore;
+  private readonly env: NodeJS.ProcessEnv | undefined;
+  private readonly homeDir: string | undefined;
+  private readonly knownRoleIds: (() => Promise<readonly string[]>) | undefined;
+  private readonly availabilityOf: (
+    driverId: string,
+    profile: DriverProfile,
+  ) => DriverRoutingDriverAvailability;
+  /** 当前有效配置（含 UI 覆盖层）；每次成功写入或 reset 后整体替换。 */
+  private currentConfig: DriverConfig;
+  /** Run 创建时冻结的 routing 投影；一个 run_id 一条，进程内不可变。 */
+  private readonly runSnapshots = new Map<string, PersistedDriverConfig>();
+  /** 单进程内的写操作串行化。 */
+  private updateChain: Promise<unknown> = Promise.resolve();
+
+  constructor(options: DriverRoutingServiceOptions) {
+    this.projectRoot = path.resolve(options.projectRoot);
+    this.registry = options.registry;
+    this.fileStore = new DriverRoutingFileStore(this.projectRoot);
+    this.env = options.env;
+    this.homeDir = options.homeDir;
+    this.knownRoleIds = options.knownRoleIds;
+    this.availabilityOf = options.availabilityOf ?? defaultDriverAvailability;
+    this.currentConfig = this.loadConfig();
+  }
+
+  /** 完整查询快照（`driver.getConfig`）。 */
+  async getSnapshot(): Promise<DriverRoutingSnapshot> {
+    // 固定一份配置引用：role 目录查询是异步的，不能让它 await 到一半时被一次 update 换掉
+    // 底层配置，否则会返回「旧 role 列表 + 新 revision」的混合体。
+    const config = this.currentConfig;
+    const { roles, orphan_roles } = await this.projectRoles(config);
+    const snapshot: DriverRoutingSnapshot = {
+      schema_version: DRIVER_ROUTING_SCHEMA_VERSION,
+      revision: revisionOf(config),
+      scope: 'project',
+      default_driver: config.default_driver,
+      drivers: Object.keys(config.drivers)
+        .sort(compareCodeUnits)
+        .map((driverId) => this.projectDriver(config, driverId)),
+      roles,
+      orphan_roles,
+    };
+    // 出口再走一次 strict schema：任何多余的敏感字段都不可能从这里漏出去。
+    return driverRoutingSnapshotSchema.parse(snapshot);
+  }
+
+  /** 当前 revision；下一次 update/reset 的 `expected_revision` 必须等于它。 */
+  currentRevision(): string {
+    return revisionOf(this.currentConfig);
+  }
+
+  /** 把当前 routing 投影成可冻结进 Run 的形式。 */
+  snapshotForRun(): PersistedDriverConfig {
+    return projectDriverConfigForRun(this.currentConfig);
+  }
+
+  /**
+   * 冻结一个 Run 的 routing 投影。
+   *
+   * 同一个 run_id 只冻结一次：重启（新 run_id）拿新快照，同一 Run 的后续所有解析拿到同一份。
+   */
+  freezeForRun(runId: string): PersistedDriverConfig {
+    const existing = this.runSnapshots.get(runId);
+    if (existing) return existing;
+    const snapshot = this.snapshotForRun();
+    this.runSnapshots.set(runId, snapshot);
+    return snapshot;
+  }
+
+  /** 某个 Run 冻结的 routing 投影；未冻结（老 Run / 本进程外创建）返回 undefined。 */
+  snapshotOfRun(runId: string): PersistedDriverConfig | undefined {
+    return this.runSnapshots.get(runId);
+  }
+
+  /**
+   * 解析 role 到 runtime handle。
+   *
+   * `runSnapshot` 给出时**只用它**，绝不回读全局当前配置——这就是「旧 Run 不被污染」。
+   */
+  resolveForRole(
+    roleId: string,
+    runSnapshot?: PersistedDriverConfig,
+  ): { driver_id: string; profile: DriverProfile; handle: DriverRuntimeHandle } {
+    const config = runSnapshot ? configFromRunSnapshot(runSnapshot) : this.currentConfig;
+    const resolved = resolveRoleDriver(config, roleId);
+    return { ...resolved, handle: this.registry.get(resolved.driver_id) };
+  }
+
+  /** 按 Run 与 role 解析：优先用该 Run 冻结的投影。 */
+  resolveForRunRole(
+    runId: string | undefined,
+    roleId: string,
+  ): { driver_id: string; profile: DriverProfile; handle: DriverRuntimeHandle } {
+    const snapshot = runId ? this.runSnapshots.get(runId) : undefined;
+    return this.resolveForRole(roleId, snapshot);
+  }
+
+  /**
+   * 原子更新整个 routing mapping（`driver.updateRouting`）。
+   *
+   * 顺序：revision 校验 → 引用与可选择性校验 → 规范化 → **不落盘预校验** → 原子写入 →
+   * 重新读取校验 → 替换内存快照。任何一步失败都不会留下「内存已改、盘没变」的状态。
+   */
+  async updateRouting(input: UpdateDriverRoutingInput): Promise<DriverRoutingSnapshot> {
+    return this.withUpdateLock(async () => {
+      this.assertRevision(input.expected_revision);
+
+      const defaultDriver = input.default_driver;
+      const defaultProfile = this.currentConfig.drivers[defaultDriver];
+      if (!defaultProfile) {
+        throw driverNotFound('default_driver', defaultDriver);
+      }
+      this.assertSelectable('default_driver', defaultDriver, defaultProfile);
+
+      for (const [roleId, driverId] of Object.entries(input.roles)) {
+        const profile = this.currentConfig.drivers[driverId];
+        if (!profile) {
+          throw driverNotFound(`roles.${roleId}`, driverId);
+        }
+        this.assertSelectable(`roles.${roleId}`, driverId, profile);
+      }
+
+      const document = normalizeUiDriverRoutingDocument({
+        default_driver: defaultDriver,
+        roles: input.roles,
+      });
+      const layer: DriverConfigLayer = {
+        version: document.version,
+        default_driver: document.default_driver,
+        roles: { ...document.roles },
+      };
+      // 落盘前先按「新层生效」合成一次：引用悬空在这里就被挡下，旧文件天然保持完整。
+      // 显式校验已经覆盖了文档列出的每一种用户错误，这条只是兜底——真触发时也只报
+      // 写入失败，不让一个裸的内部错误穿过 RPC 边界。
+      try {
+        this.loadConfig({ [this.fileStore.filePath]: layer });
+      } catch (error) {
+        throw this.writeFailed(error);
+      }
+
+      const previousRaw = this.fileStore.readRaw();
+      try {
+        this.fileStore.writeAtomic(document);
+      } catch (error) {
+        throw this.writeFailed(error);
+      }
+      try {
+        this.currentConfig = this.loadConfig({});
+      } catch (error) {
+        this.restorePrevious(previousRaw);
+        throw this.writeFailed(error);
+      }
+      return this.getSnapshot();
+    });
+  }
+
+  /**
+   * 删除 UI 覆盖文件，回到下层手工配置（`driver.resetRouting`）。
+   *
+   * 仍然要求 revision 一致：reset 也是一个写操作，不能把别人的并发修改无声抹掉。
+   */
+  async resetRouting(expectedRevision: string): Promise<DriverRoutingSnapshot> {
+    return this.withUpdateLock(async () => {
+      this.assertRevision(expectedRevision);
+      // 预校验「层被移除后」的配置是否仍然合法。
+      try {
+        this.loadConfig({ [this.fileStore.filePath]: undefined });
+      } catch (error) {
+        throw this.writeFailed(error);
+      }
+
+      const previousRaw = this.fileStore.readRaw();
+      if (previousRaw !== undefined) {
+        try {
+          this.fileStore.remove();
+        } catch (error) {
+          throw this.writeFailed(error);
+        }
+      }
+      try {
+        this.currentConfig = this.loadConfig({});
+      } catch (error) {
+        this.restorePrevious(previousRaw);
+        throw this.writeFailed(error);
+      }
+      return this.getSnapshot();
+    });
+  }
+
+  private assertRevision(expectedRevision: string): void {
+    const current = this.currentRevision();
+    if (expectedRevision === current) return;
+    throw new DriverRoutingError(
+      'revision_mismatch',
+      'Driver routing revision does not match the current configuration',
+      { reason: 'revision_mismatch', current_revision: current },
+    );
+  }
+
+  private assertSelectable(field: string, driverId: string, profile: DriverProfile): void {
+    const availability = this.projectAvailability(driverId, profile);
+    const hasRuntime = this.registry.listDriverIds().includes(driverId);
+    // 与 `projectDriver` 同一判据：投影说「不可选择」的 driver，update 也必须拒绝，
+    // 否则会出现「前端看到不可选、却保存成功、执行时才炸」的分叉。
+    if (hasRuntime && availability.selectable) return;
+    const reasonCode = hasRuntime
+      ? availability.reason_code
+      : DRIVER_RUNTIME_NOT_CONFIGURED;
+    throw new DriverRoutingError(
+      'driver_not_selectable',
+      `Driver "${driverId}" is not selectable`,
+      {
+        reason: 'driver_not_selectable',
+        field,
+        driver_id: driverId,
+        ...(reasonCode ? { reason_code: reasonCode } : {}),
+        ...(availability.limitations ? { limitations: [...availability.limitations] } : {}),
+      },
+    );
+  }
+
+  private writeFailed(error: unknown): DriverRoutingError {
+    // 只暴露路径类别与系统错误摘要：message 是我们自己写的文案，可能带环境变量名之外的
+    // 系统错误码，但不含 secret 值。
+    const summary =
+      error instanceof DriverRoutingFileError
+        ? error.message
+        : error instanceof Error
+          ? error.name
+          : 'unknown error';
+    return new DriverRoutingError(
+      'write_failed',
+      'Failed to persist driver routing configuration',
+      { reason: 'write_failed', path_category: 'project_agent_dir', error_summary: summary },
+    );
+  }
+
+  /** 把文件恢复成写入前的样子（内容或缺失）；恢复失败不再抛，避免掩盖主错误。 */
+  private restorePrevious(previousRaw: string | undefined): void {
+    try {
+      if (previousRaw === undefined) this.fileStore.remove();
+      else this.fileStore.writeTextAtomic(previousRaw);
+    } catch {
+      // 恢复失败时内存配置没有被替换，盘上仍是新内容——下一次 getConfig 会如实反映它。
+    }
+  }
+
+  private loadConfig(
+    overrides?: Readonly<Record<string, DriverConfigLayer | undefined>>,
+  ): DriverConfig {
+    return loadDriverConfig({
+      projectRoot: this.projectRoot,
+      ...(this.env ? { env: this.env } : {}),
+      ...(this.homeDir ? { homeDir: this.homeDir } : {}),
+      ...(overrides ? { layerOverrides: overrides } : {}),
+    });
+  }
+
+  private projectDriver(config: DriverConfig, driverId: string): DriverRoutingDriver {
+    const profile = config.drivers[driverId];
+    if (!profile) {
+      throw new DriverRoutingError('driver_not_found', `Unknown driver "${driverId}"`, {
+        reason: 'driver_not_found',
+        driver_id: driverId,
+      });
+    }
+    const hasRuntime = this.registry.listDriverIds().includes(driverId);
+    const availability = this.projectAvailability(driverId, profile);
+    const selectable = hasRuntime && availability.selectable;
+    const capabilities = {
+      driver_id: driverId,
+      agent: profile.agent,
+      ...(profile.description ? { description: profile.description } : {}),
+    };
+    if (!hasRuntime) {
+      return {
+        ...capabilities,
+        selectable: false,
+        status: 'unavailable',
+        reason_code: DRIVER_RUNTIME_NOT_CONFIGURED,
+        ...(availability.limitations ? { limitations: [...availability.limitations] } : {}),
+      };
+    }
+    return {
+      ...capabilities,
+      selectable,
+      status: selectable ? availability.status : 'unavailable',
+      ...(availability.reason_code ? { reason_code: availability.reason_code } : {}),
+      ...(availability.limitations ? { limitations: [...availability.limitations] } : {}),
+    };
+  }
+
+  private projectAvailability(
+    driverId: string,
+    profile: DriverProfile,
+  ): DriverRoutingDriverAvailability {
+    return this.availabilityOf(driverId, profile);
+  }
+
+  private async projectRoles(config: DriverConfig): Promise<{
+    roles: DriverRoutingRole[];
+    orphan_roles: DriverRoutingRole[];
+  }> {
+    const configured = Object.keys(config.roles ?? {});
+    let known: readonly string[] = [];
+    if (this.knownRoleIds) {
+      try {
+        known = await this.knownRoleIds();
+      } catch {
+        // 目录查询失败不等于「没有 role」：退化成只报显式配置的那些，并使 known_role 为 false。
+        known = [];
+      }
+    }
+    const knownSet = new Set(known);
+    const all = [...new Set([...known, ...configured])].sort(compareCodeUnits);
+
+    const roles: DriverRoutingRole[] = [];
+    const orphanRoles: DriverRoutingRole[] = [];
+    for (const roleId of all) {
+      const explicit = config.roles?.[roleId];
+      const row: DriverRoutingRole = {
+        role_id: roleId,
+        driver_id: explicit ?? config.default_driver,
+        effective_driver_id: explicit ?? config.default_driver,
+        source: explicit ? 'role_override' : 'default',
+        known_role: knownSet.has(roleId),
+      };
+      roles.push(row);
+      // 显式映射但不在当前目录里的 role 同时进 orphan_roles，保留其原 driver id。
+      if (explicit !== undefined && !knownSet.has(roleId)) orphanRoles.push(row);
+    }
+    return { roles, orphan_roles: orphanRoles };
+  }
+
+  private withUpdateLock<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.updateChain.then(operation, operation);
+    this.updateChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+}
+
+/** 有效配置 → revision。 */
+function revisionOf(config: DriverConfig): string {
+  return computeUiRoutingRevision(effectiveUiRoutingDocument(config));
+}
+
+/** 默认投影：档案已配置且 runtime 已构造 → 可选择，但 CLI 就绪情况本仓验证不了。 */
+function defaultDriverAvailability(
+  _driverId: string,
+  profile: DriverProfile,
+): DriverRoutingDriverAvailability {
+  const limitations = profile.limitations ? [...profile.limitations] : undefined;
+  return {
+    selectable: true,
+    status: 'degraded',
+    reason_code: AGENT_CLI_READINESS_NOT_VERIFIABLE,
+    ...(limitations ? { limitations } : {}),
+  };
+}
+
+function driverNotFound(field: string, driverId: string): DriverRoutingError {
+  return new DriverRoutingError('driver_not_found', `Unknown driver "${driverId}"`, {
+    reason: 'driver_not_found',
+    field,
+    driver_id: driverId,
+  });
+}
+
+/**
+ * 把冻结的 Run 投影还原成 `resolveRoleDriver` 看得懂的配置形状。
+ *
+ * 只需要 `default_driver` / `drivers` / `roles`：档案的运行时装配由 registry 承担，
+ * 快照里只留审计与回显需要的三个字段（见 `projectDriverConfigForRun`）。
+ */
+function configFromRunSnapshot(snapshot: PersistedDriverConfig): DriverConfig {
+  return {
+    default_driver: snapshot.default_driver,
+    drivers: Object.fromEntries(
+      Object.entries(snapshot.drivers).map(([driverId, agent]) => [driverId, { agent }]),
+    ),
+    ...(snapshot.roles ? { roles: { ...snapshot.roles } } : {}),
+  };
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}

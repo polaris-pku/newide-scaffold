@@ -164,6 +164,36 @@ try {
   const unknown = smokeMode === 'all' ? await requestRaw('unknown.method', {}) : undefined;
   if (unknown) assert(unknown.error?.code === -32601, 'Unknown method did not return -32601');
 
+  // driver.* 注册面：`driver.getConfig` 是只读的，直接调用验证返回形状；
+  // update/reset 用**空参数**探测——参数非法返回 -32602 就证明方法已注册，且不会写任何文件
+  // （冒烟脚本跑在真实仓库上，绝不能在这里改 routing）。
+  const driverConfig = smokeMode === 'all' ? await requestRaw('driver.getConfig', {}) : undefined;
+  if (driverConfig) {
+    assert(driverConfig.error === undefined, `driver.getConfig failed: ${JSON.stringify(driverConfig.error)}`);
+  }
+  const driverUpdateProbe =
+    smokeMode === 'all' ? await requestRaw('driver.updateRouting', {}) : undefined;
+  if (driverUpdateProbe) {
+    assert(
+      driverUpdateProbe.error?.code === -32602,
+      'driver.updateRouting is not registered or did not reject empty params',
+    );
+  }
+  const driverResetProbe =
+    smokeMode === 'all' ? await requestRaw('driver.resetRouting', {}) : undefined;
+  if (driverResetProbe) {
+    assert(
+      driverResetProbe.error?.code === -32602,
+      'driver.resetRouting is not registered or did not reject empty params',
+    );
+  }
+  if (driverConfig?.result !== undefined) {
+    samples.driver_get_config = {
+      request: { method: 'driver.getConfig', params: {} },
+      result: driverConfig.result,
+    };
+  }
+
   process.stdout.write(
     `${JSON.stringify({
       status: 'ok',
@@ -175,6 +205,9 @@ try {
       ...(cancelled ? { cancelled } : {}),
       ...(parseError ? { malformed_json_error: parseError.error?.code } : {}),
       ...(unknown ? { unknown_method_error: unknown.error?.code } : {}),
+      ...(driverConfig?.result === undefined ? {} : { driver_config: driverConfig.result }),
+      ...(driverUpdateProbe ? { driver_update_invalid_params: driverUpdateProbe.error?.code } : {}),
+      ...(driverResetProbe ? { driver_reset_invalid_params: driverResetProbe.error?.code } : {}),
     })}\n`,
   );
   const samplesPath = process.env.RPC_SMOKE_SAMPLES_PATH?.trim();

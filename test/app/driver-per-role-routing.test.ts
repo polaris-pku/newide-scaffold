@@ -117,7 +117,7 @@ function request(taskId: string, roleId: string) {
 
 function createFacade(
   driver: DriverRuntimeHandle,
-  resolveDriver?: (roleId: string) => DriverRuntimeHandle,
+  resolveDriver?: (roleId: string, runId?: string) => DriverRuntimeHandle,
 ) {
   return new DriverRuntimeAgentExecutionFacade({
     driver,
@@ -195,5 +195,34 @@ describe('per-role driver routing', () => {
     const result = await facade.runAgent(request('task_producer', 'reviewer'));
 
     expect(result.transcript_ref?.producer_id).toBe('driver_codex');
+  });
+
+  it('passes the run id to the resolver', async () => {
+    const claude = new StubDriver('driver_claude');
+    const seen: Array<[string, string | undefined]> = [];
+    const facade = createFacade(claude, (roleId, runId) => {
+      seen.push([roleId, runId]);
+      return claude;
+    });
+
+    await facade.runAgent(request('task_visible', 'proposer'));
+
+    expect(seen).toContainEqual(['proposer', 'run_task_visible']);
+  });
+
+  it('keeps each run on the mapping it was created with', async () => {
+    const claude = new StubDriver('driver_claude');
+    const codex = new StubDriver('driver_codex');
+    // run_a 冻结时 reviewer → codex；保存后 run_b 冻结到 reviewer → claude（跟随默认为 codex 的旧映射已经改掉）
+    const frozen: Record<string, DriverRuntimeHandle> = { run_a: codex, run_b: claude };
+    const facade = createFacade(claude, (_roleId, runId) =>
+      runId ? (frozen[runId] ?? claude) : claude,
+    );
+
+    await facade.runAgent(request('a', 'reviewer'));
+    await facade.runAgent(request('b', 'reviewer'));
+
+    expect(codex.prompts.map((prompt) => prompt.task_id)).toEqual(['a']);
+    expect(claude.prompts.map((prompt) => prompt.task_id)).toEqual(['b']);
   });
 });
