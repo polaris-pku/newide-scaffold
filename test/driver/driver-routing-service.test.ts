@@ -8,8 +8,8 @@
  *   时间戳/路径/随机数；
  * - **更新与错误**：未知 driver / 不可选择 / revision 冲突 / 落盘失败各自的错误码与 data，
  *   以及「失败不改内存、不改文件」；
- * - **Run 隔离**：Run 创建时冻结的映射不随后续保存改变，新 Run 拿到新映射；进程重启后从
- *   文件重建同样的 snapshot。
+ * - **Run 隔离**：Run 创建时冻结的映射不随后续保存改变，新 Run 拿到新映射；首次冻结先与磁盘
+ *   对齐（多实例部署下另一个 backend 可能刚写过），进程重启后从文件重建同样的 snapshot。
  */
 
 import {
@@ -709,6 +709,47 @@ describe('cross-process revision protection', () => {
     const reset = await serviceB.resetRouting(updated.revision);
     expect(reset.default_driver).toBe('claude');
     expect(() => readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toThrow();
+  });
+
+  it('freezes a new run from the on-disk config, not from a stale in-memory one', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    // 两个 backend 实例共享同一个 projectRoot；构造时各自读到旧配置（default claude）
+    const serviceA = createService({ projectRoot });
+    const serviceB = createService({ projectRoot });
+
+    // A 写下新配置：default 换 codex，reviewer 改指 claude，proposer 跟随默认
+    await serviceA.updateRouting({
+      expected_revision: serviceA.currentRevision(),
+      default_driver: 'codex',
+      roles: { proposer: 'codex', reviewer: 'claude' },
+    });
+
+    // B 没有 getSnapshot、也没撞过冲突，直接创建新 Run：必须读盘，而不是用构造时那份旧配置，
+    // 否则这个 Run 会全程用错 driver，而且没有任何错误会暴露给前端
+    const frozen = serviceB.freezeForRun('run_new');
+    expect(frozen).toMatchObject({ default_driver: 'codex', roles: { reviewer: 'claude' } });
+    expect(serviceB.resolveForRunRole('run_new', 'proposer').driver_id).toBe('codex');
+    expect(serviceB.resolveForRunRole('run_new', 'reviewer').driver_id).toBe('claude');
+
+    // 之后再改一次磁盘配置（默认改回 claude，reviewer 反过来指 codex）
+    const second = await serviceA.updateRouting({
+      expected_revision: serviceA.currentRevision(),
+      default_driver: 'claude',
+      roles: { proposer: 'claude', reviewer: 'codex' },
+    });
+    expect(second.default_driver).toBe('claude');
+
+    // 已冻结的 run_id 仍返回第一次那份快照，逐字段不变；解析也不看新配置
+    const reFrozen = serviceB.freezeForRun('run_new');
+    expect(reFrozen).toBe(frozen);
+    expect(reFrozen).toEqual(frozen);
+    expect(serviceB.resolveForRunRole('run_new', 'reviewer').driver_id).toBe('claude');
+
+    // 冻结只钉住那一个 run_id：另一个新 Run 照样读到最新磁盘配置
+    const laterRun = serviceB.freezeForRun('run_later');
+    expect(laterRun.default_driver).toBe('claude');
+    expect(serviceB.resolveForRunRole('run_later', 'reviewer').driver_id).toBe('codex');
   });
 
   it('releases the lock so consecutive writers can proceed', async () => {

@@ -10,7 +10,8 @@
  * - **Run 隔离**：Run 创建时 `freezeForRun(runId)` 复制一份当前投影，此后该 Run 的所有
  *   解析（task-loop、legacy run、Council 各席位、mailbox 投递）都走这一份。解析链固定为
  *   `Run snapshot → role mapping → default driver → runtime handle`，不会出现第一个席位用旧
- *   映射、第二个席位用新映射；
+ *   映射、第二个席位用新映射。冻结只发生一次，且**首次冻结前先与磁盘对齐**：多实例部署下本
+ *   进程的 `currentConfig` 可能落后于磁盘，直接用就会把过期映射冻结进新 Run；
  * - **并发**：单进程内一个 update mutex 串行化写操作；跨进程靠 `.agent` 下的独占写锁
  *   （`mkdir` 原子创建）加 `expected_revision` 比较。**加锁后必须重新从磁盘 load 有效配置**，
  *   再比对 revision——只比内存里的 `currentConfig` 挡不住另一个 backend 实例：两个进程都
@@ -219,19 +220,33 @@ export class DriverRoutingService implements DriverRoutingPort {
     return revisionOf(this.currentConfig);
   }
 
-  /** 把当前 routing 投影成可冻结进 Run 的形式。 */
-  snapshotForRun(): PersistedDriverConfig {
+  /**
+   * 把 `currentConfig` 投影成可冻结进 Run 的形式。
+   *
+   * 这是**纯内存投影，不读盘**，所以不对外暴露：脱离磁盘对齐地使用它会拿到一份可能落后的
+   * 投影，而「冻结进 Run 的 mapping 与实际生效的 mapping 不一致」是个不会报错的静默故障。
+   * 磁盘对齐的唯一入口是 {@link freezeForRun}。
+   */
+  private snapshotForRun(): PersistedDriverConfig {
     return projectDriverConfigForRun(this.currentConfig);
   }
 
   /**
    * 冻结一个 Run 的 routing 投影。
    *
-   * 同一个 run_id 只冻结一次：重启（新 run_id）拿新快照，同一 Run 的后续所有解析拿到同一份。
+   * 同一 run_id 只冻结一次：就算之后配置又变了，这个 Run 后续的所有解析仍拿到同一份。
+   *
+   * 首次冻结前**必须先与磁盘对齐**：多个 backend 共享同一个 projectRoot 时，另一个实例可能
+   * 刚写过配置，而本进程的 `currentConfig` 停在构造时读到的那一份。不刷新就会把过期 mapping
+   * 冻结进新 Run，该 Run 全程用错 driver，而且没有任何错误会浮到前端。已冻结的 run_id 直接
+   * 返回原快照——那一份已经代表创建瞬间的有效配置，不该被后来的变化重写。
    */
   freezeForRun(runId: string): PersistedDriverConfig {
     const existing = this.runSnapshots.get(runId);
     if (existing) return existing;
+
+    this.refreshConfigFromDisk();
+
     const snapshot = this.snapshotForRun();
     this.runSnapshots.set(runId, snapshot);
     return snapshot;
