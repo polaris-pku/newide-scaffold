@@ -229,6 +229,20 @@ describe('projectRunUsage', () => {
     expect(pendingBilledSources('failed')).toEqual([]);
   });
 
+  it('waits on the source the configured driver actually declares', () => {
+    // 换 driver 之后名字必须跟着变：否则面板会一直等一条永远不会来的腿，
+    // 而真到的那条腿被当成「不在名单里」。
+    expect(pendingBilledSources('running', 'codex_jsonl')).toEqual(['codex_jsonl']);
+    expect(
+      projectRunUsage({
+        timeline: [proxyUsage({ input_tokens: 1, output_tokens: 1 })],
+        pendingSources: pendingBilledSources('running', 'codex_jsonl'),
+      })?.billed?.pending_sources,
+    ).toEqual(['codex_jsonl']);
+    // 缺省仍是历史名，零配置行为不变
+    expect(pendingBilledSources('running')).toEqual(['claude_session_jsonl']);
+  });
+
   it('never claims a leg is pending once it is actually there', () => {
     // 名单与账本各自由不同的事实算出来：账本两条腿齐了、名单还说缺 driver 腿时，
     // 报它 pending 就是撒谎。这条判据让「还没到」永远只在真的缺席时出现。

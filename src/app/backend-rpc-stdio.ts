@@ -16,7 +16,7 @@ import {
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
-import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
+import { createDriverRegistry, loadDriverConfig, projectDriverConfigForRun } from '../driver';
 import {
   LiteLLMToolCallingClient,
   type LlmClient,
@@ -29,6 +29,7 @@ import { TaskRpcMethods } from '../rpc/task-methods';
 import { MailboxRpcMethods } from '../rpc/mailbox-methods';
 import { MemoryRpcMethods } from '../rpc/memory-methods';
 import { FileRunEvidenceStore, SqliteCoordinationStore } from '../persistence';
+import { DEFAULT_DRIVER_BILLED_SOURCE } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
 import { ProtocolCallJournal } from './protocol-call-journal';
 import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
@@ -102,6 +103,9 @@ export interface ProductionBackendServiceDependencies {
   gateExecutor?: IntegrationV0GateExecutor;
 }
 
+/** A 侧 runner 入口，相对 runner 检出目录。 */
+const DRIVER_RUNNER_ENTRY_RELATIVE = path.join('dist', 'src', 'driver', 'contract-runner.js');
+
 export async function createProductionBackendService(
   env: NodeJS.ProcessEnv = process.env,
   dependencies: ProductionBackendServiceDependencies = {},
@@ -129,7 +133,7 @@ export async function createProductionBackendService(
     throw new Error(`ACP driver runner has no driver:run script: ${runnerDir}`);
   }
 
-  const driverRunnerJs = path.join(runnerDir, 'dist', 'src', 'driver', 'contract-runner.js');
+  const driverRunnerJs = path.join(runnerDir, DRIVER_RUNNER_ENTRY_RELATIVE);
   if (!existsSync(driverRunnerJs)) {
     throw new Error(
       `ACP driver runner build missing: ${driverRunnerJs} (run pnpm --dir ${runnerDir} build)`,
@@ -144,23 +148,18 @@ export async function createProductionBackendService(
   const ephemeralAcpSessions =
     env.NEWIDE_EPHEMERAL_ACP_SESSIONS === '1' ||
     env.NEWIDE_EPHEMERAL_ACP_SESSIONS?.toLowerCase() === 'true';
-  const driver = new ExternalDriverRuntime({
-    driver_id: 'acp-external',
-    capabilities: {
-      supports_acp_extension: true,
-      supports_session_load: !ephemeralAcpSessions,
-      supports_tool_events: true,
-    },
-    transport: new CommandDriverTransport({
-      // Invoke node directly — Windows `spawn('pnpm'/'pnpm.cmd')` is unreliable without shell.
-      command: process.execPath,
-      args: [driverRunnerJs],
-      cwd: runnerDir,
-      env: {
+  // driver 可配置化：可用 driver 是一份数据体（默认 <repoRoot>/.agent/drivers.yaml），
+  // 每个档案各建一个 runtime。基础环境里**不含** ACP_AGENT_ID——它由档案的 agent 决定，
+  // 于是「换 driver」就是换 spawn 时的 agent，A 侧无需改动（进程本就是每次调用一次性）。
+  const driverConfig = loadDriverConfig({ projectRoot: repoRoot, env });
+  const driverRegistry = createDriverRegistry({
+    config: driverConfig,
+    runnerDir,
+    defaultEntryRelative: DRIVER_RUNNER_ENTRY_RELATIVE,
+    baseEnv: {
         ...driverEnv,
         COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
-        ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Offline evals execute the already-installed ACP adapter entrypoint
         // instead of letting npx resolve/download a package inside the jail.
@@ -201,18 +200,24 @@ export async function createProductionBackendService(
                 env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES,
             }
           : {}),
-      },
-      unsetEnv: [
-        'NEWIDE_B_DATABASE_URL',
-        ...MODEL_OVERRIDE_ENV.filter(
-          (key) => driverEnv[key] === undefined && env[key] === undefined,
-        ),
-      ],
-      inactivityTimeoutMs: readDriverTimeout(
-        env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
+    },
+    unsetEnv: [
+      'NEWIDE_B_DATABASE_URL',
+      ...MODEL_OVERRIDE_ENV.filter(
+        (key) => driverEnv[key] === undefined && env[key] === undefined,
       ),
-    }),
+    ],
+    defaultCapabilities: {
+      supports_acp_extension: true,
+      supports_session_load: !ephemeralAcpSessions,
+      supports_tool_events: true,
+    },
+    inactivityTimeoutMs: readDriverTimeout(
+      env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
+    ),
   });
+  // 未配置任何 driver 档案时，这里拿到的是唯一那个 acp-external，与历史装配一致。
+  const driver = driverRegistry.get(driverConfig.default_driver);
   let bRuntime: BackendBRuntime | undefined;
   let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
   let coordinationStore: SqliteCoordinationStore | undefined;
@@ -221,7 +226,7 @@ export async function createProductionBackendService(
     const failures: unknown[] = [];
     for (const close of [
       () => maintenanceScheduler?.stop(),
-      () => driver.shutdown(),
+      () => driverRegistry.shutdown(),
       () => memoryMaintenance?.waitForIdle(),
       () => bRuntime?.close(),
       () => coordinationStore?.close(),
@@ -298,6 +303,9 @@ export async function createProductionBackendService(
     );
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
+      // driver 可配置化：role 显式映射优先，否则落 default_driver。未配置任何档案时
+      // 这条解析恒等于上面那个 driver，行为与历史一致。
+      resolveDriver: (roleId) => driverRegistry.resolveForRole(roleId).handle,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
@@ -514,6 +522,12 @@ export async function createProductionBackendService(
       coordination_durable: databasePath !== ':memory:',
       driver_provider_id: runnerPackageIdentity.name,
       driver_provider_version: runnerPackageIdentity.version,
+      // 「有哪些 driver 可用」的对外出口：逐档案带上 agent 与档案自报的限制。
+      driver_profiles: Object.entries(driverConfig.drivers).map(([driverId, profile]) => ({
+        driver_id: driverId,
+        agent: profile.agent,
+        ...(profile.limitations ? { limitations: profile.limitations } : {}),
+      })),
       b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
       b_embedding: bRuntime.embedding_info ?? {
         provider: 'host-managed repository',
@@ -551,7 +565,9 @@ export async function createProductionBackendService(
         (taskId) => serviceHolder.service?.getAccumulatedDriverUsage(taskId),
         coordinationStore,
       ),
-      new FileRunRequestStore(runsRoot),
+      // 第三个参数是进程启动时冻结的 driver 配置：写进每个新 Run 的 request.json，
+      // 使「配置改动只影响新 Run」有据可依。
+      new FileRunRequestStore(runsRoot, undefined, projectDriverConfigForRun(driverConfig)),
       taskProcessor,
       mailboxService,
       mailboxRecovery,
@@ -575,6 +591,9 @@ export async function createProductionBackendService(
       // 历史读账本而不是扫目录：目录树没有任何保留策略，往期一旦被清理，重算出来的
       // 「累计」会变小。首次读会惰性回填一次目录树里已有的用量（幂等）。
       new LedgerRunUsageHistoryReader(coordinationStore, runsRoot),
+      // driver 计费腿的名字按档案解析，缺省仍是历史名 claude_session_jsonl。
+      driverConfig.drivers[driverConfig.default_driver]?.billing?.source ??
+        DEFAULT_DRIVER_BILLED_SOURCE,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();

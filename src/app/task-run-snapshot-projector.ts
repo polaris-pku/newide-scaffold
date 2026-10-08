@@ -67,6 +67,8 @@ export function projectPersistedRunSnapshot(
   const activeStage = activeStageFacts(aggregate.runtime_state.diagnostics);
   const response = stringValue(agent?.payload.response) ?? '';
   const sessionId = run.session_id ?? stringValue(agent?.payload.session_id);
+  // 真跑的那个 driver：从 agent 事件自带的 diagnostics 里取，缺省不编。
+  const driverId = stringValue(asRecord(agent?.payload.diagnostics)?.['driver_id']);
   const worktreePath =
     stringValue(completion?.payload.worktree_path) ??
     stringValue(delivered?.payload.workspace_path);
@@ -90,6 +92,7 @@ export function projectPersistedRunSnapshot(
     task_id: run.task_id,
     mode: run.mode,
     status,
+    ...(driverId ? { driver_id: driverId } : {}),
     ...(quality ? { quality } : {}),
     current: {
       stage,

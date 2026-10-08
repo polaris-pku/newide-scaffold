@@ -55,7 +55,12 @@ import {
 } from './run-request-store';
 import { projectRunSnapshot } from './run-snapshot-projector';
 import { withAlignedTimeline } from './run-timeline-sequence';
-import { billedFromDurable, pendingBilledSources, projectRunUsage } from './run-usage-projection';
+import {
+  DRIVER_BILLED_SOURCE,
+  billedFromDurable,
+  pendingBilledSources,
+  projectRunUsage,
+} from './run-usage-projection';
 import { projectRunActivity } from './run-activity-projection';
 import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
 import type { RunEvent } from '../protocol/run-event';
@@ -360,6 +365,14 @@ export class NewideBackendService {
      * 不注入时两者都缺席，`run.getUsage` 报「不可用」而不是编一个 0。
      */
     private readonly runUsageHistoryReader?: RunUsageHistoryReader,
+    /**
+     * 本部署实际使用的 driver 计费腿名。
+     *
+     * 由组装点从 driver 档案（`DriverProfile.billing.source`）解析；缺省是历史名
+     * `claude_session_jsonl`。它决定运行中的 run 把哪条腿报成「还没到」——换 driver
+     * 之后这个名字必须跟着变，否则面板会一直等一条永远不会来的腿。
+     */
+    private readonly driverBilledSource: string = DRIVER_BILLED_SOURCE,
   ) {}
 
   /**
@@ -1784,7 +1797,7 @@ export class NewideBackendService {
       driverUsage: this.getAccumulatedDriverUsage(snapshot.task_id),
       ...(durableUsage ? { durable: durableUsage } : {}),
       // 「还没到」的腿按 run 状态算：driver 计费腿是收尾时刮出来的，运行中注定没有。
-      pendingSources: pendingBilledSources(snapshot.status),
+      pendingSources: pendingBilledSources(snapshot.status, this.driverBilledSource),
     });
     // 在飞状态是内存里的，只有本进程持有的 run 才有；没有就是没有这个字段。
     // agent 半边来自进程级状态点，driver 半边从同一条存活期事件流里折出来（含 chunk，

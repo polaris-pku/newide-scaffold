@@ -350,3 +350,164 @@ describe('SqliteTokenUsageLedger', () => {
     reopened.close();
   });
 });
+
+/**
+ * 旧库升级演练。
+ *
+ * 这一组用**真实文件库**而不是内存库来跑，因为要验的正是「已经存在的库能不能被就地改好」：
+ * 旧 schema 的 `source` 列写死了 `CHECK (source IN ('proxy', 'claude_session_jsonl'))`，
+ * 而 `CREATE TABLE IF NOT EXISTS` 永远不会改它。不重建表，换 driver 后第一次记账就撞约束，
+ * 丢的是「累计用量」这条最不该丢的路径。
+ */
+describe('legacy source constraint migration', () => {
+  const LEGACY_DDL = `
+    CREATE TABLE token_usage_ledger (
+      run_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      role_id TEXT NOT NULL,
+      source TEXT NOT NULL CHECK (source IN ('proxy', 'claude_session_jsonl')),
+      metric TEXT NOT NULL CHECK (metric IN ('billed_tokens')),
+      input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+      output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+      cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
+      cache_read_input_tokens INTEGER NOT NULL CHECK (cache_read_input_tokens >= 0),
+      total_input_tokens INTEGER NOT NULL CHECK (total_input_tokens >= 0),
+      total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+      call_count INTEGER NOT NULL CHECK (call_count >= 0),
+      recorded_at TEXT NOT NULL,
+      schema_version TEXT NOT NULL,
+      PRIMARY KEY (run_id, role_id, source, metric)
+    );
+    CREATE INDEX token_usage_ledger_by_task ON token_usage_ledger(task_id);
+    CREATE INDEX token_usage_ledger_by_role ON token_usage_ledger(role_id);
+  `;
+
+  /** 建一个「老库」：旧 CHECK + 一行历史用量。 */
+  function seedLegacyLedger(databasePath: string): void {
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(LEGACY_DDL);
+    legacy
+      .prepare(
+        `INSERT INTO token_usage_ledger (
+           run_id, task_id, role_id, source, metric,
+           input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+           total_input_tokens, total_tokens, call_count, recorded_at, schema_version
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        'run_old',
+        'task_old',
+        'role_old',
+        'claude_session_jsonl',
+        'billed_tokens',
+        10,
+        20,
+        0,
+        0,
+        10,
+        30,
+        1,
+        'T',
+        TOKEN_USAGE_LEDGER_SCHEMA_VERSION,
+      );
+    legacy.close();
+  }
+
+  function insertWithSource(databasePath: string, source: string): void {
+    const database = new DatabaseSync(databasePath);
+    try {
+      database
+        .prepare(
+          `INSERT INTO token_usage_ledger (
+             run_id, task_id, role_id, source, metric,
+             input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+             total_input_tokens, total_tokens, call_count, recorded_at, schema_version
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run('run_new', 'task_new', 'role_new', source, 'billed_tokens', 1, 1, 0, 0, 1, 2, 1, 'T', TOKEN_USAGE_LEDGER_SCHEMA_VERSION);
+    } finally {
+      // 抛错路径也必须关库：Windows 上留着句柄会让 afterEach 的目录清理 EPERM。
+      database.close();
+    }
+  }
+
+  function tableSql(databasePath: string): string {
+    const database = new DatabaseSync(databasePath);
+    try {
+      const row = database
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'token_usage_ledger'`,
+        )
+        .get() as { sql: string } | undefined;
+      return row?.sql ?? '';
+    } finally {
+      database.close();
+    }
+  }
+
+  it('refuses a driver-declared source on a legacy ledger, which is why the rebuild exists', () => {
+    const databasePath = tempDatabasePath();
+    seedLegacyLedger(databasePath);
+
+    // 先确认这个失败模式是真的：不重建的话，换 driver 的名字直接撞 CHECK
+    expect(() => insertWithSource(databasePath, 'codex_jsonl')).toThrow(/CHECK constraint/i);
+  });
+
+  it('rebuilds the table, keeps history, and accepts a newly declared source', () => {
+    const databasePath = tempDatabasePath();
+    seedLegacyLedger(databasePath);
+
+    // 打开生产库 → 迁移就地跑起来
+    const store = new SqliteCoordinationStore(databasePath);
+    store.close();
+
+    // 历史行必须原样保留
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare('SELECT source, total_tokens FROM token_usage_ledger WHERE run_id = ?')
+        .get('run_old'),
+    ).toEqual({ source: 'claude_session_jsonl', total_tokens: 30 });
+    database.close();
+
+    // 约束已放开，且索引被重建
+    expect(tableSql(databasePath)).not.toContain('CHECK (source IN (');
+    expect(() => insertWithSource(databasePath, 'codex_jsonl')).not.toThrow();
+
+    const indexes = new DatabaseSync(databasePath);
+    const indexNames = indexes
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'token_usage_ledger'`)
+      .all() as Array<{ name: string }>;
+    indexes.close();
+    // 只看两条显式索引；主键还会自带一个 sqlite_autoindex。
+    expect(indexNames.map((row) => row.name)).toEqual(
+      expect.arrayContaining(['token_usage_ledger_by_task', 'token_usage_ledger_by_role']),
+    );
+  });
+
+  it('is idempotent across repeated opens', () => {
+    const databasePath = tempDatabasePath();
+    seedLegacyLedger(databasePath);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const store = new SqliteCoordinationStore(databasePath);
+      store.close();
+    }
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database.prepare('SELECT COUNT(*) AS n FROM token_usage_ledger').get(),
+    ).toEqual({ n: 1 });
+    database.close();
+    expect(() => insertWithSource(databasePath, 'gemini_jsonl')).not.toThrow();
+  });
+
+  it('leaves a freshly created ledger on the open source domain', () => {
+    const databasePath = tempDatabasePath();
+    const store = new SqliteCoordinationStore(databasePath);
+    store.close();
+
+    expect(tableSql(databasePath)).not.toContain('CHECK (source IN (');
+    expect(() => insertWithSource(databasePath, 'anything_declared_by_a_profile')).not.toThrow();
+  });
+});

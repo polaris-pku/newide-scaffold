@@ -45,9 +45,34 @@ export interface ProductionSystemStatusInput {
   coordination_durable: boolean;
   driver_provider_id: string;
   driver_provider_version?: string;
+  /**
+   * 已配置的 driver 档案。缺省表示「没有可配置能力」，输出与历史单 driver 一致。
+   */
+  driver_profiles?: readonly SystemStatusDriverProfile[];
   b_repository_mode: string;
   b_embedding: BEmbeddingRuntimeInfo;
 }
+
+/** 一个已配置 driver 的对外可见事实。 */
+export interface SystemStatusDriverProfile {
+  /** 本仓 driver 标识（`DriverConfig` 的 key）。 */
+  driver_id: string;
+  /** 该 driver 使用的 A 侧 agent（`ACP_AGENT_ID`）。 */
+  agent: string;
+  /** 档案自己声明的已知限制，会一并并入 `driver.execute` 的 `limitations`。 */
+  limitations?: readonly string[];
+}
+
+/**
+ * 诚实降级措辞。
+ *
+ * 本仓能自足判定的是「档案已配置、runner 入口存在、凭据键齐备」；**本机是否装了该
+ * agent CLI 判断不了**——启动命令来自 A 侧的 `${AGENT_ID}_CLI_COMMAND` 或 adapter
+ * 默认值（如 `npx -y <pkg>`）。所以能力条目不能宣称「可用」，只能如实标注这一条
+ * 未验证。前端文案与本常量同源，不允许各写各的。
+ */
+export const DRIVER_CONFIGURED_CLI_UNVERIFIED =
+  'driver 已配置且凭据齐备；agent CLI 是否就绪未验证';
 
 export class SystemStatusService {
   private readonly capabilitiesById = new Map<string, CapabilityStatusV1>();
@@ -169,6 +194,7 @@ export function createProductionSystemStatusService(
     input.driver_provider_version,
     'external-command',
   );
+  const driverProfiles = input.driver_profiles ?? [];
   const bRepository = provider('b-memory-repository', undefined, input.b_repository_mode);
   const bEmbedding = provider(
     input.b_embedding.provider,
@@ -189,6 +215,16 @@ export function createProductionSystemStatusService(
         input.coordination_durable ? undefined : 'NON_DURABLE_COORDINATION_STORE',
       ),
       component('driver_provider', 'degraded', driver, 'DRIVER_HANDSHAKE_UNAVAILABLE'),
+      // 每个已配置档案各出一个组件：这是「有哪些 driver 可用」的结构化出口。
+      // 状态恒为 degraded，因为 agent CLI 是否就绪本仓验证不了（见上面的措辞常量）。
+      ...driverProfiles.map((profile) =>
+        component(
+          `driver:${profile.driver_id}`,
+          'degraded',
+          provider(profile.agent, undefined, 'configured-credentials-complete'),
+          'AGENT_CLI_READINESS_NOT_VERIFIABLE',
+        ),
+      ),
       component('b_repository', 'ready', bRepository),
       component(
         'b_embedding',
@@ -203,7 +239,15 @@ export function createProductionSystemStatusService(
       input.coordination_durable
         ? available('coordination.persist', coordination)
         : unavailable('coordination.persist', 'NON_DURABLE_COORDINATION_STORE', coordination),
-      degraded('driver.execute', 'DRIVER_HANDSHAKE_UNAVAILABLE', driver),
+      // 未配置任何档案时保持历史输出逐字段不变（不加 limitations）。
+      ...(driverProfiles.length > 0
+        ? [
+            {
+              ...degraded('driver.execute', 'DRIVER_HANDSHAKE_UNAVAILABLE', driver),
+              limitations: driverLimitations(driverProfiles),
+            },
+          ]
+        : [degraded('driver.execute', 'DRIVER_HANDSHAKE_UNAVAILABLE', driver)]),
       unavailable('driver.workspace', 'PER_REQUEST_WORKSPACE_NOT_CONFIRMED', driver),
       available('agent.read', bRepository),
       available(
@@ -254,6 +298,22 @@ export function createUnavailableSystemStatusService(): SystemStatusService {
 }
 
 type Provider = NonNullable<CapabilityStatusV1['provider']>;
+
+/**
+ * `driver.execute` 的 limitations：逐 driver 列出「已配置到哪一步」，再并入档案自报的限制。
+ *
+ * 逐条带 driver_id 与 agent，是为了让前端能指出**具体哪一个** driver 的 CLI 未验证，
+ * 而不是笼统地说「driver 未就绪」。
+ */
+function driverLimitations(profiles: readonly SystemStatusDriverProfile[]): string[] {
+  return [
+    ...profiles.map(
+      (profile) =>
+        `driver "${profile.driver_id}"（agent: ${profile.agent}）: ${DRIVER_CONFIGURED_CLI_UNVERIFIED}`,
+    ),
+    ...profiles.flatMap((profile) => profile.limitations ?? []),
+  ];
+}
 
 function provider(providerId: string, version?: string, mode?: string): Provider {
   return {

@@ -1,0 +1,91 @@
+# ============================================
+# Driver profiles (example)
+#
+# Copy to `.agent/drivers.yaml` and trim to the drivers you actually use.
+# `drivers.example.yaml` itself is never loaded — only `drivers.yaml` and
+# `drivers.local.yaml` are.
+#
+# Layers, later overrides earlier:
+#   ~/.agent/drivers.yaml
+#   ~/.agent/drivers.local.yaml
+#   <repoRoot>/.agent/drivers.yaml
+#   <repoRoot>/.agent/drivers.local.yaml
+# then environment overrides:
+#   NEWIDE_DRIVER   -> default_driver
+#   ACP_AGENT_ID    -> the `acp-external` profile's agent
+#
+# Delete every layer to keep the legacy single-driver behaviour: one
+# `acp-external` profile whose agent is `ACP_AGENT_ID ?? claude`.
+#
+# Every declared driver is validated at STARTUP: its runner entry must exist
+# and every key listed under `credentials.env` must be present. So declare only
+# the drivers you really use — an unused profile with missing credentials
+# fails the boot on purpose, naming the key.
+# ============================================
+
+version: 1
+
+# Every role not listed under `roles` uses this driver.
+default_driver: claude
+
+drivers:
+  # Without any config file this single profile is the whole system. Keep the
+  # id `acp-external` if you want historical runs, ledger rows and
+  # summary.json to line up.
+  claude:
+    agent: claude
+    description: Claude Code, through the Claude Agent SDK adapter.
+
+    # Omit `runtime` to use the deployment defaults: ACP_DRIVER_RUNNER_DIR plus
+    # `dist/src/driver/contract-runner.js`. Override only when a driver needs
+    # its own checkout or its own child-process environment.
+    runtime:
+      # runner_dir: /absolute/path/to/acp-client-prototype
+      # entry: dist/src/driver/contract-runner.js
+      env:
+        ANTHROPIC_BASE_URL: https://api.anthropic.com
+
+    # Key NAMES only — values come from the A-side `.env` (or the file named by
+    # ACP_DRIVER_ENV_FILE). Nothing secret belongs in this file, so it stays
+    # safe to commit.
+    credentials:
+      env:
+        - ANTHROPIC_API_KEY
+
+    capabilities:
+      supports_session_load: true
+
+    # Which ledger leg this driver's billed usage lands on. Omit to keep the
+    # historical name `claude_session_jsonl`.
+    billing:
+      source: claude_session_jsonl
+
+    limitations:
+      - "Unused here: free-form notes that surface in `system.readiness`."
+
+  codex:
+    agent: codex
+    description: Codex, through its ACP adapter.
+
+    credentials:
+      env:
+        - OPENAI_API_KEY
+
+    # A driver that is not Claude must not keep reporting its usage as
+    # `claude_session_jsonl`: that name is what the ledger, the event stream
+    # and summary.json already carry for the Claude leg.
+    billing:
+      source: codex_jsonl
+
+    # Shown in `system.readiness` next to the driver's component. The
+    # repository can verify "configured, runner present, credentials complete";
+    # it CANNOT verify that this machine has the agent CLI installed, because
+    # the launch command comes from ACP (`${AGENT_ID}_CLI_COMMAND` or the
+    # adapter default). That is why every driver component reports `degraded`.
+    limitations:
+      - The agent CLI on this machine is not verified by this repository.
+
+# B-side roles -> driver. Council seats are roles too, so one council run can
+# execute four seats through four different drivers.
+roles:
+  reviewer: codex
