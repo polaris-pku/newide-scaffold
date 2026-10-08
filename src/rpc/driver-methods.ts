@@ -60,6 +60,8 @@ const DRIVER_ROUTING_RPC_CODES: Readonly<Record<DriverRoutingErrorCode, number>>
   revision_mismatch: JSON_RPC_ERROR_CODES.DRIVER_CONFIG_CONFLICT,
   driver_not_found: JSON_RPC_ERROR_CODES.DRIVER_NOT_FOUND,
   driver_not_selectable: JSON_RPC_ERROR_CODES.DRIVER_NOT_SELECTABLE,
+  default_driver_locked: JSON_RPC_ERROR_CODES.DRIVER_DEFAULT_LOCKED,
+  config_busy: JSON_RPC_ERROR_CODES.DRIVER_CONFIG_BUSY,
   write_failed: JSON_RPC_ERROR_CODES.DRIVER_CONFIG_WRITE_FAILED,
 };
 

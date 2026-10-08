@@ -12,7 +12,15 @@
  *   文件重建同样的 snapshot。
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -24,8 +32,10 @@ import {
   effectiveUiRoutingDocument,
   computeUiRoutingRevision,
   normalizeUiDriverRoutingDocument,
+  uiDriverRoutingLockPath,
   uiDriverRoutingPath,
   type DriverRoutingDriverAvailability,
+  type DriverRoutingLockOptions,
 } from '../../src/driver';
 import { driverRoutingSnapshotSchema } from '../../src/protocol/driver-routing';
 
@@ -106,17 +116,20 @@ function createService(options: {
   knownRoleIds?: readonly string[];
   availabilityOf?: (driverId: string) => DriverRoutingDriverAvailability;
   registryDriverIds?: readonly string[];
+  env?: NodeJS.ProcessEnv;
+  lock?: DriverRoutingLockOptions;
 }): DriverRoutingService {
   const knownRoleIds = options.knownRoleIds ?? ['proposer', 'reviewer'];
   return new DriverRoutingService({
     projectRoot: options.projectRoot,
-    env: {},
+    env: options.env ?? {},
     homeDir: makeTempDir('newide-driver-routing-home-'),
     registry: stubRegistry(options.registryDriverIds ?? ['acp-external', 'claude', 'codex']),
     knownRoleIds: async () => knownRoleIds,
     ...(options.availabilityOf
       ? { availabilityOf: (driverId: string) => options.availabilityOf!(driverId) }
       : {}),
+    ...(options.lock ? { lock: options.lock } : {}),
   });
 }
 
@@ -591,6 +604,336 @@ describe('run isolation', () => {
     expect(snapshot.default_driver).toBe('codex');
     expect(snapshot.roles.find((role) => role.role_id === 'proposer')?.driver_id).toBe('claude');
     expect(await restarted.getSnapshot()).toEqual(updated);
+  });
+});
+
+/**
+ * 跨进程 revision 保护。
+ *
+ * 场景刻意用**两个 service 实例**模拟两个 backend 进程：它们各自在内存里持有同一份
+ * revision，只有「加锁后重新读盘再 CAS」才能挡住后者用过期 revision 覆盖前者。
+ * 目标平台 Windows：独占锁用 `mkdir`（原子），stale 接管用 `rename`（原子）。
+ */
+describe('cross-process revision protection', () => {
+  it('rejects the second writer that still holds the old revision', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const serviceA = createService({ projectRoot });
+    const serviceB = createService({ projectRoot });
+
+    // 两个实例都读到 R1
+    const revisionA = (await serviceA.getSnapshot()).revision;
+    const revisionB = (await serviceB.getSnapshot()).revision;
+    expect(revisionA).toBe(revisionB);
+
+    // A 用 R1 更新成功，磁盘变成 R2
+    const updated = await serviceA.updateRouting({
+      expected_revision: revisionA,
+      default_driver: 'codex',
+      roles: { proposer: 'claude' },
+    });
+    const fileAfterA = readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8');
+
+    // B 手里还是 R1：必须 conflict，绝不能覆盖 A
+    const error = await captureError(() =>
+      serviceB.updateRouting({
+        expected_revision: revisionB,
+        default_driver: 'claude',
+        roles: {},
+      }),
+    );
+    expect(error.code).toBe('revision_mismatch');
+    expect(error.data).toMatchObject({
+      reason: 'revision_mismatch',
+      current_revision: updated.revision,
+    });
+
+    // 磁盘上仍然是 A 的结果
+    expect(readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toBe(fileAfterA);
+    // B 的内存配置被刷新成磁盘真相，而不是继续抱着 R1
+    await expect(serviceB.getSnapshot()).resolves.toMatchObject({
+      default_driver: 'codex',
+      revision: updated.revision,
+    });
+
+    // 拿着新 revision 重试即可成功 —— 证明锁在错误路径上也释放了
+    const retried = await serviceB.updateRouting({
+      expected_revision: updated.revision,
+      default_driver: 'codex',
+      roles: {},
+    });
+    expect(retried.revision).not.toBe(updated.revision);
+    expect(retried.default_driver).toBe('codex');
+  });
+
+  it('serves the on-disk revision to a second instance before any conflict', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const serviceA = createService({ projectRoot });
+    const serviceB = createService({ projectRoot });
+    const before = (await serviceB.getSnapshot()).revision;
+
+    const updated = await serviceA.updateRouting({
+      expected_revision: before,
+      default_driver: 'codex',
+      roles: {},
+    });
+
+    // B 没写过、也没撞过冲突，但 getConfig 必须给出磁盘真相——否则前端永远拿着过期 revision
+    const seen = await serviceB.getSnapshot();
+    expect(seen.revision).toBe(updated.revision);
+    expect(seen.default_driver).toBe('codex');
+  });
+
+  it('protects resetRouting with the same CAS', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const serviceA = createService({ projectRoot });
+    const serviceB = createService({ projectRoot });
+    const revisionB = (await serviceB.getSnapshot()).revision;
+
+    const updated = await serviceA.updateRouting({
+      expected_revision: revisionB,
+      default_driver: 'codex',
+      roles: {},
+    });
+    const fileAfterA = readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8');
+
+    // B 用旧 revision reset：必须 conflict，且不能把 A 的文件删掉
+    const conflict = await captureError(() => serviceB.resetRouting(revisionB));
+    expect(conflict.code).toBe('revision_mismatch');
+    expect(conflict.data).toMatchObject({ current_revision: updated.revision });
+    expect(readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toBe(fileAfterA);
+
+    // 用新 revision reset 成功
+    const reset = await serviceB.resetRouting(updated.revision);
+    expect(reset.default_driver).toBe('claude');
+    expect(() => readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toThrow();
+  });
+
+  it('releases the lock so consecutive writers can proceed', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const serviceA = createService({ projectRoot });
+    const serviceB = createService({ projectRoot });
+
+    const first = await serviceA.updateRouting({
+      expected_revision: serviceA.currentRevision(),
+      default_driver: 'codex',
+      roles: {},
+    });
+    const second = await serviceB.updateRouting({
+      expected_revision: first.revision,
+      default_driver: 'claude',
+      roles: {},
+    });
+
+    expect(second.default_driver).toBe('claude');
+    // 锁目录不残留，后续写入照常
+    expect(existsSync(uiDriverRoutingLockPath(projectRoot))).toBe(false);
+    await expect(
+      serviceA.updateRouting({
+        expected_revision: second.revision,
+        default_driver: 'codex',
+        roles: {},
+      }),
+    ).resolves.toMatchObject({ default_driver: 'codex' });
+  });
+
+  it('lets exactly one of two racing writers win', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    // 两个实例并发写：跨进程锁保证临界区互斥，后进者在锁内重新读盘，必然撞到新 revision。
+    const serviceA = createService({ projectRoot, lock: { timeoutMs: 2_000, retryMs: 5 } });
+    const serviceB = createService({ projectRoot, lock: { timeoutMs: 2_000, retryMs: 5 } });
+    const revision = (await serviceA.getSnapshot()).revision;
+
+    const results = await Promise.allSettled([
+      serviceA.updateRouting({
+        expected_revision: revision,
+        default_driver: 'codex',
+        roles: {},
+      }),
+      serviceB.updateRouting({
+        expected_revision: revision,
+        default_driver: 'claude',
+        roles: {},
+      }),
+    ]);
+
+    const winners = results.filter(
+      (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof serviceA.updateRouting>>> =>
+        result.status === 'fulfilled',
+    );
+    const losers = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(losers[0]!.reason).toBeInstanceOf(DriverRoutingError);
+    expect((losers[0]!.reason as DriverRoutingError).code).toBe('revision_mismatch');
+
+    // 磁盘上是赢家写的，锁不残留
+    expect(readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toContain(
+      `default_driver: ${winners[0]!.value.default_driver}`,
+    );
+    expect(existsSync(uiDriverRoutingLockPath(projectRoot))).toBe(false);
+  });
+
+  it('steals a stale lock left behind by a crashed process', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    // staleMs 给足，让「mtime 很旧」成为唯一的接管依据，从而验证 stale 路径本身
+    const service = createService({
+      projectRoot,
+      lock: { timeoutMs: 2_000, retryMs: 20, staleMs: 5_000 },
+    });
+
+    const lockPath = uiDriverRoutingLockPath(projectRoot);
+    mkdirSync(lockPath, { recursive: true }); // 崩溃残骸：目录在、owner.json 没写成
+    const longAgo = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, longAgo, longAgo);
+
+    const snapshot = await service.getSnapshot();
+    const updated = await service.updateRouting({
+      expected_revision: snapshot.revision,
+      default_driver: 'codex',
+      roles: {},
+    });
+
+    expect(updated.default_driver).toBe('codex');
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('returns config_busy when a live writer holds the lock', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const service = createService({
+      projectRoot,
+      lock: { timeoutMs: 150, retryMs: 20, staleMs: 60_000 },
+    });
+
+    // 另一个「活着的」进程持锁：owner pid 是当前进程（必然存活），mtime 新鲜
+    const lockPath = uiDriverRoutingLockPath(projectRoot);
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(
+      join(lockPath, 'owner.json'),
+      JSON.stringify({ token: 'foreign-writer', pid: process.pid, created_at: new Date().toISOString() }),
+      'utf-8',
+    );
+
+    const revision = (await service.getSnapshot()).revision;
+    const error = await captureError(() =>
+      service.updateRouting({ expected_revision: revision, default_driver: 'codex', roles: {} }),
+    );
+
+    expect(error.code).toBe('config_busy');
+    expect(error.data).toMatchObject({ reason: 'config_busy', path_category: 'project_agent_dir' });
+    // 没写文件，也没改内存
+    expect(existsSync(uiDriverRoutingPath(projectRoot))).toBe(false);
+    await expect(service.getSnapshot()).resolves.toMatchObject({ default_driver: 'claude' });
+    // 别人的锁原样保留，绝不因为我们等超时就把它删掉
+    expect(existsSync(lockPath)).toBe(true);
+  });
+});
+
+/**
+ * `NEWIDE_DRIVER` = 部署级锁定的 default driver。
+ *
+ * loader 的 env 覆盖层排在 UI 层之后，所以「文件里写 X、有效值是 env」不是可修复的状态；
+ * 与其让前端保存成功却看不到效果，不如在写文件前明确拒绝。
+ */
+describe('NEWIDE_DRIVER locked default driver', () => {
+  const LOCKED_ENV = { NEWIDE_DRIVER: 'claude' };
+
+  it('rejects an update that tries to change the locked default driver', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const service = createService({ projectRoot, env: LOCKED_ENV });
+    const before = await service.getSnapshot();
+    expect(before.default_driver).toBe('claude');
+
+    const error = await captureError(() =>
+      service.updateRouting({
+        expected_revision: before.revision,
+        default_driver: 'codex',
+        roles: {},
+      }),
+    );
+
+    expect(error.code).toBe('default_driver_locked');
+    expect(error.data).toMatchObject({
+      reason: 'default_driver_locked',
+      field: 'default_driver',
+      driver_id: 'codex',
+      locked_driver_id: 'claude',
+    });
+    // 没有落任何文件，也没有改内存
+    expect(existsSync(uiDriverRoutingPath(projectRoot))).toBe(false);
+    await expect(service.getSnapshot()).resolves.toMatchObject({ default_driver: 'claude' });
+  });
+
+  it('allows role mapping changes while the default driver is locked', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const service = createService({ projectRoot, env: LOCKED_ENV });
+    const before = await service.getSnapshot();
+
+    const updated = await service.updateRouting({
+      expected_revision: before.revision,
+      default_driver: 'claude',
+      roles: { proposer: 'codex' },
+    });
+
+    expect(updated.default_driver).toBe('claude');
+    expect(updated.roles.find((role) => role.role_id === 'proposer')).toMatchObject({
+      driver_id: 'codex',
+      source: 'role_override',
+    });
+    // 文件确实写了，且 default_driver 与锁定值一致
+    expect(readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toContain('default_driver: claude');
+  });
+
+  it('still reports the locked driver after reset', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const service = createService({ projectRoot, env: LOCKED_ENV });
+    const updated = await service.updateRouting({
+      expected_revision: service.currentRevision(),
+      default_driver: 'claude',
+      roles: { proposer: 'codex' },
+    });
+
+    const reset = await service.resetRouting(updated.revision);
+
+    expect(reset.default_driver).toBe('claude');
+    expect(() => readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toThrow();
+  });
+
+  it('reports the env-locked driver even when the UI file asks for another one', async () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    // 外部写下的 UI 覆盖（例如上一版后端）：文件说 codex，env 说 claude
+    writeFileSync(
+      uiDriverRoutingPath(projectRoot),
+      ['version: 1', 'default_driver: codex', 'roles: {}', ''].join('\n'),
+      'utf-8',
+    );
+
+    const service = createService({ projectRoot, env: LOCKED_ENV });
+    const snapshot = await service.getSnapshot();
+
+    // 有效值以 env 为准：前端看到的就是真正生效的那个
+    expect(snapshot.default_driver).toBe('claude');
+    // 想把它改回 codex 也是被锁定的
+    const error = await captureError(() =>
+      service.updateRouting({
+        expected_revision: snapshot.revision,
+        default_driver: 'codex',
+        roles: {},
+      }),
+    );
+    expect(error.code).toBe('default_driver_locked');
   });
 });
 

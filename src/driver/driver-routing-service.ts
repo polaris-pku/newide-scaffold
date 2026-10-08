@@ -11,8 +11,14 @@
  *   解析（task-loop、legacy run、Council 各席位、mailbox 投递）都走这一份。解析链固定为
  *   `Run snapshot → role mapping → default driver → runtime handle`，不会出现第一个席位用旧
  *   映射、第二个席位用新映射；
- * - **并发**：单进程内一个 update mutex 串行化写操作；跨进程靠 `expected_revision` + rename。
- *   更新失败不改变内存配置、不影响在飞 Run。
+ * - **并发**：单进程内一个 update mutex 串行化写操作；跨进程靠 `.agent` 下的独占写锁
+ *   （`mkdir` 原子创建）加 `expected_revision` 比较。**加锁后必须重新从磁盘 load 有效配置**，
+ *   再比对 revision——只比内存里的 `currentConfig` 挡不住另一个 backend 实例：两个进程都
+ *   持有 R1 时，后者会用过期 revision 覆盖前者的 R2；
+ * - **部署锁定**：`NEWIDE_DRIVER` 是部署级锁定的 default driver。请求想改成别的 driver 一律
+ *   在写文件前拒绝（`default_driver_locked`），因为写了也不会生效——loader 的 env 覆盖层
+ *   永远赢。成功返回的 snapshot 一定来自「写完文件后重新 load 的」有效配置；
+ * - 更新失败不改变内存配置、不影响在飞 Run。
  */
 import path from 'node:path';
 
@@ -28,9 +34,11 @@ import {
 import {
   DriverRoutingFileStore,
   DriverRoutingFileError,
+  DriverRoutingLockError,
   computeUiRoutingRevision,
   effectiveUiRoutingDocument,
   normalizeUiDriverRoutingDocument,
+  type DriverRoutingLockOptions,
 } from './driver-routing-file-store';
 import { loadDriverConfig } from './profile-loader';
 import {
@@ -64,6 +72,8 @@ export type DriverRoutingErrorCode =
   | 'revision_mismatch'
   | 'driver_not_found'
   | 'driver_not_selectable'
+  | 'default_driver_locked'
+  | 'config_busy'
   | 'write_failed';
 
 /** JSON-RPC 错误 data 的结构化内容；绝不承载 secret。 */
@@ -72,11 +82,13 @@ export interface DriverRoutingErrorData {
   current_revision?: string;
   field?: string;
   driver_id?: string;
+  /** `default_driver_locked` 时被 `NEWIDE_DRIVER` 锁定的 driver id。 */
+  locked_driver_id?: string;
   reason_code?: string;
   limitations?: string[];
-  /** 写入失败的路径类别（不含绝对路径细节）。 */
+  /** 写入/加锁失败的路径类别（不含绝对路径细节）。 */
   path_category?: string;
-  /** 写入失败的系统错误摘要（只含错误码/我们自己的文案）。 */
+  /** 系统错误摘要（只含错误码或我们自己的文案）。 */
   error_summary?: string;
 }
 
@@ -122,6 +134,12 @@ export interface DriverRoutingServiceOptions {
   knownRoleIds?: () => Promise<readonly string[]>;
   /** 覆盖默认的可选择性投影（测试缝）。 */
   availabilityOf?: (driverId: string, profile: DriverProfile) => DriverRoutingDriverAvailability;
+  /**
+   * 跨进程写锁的等待参数；缺省 5s 超时 / 25ms 重试 / 30s stale。
+   *
+   * 测试用它把等待压到毫秒级，避免一条「等锁超时」用例真的挂 5 秒。
+   */
+  lock?: DriverRoutingLockOptions;
 }
 
 /** 只暴露 Run 冻结所需的端口，供 `NewideBackendService` 注入。 */
@@ -152,6 +170,7 @@ export class DriverRoutingService implements DriverRoutingPort {
     driverId: string,
     profile: DriverProfile,
   ) => DriverRoutingDriverAvailability;
+  private readonly lockOptions: DriverRoutingLockOptions;
   /** 当前有效配置（含 UI 覆盖层）；每次成功写入或 reset 后整体替换。 */
   private currentConfig: DriverConfig;
   /** Run 创建时冻结的 routing 投影；一个 run_id 一条，进程内不可变。 */
@@ -167,11 +186,15 @@ export class DriverRoutingService implements DriverRoutingPort {
     this.homeDir = options.homeDir;
     this.knownRoleIds = options.knownRoleIds;
     this.availabilityOf = options.availabilityOf ?? defaultDriverAvailability;
+    this.lockOptions = options.lock ?? {};
     this.currentConfig = this.loadConfig();
   }
 
   /** 完整查询快照（`driver.getConfig`）。 */
   async getSnapshot(): Promise<DriverRoutingSnapshot> {
+    // 多实例部署下，另一个 backend 可能刚写过：先与磁盘对齐。否则本实例会永远返回过期
+    // revision，前端的每一次保存都必然撞 conflict（唯一的补救是冲突错误里的 current_revision）。
+    this.refreshConfigFromDisk();
     // 固定一份配置引用：role 目录查询是异步的，不能让它 await 到一半时被一次 update 换掉
     // 底层配置，否则会返回「旧 role 列表 + 新 revision」的混合体。
     const config = this.currentConfig;
@@ -245,58 +268,75 @@ export class DriverRoutingService implements DriverRoutingPort {
   /**
    * 原子更新整个 routing mapping（`driver.updateRouting`）。
    *
-   * 顺序：revision 校验 → 引用与可选择性校验 → 规范化 → **不落盘预校验** → 原子写入 →
-   * 重新读取校验 → 替换内存快照。任何一步失败都不会留下「内存已改、盘没变」的状态。
+   * 临界区（进程内 mutex + 跨进程文件锁）内顺序：
+   * 1. **重新从磁盘 load** 有效配置——另一个 backend 实例可能刚写过，内存里的 revision 不作数；
+   * 2. 以磁盘 revision 比对 `expected_revision`（CAS：不一致就 conflict，绝不覆盖）；
+   * 3. 校验 `NEWIDE_DRIVER` 部署锁定、引用存在、可选择性；
+   * 4. 规范化 → **不落盘预校验** → 原子写入 → 重新 load → 替换内存；
+   * 5. `finally` 释放锁。
+   *
+   * 任何一步失败都不写文件、不用被拒的请求改内存（内存只被刷新成磁盘真相）。
    */
   async updateRouting(input: UpdateDriverRoutingInput): Promise<DriverRoutingSnapshot> {
     return this.withUpdateLock(async () => {
-      this.assertRevision(input.expected_revision);
+      await this.withFileLock(() => {
+        // 第 1 步：以磁盘为准。顺带把内存里可能已经过期的配置刷新成磁盘真相。
+        const diskConfig = this.loadConfigSafely();
+        this.currentConfig = diskConfig;
 
-      const defaultDriver = input.default_driver;
-      const defaultProfile = this.currentConfig.drivers[defaultDriver];
-      if (!defaultProfile) {
-        throw driverNotFound('default_driver', defaultDriver);
-      }
-      this.assertSelectable('default_driver', defaultDriver, defaultProfile);
+        // 第 2 步：CAS。用磁盘 revision，而不是内存 revision。
+        this.assertRevision(input.expected_revision, diskConfig);
 
-      for (const [roleId, driverId] of Object.entries(input.roles)) {
-        const profile = this.currentConfig.drivers[driverId];
-        if (!profile) {
-          throw driverNotFound(`roles.${roleId}`, driverId);
+        // 第 3 步：部署锁定——写了也不生效，所以必须在写文件前拒绝。
+        const defaultDriver = input.default_driver;
+        const lockedDriver = this.lockedDefaultDriver();
+        if (lockedDriver !== undefined && defaultDriver !== lockedDriver) {
+          throw defaultDriverLocked(lockedDriver, defaultDriver);
         }
-        this.assertSelectable(`roles.${roleId}`, driverId, profile);
-      }
 
-      const document = normalizeUiDriverRoutingDocument({
-        default_driver: defaultDriver,
-        roles: input.roles,
+        const defaultProfile = diskConfig.drivers[defaultDriver];
+        if (!defaultProfile) {
+          throw driverNotFound('default_driver', defaultDriver);
+        }
+        this.assertSelectable('default_driver', defaultDriver, defaultProfile);
+
+        for (const [roleId, driverId] of Object.entries(input.roles)) {
+          const profile = diskConfig.drivers[driverId];
+          if (!profile) {
+            throw driverNotFound(`roles.${roleId}`, driverId);
+          }
+          this.assertSelectable(`roles.${roleId}`, driverId, profile);
+        }
+
+        const document = normalizeUiDriverRoutingDocument({
+          default_driver: defaultDriver,
+          roles: input.roles,
+        });
+        const layer: DriverConfigLayer = {
+          version: document.version,
+          default_driver: document.default_driver,
+          roles: { ...document.roles },
+        };
+        // 第 4 步：落盘前先按「新层生效」合成一次。引用悬空在这里就被挡下，旧文件天然完整。
+        // 显式校验已经覆盖了文档列出的每一种用户错误，这条只是兜底——真触发时也只报写入
+        // 失败，不让一个裸的内部错误穿过 RPC 边界。
+        this.loadConfigSafely({ [this.fileStore.filePath]: layer });
+
+        const previousRaw = this.fileStore.readRaw();
+        try {
+          this.fileStore.writeAtomic(document);
+        } catch (error) {
+          throw this.writeFailed(error);
+        }
+        try {
+          this.currentConfig = this.loadConfig();
+        } catch (error) {
+          this.restorePrevious(previousRaw);
+          throw this.writeFailed(error);
+        }
       });
-      const layer: DriverConfigLayer = {
-        version: document.version,
-        default_driver: document.default_driver,
-        roles: { ...document.roles },
-      };
-      // 落盘前先按「新层生效」合成一次：引用悬空在这里就被挡下，旧文件天然保持完整。
-      // 显式校验已经覆盖了文档列出的每一种用户错误，这条只是兜底——真触发时也只报
-      // 写入失败，不让一个裸的内部错误穿过 RPC 边界。
-      try {
-        this.loadConfig({ [this.fileStore.filePath]: layer });
-      } catch (error) {
-        throw this.writeFailed(error);
-      }
-
-      const previousRaw = this.fileStore.readRaw();
-      try {
-        this.fileStore.writeAtomic(document);
-      } catch (error) {
-        throw this.writeFailed(error);
-      }
-      try {
-        this.currentConfig = this.loadConfig({});
-      } catch (error) {
-        this.restorePrevious(previousRaw);
-        throw this.writeFailed(error);
-      }
+      // 第 5 步：快照在锁外构建——`projectRoles` 要查 Agent 目录（生产是 PostgreSQL），
+      // 不该占着跨进程写锁。此时 `currentConfig` 已经是第 4 步重新加载后的有效配置。
       return this.getSnapshot();
     });
   }
@@ -304,38 +344,43 @@ export class DriverRoutingService implements DriverRoutingPort {
   /**
    * 删除 UI 覆盖文件，回到下层手工配置（`driver.resetRouting`）。
    *
-   * 仍然要求 revision 一致：reset 也是一个写操作，不能把别人的并发修改无声抹掉。
+   * 走同一套临界区与 CAS：reset 也是一个写操作，不能把另一个 backend 实例刚写的配置无声
+   * 抹掉。返回的 snapshot 来自删除后重新 load 的有效配置（因此仍反映 `NEWIDE_DRIVER` 覆盖）。
    */
   async resetRouting(expectedRevision: string): Promise<DriverRoutingSnapshot> {
     return this.withUpdateLock(async () => {
-      this.assertRevision(expectedRevision);
-      // 预校验「层被移除后」的配置是否仍然合法。
-      try {
-        this.loadConfig({ [this.fileStore.filePath]: undefined });
-      } catch (error) {
-        throw this.writeFailed(error);
-      }
+      await this.withFileLock(() => {
+        const diskConfig = this.loadConfigSafely();
+        this.currentConfig = diskConfig;
+        this.assertRevision(expectedRevision, diskConfig);
 
-      const previousRaw = this.fileStore.readRaw();
-      if (previousRaw !== undefined) {
+        // 预校验「层被移除后」的配置是否仍然合法。
+        this.loadConfigSafely({ [this.fileStore.filePath]: undefined });
+
+        const previousRaw = this.fileStore.readRaw();
+        if (previousRaw !== undefined) {
+          try {
+            this.fileStore.remove();
+          } catch (error) {
+            throw this.writeFailed(error);
+          }
+        }
         try {
-          this.fileStore.remove();
+          this.currentConfig = this.loadConfig();
         } catch (error) {
+          this.restorePrevious(previousRaw);
           throw this.writeFailed(error);
         }
-      }
-      try {
-        this.currentConfig = this.loadConfig({});
-      } catch (error) {
-        this.restorePrevious(previousRaw);
-        throw this.writeFailed(error);
-      }
+      });
       return this.getSnapshot();
     });
   }
 
-  private assertRevision(expectedRevision: string): void {
-    const current = this.currentRevision();
+  private assertRevision(
+    expectedRevision: string,
+    config: DriverConfig = this.currentConfig,
+  ): void {
+    const current = revisionOf(config);
     if (expectedRevision === current) return;
     throw new DriverRoutingError(
       'revision_mismatch',
@@ -392,15 +437,109 @@ export class DriverRoutingService implements DriverRoutingPort {
     }
   }
 
+  /**
+   * 加载有效配置。
+   *
+   * `env` 显式取自 {@link routingEnv}，与 {@link lockedDefaultDriver} 同源：判断「默认 driver
+   * 是否被部署锁定」和「实际生效的默认 driver 是什么」绝不能读两份不同的环境。
+   */
   private loadConfig(
     overrides?: Readonly<Record<string, DriverConfigLayer | undefined>>,
   ): DriverConfig {
     return loadDriverConfig({
       projectRoot: this.projectRoot,
-      ...(this.env ? { env: this.env } : {}),
+      env: this.routingEnv(),
       ...(this.homeDir ? { homeDir: this.homeDir } : {}),
       ...(overrides ? { layerOverrides: overrides } : {}),
     });
+  }
+
+  /**
+   * 读磁盘配置；读不出来（文件被占位成目录、YAML 坏了）时按「无法安全持久化」处理。
+   *
+   * 这类失败发生在临界区开头，走 `write_failed` 而不是裸的内部错误——调用方拿到的是稳定
+   * 业务码，且锁一定会释放。
+   */
+  private loadConfigSafely(
+    overrides?: Readonly<Record<string, DriverConfigLayer | undefined>>,
+  ): DriverConfig {
+    try {
+      return this.loadConfig(overrides);
+    } catch (error) {
+      throw this.writeFailed(error);
+    }
+  }
+
+  /**
+   * 磁盘 revision 与内存不一致时，把内存换成磁盘那一份。
+   *
+   * 全程同步（`loadConfig` 是同步的），因此不可能与同进程的一次 update 交错；磁盘又是唯一
+   * 真相，所以这个方向的刷新只会让内存变新，不会写回更旧的配置。
+   * 读盘失败时保留内存配置：一次查询不该因为别人的文件坏了而失败。
+   */
+  private refreshConfigFromDisk(): void {
+    try {
+      const diskConfig = this.loadConfig();
+      if (revisionOf(diskConfig) !== revisionOf(this.currentConfig)) {
+        this.currentConfig = diskConfig;
+      }
+    } catch {
+      // 磁盘暂时读不出来：沿用内存里的配置，下一次写操作会带着明确错误再报。
+    }
+  }
+
+  /** loader 真正会读的那份 env；服务缺省 `process.env`，与 loader 的缺省一致。 */
+  private routingEnv(): NodeJS.ProcessEnv {
+    return this.env ?? process.env;
+  }
+
+  /**
+   * 部署级锁定的 default driver（`NEWIDE_DRIVER`）。
+   *
+   * 语义：前端不能改它。更新请求写了别的值一律拒绝，因为 loader 的 env 覆盖层排在 UI 层
+   * 之后——文件写得再对，重新加载后的有效值仍是 env 那个。
+   */
+  private lockedDefaultDriver(): string | undefined {
+    const locked = this.routingEnv().NEWIDE_DRIVER?.trim();
+    return locked ? locked : undefined;
+  }
+
+  /**
+   * 跨进程临界区。
+   *
+   * 先拿 `.agent` 下的独占锁，再执行操作，`finally` 释放。等不到锁时抛 `config_busy`
+   * （可重试），而不是 `write_failed`——不是写坏了，是另一个实例正在写。
+   */
+  private async withFileLock<T>(operation: () => Promise<T> | T): Promise<T> {
+    let lock;
+    try {
+      lock = await this.fileStore.acquireLock(this.lockOptions);
+    } catch (error) {
+      throw this.configBusy(error);
+    }
+    try {
+      return await operation();
+    } finally {
+      lock.release();
+    }
+  }
+
+  private configBusy(error: unknown): DriverRoutingError {
+    const summary =
+      error instanceof DriverRoutingLockError
+        ? error.message
+        : error instanceof Error
+          ? error.name
+          : 'unknown error';
+    return new DriverRoutingError(
+      'config_busy',
+      'Driver routing configuration is being updated by another writer',
+      {
+        reason: 'config_busy',
+        path_category: 'project_agent_dir',
+        error_summary: summary,
+      },
+    );
   }
 
   private projectDriver(config: DriverConfig, driverId: string): DriverRoutingDriver {
@@ -514,6 +653,28 @@ function driverNotFound(field: string, driverId: string): DriverRoutingError {
     field,
     driver_id: driverId,
   });
+}
+
+/**
+ * `NEWIDE_DRIVER` 锁定了 default driver，而请求想改成别的。
+ *
+ * `driver_id` 是请求值、`locked_driver_id` 是部署锁定值：前端要能一眼看出「你选了 X，但本
+ * 部署锁在 Y」，而不是笼统的「冲突」。
+ */
+function defaultDriverLocked(
+  lockedDriverId: string,
+  requestedDriverId: string,
+): DriverRoutingError {
+  return new DriverRoutingError(
+    'default_driver_locked',
+    `default_driver is locked to "${lockedDriverId}" by NEWIDE_DRIVER`,
+    {
+      reason: 'default_driver_locked',
+      field: 'default_driver',
+      driver_id: requestedDriverId,
+      locked_driver_id: lockedDriverId,
+    },
+  );
 }
 
 /**

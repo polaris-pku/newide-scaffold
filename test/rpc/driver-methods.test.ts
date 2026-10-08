@@ -10,7 +10,7 @@
  *   就能证明注册存在，而不需要真的写盘。
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -195,6 +195,21 @@ describe('driver.* error mapping', () => {
       },
     ],
     [
+      'default_driver_locked',
+      JSON_RPC_ERROR_CODES.DRIVER_DEFAULT_LOCKED,
+      {
+        reason: 'default_driver_locked',
+        field: 'default_driver',
+        driver_id: 'codex',
+        locked_driver_id: 'claude',
+      },
+    ],
+    [
+      'config_busy',
+      JSON_RPC_ERROR_CODES.DRIVER_CONFIG_BUSY,
+      { reason: 'config_busy', path_category: 'project_agent_dir' },
+    ],
+    [
       'write_failed',
       JSON_RPC_ERROR_CODES.DRIVER_CONFIG_WRITE_FAILED,
       { reason: 'write_failed', path_category: 'project_agent_dir' },
@@ -294,5 +309,138 @@ describe('driver.* against the real routing service', () => {
     expect((reset as { result: DriverRoutingSnapshot }).result.revision).toBe(
       initialResult.result.revision,
     );
+  });
+});
+
+/**
+ * `NEWIDE_DRIVER` 锁定 default driver 的 RPC 面。
+ *
+ * 关键断言是「稳定错误码 + 结构化 data + 没有落文件 + getConfig 仍是有效值」：前端据此
+ * 能提示「本部署锁定在 claude」，而不是显示一个保存成功却毫无效果的假象。
+ */
+describe('driver.* with NEWIDE_DRIVER locking the default driver', () => {
+  function createLockedRouting(projectRoot: string, homeDir: string): DriverRoutingService {
+    return new DriverRoutingService({
+      projectRoot,
+      env: { NEWIDE_DRIVER: 'claude' },
+      homeDir,
+      registry: {
+        listDriverIds: () => ['claude', 'codex'],
+        get: () => {
+          throw new Error('handles are not needed by the RPC layer');
+        },
+      },
+      knownRoleIds: async () => ['reviewer'],
+    });
+  }
+
+  function writeBaseProject(projectRoot: string): void {
+    mkdirSync(join(projectRoot, '.agent'), { recursive: true });
+    writeFileSync(
+      join(projectRoot, '.agent', 'drivers.yaml'),
+      [
+        'version: 1',
+        'default_driver: claude',
+        'drivers:',
+        '  claude:',
+        '    agent: claude',
+        '  codex:',
+        '    agent: codex',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+  }
+
+  it('rejects default_driver changes with a stable code and no file write', async () => {
+    const projectRoot = makeTempDir();
+    const homeDir = makeTempDir('newide-driver-methods-home-');
+    writeBaseProject(projectRoot);
+    const dispatcher = dispatcherFor(
+      createDriverMethodsService(createLockedRouting(projectRoot, homeDir)),
+    );
+
+    const initial = (await call(dispatcher, 'driver.getConfig', {})) as {
+      result: DriverRoutingSnapshot;
+    };
+    expect(initial.result.default_driver).toBe('claude');
+
+    const rejected = await call(dispatcher, 'driver.updateRouting', {
+      expected_revision: initial.result.revision,
+      default_driver: 'codex',
+      roles: {},
+    });
+
+    expect(rejected).toMatchObject({
+      error: {
+        code: JSON_RPC_ERROR_CODES.DRIVER_DEFAULT_LOCKED,
+        data: {
+          reason: 'default_driver_locked',
+          field: 'default_driver',
+          driver_id: 'codex',
+          locked_driver_id: 'claude',
+        },
+      },
+    });
+    // 没有落任何文件
+    expect(existsSync(uiDriverRoutingPath(projectRoot))).toBe(false);
+    // 有效配置仍是锁定值
+    const after = (await call(dispatcher, 'driver.getConfig', {})) as {
+      result: DriverRoutingSnapshot;
+    };
+    expect(after.result.default_driver).toBe('claude');
+    expect(after.result.revision).toBe(initial.result.revision);
+  });
+
+  it('allows role mapping updates that keep the locked default', async () => {
+    const projectRoot = makeTempDir();
+    const homeDir = makeTempDir('newide-driver-methods-home-');
+    writeBaseProject(projectRoot);
+    const dispatcher = dispatcherFor(
+      createDriverMethodsService(createLockedRouting(projectRoot, homeDir)),
+    );
+
+    const initial = (await call(dispatcher, 'driver.getConfig', {})) as {
+      result: DriverRoutingSnapshot;
+    };
+    const updated = await call(dispatcher, 'driver.updateRouting', {
+      expected_revision: initial.result.revision,
+      default_driver: 'claude',
+      roles: { reviewer: 'codex' },
+    });
+
+    expect(updated).toMatchObject({ result: { default_driver: 'claude' } });
+    expect(readFileSync(uiDriverRoutingPath(projectRoot), 'utf-8')).toContain(
+      'reviewer: codex',
+    );
+
+    // reset 之后有效值仍然是被锁定的 driver（reset 本身允许执行）
+    const currentRevision = (updated as { result: DriverRoutingSnapshot }).result.revision;
+    const reset = (await call(dispatcher, 'driver.resetRouting', {
+      expected_revision: currentRevision,
+    })) as { result: DriverRoutingSnapshot };
+    expect(reset.result.default_driver).toBe('claude');
+    expect(existsSync(uiDriverRoutingPath(projectRoot))).toBe(false);
+  });
+
+  it('reports the env-locked driver even when the UI file disagrees', async () => {
+    const projectRoot = makeTempDir();
+    const homeDir = makeTempDir('newide-driver-methods-home-');
+    writeBaseProject(projectRoot);
+    // 外部留下的 UI 覆盖说 codex；有效值必须由 env 决定
+    writeFileSync(
+      uiDriverRoutingPath(projectRoot),
+      ['version: 1', 'default_driver: codex', 'roles: {}', ''].join('\n'),
+      'utf-8',
+    );
+    const dispatcher = dispatcherFor(
+      createDriverMethodsService(createLockedRouting(projectRoot, homeDir)),
+    );
+
+    const snapshot = (await call(dispatcher, 'driver.getConfig', {})) as {
+      result: DriverRoutingSnapshot;
+    };
+
+    expect(snapshot.result.default_driver).toBe('claude');
   });
 });
