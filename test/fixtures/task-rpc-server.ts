@@ -62,7 +62,15 @@ function deterministicInvokeDriverLlm(): ToolCallingClient {
 
 function deterministicMaintenanceLlm(): LlmClient {
   return {
-    async complete() {
+    async complete(input) {
+      const userMessage = input.messages.find((message) => message.role === 'user')?.content ?? '';
+      // 上下文清理问的是另一件事：答成提取结果只会让清理静默降级。
+      if (userMessage.includes('## Raw Agent Context')) {
+        return JSON.stringify({
+          thinking_trace: 'RPC fixture top-level reasoning.',
+          planning_trace: 'RPC fixture execution plan.',
+        });
+      }
       return JSON.stringify({
         experiences: [
           {

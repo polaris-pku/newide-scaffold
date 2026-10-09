@@ -9,6 +9,7 @@
  * - spec：Coordinator → 顶层 Agent，完整任务规格
  * - task_instruction：顶层 Agent → Driver，由 planTaskInstruction 在运行期产出，不在此 DTO 中
  */
+import type { MemoryRetrievalResult } from './services/memory-query';
 
 /**
  * 协调层派发给顶层 Agent 的一次工作任务请求。
@@ -34,6 +35,16 @@ export interface AgentTaskRequest {
   activity_run_id?: string;
   /** 本次执行的工作区（绝对路径）；Session 绑定键 (task, workspace, role) 之一 */
   workspace_path?: string;
+  /**
+   * 本次任务的记忆检索结果，由调用方（生产是执行 facade）在派发前算好传入。
+   *
+   * Agent 自己不检索记忆——检索在 Agent 之外完成并随 driver_context 直达 Driver，
+   * 顶层上下文刻意不带记忆（否则 Agent 就没有理由调 query_memory）。这里回传的
+   * 唯一用途是让 MemoryCycleResult 如实反映「本次到底检索到了什么」，而不是
+   * 无论真假都返回一对空数组。缺省表示调用方没有检索结果，此时如实返回空数组
+   * 并在 warnings 里记明原因。
+   */
+  retrieval?: MemoryRetrievalResult;
   /** Driver 调用 ID，写入 AgentContextSnapshot.driver_calls 供溯源 */
   call_id?: string;
   /** 执行该任务的 Driver 标识；缺省为 "mock-driver" */

@@ -110,8 +110,14 @@ function buildExtractionPrompt(dr: DriverReturn, agentContext?: AgentContextSnap
       .join('\n') || '  (none)'
   }`);
 
-  if (agentContext?.thinking_trace) {
-    sections.push(`## Agent Context (why it was done)\nThinking: ${agentContext.thinking_trace}`);
+  // 清理后的上下文是成对的另一半：thinking 说「为什么这么选」，planning 说「打算怎么走」。
+  // 两个都给药，提取器才可能归纳出「什么情境下该先做什么」这类可迁移的规律——
+  // 只看 Driver 报告，拿到的永远是已经发生的事的转述。
+  if (agentContext && (agentContext.thinking_trace || agentContext.planning_trace)) {
+    const lines: string[] = [];
+    if (agentContext.thinking_trace) lines.push(`Thinking: ${agentContext.thinking_trace}`);
+    if (agentContext.planning_trace) lines.push(`Planning: ${agentContext.planning_trace}`);
+    sections.push(`## Agent Context (why it was done)\n${lines.join('\n')}`);
   }
 
   return sections.join('\n\n');

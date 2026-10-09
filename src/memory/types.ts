@@ -114,6 +114,13 @@ export interface MemoryCycleResult {
   extraction: ExtractionOutput;
   /** 技能晋升检查结果 */
   promotion: PromotionOutcome;
+  /**
+   * 本次周期中「本该有、但没有」的东西及原因（如上下文清理失败、调用方没传检索结果）。
+   *
+   * 存在的意义是区分「没有上下文」和「上下文是空的」：缺了上下文快照时经验提取
+   * 只能看到 DriverReturn，若不留痕，事后无法判断这是设计如此还是清理挂了。
+   */
+  warnings?: string[];
 }
 
 export type { MemoryRetrievalResult } from './services/memory-query';

@@ -244,30 +244,43 @@ function invokeDriverLlm(): ToolCallingClient {
   };
 }
 
+/**
+ * B 侧文本 LLM 的替身。
+ *
+ * 按**提示词里问的是什么**分派，不按调用次序分派：这条链上现在有三个消费者
+ * （上下文清理 / 经验提取 / 技能晋升），谁先谁后是执行路径的实现细节，
+ * 用奇偶轮次认人会在下一个消费者接进来时静默答错题。
+ */
 function memoryMaintenanceLlm(): LlmClient {
-  let calls = 0;
   return {
-    async complete() {
-      calls += 1;
-      if (calls % 2 === 1) {
-        // LlmExperienceExtractor 的提取响应
+    async complete(input) {
+      const userMessage = input.messages.find((message) => message.role === 'user')?.content ?? '';
+      if (userMessage.includes('## Raw Agent Context')) {
+        // LlmContextCleaner 的清理响应
         return JSON.stringify({
-          experiences: [
-            {
-              description: 'CLI task E2E reusable lesson',
-              content: 'Fake ACP completed the request.',
-              type: 'positive',
-              confidence: 0.99,
-              tags: ['cli-e2e'],
-            },
-          ],
+          thinking_trace: 'Cleaned the top-level context for the CLI task E2E run.',
+          planning_trace: 'Step 1: delegate to the driver. Step 2: report the lesson.',
         });
       }
-      // LlmSkillPromotion 的晋升响应
+      if (userMessage.includes('## Experience to promote')) {
+        // LlmSkillPromotion 的晋升响应
+        return JSON.stringify({
+          description: 'Promoted CLI task E2E lesson',
+          content: 'Fake ACP completed the request.',
+          tags: ['cli-e2e', 'promoted'],
+        });
+      }
+      // LlmExperienceExtractor 的提取响应
       return JSON.stringify({
-        description: 'Promoted CLI task E2E lesson',
-        content: 'Fake ACP completed the request.',
-        tags: ['cli-e2e', 'promoted'],
+        experiences: [
+          {
+            description: 'CLI task E2E reusable lesson',
+            content: 'Fake ACP completed the request.',
+            type: 'positive',
+            confidence: 0.99,
+            tags: ['cli-e2e'],
+          },
+        ],
       });
     },
   };

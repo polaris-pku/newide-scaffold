@@ -171,6 +171,42 @@ describe('FileBufferRepository', () => {
     expect(meta.total_dead_letters).toBe(1);
   });
 
+  it('moves the paired context file with the report on processed / dead_letter / restore', async () => {
+    const { repo, agentStateRoot } = await createRepository();
+    const role_id = 'role_context_migration';
+    const bufferDir = join(agentStateRoot, role_id, 'buffer');
+    await repo.ensureAgent(role_id);
+
+    // 三条各自成对写入，随后分别走 processed / dead_letter / dead_letter→restore
+    for (const seq of [1, 2, 3]) {
+      await repo.saveBufferSnapshot(
+        role_id,
+        sampleBufferSnapshot({ task_id: `task_${seq}` }),
+        sampleAgentContext(role_id),
+      );
+    }
+
+    await repo.markBufferProcessed(role_id, 1);
+    await repo.markBufferDeadLetter(role_id, 2);
+    await repo.markBufferDeadLetter(role_id, 3);
+
+    // 报告与它的上下文必须永远同进同出：留下孤儿报告，提取器就会以为
+    // 「这次没有上下文」，而实际上只是搬丢了。
+    await expect(readFile(join(bufferDir, 'processed', 'report_1.json'), 'utf8')).resolves.toBeTruthy();
+    await expect(readFile(join(bufferDir, 'processed', 'context_1.json'), 'utf8')).resolves.toBeTruthy();
+    await expect(readFile(join(bufferDir, 'dead_letter', 'report_2.json'), 'utf8')).resolves.toBeTruthy();
+    await expect(readFile(join(bufferDir, 'dead_letter', 'context_2.json'), 'utf8')).resolves.toBeTruthy();
+    await expect(readFile(join(bufferDir, 'pending', 'report_1.json'), 'utf8')).rejects.toThrow();
+    await expect(readFile(join(bufferDir, 'pending', 'context_1.json'), 'utf8')).rejects.toThrow();
+
+    await repo.restoreDeadLetter(role_id, 3);
+
+    const restored = await repo.getPendingBuffer(role_id, 3);
+    expect(restored?.snapshot.task_id).toBe('task_3');
+    expect(restored?.snapshot.extraction_status).toBe('pending');
+    expect(restored?.agentContext?.agent_id).toBe(role_id);
+  });
+
   it('survives repository restart against the same agentStateRoot', async () => {
     const { repo, agentStateRoot } = await createRepository();
     const role_id = 'role_restart';

@@ -18,7 +18,9 @@ import {
 } from '../council';
 import { createDriverRegistry, DriverRoutingService, loadDriverConfig } from '../driver';
 import {
+  LlmContextCleaner,
   LiteLLMToolCallingClient,
+  type AgentContextCleaner,
   type LlmClient,
   type ToolCallingClient,
 } from '../memory';
@@ -99,6 +101,8 @@ export interface BackendRpcServer {
 export interface ProductionBackendServiceDependencies {
   agentLlm?: ToolCallingClient;
   memoryLlm?: LlmClient;
+  /** 顶层上下文清理器覆盖（测试缝）；缺省用 B 侧文本 LLM 构造 LlmContextCleaner */
+  contextCleaner?: AgentContextCleaner;
   memoryMaintenance?: BMemoryMaintenanceRunner;
   bRuntime?: BackendBRuntime;
   gateExecutor?: IntegrationV0GateExecutor;
@@ -325,6 +329,10 @@ export async function createProductionBackendService(
       resolveDriver: (roleId, runId) => driverRoutingService.resolveForRunRole(runId, roleId).handle,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
+      // 顶层上下文清理：任务结束时把该次 tool-calling 对话压成 AgentContextSnapshot，
+      // 与 DriverReturn 成对落进同一条 Buffer，经验提取才看得到「为什么这么做」。
+      // 复用 B 侧那个文本 LLM（与 memoryMaintenance 同一个），失败只是降级不留痕变留痕。
+      contextCleaner: dependencies.contextCleaner ?? new LlmContextCleaner(memoryLlm),
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
       llm:
         dependencies.agentLlm ??

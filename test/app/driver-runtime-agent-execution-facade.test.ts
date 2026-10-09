@@ -23,11 +23,12 @@ import {
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
+  type AgentContextCleaner,
   type CallJournalEvent,
   type CallJournalPort,
   type ToolCallingClient,
 } from '../../src/memory';
-import type { ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
+import type { AgentContextSnapshot, ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
 import {
   MailboxDeliveryWorker,
   PersistentMailboxService,
@@ -940,6 +941,82 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         experiences: [storedEligibleExperience],
       });
       expect(persisted.driver_invocation_context).toEqual(prompt);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('pairs the cleaned Agent context with the same memory_buffer_ref the evidence reports', async () => {
+    const roleId = 'context_pairing_role';
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-context-evidence-'));
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: roleId, name: roleId });
+    const buffer = new InMemoryBufferRepository();
+    const cleaner: AgentContextCleaner = {
+      async clean(input) {
+        return {
+          snapshot_id: randomUUID(),
+          source_task_id: input.source_task_id,
+          agent_id: input.agent_id,
+          thinking_trace: 'Considered a second code path, rejected it.',
+          planning_trace: 'Step 1: extend the existing serializer.',
+          driver_calls: input.driver_returns.map((call) => ({
+            call_id: call.call_id,
+            driver_id: call.driver_id,
+            driver_return_ref: 'placeholder.json',
+          })),
+          cleaned_at: nowTimestamp(),
+          original_token_count: 200,
+          cleaned_token_count: 60,
+          compression_ratio: 0.3,
+        } satisfies AgentContextSnapshot;
+      },
+    };
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository,
+      bufferRepository: buffer,
+      llm: invokeDriverLlm(),
+      contextCleaner: cleaner,
+      evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+    });
+
+    try {
+      const result = await facade.runAgent(request('task_context_pairing', roleId));
+
+      // 证据里的引用和真正落盘的那条 Buffer 说的是同一件事
+      const pending = await buffer.getPendingBuffer(roleId, 1);
+      expect(pending?.snapshot.context_snapshot_ref).toBe('1');
+      expect(pending?.agentContext?.source_task_id).toBe('task_context_pairing');
+      expect(pending?.agentContext?.driver_calls.map((call) => call.driver_return_ref)).toEqual([
+        'report_1.json',
+      ]);
+      expect(result.memory_buffer_ref).toBe(`${roleId}:1`);
+      expect(result.diagnostics).not.toHaveProperty('memory_context_warnings');
+
+      const persisted = JSON.parse(
+        await fs.readFile(path.join(root, `${result.context_pack_ref}.json`), 'utf-8'),
+      ) as { memory_buffer_ref: string; context_snapshot_paired: boolean };
+      expect(persisted.memory_buffer_ref).toBe(result.memory_buffer_ref);
+      expect(persisted.context_snapshot_paired).toBe(true);
+
+      // 降级路径：同一个 facade 换个没有清理器的实例，任务照样完成，但证据不再声称成对
+      const degraded = new DriverRuntimeAgentExecutionFacade({
+        driver: new CapturingDriver('succeeded'),
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+        evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+      });
+      const degradedResult = await degraded.runAgent(request('task_context_degraded', roleId));
+      const degradedEvidence = JSON.parse(
+        await fs.readFile(path.join(root, `${degradedResult.context_pack_ref}.json`), 'utf-8'),
+      ) as { context_snapshot_paired: boolean; context_snapshot_warnings?: string[] };
+      expect(degradedEvidence.context_snapshot_paired).toBe(false);
+      expect(String(degradedEvidence.context_snapshot_warnings?.join(' '))).toContain(
+        'AgentContextCleaner',
+      );
+      expect(degradedResult.diagnostics.context_snapshot_paired).toBe(false);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

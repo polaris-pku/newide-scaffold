@@ -22,6 +22,7 @@ import {
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
+  type AgentContextCleaner,
   type AgentTaskRequest,
   type AgentHandle,
   type BufferRepository,
@@ -36,6 +37,7 @@ import {
   type LlmClient,
   type MemoryRetrievalResult,
   type MemoryRepository,
+  type MemoryCycleResult,
   type RetireOptions,
   type RetireResult,
   type RetirementEvaluator,
@@ -107,6 +109,14 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
+  /**
+   * 顶层上下文清理器（可选）：注入后每次任务结束时把该次 tool-calling 对话清理成
+   * AgentContextSnapshot，与 DriverReturn 成对落进同一条 Buffer。
+   *
+   * 生产组合根注入 LlmContextCleaner；不注入则 Buffer 只落 DriverReturn，经验提取
+   * 走既有的无上下文降级路径——那条路径仍然能跑，但下游看不到「为什么这么做」。
+   */
+  contextCleaner?: AgentContextCleaner;
   embedding?: EmbeddingProvider;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
@@ -238,6 +248,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         tools,
         maxToolCalls: this.options.mailbox ? 6 : 4,
         ...(this.options.callJournal ? { callJournal: this.options.callJournal } : {}),
+        ...(this.options.contextCleaner ? { contextCleaner: this.options.contextCleaner } : {}),
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
@@ -565,7 +576,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ? await snapshotWorkspaceFiles(input.workspace_path)
         : undefined;
       const rawDispatch = await this.invocationContext.run(invocation, () =>
-        manager.dispatchTask(runtimeRoleId, task),
+        // retrieval 随任务一起交给 Agent：Agent 自己不检索（记忆是经 driver_context
+        // 直达 Driver 的），但它要如实把这批结果填进 MemoryCycleResult——否则那个
+        // 返回值无论真假都是一对空数组，读的人分不出「没检索到」和「没检索」。
+        manager.dispatchTask(runtimeRoleId, { ...task, retrieval }),
       );
       const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
       const workspaceArtifacts = await collectWorkspaceArtifacts(
@@ -1127,6 +1141,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         },
         promotion: dispatched.cycle.promotion.check,
         agent_runtime: agentRuntime,
+        ...memoryContextDiagnostics(dispatched.cycle),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1218,6 +1233,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           skills: dispatched.cycle.retrieval.skills.length,
         },
         agent_runtime: agentRuntime,
+        ...memoryContextDiagnostics(dispatched.cycle),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1307,6 +1323,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
     });
     const contextPackRef = `context_pack_${createHash('sha256').update(identity).digest('hex').slice(0, 24)}`;
+    const contextWarnings = memoryContextWarnings(dispatched.cycle);
     const evidence: AgentContextPackEvidence = {
       context_pack_id: contextPackRef,
       task_id: input.task_id,
@@ -1328,6 +1345,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       driver_context: dispatched.cycle.driver_context,
       ...(driverInvocationContext ? { driver_invocation_context: driverInvocationContext } : {}),
       agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
+      // 配对与否由真正写盘的那一侧决定：cycle 里 Buffer 快照带 context_snapshot_ref
+      // 才说明 context_{seq}.json 确实落下了，而不是「我们打算清理」。
+      context_snapshot_paired: contextSnapshotPaired(dispatched.cycle),
+      ...(contextWarnings ? { context_snapshot_warnings: contextWarnings } : {}),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
@@ -1488,6 +1509,33 @@ function withRetrievedMemory(
       },
       driver_context: driverContext,
     },
+  };
+}
+
+/**
+ * AgentContextSnapshot 是否真的和这次 Buffer 成对落了盘。
+ *
+ * 判据是 Buffer 快照自己的 context_snapshot_ref——那是写入侧在真写下了 context 文件
+ * 才会填的字段。写在这里而不是另记一个「清理成功」标志，是为了不让「打算清理」和
+ * 「清理结果落了盘」在证据里长得一样。
+ */
+function contextSnapshotPaired(cycle: MemoryCycleResult): boolean {
+  return cycle.buffer_snapshot.context_snapshot_ref !== undefined;
+}
+
+/** cycle.warnings 中属于上下文清理的那些；没有则返回 undefined（调用方据此省略字段）。 */
+function memoryContextWarnings(cycle: MemoryCycleResult): string[] | undefined {
+  const warnings = cycle.warnings?.filter((warning) => warning.startsWith('context_cleaning'));
+  return warnings && warnings.length > 0 ? warnings : undefined;
+}
+
+/** 把上下文降级原因放进执行诊断：任务照样完成，但现场要留一句为什么。 */
+function memoryContextDiagnostics(cycle: MemoryCycleResult): Record<string, unknown> {
+  const warnings = memoryContextWarnings(cycle);
+  if (!warnings) return {};
+  return {
+    context_snapshot_paired: contextSnapshotPaired(cycle),
+    memory_context_warnings: warnings,
   };
 }
 
