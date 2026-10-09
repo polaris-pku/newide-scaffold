@@ -388,6 +388,7 @@ export type {
   SkillListFilter,
   ExperienceListFilter,
 } from './ports/agent-board-query';
+export type { RoleTokenUsageReader } from './ports/role-token-usage';
 
 // ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型

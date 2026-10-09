@@ -60,7 +60,7 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
 } from './b-memory-maintenance-runner';
 import { BMemoryBackendService } from './b-memory-backend-service';
-import { createBPublicCapabilities } from './b-public-capabilities';
+import { createBPublicCapabilities, createLedgerRoleTokenUsage } from './b-public-capabilities';
 import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
 import {
@@ -295,7 +295,13 @@ export async function createProductionBackendService(
     } catch {
       throw new Error('Production B Agent manager readiness check failed');
     }
-    const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    // Agent Board 上角色的「累计消耗」取自用量账本（按 role_id 求和），而不是档案里的
+    // `token_cost_total`——那个字段只有种子把它置 0，全仓没有写入方。只读投影，不回写档案。
+    const bCapabilities = createBPublicCapabilities(
+      bRuntime,
+      memoryMaintenance,
+      createLedgerRoleTokenUsage(coordinationStore),
+    );
     // 动态 Agent 目录：选人 / 议会 / 邮箱协作每次使用时查询当前注册 Agent，
     // 使 memory.createAgent 新增的 Agent 无需重启即可进入协作流程。
     const agentCatalogProvider = createAgentCatalogProvider(
