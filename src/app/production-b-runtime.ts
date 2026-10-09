@@ -105,10 +105,15 @@ export async function createProductionBRuntime(
     const agentStateRoot = path.join(appStateRoot, 'b', 'agent-state');
     const bufferRepository = new FileBufferRepository({ agentStateRoot });
     await seedCatalog(storage.repository, bufferRepository);
+    const deliveryRepository = new FileMemoryDeliveryRepository({ agentStateRoot });
+    // 启动恢复：上一次进程在 processing 里退出时留下的 lease 必须回到可交付队列。
+    // 不做这一步，那些交付项要等到有人手动调用 restore 才会再次被投递——而
+    // 「进程崩过」正是最需要自动恢复的场景。
+    await deliveryRepository.restoreExpiredDeliveryClaims();
     return {
       repository: storage.repository,
       bufferRepository,
-      deliveryRepository: new FileMemoryDeliveryRepository({ agentStateRoot }),
+      deliveryRepository,
       ...(storage.embedding ? { embedding: storage.embedding } : {}),
       app_state_root: appStateRoot,
       // 目录以 DB 当前注册的 Agent 为准（含历史运行创建的 Agent），而非硬编码种子；

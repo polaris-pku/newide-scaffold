@@ -74,6 +74,20 @@ export interface BDriverFeedbackRequest {
  */
 export type BMemoryMaintenanceMode = 'delivery' | 'in_process_emulation';
 
+/**
+ * 由请求本身判定加工归属。
+ *
+ * 单独导出，是因为调用方也要按同一判据汇报结果：任务收尾在 scheduleBuffer
+ * 抛错时会写一条 failed evidence，它的 `kind` 必须和这次实际走的路径一致——
+ * 生产路径的交付失败报成 `experience_extraction`，就等于在说「任务流程在提取」，
+ * 而这正是本计划要拆掉的那条边界。
+ */
+export function resolveMaintenanceMode(
+  input: Pick<BMemoryMaintenanceRequest, 'memory_ablation'>,
+): BMemoryMaintenanceMode {
+  return input.memory_ablation ? 'in_process_emulation' : 'delivery';
+}
+
 export interface BSkillPromotionRequest {
   role_id: string;
   requested_by: string;
@@ -198,8 +212,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
    * 交付与反馈，Experience/Skill/Persona 由外部 Memory Maintenance 系统负责。
    */
   private resolveMode(input: BMemoryMaintenanceRequest): BMemoryMaintenanceMode {
-    if (this.options.mode) return this.options.mode;
-    return input.memory_ablation ? 'in_process_emulation' : 'delivery';
+    return this.options.mode ?? resolveMaintenanceMode(input);
   }
 
   private get extractor(): ExperienceExtractor {

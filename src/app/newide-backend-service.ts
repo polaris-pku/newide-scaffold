@@ -113,6 +113,9 @@ import type {
   ReindexMemoryResult,
   ContextDeliveryFilter,
   DriverFeedbackFilter,
+  DeliveryChannel,
+  DeliveryClaimRequest,
+  DeliveryRecordLocator,
 } from '../memory';
 import type {
   SkillRecord,
@@ -127,6 +130,8 @@ import type {
   AgentMetaPatch,
   BMemoryBackendService,
   ContextDeliveryPayload,
+  DeliveryRecordPayload,
+  DeliveryStateSummary,
 } from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
 import {
@@ -693,6 +698,7 @@ export class NewideBackendService {
     pending_seqs: number[];
     dead_letter_seqs: number[];
     dead_letters: DeadLetterEntry[];
+    delivery: DeliveryStateSummary;
   }> {
     return this.requireBMemoryService().getBufferState(roleId);
   }
@@ -723,6 +729,48 @@ export class NewideBackendService {
 
   listMemoryDriverFeedback(filter?: DriverFeedbackFilter): Promise<DriverFeedbackRecord[]> {
     return this.requireBMemoryService().listDriverFeedback(filter);
+  }
+
+  claimMemoryDelivery(
+    input: DeliveryClaimRequest & { id?: string | undefined },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    return this.requireBMemoryService().claimDelivery(input);
+  }
+
+  renewMemoryDeliveryClaim(
+    input: DeliveryRecordLocator & { owner: string; lease_ms?: number | undefined },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    return this.requireBMemoryService().renewDeliveryClaim(input);
+  }
+
+  ackMemoryDelivery(
+    input: DeliveryRecordLocator & {
+      owner?: string | undefined;
+      outcome: 'processed' | 'failed';
+      error?: string | undefined;
+      retryable?: boolean | undefined;
+      processor_version?: string | undefined;
+    },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    return this.requireBMemoryService().ackDelivery(input);
+  }
+
+  retryMemoryDelivery(input: DeliveryRecordLocator): Promise<DeliveryRecordPayload | undefined> {
+    return this.requireBMemoryService().retryDelivery(input);
+  }
+
+  restoreExpiredMemoryDeliveries(options?: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  }): Promise<DeliveryRecordPayload[]> {
+    return this.requireBMemoryService().restoreExpiredDeliveries(options ?? {});
+  }
+
+  listRetryableMemoryDeliveries(options?: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  }): Promise<DeliveryRecordPayload[]> {
+    return this.requireBMemoryService().listRetryableDeliveries(options ?? {});
   }
 
   searchAgentMemory(

@@ -86,6 +86,8 @@ export function buildContextDeliveryItem(input: ContextDeliveryInput): ContextDe
       : {}),
     source_driver: input.source_driver,
     status: 'pending',
+    // 新记录还没投递过：attempt_count 在每次 claim 时递增（见 delivery-lifecycle）
+    attempt_count: 0,
     schema_version,
     created_at: at,
     updated_at: at,
@@ -173,6 +175,7 @@ export function buildDriverUsageFeedbackRecords(
       feedback_source: 'driver_usage' as const,
       event_version,
       status: 'pending' as const,
+      attempt_count: 0,
       created_at: observed_at,
       updated_at: observed_at,
     });

@@ -47,6 +47,12 @@ import {
   type ContextDeliveryFilter,
   type DriverFeedbackFilter,
   type MemoryDeliveryRepository,
+  type ClaimedDelivery,
+  type DeliveryChannel,
+  type DeliveryClaimRequest,
+  type DeliveryRecordLocator,
+  contextDeliveryId,
+  contextDeliveryKey,
 } from '../memory';
 import type {
   AgentContextSnapshot,
@@ -54,6 +60,7 @@ import type {
   BufferMeta,
   BufferSnapshot,
   ContextDeliveryItem,
+  DeliveryStatus,
   DriverFeedbackRecord,
   ExperienceRecord,
   PersonaDef,
@@ -69,8 +76,25 @@ export interface BMemoryOperationCapability {
   reason?: string;
 }
 
+/**
+ * 交付 claim 的能力声明。
+ *
+ * `isolation` 是这里最要紧的一格：只有文件实现用独占锁文件串行化 claim，
+ * 多进程消费才成立；内存实现只在同进程内不重复投递，把它当生产部署用会
+ * 出现两个消费者同时处理同一条交付。调用方据此决定能不能开多个消费者。
+ */
+export interface BMemoryDeliveryClaimCapability {
+  status: 'available' | 'unavailable';
+  reason?: string;
+  isolation: 'process_mutex' | 'exclusive_lock_file' | 'unavailable';
+  /** 未显式指定 lease_ms 时的租约时长 */
+  lease_ms: number;
+  /** 投递次数上限；达到后交付项进 dead_letter */
+  max_attempts: number;
+}
+
 export interface BMemoryCapabilities {
-  schema_version: 'newide.b-memory-capabilities.v3';
+  schema_version: 'newide.b-memory-capabilities.v4';
   embedding: BEmbeddingRuntimeInfo;
   skill_review: {
     mode: 'manual' | 'auto_approve';
@@ -86,6 +110,8 @@ export interface BMemoryCapabilities {
     ownership: 'external';
     context_delivery: BMemoryOperationCapability;
     driver_feedback_outbox: BMemoryOperationCapability;
+    /** claim/lease/重试的可用性与隔离级别（决定能不能多进程消费） */
+    claim: BMemoryDeliveryClaimCapability;
   };
   operations: {
     list_agents: BMemoryOperationCapability;
@@ -107,8 +133,20 @@ export interface BMemoryCapabilities {
     list_context_deliveries: BMemoryOperationCapability;
     /** 下游交付：按 id 取一条交付项及其完整 DriverReturn + AgentContextSnapshot */
     get_context_delivery: BMemoryOperationCapability;
-    /** 下游 feedback outbox：列出 Driver 使用反馈（含经验尚不存在的那部分） */
+    /** 下游交付：列出 Driver 使用反馈（含经验尚不存在的那部分） */
     list_driver_feedback: BMemoryOperationCapability;
+    /** 下游交付：claim 一条待投递的上下文或反馈（pending → processing） */
+    claim_delivery: BMemoryOperationCapability;
+    /** 下游交付：延长自己持有的 lease */
+    renew_delivery_claim: BMemoryOperationCapability;
+    /** 下游交付：ack 一次交付（processed / failed，失败走重试或 dead_letter） */
+    ack_delivery: BMemoryOperationCapability;
+    /** 下游交付：人工把 dead_letter 放回 pending */
+    retry_delivery: BMemoryOperationCapability;
+    /** 下游交付：把 lease 过期仍停在 processing 的记录放回队列 */
+    restore_expired_deliveries: BMemoryOperationCapability;
+    /** 下游交付：列出当前可投递的记录 */
+    list_retryable_deliveries: BMemoryOperationCapability;
     search_memory: BMemoryOperationCapability;
     market_search: BMemoryOperationCapability;
     market_import: BMemoryOperationCapability;
@@ -137,6 +175,39 @@ export interface ContextDeliveryPayload {
   payload_available: boolean;
   driver_return?: BufferSnapshot['driver_return'];
   agent_context?: AgentContextSnapshot;
+}
+
+/** claim / ack 的返回：交付项本身，按通道放在各自的字段下 */
+export type DeliveryRecordPayload =
+  | { channel: 'context'; delivery: ContextDeliveryItem }
+  | { channel: 'feedback'; feedback: DriverFeedbackRecord };
+
+/** 交付状态计数 */
+export interface DeliveryStatusCounts {
+  pending: number;
+  processing: number;
+  processed: number;
+  dead_letter: number;
+}
+
+/** 一条死信交付的摘要（不含 payload，只够解释「为什么卡住」） */
+export interface DeliveryDeadLetterEntry {
+  channel: DeliveryChannel;
+  /** delivery_id / feedback_id */
+  id: string;
+  task_id: string;
+  attempt_count: number;
+  last_error?: string;
+  updated_at: string;
+}
+
+/** memory.getBufferState 里的交付视图 */
+export interface DeliveryStateSummary {
+  /** 本运行时有没有交付存储；没有时下面各项恒为空 */
+  available: boolean;
+  context: DeliveryStatusCounts;
+  feedback: DeliveryStatusCounts;
+  dead_letters: DeliveryDeadLetterEntry[];
 }
 
 /** Agent 元数据更新补丁（与 MemoryRepository.updateAgentMeta 对齐） */
@@ -192,7 +263,7 @@ export class BMemoryBackendService {
             reason: `B runtime has no MemoryDeliveryRepository configured (${what}).`,
           };
     return {
-      schema_version: 'newide.b-memory-capabilities.v3',
+      schema_version: 'newide.b-memory-capabilities.v4',
       embedding: { ...this.embeddingInfo },
       skill_review: {
         mode: this.options.autoApprovePromotedSkills ? 'auto_approve' : 'manual',
@@ -201,11 +272,31 @@ export class BMemoryBackendService {
         ownership: 'external',
         context_delivery: deliveryCapability('context delivery'),
         driver_feedback_outbox: deliveryCapability('driver feedback outbox'),
+        claim: delivery
+          ? {
+              status: 'available',
+              isolation: delivery.policy.claim_isolation,
+              lease_ms: delivery.policy.lease_ms,
+              max_attempts: delivery.policy.max_attempts,
+            }
+          : {
+              status: 'unavailable',
+              reason: 'B runtime has no MemoryDeliveryRepository configured (delivery claim).',
+              isolation: 'unavailable',
+              lease_ms: 0,
+              max_attempts: 0,
+            },
       },
       operations: {
         list_context_deliveries: deliveryCapability('list context deliveries'),
         get_context_delivery: deliveryCapability('get context delivery'),
         list_driver_feedback: deliveryCapability('list driver feedback'),
+        claim_delivery: deliveryCapability('delivery claim'),
+        renew_delivery_claim: deliveryCapability('delivery claim renewal'),
+        ack_delivery: deliveryCapability('delivery acknowledgement'),
+        retry_delivery: deliveryCapability('delivery retry'),
+        restore_expired_deliveries: deliveryCapability('expired claim recovery'),
+        list_retryable_deliveries: deliveryCapability('retryable delivery listing'),
         list_agents: { status: 'available' },
         get_agent_persona: { status: 'available' },
         list_experiences: { status: 'available' },
@@ -568,24 +659,76 @@ export class BMemoryBackendService {
 
   /**
    * Buffer 状态总览（memory.getBufferState）：
-   * meta + pending + dead-letter seq 列表 + 死信详情（含失败原因）。
+   * meta + pending + dead-letter seq 列表 + 死信详情（含失败原因）
+   * + 交付视图（两条通道的状态计数与死信摘要）。
+   *
+   * 交付视图放这里，是因为「失败 3 次之后卡住了」是运维必须能一眼看到的事实：
+   * 交付项自己不会主动喊，得有一个总览入口。它的状态与 Buffer 状态互相独立——
+   * 上下文交付了不等于 Buffer 被处理过，反之亦然。
    */
   async getBufferState(roleId: string): Promise<{
     meta: BufferMeta;
     pending_seqs: number[];
     dead_letter_seqs: number[];
     dead_letters: DeadLetterEntry[];
+    delivery: DeliveryStateSummary;
   }> {
     const repository = this.requireRepository('Buffer state');
-    const [meta, pending_seqs, dead_letter_seqs, dead_letters] = await Promise.all([
+    const [meta, pending_seqs, dead_letter_seqs, dead_letters, delivery] = await Promise.all([
       this.capabilities.bufferRepository.getBufferMeta(roleId),
       this.capabilities.bufferRepository.listPendingBufferSeqs(roleId),
       this.capabilities.bufferRepository.listDeadLetterSeqs(roleId),
       this.capabilities.bufferRepository.listDeadLetterEntries(roleId),
+      this.describeDeliveryState(roleId),
     ]);
     // roleId 必须存在（避免对不存在 Agent 的探针）
     await repository.getAgent(roleId);
-    return { meta, pending_seqs, dead_letter_seqs, dead_letters };
+    return { meta, pending_seqs, dead_letter_seqs, dead_letters, delivery };
+  }
+
+  /** 交付视图：两条通道各自的状态计数 + 死信摘要 */
+  private async describeDeliveryState(roleId: string): Promise<DeliveryStateSummary> {
+    const repository = this.capabilities.deliveryRepository;
+    if (!repository) {
+      return {
+        available: false,
+        context: emptyDeliveryStatusCounts(),
+        feedback: emptyDeliveryStatusCounts(),
+        dead_letters: [],
+      };
+    }
+    const [context, feedback] = await Promise.all([
+      repository.listContextDeliveries({ role_id: roleId }),
+      repository.listDriverFeedback({ role_id: roleId }),
+    ]);
+    const dead_letters: DeliveryDeadLetterEntry[] = [
+      ...context
+        .filter((item) => item.status === 'dead_letter')
+        .map((item) => ({
+          channel: 'context' as const,
+          id: item.delivery_id,
+          task_id: item.task_id,
+          attempt_count: item.attempt_count,
+          ...(item.last_error !== undefined ? { last_error: item.last_error } : {}),
+          updated_at: item.updated_at,
+        })),
+      ...feedback
+        .filter((record) => record.status === 'dead_letter')
+        .map((record) => ({
+          channel: 'feedback' as const,
+          id: record.feedback_id,
+          task_id: record.task_id,
+          attempt_count: record.attempt_count,
+          ...(record.last_error !== undefined ? { last_error: record.last_error } : {}),
+          updated_at: record.updated_at,
+        })),
+    ];
+    return {
+      available: true,
+      context: countDeliveryStatus(context),
+      feedback: countDeliveryStatus(feedback),
+      dead_letters,
+    };
   }
 
   /** 查看一条 pending 缓冲区快照（memory.getPendingBuffer）。 */
@@ -600,13 +743,25 @@ export class BMemoryBackendService {
   /**
    * 重试交付（memory.retryExtraction）：死信缓冲区恢复到 pending 后重新提交交付项。
    *
-   * 名字沿用历史接口，但语义是「恢复下游交付」——本仓不执行 Experience 提取，
-   * 下游系统怎么消费、什么时候消费都不由这里决定。
+   * 名字沿用历史接口，但语义是「恢复这条 Buffer 的下游交付」——本仓不执行
+   * Experience 提取，下游系统怎么消费、什么时候消费都不由这里决定。
+   *
+   * 因此交付项如果已经进过死信，要一并放回队列：只把 Buffer 挪回去而让交付项留在
+   * 死信里，返回的 `scheduled` 就是假的。两处死信是各自独立的（Buffer 一条、交付
+   * 一条），这条 RPC 同时恢复它们。
    */
   async retryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
     const repository = this.requireRepository('Extraction retry');
     await repository.getAgent(roleId);
     await this.capabilities.bufferRepository.restoreDeadLetter(roleId, seq);
+    const deliveryRepository = this.capabilities.deliveryRepository;
+    if (deliveryRepository) {
+      await deliveryRepository.retryDeadLetterDelivery({
+        channel: 'context',
+        role_id: roleId,
+        id: contextDeliveryId(contextDeliveryKey({ role_id: roleId, buffer_seq: seq })),
+      });
+    }
     const pending = await this.capabilities.bufferRepository.getPendingBuffer(roleId, seq);
     if (!pending) {
       throw new Error(`Pending buffer not found after restore: seq=${seq}`);
@@ -669,6 +824,109 @@ export class BMemoryBackendService {
    */
   async listDriverFeedback(filter: DriverFeedbackFilter = {}): Promise<DriverFeedbackRecord[]> {
     return this.requireDeliveryRepository('Driver feedback outbox').listDriverFeedback(filter);
+  }
+
+  // ── 下游交付的 claim / lease / 重试（工作包 C） ──────────────────
+  //
+  // 这几个方法是外部 Memory Maintenance 系统真正的「取活」入口：claim 拿到一条
+  // 交付项，处理完 ack；中途崩了就让 lease 过期，由 restore 放回队列。本仓不参与
+  // 处理过程，也不因为下游失败而改动 Task/Run 的终态。
+
+  /**
+   * claim 一条可投递的交付项（memory.claimDelivery）。
+   *
+   * 给 `id` 就只 claim 那一条，否则 claim 当前最该投递的一条。两条通道共用
+   * 同一套状态机；拿不到（已被别人 claim、还没到退避时刻、次数用满）返回 undefined。
+   */
+  async claimDelivery(
+    input: DeliveryClaimRequest & { id?: string | undefined },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    const repository = this.requireDeliveryRepository('Delivery claim');
+    const claimed =
+      input.id !== undefined
+        ? await repository.claimDelivery({ ...input, role_id: requireRoleId(input), id: input.id })
+        : await repository.claimNextDelivery(input);
+    return claimed ? toDeliveryPayload(claimed) : undefined;
+  }
+
+  /** 延长自己持有的 lease（memory.renewDeliveryClaim） */
+  async renewDeliveryClaim(
+    input: DeliveryRecordLocator & { owner: string; lease_ms?: number | undefined },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    const claimed = await this.requireDeliveryRepository(
+      'Delivery claim renewal',
+    ).renewDeliveryClaim(input);
+    return claimed ? toDeliveryPayload(claimed) : undefined;
+  }
+
+  /**
+   * ack 一次交付（memory.ackDelivery）。
+   *
+   * `outcome: 'processed'` 表示下游处理完成；`'failed'` 需要给出 error 与
+   * retryable —— 可重试的错误在退避后回到队列，不可重试或已用满次数的进 dead_letter。
+   */
+  async ackDelivery(
+    input: DeliveryRecordLocator & {
+      owner?: string | undefined;
+      outcome: 'processed' | 'failed';
+      error?: string | undefined;
+      retryable?: boolean | undefined;
+      processor_version?: string | undefined;
+    },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    const repository = this.requireDeliveryRepository('Delivery acknowledgement');
+    if (input.outcome === 'processed') {
+      const completed = await repository.completeDelivery({
+        channel: input.channel,
+        role_id: input.role_id,
+        id: input.id,
+        owner: input.owner,
+        processor_version: input.processor_version,
+      });
+      return completed ? toDeliveryPayload(completed) : undefined;
+    }
+    const failed = await repository.failDelivery({
+      channel: input.channel,
+      role_id: input.role_id,
+      id: input.id,
+      owner: input.owner,
+      error: input.error ?? 'Delivery failed without a reason',
+      retryable: input.retryable ?? false,
+    });
+    return failed ? toDeliveryPayload(failed) : undefined;
+  }
+
+  /** 人工重试：把 dead_letter 的交付项放回 pending（memory.retryDelivery） */
+  async retryDelivery(input: DeliveryRecordLocator): Promise<DeliveryRecordPayload | undefined> {
+    const retried = await this.requireDeliveryRepository('Delivery retry').retryDeadLetterDelivery(
+      input,
+    );
+    return retried ? toDeliveryPayload(retried) : undefined;
+  }
+
+  /**
+   * 启动/运维恢复：把 lease 过期仍停在 processing 的交付项放回队列
+   * （memory.restoreExpiredDeliveries）。
+   */
+  async restoreExpiredDeliveries(options: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  } = {}): Promise<DeliveryRecordPayload[]> {
+    const restored = await this.requireDeliveryRepository(
+      'Expired claim recovery',
+    ).restoreExpiredDeliveryClaims(options);
+    return restored.map(toDeliveryPayload);
+  }
+
+  /** 当前可投递的记录（memory.listRetryableDeliveries） */
+  async listRetryableDeliveries(options: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  } = {}): Promise<DeliveryRecordPayload[]> {
+    const due = await this.requireDeliveryRepository(
+      'Retryable delivery listing',
+    ).listRetryableDeliveries(options);
+    return due.map(toDeliveryPayload);
   }
 
   private requireDeliveryRepository(operation: string): MemoryDeliveryRepository {
@@ -845,4 +1103,33 @@ function isPendingSkill(value: unknown): value is { id: string; review_status: '
   if (!value || typeof value !== 'object') return false;
   const skill = value as Record<string, unknown>;
   return typeof skill.id === 'string' && skill.review_status === 'pending';
+}
+
+/** 把 port 的判别式结果摊平成 JSON 友好的形状（前端不必再按 channel 取字段） */
+function toDeliveryPayload(claimed: ClaimedDelivery): DeliveryRecordPayload {
+  return claimed.channel === 'feedback'
+    ? { channel: 'feedback', feedback: claimed.item }
+    : { channel: 'context', delivery: claimed.item };
+}
+
+/** 按 id claim 时必须知道 role（id 只在 role 目录下唯一） */
+function requireRoleId(input: { role_id?: string | undefined }): string {
+  if (!input.role_id) {
+    throw new Error('Claiming a specific delivery requires role_id.');
+  }
+  return input.role_id;
+}
+
+function emptyDeliveryStatusCounts(): DeliveryStatusCounts {
+  return { pending: 0, processing: 0, processed: 0, dead_letter: 0 };
+}
+
+function countDeliveryStatus(
+  records: ReadonlyArray<{ status: DeliveryStatus }>,
+): DeliveryStatusCounts {
+  const counts = emptyDeliveryStatusCounts();
+  for (const record of records) {
+    counts[record.status] += 1;
+  }
+  return counts;
 }

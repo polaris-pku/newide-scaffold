@@ -425,7 +425,7 @@ function reindexEvidence() {
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
     getMemoryCapabilities: () => ({
-      schema_version: 'newide.b-memory-capabilities.v3',
+      schema_version: 'newide.b-memory-capabilities.v4',
       skill_review: { mode: 'manual' },
       embedding: {
         provider: 'test',
@@ -437,6 +437,12 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         ownership: 'external',
         context_delivery: { status: 'available' },
         driver_feedback_outbox: { status: 'available' },
+        claim: {
+          status: 'available',
+          isolation: 'process_mutex',
+          lease_ms: 60000,
+          max_attempts: 3,
+        },
       },
       operations: {
         list_agents: { status: 'available' },
@@ -457,6 +463,12 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         list_context_deliveries: { status: 'available' },
         get_context_delivery: { status: 'available' },
         list_driver_feedback: { status: 'available' },
+        claim_delivery: { status: 'available' },
+        renew_delivery_claim: { status: 'available' },
+        ack_delivery: { status: 'available' },
+        retry_delivery: { status: 'available' },
+        restore_expired_deliveries: { status: 'available' },
+        list_retryable_deliveries: { status: 'available' },
         search_memory: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
@@ -591,6 +603,26 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
       payload_available: true,
     }),
     listMemoryDriverFeedback: async () => [driverFeedback()],
+    // 交付 claim 系列不在本文件覆盖（见 test/app/memory-delivery-claim-service.test.ts）；
+    // 这里保留显式占位，避免调用方以为它们已经接好
+    claimMemoryDelivery: async () => {
+      throw new Error('delivery claim is not wired in this test');
+    },
+    renewMemoryDeliveryClaim: async () => {
+      throw new Error('delivery claim renewal is not wired in this test');
+    },
+    ackMemoryDelivery: async () => {
+      throw new Error('delivery acknowledgement is not wired in this test');
+    },
+    retryMemoryDelivery: async () => {
+      throw new Error('delivery retry is not wired in this test');
+    },
+    restoreExpiredMemoryDeliveries: async () => {
+      throw new Error('expired delivery recovery is not wired in this test');
+    },
+    listRetryableMemoryDeliveries: async () => {
+      throw new Error('retryable delivery listing is not wired in this test');
+    },
     searchAgentMemory: async () => ({
       skills: [{ id: 'skill_1', similarity: 0.82 } as never],
       experiences: [{ id: 'experience_1', similarity: 0.71 } as never],

@@ -621,13 +621,26 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(result.status).toBe('completed');
     expect(result.diagnostics.memory_maintenance).toMatchObject({
       maintenance_ref: expect.stringMatching(/^b_maintenance_/),
-      kind: 'experience_extraction',
+      // 生产路径（无消融标签）失败的是「交付」，不是「本进程提取」——报成
+      // experience_extraction 就等于在说任务流程在提取，那是这条边界要拆掉的说法
+      kind: 'context_delivery',
       status: 'failed',
       task_id: 'task_maintenance_failure',
       run_id: 'run_task_maintenance_failure',
       role_id: 'proposer_a',
       buffer_seq: 1,
       error: 'maintenance evidence store unavailable',
+      warnings: ['Memory maintenance could not be scheduled; Agent execution was preserved.'],
+    });
+
+    // 消融路径才在本进程模拟下游，失败的说法随之不同
+    const emulated = await facade.runAgent({
+      ...request('task_maintenance_emulated', 'proposer_a'),
+      memory_ablation: 'B2',
+    });
+    expect(emulated.diagnostics.memory_maintenance).toMatchObject({
+      kind: 'experience_extraction',
+      status: 'failed',
     });
   });
 

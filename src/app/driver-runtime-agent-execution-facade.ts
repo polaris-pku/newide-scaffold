@@ -93,6 +93,7 @@ import type {
   BMemoryMaintenanceEvidence,
   BMemoryMaintenancePort,
 } from './b-memory-maintenance-runner';
+import { resolveMaintenanceMode } from './b-memory-maintenance-runner';
 import type { DriverFeedbackRecord } from '../memory/schemas';
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
@@ -1300,7 +1301,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const completedAt = nowTimestamp();
       return {
         maintenance_ref: createId('b_maintenance'),
-        kind: 'experience_extraction',
+        // 报成这次实际走的路径：生产路径失败的是「交付」，不是「提取」
+        kind:
+          resolveMaintenanceMode(input) === 'delivery'
+            ? 'context_delivery'
+            : 'experience_extraction',
         status: 'failed',
         task_id: input.task_id,
         run_id: input.run_id,

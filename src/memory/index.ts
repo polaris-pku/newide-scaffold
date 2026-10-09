@@ -389,7 +389,20 @@ export type {
   ContextDeliveryFilter,
   DriverFeedbackFilter,
   DeliverySubmitResult,
+  DeliveryChannel,
+  DeliveryClaimRequest,
+  DeliveryRecordLocator,
+  DeliveryRepositoryPolicy,
+  ClaimedDelivery,
+  ClaimedContextDelivery,
+  ClaimedDriverFeedback,
 } from './ports/memory-delivery';
+export {
+  DEFAULT_DELIVERY_LEASE_MS,
+  DEFAULT_DELIVERY_LOCK_TTL_MS,
+  DEFAULT_DELIVERY_RETRY_POLICY,
+  type DeliveryRetryPolicy,
+} from './services/delivery-lifecycle';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';

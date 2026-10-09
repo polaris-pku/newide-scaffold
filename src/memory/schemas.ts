@@ -633,6 +633,36 @@ export const CONTEXT_DELIVERY_SCHEMA_VERSION = 'context-delivery.v1';
 export const DRIVER_FEEDBACK_EVENT_VERSION = 'driver-usage.v1';
 
 /**
+ * 上下文交付项与反馈 outbox 共用的**状态机字段**。
+ *
+ * 两条通道必须走同一套 claim/lease/retry 语义，所以这些字段只在这里定义一次，
+ * 再由两个 schema 各自展开——两条通道的字段集合不可能漂移。
+ *
+ * `attempt_count` 给 `.default(0)`：工作包 B 落盘的历史记录没有这个字段，
+ * 默认值是它们的真实语义（还没投递过），不必写迁移脚本。
+ */
+const deliveryLifecycleFields = {
+  /** 交付状态；推进规则见 services/delivery-lifecycle.ts */
+  status: DeliveryStatusSchema,
+  /** 已发起的投递次数（claim 一次算一次），达到重试上限后进 dead_letter */
+  attempt_count: z.number().int().min(0).default(0),
+  /** 当前持有者最后一次 claim 的时刻 */
+  claimed_at: z.iso.datetime().optional(),
+  /** 当前持有者标识（下游消费者自己给；本仓不解释它的含义） */
+  claim_owner: z.string().optional(),
+  /** 本次 lease 的到期时刻；过期即可被 restoreExpired* 放回队列 */
+  lease_expires_at: z.iso.datetime().optional(),
+  /** 退避后的最早可再投递时刻；缺席表示立即可投递 */
+  next_retry_at: z.iso.datetime().optional(),
+  /** 最近一次失败原因（dead_letter 时保留最后一次） */
+  last_error: z.string().optional(),
+  /** 下游 processor 的版本位（由外部系统在 ack 时填充） */
+  processor_version: z.string().optional(),
+  created_at: z.iso.datetime(),
+  updated_at: z.iso.datetime(),
+};
+
+/**
  * 上下文交付项 — 一次 Agent 任务完成后交付给外部 Memory Maintenance 系统的输入。
  *
  * 只存**稳定引用**，不复制 payload：DriverReturn 与 AgentContextSnapshot 各只有
@@ -661,16 +691,9 @@ export const ContextDeliveryItemSchema = z.object({
   context_snapshot_ref: z.string().optional(),
   /** 执行该任务的 Driver 标识 */
   source_driver: z.string(),
-  /** 交付状态（下游 claim/完成/失败由外部系统驱动，见 工作包 C） */
-  status: DeliveryStatusSchema,
   /** 契约版本；下游据此判断自己能不能消费这条 */
   schema_version: z.string(),
-  /** 下游 processor 的版本位（由外部系统填充；本仓写入时为 NULL 占位语义） */
-  processor_version: z.string().optional(),
-  created_at: z.iso.datetime(),
-  updated_at: z.iso.datetime(),
-  /** 最近一次失败原因（status='dead_letter' 时可见） */
-  last_error: z.string().optional(),
+  ...deliveryLifecycleFields,
 });
 export type ContextDeliveryItem = z.infer<typeof ContextDeliveryItemSchema>;
 
@@ -713,10 +736,6 @@ export const DriverFeedbackRecordSchema = z.object({
   feedback_source: DriverFeedbackSourceSchema,
   /** 契约事件版本（见 DRIVER_FEEDBACK_EVENT_VERSION） */
   event_version: z.string(),
-  /** 归并状态（下游消费后置 processed） */
-  status: DeliveryStatusSchema,
-  created_at: z.iso.datetime(),
-  updated_at: z.iso.datetime(),
-  last_error: z.string().optional(),
+  ...deliveryLifecycleFields,
 });
 export type DriverFeedbackRecord = z.infer<typeof DriverFeedbackRecordSchema>;

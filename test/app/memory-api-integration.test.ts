@@ -101,7 +101,7 @@ describe('memory.* full API integration (M7)', () => {
     // 1. capabilities v3 且关键能力可用
     const capabilities = await call(1, 'memory.getCapabilities', {});
     expect(capabilities.result!.capabilities).toMatchObject({
-      schema_version: 'newide.b-memory-capabilities.v3',
+      schema_version: 'newide.b-memory-capabilities.v4',
       memory_maintenance: {
         ownership: 'external',
       },
