@@ -25,11 +25,21 @@ import {
   type DriverConfig,
   type DriverConfigLayer,
 } from './profile';
+import { UI_DRIVER_ROUTING_FILE_NAME } from './driver-routing-file-store';
 
 /** 一层配置文件的来源。 */
 export interface DriverConfigLayerSource {
   /** YAML 文件绝对路径。 */
   path: string;
+  /**
+   * 该层的 `roles` 如何参与合并。
+   *
+   * - `merge`（缺省）：逐 key 覆盖，用于手工维护的档案层；
+   * - `replace`：整张 `roles` 表替换，用于 UI routing 覆盖层。这是「删除某个 role 的显式
+   *   映射即恢复跟随默认 driver」得以成立的前提——逐 key 合并时，下层同名 key 会重新冒出来，
+   *   删除永远删不干净。UI 更新接口本来就收发完整 mapping，整表替换与之一致。
+   */
+  rolesMode?: 'merge' | 'replace';
 }
 
 export interface LoadDriverConfigOptions {
@@ -41,6 +51,13 @@ export interface LoadDriverConfigOptions {
   homeDir?: string;
   /** 覆盖默认层次顺序（后者覆盖前者）。测试用。 */
   layers?: readonly DriverConfigLayerSource[];
+  /**
+   * 逐路径覆盖某一层的内容（`undefined` 表示该层不存在）。
+   *
+   * 写入前**预校验**用：不落盘就先按「新 UI 层生效」合成一次配置，引用悬空在写文件之前
+   * 就被挡下，旧文件因此天然保持完整。
+   */
+  layerOverrides?: Readonly<Record<string, DriverConfigLayer | undefined>>;
 }
 
 /**
@@ -48,6 +65,9 @@ export interface LoadDriverConfigOptions {
  *
  * 用户级在前、项目级在后，所以**项目配置赢过用户配置**——这是「部署默认 + 项目覆盖」
  * 的意图。`.local.yaml` 排在各自的正式文件之后，用于不入库的个人覆盖。
+ *
+ * `drivers.ui.local.yaml` 排在最后且 `rolesMode: 'replace'`：前端编辑过的 routing 覆盖
+ * 一切手工默认值，并且**拥有整张 role 表**——UI 里没有的 role 就是「跟随默认 driver」。
  */
 export function defaultDriverConfigLayers(
   projectRoot: string,
@@ -58,6 +78,10 @@ export function defaultDriverConfigLayers(
     { path: join(home, '.agent', 'drivers.local.yaml') },
     { path: join(projectRoot, '.agent', 'drivers.yaml') },
     { path: join(projectRoot, '.agent', 'drivers.local.yaml') },
+    {
+      path: join(projectRoot, '.agent', UI_DRIVER_ROUTING_FILE_NAME),
+      rolesMode: 'replace',
+    },
   ];
 }
 
@@ -72,12 +96,30 @@ export function loadDriverConfig(options: LoadDriverConfigOptions = {}): DriverC
   const env = options.env ?? process.env;
   const home = options.homeDir ?? homedir();
   const layers = options.layers ?? defaultDriverConfigLayers(projectRoot, home);
+  const overrides = options.layerOverrides;
 
   let merged: DriverConfigLayer = builtinLayer(env);
 
   for (const layer of layers) {
+    const overridden =
+      overrides && Object.prototype.hasOwnProperty.call(overrides, layer.path)
+        ? overrides[layer.path]
+        : undefined;
+    if (overridden !== undefined) {
+      merged = mergeDriverConfigLayers(
+        merged,
+        overridden,
+        layer.rolesMode ?? 'merge',
+      );
+      continue;
+    }
+    if (overrides && Object.prototype.hasOwnProperty.call(overrides, layer.path)) continue;
     if (!existsSync(layer.path)) continue;
-    merged = mergeDriverConfigLayers(merged, readDriverConfigLayer(layer.path));
+    merged = mergeDriverConfigLayers(
+      merged,
+      readDriverConfigLayer(layer.path),
+      layer.rolesMode ?? 'merge',
+    );
   }
 
   return parseDriverConfig(applyEnvOverlay(merged, env));
@@ -87,13 +129,17 @@ export function loadDriverConfig(options: LoadDriverConfigOptions = {}): DriverC
 export function mergeDriverConfigLayers(
   base: DriverConfigLayer,
   override: DriverConfigLayer,
+  rolesMode: 'merge' | 'replace' = 'merge',
 ): DriverConfigLayer {
   return {
     version: override.version ?? base.version,
     default_driver: override.default_driver ?? base.default_driver,
     // 同 id 整档案替换：档案是原子的，深合并会造出没有任何一层声明过的组合。
     drivers: { ...(base.drivers ?? {}), ...(override.drivers ?? {}) },
-    roles: { ...(base.roles ?? {}), ...(override.roles ?? {}) },
+    roles:
+      rolesMode === 'replace'
+        ? { ...(override.roles ?? {}) }
+        : { ...(base.roles ?? {}), ...(override.roles ?? {}) },
   };
 }
 

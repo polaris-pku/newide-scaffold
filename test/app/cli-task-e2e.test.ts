@@ -97,6 +97,24 @@ describe('CLI task E2E through the production composition', () => {
       const snapshot = service.getSnapshot(created.run_id);
 
       expect(snapshot.status).toBe('completed');
+
+      // ── 1b. Run 创建点冻结的 driver 配置逐 Run 落进 request.json ──
+      // 零配置下就是那个历史 driver，并且是**非敏感投影**：只有 id 与 agent。
+      const persistedRequest = JSON.parse(
+        await readFile(
+          path.join(process.cwd(), '.newide', 'runs', created.run_id, 'request.json'),
+          'utf8',
+        ),
+      ) as { driver_config?: Record<string, unknown> };
+      expect(persistedRequest.driver_config).toMatchObject({
+        default_driver: 'acp-external',
+        drivers: { 'acp-external': 'claude' },
+      });
+      expect(Object.keys(persistedRequest.driver_config ?? {}).sort()).toEqual([
+        'default_driver',
+        'drivers',
+      ]);
+
       const executionCompleted = snapshot.events.find(
         (event) => event.type === 'agent.execution_completed',
       );

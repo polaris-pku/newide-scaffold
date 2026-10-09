@@ -16,7 +16,7 @@ import {
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
-import { createDriverRegistry, loadDriverConfig, projectDriverConfigForRun } from '../driver';
+import { createDriverRegistry, DriverRoutingService, loadDriverConfig } from '../driver';
 import {
   LiteLLMToolCallingClient,
   type LlmClient,
@@ -70,6 +70,7 @@ import {
 } from './market-event-payload';
 import { SystemRpcMethods } from '../rpc/system-methods';
 import { ArtifactRpcMethods } from '../rpc/artifact-methods';
+import { DriverRpcMethods, createDriverMethodsService } from '../rpc/driver-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
@@ -301,11 +302,21 @@ export async function createProductionBackendService(
       bCapabilities.boardQuery,
       bRuntime.market_agent_ids,
     );
+    // driver routing 领域服务：读 UI 覆盖文件、算 revision、热更新 mapping，并按 Run 快照解析。
+    // registry 在启动时构造一次，Phase 1 的更新只换 mapping、不重建 runtime。
+    const driverRoutingService = new DriverRoutingService({
+      projectRoot: repoRoot,
+      env,
+      registry: driverRegistry,
+      // 可协作 role 用同一条动态目录：运行时新增/退休的 Agent 立即反映在路由快照里。
+      knownRoleIds: agentCatalogProvider,
+    });
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       // driver 可配置化：role 显式映射优先，否则落 default_driver。未配置任何档案时
       // 这条解析恒等于上面那个 driver，行为与历史一致。
-      resolveDriver: (roleId) => driverRegistry.resolveForRole(roleId).handle,
+      // Run 隔离：run_id 用于取该 Run 冻结的 routing，绝不回读保存后的全局配置。
+      resolveDriver: (roleId, runId) => driverRoutingService.resolveForRunRole(runId, roleId).handle,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
@@ -565,9 +576,9 @@ export async function createProductionBackendService(
         (taskId) => serviceHolder.service?.getAccumulatedDriverUsage(taskId),
         coordinationStore,
       ),
-      // 第三个参数是进程启动时冻结的 driver 配置：写进每个新 Run 的 request.json，
-      // 使「配置改动只影响新 Run」有据可依。
-      new FileRunRequestStore(runsRoot, undefined, projectDriverConfigForRun(driverConfig)),
+      // driver 配置不再由 store 在构造期固定：每个 Run 创建时从 routing service 冻结一份
+      // 并通过 `save({ driver_config })` 逐 Run 写入，热更新才能只影响新 Run。
+      new FileRunRequestStore(runsRoot),
       taskProcessor,
       mailboxService,
       mailboxRecovery,
@@ -594,6 +605,8 @@ export async function createProductionBackendService(
       // driver 计费腿的名字按档案解析，缺省仍是历史名 claude_session_jsonl。
       driverConfig.drivers[driverConfig.default_driver]?.billing?.source ??
         DEFAULT_DRIVER_BILLED_SOURCE,
+      // Run 创建时冻结 routing 快照；`startBackendRpcServer` 也从 service 上取它注册 driver.* 方法。
+      driverRoutingService,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();
@@ -761,6 +774,12 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   mailboxMethods.register(dispatcher);
   memoryMethods.register(dispatcher);
   artifactMethods.register(dispatcher);
+  // driver 读写 RPC 只在组装点注入了 routing service 时注册：测试里的裸 service 不会凭空
+  // 多出三个方法，生产装配则自动带上（`system.*` 的只读语义不受影响）。
+  if (service.driverRouting) {
+    const driverMethods = new DriverRpcMethods(createDriverMethodsService(service.driverRouting));
+    driverMethods.register(dispatcher);
+  }
 
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   let pending = Promise.resolve();

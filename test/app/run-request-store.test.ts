@@ -309,6 +309,34 @@ describe('NewideBackendService run restart', () => {
       await rm(runsRoot, { recursive: true, force: true });
     }
   });
+
+  it('lets the per-run driver_config win over the constructor fallback', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'run-request-driver-per-run-'));
+    const fallback = { default_driver: 'claude', drivers: { claude: 'claude' } };
+    const perRun = {
+      default_driver: 'codex',
+      drivers: { claude: 'claude', codex: 'codex' },
+      roles: { reviewer: 'codex' },
+    };
+    const store = new FileRunRequestStore(runsRoot, undefined, fallback);
+    try {
+      await store.save({
+        run_id: 'run_per_run',
+        task_id: 'task_per_run',
+        prompt: 'Frozen at creation',
+        workspace_path: '/tmp/workspace-per-run',
+        mode: 'single_agent',
+        driver_config: perRun,
+      });
+
+      // 热更新后每个 Run 在创建点取自己的快照；构造期那份只是历史兼容的兜底。
+      await expect(store.load('run_per_run')).resolves.toMatchObject({
+        driver_config: perRun,
+      });
+    } finally {
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 async function requestPersisted(runsRoot: string, runId: string): Promise<void> {

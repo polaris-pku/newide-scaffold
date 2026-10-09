@@ -79,8 +79,11 @@ export class FileRunRequestStore implements RunRequestStore {
     private readonly runsRoot = '.newide/runs',
     private readonly now: () => Timestamp = () => new Date().toISOString(),
     /**
-     * 进程启动时解析并冻结的 driver 配置；缺省不写 `driver_config`
-     * （测试与历史路径保持原样）。
+     * **已废弃**的启动期固定 driver 配置。
+     *
+     * 热更新之后 driver 配置必须在 Run 创建点逐 Run 取得（见 `save` 的 `driver_config`），
+     * 否则所有新 Run 都会共用启动那一刻的映射。这里保留只是为了兼容既有测试；显式传入的
+     * `driver_config` 排在后面，永远赢过它。
      */
     private readonly driverConfig?: PersistedDriverConfig,
   ) {}

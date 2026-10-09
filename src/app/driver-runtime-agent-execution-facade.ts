@@ -93,13 +93,17 @@ import type {
 export interface DriverRuntimeAgentExecutionFacadeOptions {
   driver: DriverRuntimeHandle;
   /**
-   * 按 B 侧 role 解析 driver。缺省时所有 role 都用 `driver`，即历史单 driver 行为。
+   * 按 B 侧 role 解析 driver，`runId` 用于取该 Run 冻结的 routing 快照。缺省时所有 role
+   * 都用 `driver`，即历史单 driver 行为。
    *
    * role 从 `invocationContext`（ALS）取——`execute_agent`、council 各席位、mailbox
    * 投递都从同一个入口进，所以解析点只需收敛在这里一处，调用方不必各自叠一层。
    * driver 是 per-role 的无状态工具：换 driver 不影响 B 侧记忆（它绑在 role_id 上）。
+   *
+   * `runId` 是 Run 隔离的关键：同一个 Run 的每个席位都必须解析到同一份 routing 快照，
+   * 否则会出现「第一个席位用旧映射、第二个席位用刚保存的新映射」。
    */
-  resolveDriver?: (roleId: string) => DriverRuntimeHandle;
+  resolveDriver?: (roleId: string, runId?: string) => DriverRuntimeHandle;
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
@@ -174,7 +178,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
   /** 按 role 解析 driver；未配置档案时恒为构造时那一个（历史行为）。 */
-  private readonly driverFor: (roleId: string) => DriverRuntimeHandle;
+  private readonly driverFor: (roleId: string, runId?: string) => DriverRuntimeHandle;
   /**
    * 每个 driver_id 各持一个 invoker。
    *
@@ -274,8 +278,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   ): Promise<string> {
     await this.ensureRole(input.role_id);
     throwIfAborted(options?.signal);
-    // 会话 provisioning 也必须按 role 选 driver：否则会把某个 agent 的会话发给另一个。
-    const driver = this.driverFor(input.role_id);
+    // 会话 provisioning 也必须按 role + Run 快照选 driver：否则会把某个 agent 的会话发给另一个。
+    const driver = this.driverFor(input.role_id, input.run_id);
     const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
@@ -496,8 +500,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
       ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       call_id: createId('call'),
-      // 归属到本 role 实际会用的 driver，与真正下发的那一个保持一致。
-      source_driver: this.driverFor(runtimeRoleId).driver_id,
+      // 归属到本 role 实际会用的 driver（按本 Run 冻结的 routing 解析），与真正下发的那一个保持一致。
+      source_driver: this.driverFor(runtimeRoleId, input.run_id).driver_id,
     };
     const inboundMailbox = input.mailbox_delivery_id
       ? this.requireInboundMailbox(input)
@@ -960,8 +964,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error('A C role execution can invoke the driver only once');
     }
     throwIfAborted(invocation.signal);
-    // 解析点收敛在这里：role 来自 ALS，任何进入 invoke_driver 的路径都经过它。
-    const driver = this.driverFor(invocation.role_id);
+    // 解析点收敛在这里：role 与 run 都来自 ALS，任何进入 invoke_driver 的路径都经过它。
+    const driver = this.driverFor(invocation.role_id, invocation.run_id);
     try {
       const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
         task_instruction: invocation.driver_instruction,
@@ -1154,7 +1158,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
-    const driver = this.driverFor(input.role_id);
+    const driver = this.driverFor(input.role_id, input.run_id);
     const mailboxWait = mailboxOutcomes.find(
       (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
     );

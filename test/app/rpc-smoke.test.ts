@@ -17,6 +17,10 @@ describe('production RPC composition smoke script', () => {
       cancelled: { status: 'cancelled' },
       malformed_json_error: -32700,
       unknown_method_error: -32601,
+      // driver.* 三个方法都注册到了生产 dispatcher 上
+      driver_config: { schema_version: 'driver-routing.v1' },
+      driver_update_invalid_params: -32602,
+      driver_reset_invalid_params: -32602,
     });
   }, 60_000);
 
