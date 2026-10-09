@@ -24,6 +24,7 @@ import type { AppRunEvent } from '../../src/app/run-registry';
 import { TaskProcessor } from '../../src/coordination';
 import {
   InMemoryBufferRepository,
+  InMemoryMemoryDeliveryRepository,
   InMemoryRepository,
   type LlmClient,
   type ToolCallingClient,
@@ -953,6 +954,7 @@ function createInMemoryBRuntime(close = async () => undefined): BackendBRuntime 
   return {
     repository: new InMemoryRepository(),
     bufferRepository: new InMemoryBufferRepository(),
+    deliveryRepository: new InMemoryMemoryDeliveryRepository(),
     app_state_root: path.join(process.cwd(), '.newide'),
     market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
     close,

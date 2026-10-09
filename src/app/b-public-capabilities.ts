@@ -3,6 +3,7 @@ import {
   reviewSkill,
   type AgentBoardQuery,
   type BufferRepository,
+  type MemoryDeliveryRepository,
   type MemoryRepository,
   type ReviewSkillInput,
   type RoleTokenUsageReader,
@@ -31,6 +32,8 @@ export interface BMemoryMaintenanceCapabilities extends BMemoryMaintenancePort {
 export interface BPublicCapabilities {
   readonly repository: MemoryRepository;
   readonly bufferRepository: BufferRepository;
+  /** 下游交付存储：上下文交付项与 Driver 反馈 outbox */
+  readonly deliveryRepository: MemoryDeliveryRepository;
   readonly boardQuery: AgentBoardQuery;
   readonly maintenance: BMemoryMaintenanceCapabilities;
   reviewSkill(input: ReviewSkillInput): Promise<ReviewedSkill>;
@@ -47,6 +50,7 @@ export function createBPublicCapabilities(
   return {
     repository: runtime.repository,
     bufferRepository: runtime.bufferRepository,
+    deliveryRepository: runtime.deliveryRepository,
     boardQuery: new RepositoryAgentBoardQuery(runtime.repository, roleTokenUsage),
     maintenance,
     reviewSkill: (input) => reviewSkill(runtime.repository, input),

@@ -40,13 +40,14 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       const primaryAgentId = firstTerminal.task.owner_agent_id;
       expect(primaryAgentId).toMatch(/^role_/);
       if (!primaryAgentId) throw new Error('Completed Task has no selected primary Agent');
-      const firstExperiences = await waitForExperiences(
+      const firstDelivery = await waitForContextDelivery(
         client,
         primaryAgentId,
         created.task.task_id,
       );
-      expect(firstExperiences).toMatchObject({
-        experiences: [expect.objectContaining({ source_task_id: created.task.task_id })],
+      expect(firstDelivery.deliveries[0]).toMatchObject({
+        task_id: created.task.task_id,
+        memory_buffer_ref: expect.stringMatching(/^role_[a-z_]+:\d+$/),
       });
       await client.call('task.subscribe', { task_id: created.task.task_id });
 
@@ -165,31 +166,30 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       expect(maintenance.maintenance.map((item) => item.role_id)).toEqual(
         expect.arrayContaining(['role_ts_engineer', 'role_fullstack_engineer']),
       );
+      // 生产路径交给下游的是**上下文交付项**，本进程不加工记忆
       expect(maintenance.maintenance).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ status: 'completed', evidence_uri: expect.stringMatching(/^file:/) }),
+          expect.objectContaining({
+            kind: 'context_delivery',
+            status: 'scheduled',
+            context_delivery: expect.objectContaining({
+              memory_buffer_ref: expect.stringMatching(/^role_[a-z_]+:\d+$/),
+            }),
+          }),
         ]),
       );
+      // 人工晋升入口仍在，但主链没有隐式副作用：没有经验可晋升，也就没有技能
       await expect(
         client.call('memory.promoteSkills', {
           role_id: primaryAgentId,
           requested_by: 'acceptance',
         }),
       ).resolves.toMatchObject({
-        maintenance: {
-          status: 'completed',
-          skills: expect.arrayContaining([
-            expect.objectContaining({ review_status: 'pending' }),
-          ]),
-        },
+        maintenance: { status: 'completed', skills: [] },
       });
       await expect(
         client.call('memory.listSkills', { role_id: primaryAgentId }),
-      ).resolves.toMatchObject({
-        skills: expect.arrayContaining([
-          expect.objectContaining({ review_status: 'pending' }),
-        ]),
-      });
+      ).resolves.toMatchObject({ skills: [] });
 
       const replayCursor = liveCouncilEvents.find((event) => event.type === 'run.created');
       expect(replayCursor).toBeDefined();
@@ -493,42 +493,48 @@ async function waitForTerminalTask(client: RpcChildClient, taskId: string): Prom
   throw new Error(`Task ${taskId} did not reach terminal state`);
 }
 
-async function waitForExperiences(
+/**
+ * 等一次任务的上下文交付项出现。
+ *
+ * 生产路径不在本进程提取经验（那是外部 Memory Maintenance 系统的事），所以要等
+ * 的是「任务产出的上下文已经登记给下游」，而不是「经验已经写出来」。
+ */
+async function waitForContextDelivery(
   client: RpcChildClient,
   roleId: string,
-  sourceTaskId: string,
-): Promise<{ experiences: Array<{ source_task_id: string }> }> {
+  taskId: string,
+): Promise<{ deliveries: Array<{ task_id: string; memory_buffer_ref: string }> }> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
-    const result = await client.call<{ experiences: Array<{ source_task_id: string }> }>(
-      'memory.listExperiences',
-      { role_id: roleId },
-    );
-    if (result.experiences.some((experience) => experience.source_task_id === sourceTaskId)) {
+    const result = await client.call<{
+      deliveries: Array<{ task_id: string; memory_buffer_ref: string }>;
+    }>('memory.listContextDeliveries', { role_id: roleId, task_id: taskId });
+    if (result.deliveries.length > 0) {
       return result;
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error(`Timed out waiting for B Experience from ${sourceTaskId}`);
+  throw new Error(`Timed out waiting for a B context delivery from ${taskId}`);
 }
 
+/** 等每个角色都至少留下一条上下文交付证据（生产路径的 maintenance 就是它） */
 async function waitForMaintenance(
   client: RpcChildClient,
   roleIds: readonly string[],
 ): Promise<{
-  maintenance: Array<{ role_id: string; status: string; evidence_uri?: string }>;
+  maintenance: Array<{ role_id: string; kind: string; status: string }>;
 }> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const result = await client.call<{
-      maintenance: Array<{ role_id: string; status: string; evidence_uri?: string }>;
+      maintenance: Array<{ role_id: string; kind: string; status: string }>;
     }>('memory.listMaintenance', {});
-    const completedRoles = new Set(
+    const deliveredRoles = new Set(
       result.maintenance
-        .filter((item) => item.status === 'completed')
+        .filter((item) => item.kind === 'context_delivery' && item.status === 'scheduled')
         .map((item) => item.role_id),
     );
-    if (roleIds.every((roleId) => completedRoles.has(roleId))) return result;
+    if (roleIds.every((roleId) => deliveredRoles.has(roleId))) return result;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for B maintenance for ${roleIds.join(', ')}`);

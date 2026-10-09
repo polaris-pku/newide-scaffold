@@ -46,6 +46,9 @@ describe('B memory evolution end to end', () => {
       bufferRepository,
       llm: extractionLlm(),
       evidenceStore: new FileBMemoryMaintenanceEvidenceStore(path.join(root, 'maintenance')),
+      // 实验路径：本进程内模拟下游 Memory Maintenance，让记忆真的演化。
+      // 生产路径只交付上下文，由外部系统加工（见 memory-delivery-contract.test.ts）。
+      mode: 'in_process_emulation',
     });
     const facade = new DriverRuntimeAgentExecutionFacade({
       driver,
@@ -101,6 +104,9 @@ describe('B memory evolution end to end', () => {
       bufferRepository,
       llm: extractionLlm(),
       evidenceStore: new FileBMemoryMaintenanceEvidenceStore(path.join(root, 'maintenance')),
+      // 实验路径：本进程内模拟下游 Memory Maintenance，让记忆真的演化。
+      // 生产路径只交付上下文，由外部系统加工（见 memory-delivery-contract.test.ts）。
+      mode: 'in_process_emulation',
     });
     const facade = new DriverRuntimeAgentExecutionFacade({
       driver,

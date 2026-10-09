@@ -32,9 +32,11 @@ import {
   type CreateAgentSpec,
   type DispatchTaskResult,
   type DriverContext,
+  type DriverReferencedExperience,
   type DriverTask,
   type EmbeddingProvider,
   type LlmClient,
+  type MemoryDeliveryRepository,
   type MemoryRetrievalResult,
   type MemoryRepository,
   type MemoryCycleResult,
@@ -91,6 +93,7 @@ import type {
   BMemoryMaintenanceEvidence,
   BMemoryMaintenancePort,
 } from './b-memory-maintenance-runner';
+import type { DriverFeedbackRecord } from '../memory/schemas';
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
   driver: DriverRuntimeHandle;
@@ -118,6 +121,8 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
    */
   contextCleaner?: AgentContextCleaner;
   embedding?: EmbeddingProvider;
+  /** 下游交付存储：交给基座 AgentManager 做角色创建/删除的生命周期清理 */
+  deliveryRepository?: MemoryDeliveryRepository;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
   /** 进程内调用留档（B1）：注入后 memory_query 调用收尾写 P1 journal；缺省不留档 */
@@ -171,6 +176,12 @@ interface InvocationContext {
   collaboration_brief?: string;
   driver_attempts: number;
   abortObserved: boolean;
+}
+
+/** Driver 使用反馈的提交结果；`error` 只进诊断，不影响任务状态。 */
+interface DriverFeedbackOutcome {
+  recorded: DriverFeedbackRecord[];
+  error?: string;
 }
 
 const AGENT_RUNTIME_POLICY_ID = 'b-persona-tools-v1';
@@ -251,6 +262,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...(this.options.contextCleaner ? { contextCleaner: this.options.contextCleaner } : {}),
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
+      ...(this.options.deliveryRepository
+        ? { deliveryRepository: this.options.deliveryRepository }
+        : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
       retirementEvaluator: createToolRetirementEvaluator(this.options.llm),
     });
@@ -1081,6 +1095,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       runtimeRoleId,
       dispatched.cycle.buffer_seq,
     );
+    // 反馈与上下文交付走两条独立通道：交付是给下游做提取的输入，反馈是给下游
+    // 判断 Skill 晋升的输入。两者都不拦任务，也都不等待下游。
+    const driverFeedback = await this.recordDriverFeedback(
+      input,
+      runtimeRoleId,
+      dispatched.cycle.buffer_seq,
+      dispatched.cycle.buffer_snapshot.driver_return.referenced_experiences,
+    );
     if (!execution) {
       return this.buildNoExecutionResult(
         input,
@@ -1091,6 +1113,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         workspaceArtifacts,
         memoryMaintenance,
         mailboxOutcomes,
+        driverFeedback,
       );
     }
 
@@ -1142,6 +1165,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         promotion: dispatched.cycle.promotion.check,
         agent_runtime: agentRuntime,
         ...memoryContextDiagnostics(dispatched.cycle),
+        ...driverFeedbackDiagnostics(driverFeedback),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1170,6 +1194,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     workspaceArtifacts: ArtifactRef[],
     memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
     mailboxOutcomes: readonly MailboxToolOutcome[],
+    driverFeedback: DriverFeedbackOutcome,
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
@@ -1234,6 +1259,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         },
         agent_runtime: agentRuntime,
         ...memoryContextDiagnostics(dispatched.cycle),
+        ...driverFeedbackDiagnostics(driverFeedback),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1287,6 +1313,42 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         created_at: completedAt,
         completed_at: completedAt,
         schema_version: SCHEMA_VERSION,
+      };
+    }
+  }
+
+  /**
+   * 把 Driver 对既有经验的使用反馈写进下游 outbox。
+   *
+   * 与提取解耦：不查经验是否存在、不调 scheduleBuffer、更不在本进程改置信度。
+   * 引用一条还不存在的经验是正常情况（跨 agent / 已处置 / 下游尚未提取），
+   * 反馈先落 outbox，等下游按 feedback_id 归并。
+   *
+   * best-effort：写失败只记进 diagnostics，绝不让一个已经完成的 Agent 任务
+   * 因为下游的事变成失败。
+   */
+  private async recordDriverFeedback(
+    input: AgentExecutionRequest,
+    runtimeRoleId: string,
+    bufferSeq: number,
+    references: readonly DriverReferencedExperience[],
+  ): Promise<DriverFeedbackOutcome> {
+    if (!this.options.memoryMaintenance || references.length === 0) return { recorded: [] };
+    const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
+    if (!ablationPolicy.schedule_extraction) return { recorded: [] };
+    try {
+      const recorded = await this.options.memoryMaintenance.recordDriverUsageFeedback({
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: runtimeRoleId,
+        ...(bufferSeq > 0 ? { buffer_seq: bufferSeq } : {}),
+        references,
+      });
+      return { recorded };
+    } catch (error) {
+      return {
+        recorded: [],
+        error: error instanceof Error ? error.message : String(error),
       };
     }
   }
@@ -1536,6 +1598,22 @@ function memoryContextDiagnostics(cycle: MemoryCycleResult): Record<string, unkn
   return {
     context_snapshot_paired: contextSnapshotPaired(cycle),
     memory_context_warnings: warnings,
+  };
+}
+
+/**
+ * 把反馈提交结果放进执行诊断。
+ *
+ * 只在真有反馈可报时才出现这两个键——「这次没有引用任何经验」和「报了但没写进去」
+ * 是两件事，混成同一个空值就分不出来了。
+ */
+function driverFeedbackDiagnostics(outcome: DriverFeedbackOutcome): Record<string, unknown> {
+  if (outcome.error === undefined && outcome.recorded.length === 0) return {};
+  return {
+    driver_feedback_recorded: outcome.recorded.length,
+    ...(outcome.error === undefined
+      ? { driver_feedback_ids: outcome.recorded.map((record) => record.feedback_id) }
+      : { driver_feedback_error: outcome.error }),
   };
 }
 

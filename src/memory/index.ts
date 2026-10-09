@@ -64,6 +64,11 @@ export {
   FileBufferRepository,
   type FileBufferRepositoryOptions,
 } from './adapters/file-buffer-repository';
+export { InMemoryMemoryDeliveryRepository } from './adapters/in-memory-memory-delivery';
+export {
+  FileMemoryDeliveryRepository,
+  type FileMemoryDeliveryRepositoryOptions,
+} from './adapters/file-memory-delivery';
 
 // ════════════════════════════════════════════════════════
 //  3. LLM 客户端适配器
@@ -132,6 +137,17 @@ export {
   type UsageFeedbackEntry,
   type UsageFeedbackResult,
 } from './services/usage-feedback';
+export {
+  buildContextDeliveryItem,
+  buildDriverUsageFeedbackRecords,
+  contextDeliveryId,
+  contextDeliveryKey,
+  driverFeedbackId,
+  driverFeedbackKey,
+  type ContextDeliveryInput,
+  type DriverFeedbackInput,
+  type DriverReferencedExperience,
+} from './services/context-delivery';
 export {
   computeMemoryOverview,
   type MemoryOverview,
@@ -368,6 +384,12 @@ export type {
   DeadLetterEntry,
   SaveBufferResult,
 } from './ports/buffer-repository';
+export type {
+  MemoryDeliveryRepository,
+  ContextDeliveryFilter,
+  DriverFeedbackFilter,
+  DeliverySubmitResult,
+} from './ports/memory-delivery';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';

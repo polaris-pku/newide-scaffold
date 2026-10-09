@@ -1,7 +1,11 @@
 /** memory.* JSON-RPC methods backed by B's public board and application maintenance services. */
 import { z } from 'zod';
 import type { BMemoryMaintenanceEvidence } from '../app/b-memory-maintenance-runner';
-import type { AgentMetaPatch, BMemoryCapabilities } from '../app/b-memory-backend-service';
+import type {
+  AgentMetaPatch,
+  BMemoryCapabilities,
+  ContextDeliveryPayload,
+} from '../app/b-memory-backend-service';
 import type { ReviewedSkill } from '../app/b-public-capabilities';
 import type {
   AgentBoardAgentView,
@@ -27,9 +31,18 @@ import type {
   UserRatingResult,
   MemoryOverview,
   DeadLetterEntry,
+  ContextDeliveryFilter,
+  DriverFeedbackFilter,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
-import type { AgentContextSnapshot, BufferMeta, BufferSnapshot } from '../memory/schemas';
+import { DeliveryStatusSchema } from '../memory/schemas';
+import type {
+  AgentContextSnapshot,
+  BufferMeta,
+  BufferSnapshot,
+  ContextDeliveryItem,
+  DriverFeedbackRecord,
+} from '../memory/schemas';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 
@@ -104,6 +117,18 @@ export interface MemoryMethodsService {
   ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined>;
   /** 重试提取（memory.retryExtraction） */
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence>;
+  /**
+   * 下游交付：列出已提交的上下文交付项（memory.listContextDeliveries）。
+   * 下游系统的「有哪些活要干」入口。
+   */
+  listMemoryContextDeliveries(filter?: ContextDeliveryFilter): Promise<ContextDeliveryItem[]>;
+  /** 下游交付：按 id 取回完整 DriverReturn + AgentContextSnapshot（memory.getContextDelivery） */
+  getMemoryContextDelivery(
+    roleId: string,
+    deliveryId: string,
+  ): Promise<ContextDeliveryPayload | undefined>;
+  /** 下游 feedback outbox：列出 Driver 使用反馈（memory.listDriverFeedback） */
+  listMemoryDriverFeedback(filter?: DriverFeedbackFilter): Promise<DriverFeedbackRecord[]>;
   /** 单 Agent 内文本检索（memory.searchMemory）；召回项附相似度分数 */
   searchAgentMemory(
     roleId: string,
@@ -333,6 +358,27 @@ const bufferSeqParamsSchema = z
   .object({
     role_id: z.string().trim().min(1),
     seq: z.number().int().positive(),
+  })
+  .strict();
+const contextDeliveryFilterParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1).optional(),
+    task_id: z.string().trim().min(1).optional(),
+    status: DeliveryStatusSchema.optional(),
+  })
+  .strict();
+const contextDeliveryParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    delivery_id: z.string().trim().min(1),
+  })
+  .strict();
+const driverFeedbackFilterParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1).optional(),
+    task_id: z.string().trim().min(1).optional(),
+    experience_id: z.string().trim().min(1).optional(),
+    status: DeliveryStatusSchema.optional(),
   })
   .strict();
 const taskIdParamsSchema = z
@@ -620,6 +666,24 @@ export class MemoryRpcMethods {
       const parsed = parseParams(bufferSeqParamsSchema, params);
       const maintenance = await this.service.retryMemoryExtraction(parsed.role_id, parsed.seq);
       return { maintenance };
+    });
+    dispatcher.register('memory.listContextDeliveries', async (params) => {
+      const parsed = parseParams(contextDeliveryFilterParamsSchema, params ?? {});
+      const deliveries = await this.service.listMemoryContextDeliveries(parsed);
+      return { deliveries };
+    });
+    dispatcher.register('memory.getContextDelivery', async (params) => {
+      const parsed = parseParams(contextDeliveryParamsSchema, params);
+      const payload = await this.service.getMemoryContextDelivery(
+        parsed.role_id,
+        parsed.delivery_id,
+      );
+      return { payload };
+    });
+    dispatcher.register('memory.listDriverFeedback', async (params) => {
+      const parsed = parseParams(driverFeedbackFilterParamsSchema, params ?? {});
+      const feedback = await this.service.listMemoryDriverFeedback(parsed);
+      return { feedback };
     });
     dispatcher.register('memory.reindex', async (params) => {
       const parsed = parseParams(reindexParamsSchema, params ?? {});

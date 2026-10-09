@@ -44,12 +44,17 @@ import {
   promoteExperienceToSkill,
   reindexMemory,
   type ReindexMemoryResult,
+  type ContextDeliveryFilter,
+  type DriverFeedbackFilter,
+  type MemoryDeliveryRepository,
 } from '../memory';
 import type {
   AgentContextSnapshot,
   AgentStatus,
   BufferMeta,
   BufferSnapshot,
+  ContextDeliveryItem,
+  DriverFeedbackRecord,
   ExperienceRecord,
   PersonaDef,
   SkillRecord,
@@ -65,10 +70,22 @@ export interface BMemoryOperationCapability {
 }
 
 export interface BMemoryCapabilities {
-  schema_version: 'newide.b-memory-capabilities.v2';
+  schema_version: 'newide.b-memory-capabilities.v3';
   embedding: BEmbeddingRuntimeInfo;
   skill_review: {
     mode: 'manual' | 'auto_approve';
+  };
+  /**
+   * 记忆加工的归属声明。
+   *
+   * Experience 提取 / Skill 晋升 / Persona 演化由**外部** Memory Maintenance 系统
+   * 负责；本仓只提供交付项、反馈 outbox 与只读查询。这里刻意不暴露本仓的加工
+   * 状态——本仓没有那样的 Worker，暴露它只会让人以为任务流程会等下游。
+   */
+  memory_maintenance: {
+    ownership: 'external';
+    context_delivery: BMemoryOperationCapability;
+    driver_feedback_outbox: BMemoryOperationCapability;
   };
   operations: {
     list_agents: BMemoryOperationCapability;
@@ -86,6 +103,12 @@ export interface BMemoryCapabilities {
     get_buffer_state: BMemoryOperationCapability;
     get_pending_buffer: BMemoryOperationCapability;
     retry_extraction: BMemoryOperationCapability;
+    /** 下游交付：列出本仓已提交的上下文交付项 */
+    list_context_deliveries: BMemoryOperationCapability;
+    /** 下游交付：按 id 取一条交付项及其完整 DriverReturn + AgentContextSnapshot */
+    get_context_delivery: BMemoryOperationCapability;
+    /** 下游 feedback outbox：列出 Driver 使用反馈（含经验尚不存在的那部分） */
+    list_driver_feedback: BMemoryOperationCapability;
     search_memory: BMemoryOperationCapability;
     market_search: BMemoryOperationCapability;
     market_import: BMemoryOperationCapability;
@@ -105,6 +128,15 @@ export interface BMemoryCapabilities {
     list_experiences_by_source_task: BMemoryOperationCapability;
     reindex: BMemoryOperationCapability;
   };
+}
+
+/** getContextDelivery 的返回：交付项本身 + 从 Buffer 现取的完整输入 */
+export interface ContextDeliveryPayload {
+  delivery: ContextDeliveryItem;
+  /** Buffer 是否仍在 pending；false 表示 payload 暂时取不到（不是空上下文） */
+  payload_available: boolean;
+  driver_return?: BufferSnapshot['driver_return'];
+  agent_context?: AgentContextSnapshot;
 }
 
 /** Agent 元数据更新补丁（与 MemoryRepository.updateAgentMeta 对齐） */
@@ -137,7 +169,7 @@ export class BMemoryBackendService {
     private readonly capabilities: Pick<
       BPublicCapabilities,
       'boardQuery' | 'maintenance' | 'reviewSkill' | 'bufferRepository'
-    >,
+    > & { deliveryRepository?: MemoryDeliveryRepository },
     private readonly embeddingInfo: BEmbeddingRuntimeInfo,
     private readonly options: BMemoryBackendServiceOptions = {},
     // 以下为可选注入：不注入时对应能力在 getCapabilities() 里报告 unavailable，
@@ -149,13 +181,31 @@ export class BMemoryBackendService {
   ) {}
 
   getCapabilities(): BMemoryCapabilities {
+    // 交付存储是可选的（测试缝/无下游部署）：缺席时明确报 unavailable，
+    // 而不是让调用方在后面收到一个语焉不详的 undefined。
+    const delivery = this.capabilities.deliveryRepository;
+    const deliveryCapability = (what: string): BMemoryOperationCapability =>
+      delivery
+        ? { status: 'available' }
+        : {
+            status: 'unavailable',
+            reason: `B runtime has no MemoryDeliveryRepository configured (${what}).`,
+          };
     return {
-      schema_version: 'newide.b-memory-capabilities.v2',
+      schema_version: 'newide.b-memory-capabilities.v3',
       embedding: { ...this.embeddingInfo },
       skill_review: {
         mode: this.options.autoApprovePromotedSkills ? 'auto_approve' : 'manual',
       },
+      memory_maintenance: {
+        ownership: 'external',
+        context_delivery: deliveryCapability('context delivery'),
+        driver_feedback_outbox: deliveryCapability('driver feedback outbox'),
+      },
       operations: {
+        list_context_deliveries: deliveryCapability('list context deliveries'),
+        get_context_delivery: deliveryCapability('get context delivery'),
+        list_driver_feedback: deliveryCapability('list driver feedback'),
         list_agents: { status: 'available' },
         get_agent_persona: { status: 'available' },
         list_experiences: { status: 'available' },
@@ -548,8 +598,10 @@ export class BMemoryBackendService {
   }
 
   /**
-   * 重试提取（memory.retryExtraction）：死信缓冲区恢复到 pending 后重新入队
-   * 维护链路（BMemoryMaintenanceRunner.scheduleBuffer），返回调度证据。
+   * 重试交付（memory.retryExtraction）：死信缓冲区恢复到 pending 后重新提交交付项。
+   *
+   * 名字沿用历史接口，但语义是「恢复下游交付」——本仓不执行 Experience 提取，
+   * 下游系统怎么消费、什么时候消费都不由这里决定。
    */
   async retryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
     const repository = this.requireRepository('Extraction retry');
@@ -565,6 +617,66 @@ export class BMemoryBackendService {
       role_id: roleId,
       buffer_seq: seq,
     });
+  }
+
+  /**
+   * 列出已提交的上下文交付项（memory.listContextDeliveries）。
+   *
+   * 这是下游系统「有哪些活要干」的只读入口：只返回交付项本身，payload 由
+   * getContextDelivery 按需取回。
+   */
+  async listContextDeliveries(filter: ContextDeliveryFilter = {}): Promise<ContextDeliveryItem[]> {
+    return this.requireDeliveryRepository('Context delivery').listContextDeliveries(filter);
+  }
+
+  /**
+   * 按交付 id 取回完整输入（memory.getContextDelivery）。
+   *
+   * payload 从 Buffer 现取现读，不存第二份副本——DriverReturn 与
+   * AgentContextSnapshot 的唯一事实来源始终是 `report_<seq>` / `context_<seq>`。
+   * Buffer 已不在 pending（被恢复流程挪走或已被清理）时如实返回
+   * `payload_available: false`，而不是给一个看起来完整的空壳。
+   */
+  async getContextDelivery(
+    roleId: string,
+    deliveryId: string,
+  ): Promise<ContextDeliveryPayload | undefined> {
+    const delivery = await this.requireDeliveryRepository('Context delivery').getContextDelivery(
+      roleId,
+      deliveryId,
+    );
+    if (!delivery) return undefined;
+    const pending = await this.capabilities.bufferRepository.getPendingBuffer(
+      roleId,
+      delivery.buffer_seq,
+    );
+    if (!pending) {
+      return { delivery, payload_available: false };
+    }
+    return {
+      delivery,
+      payload_available: true,
+      driver_return: pending.snapshot.driver_return,
+      ...(pending.agentContext ? { agent_context: pending.agentContext } : {}),
+    };
+  }
+
+  /**
+   * 列出 Driver 使用反馈（memory.listDriverFeedback）。
+   *
+   * 包含引用了尚不存在经验的那部分——它们就在 outbox 里等着下游归并，
+   * 不是需要被过滤掉的异常数据。
+   */
+  async listDriverFeedback(filter: DriverFeedbackFilter = {}): Promise<DriverFeedbackRecord[]> {
+    return this.requireDeliveryRepository('Driver feedback outbox').listDriverFeedback(filter);
+  }
+
+  private requireDeliveryRepository(operation: string): MemoryDeliveryRepository {
+    const repository = this.capabilities.deliveryRepository;
+    if (!repository) {
+      throw new Error(`${operation} requires a MemoryDeliveryRepository, which this runtime does not have.`);
+    }
+    return repository;
   }
 
   /**

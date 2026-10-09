@@ -4,6 +4,7 @@ import {
 } from '../../src/app/backend-rpc-stdio';
 import {
   InMemoryBufferRepository,
+  InMemoryMemoryDeliveryRepository,
   InMemoryRepository,
   type LlmClient,
   type ToolCallingClient,
@@ -16,6 +17,8 @@ const service = await createProductionBackendService(process.env, {
   bRuntime: {
     repository: new InMemoryRepository(),
     bufferRepository: new InMemoryBufferRepository(),
+    // 生产路径只交付上下文；没有交付存储时 scheduleBuffer 会明确报 failed
+    deliveryRepository: new InMemoryMemoryDeliveryRepository(),
     app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(process.cwd(), '.newide'),
     market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
     close: async () => undefined,

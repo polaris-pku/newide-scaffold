@@ -12,6 +12,7 @@ import {
   type RetiredReason,
 } from '../schemas';
 import type { BufferRepository } from '../ports/buffer-repository';
+import type { MemoryDeliveryRepository } from '../ports/memory-delivery';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { AgentTaskRequest } from '../agent-types';
 import type { MemoryCycleResult } from '../types';
@@ -50,6 +51,12 @@ export interface AgentManagerOptions {
   embedding?: EmbeddingProvider;
   retirementEvaluator?: RetirementEvaluator;
   retirementDetector?: RetirementDetector;
+  /**
+   * 下游交付存储（可选）：与 bufferRepository 同生命周期——角色创建时初始化、
+   * 硬删除时一并清理。缺省表示本进程没有交付存储（测试/无下游场景），
+   * 对 Agent 的创建与派发行为没有影响。
+   */
+  deliveryRepository?: MemoryDeliveryRepository;
 }
 
 /**
@@ -169,6 +176,7 @@ export class AgentManager {
       if (!this.agents.has(role_id)) {
         await this.repository.ensureAgent(role_id);
         await this.bufferRepository.ensureAgent(role_id);
+        await this.options.deliveryRepository?.ensureAgent(role_id);
         const memory = createAgentMemoryScope(this.repository, this.bufferRepository, role_id);
         const tools = {
           ...this.options.tools,
@@ -221,6 +229,7 @@ export class AgentManager {
     }
     await this.repository.deleteAgent(role_id);
     await this.bufferRepository.deleteAgent(role_id);
+    await this.options.deliveryRepository?.deleteAgent(role_id);
     this.agents.delete(role_id);
   }
 
@@ -230,6 +239,7 @@ export class AgentManager {
    */
   private async instantiateAgent(role_id: string): Promise<Agent> {
     await this.bufferRepository.ensureAgent(role_id);
+    await this.options.deliveryRepository?.ensureAgent(role_id);
     const memory = createAgentMemoryScope(this.repository, this.bufferRepository, role_id);
 
     // 自动注入 QueryMemoryTool（需要 AgentMemoryScope，只能在这里创建）
@@ -760,6 +770,7 @@ export class AgentManager {
     await this.repository.archiveAgent(role_id, archive);
     await this.repository.deleteAgent(role_id);
     await this.bufferRepository.deleteAgent(role_id);
+    await this.options.deliveryRepository?.deleteAgent(role_id);
     this.agents.delete(role_id);
 
     return {

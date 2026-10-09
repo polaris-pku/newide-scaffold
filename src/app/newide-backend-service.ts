@@ -111,10 +111,23 @@ import type {
   MemoryOverview,
   DeadLetterEntry,
   ReindexMemoryResult,
+  ContextDeliveryFilter,
+  DriverFeedbackFilter,
 } from '../memory';
-import type { SkillRecord, BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../memory/schemas';
+import type {
+  SkillRecord,
+  BufferMeta,
+  BufferSnapshot,
+  AgentContextSnapshot,
+  ContextDeliveryItem,
+  DriverFeedbackRecord,
+} from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
-import type { AgentMetaPatch, BMemoryBackendService } from './b-memory-backend-service';
+import type {
+  AgentMetaPatch,
+  BMemoryBackendService,
+  ContextDeliveryPayload,
+} from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
 import {
   FileDriverStreamAuditWriter,
@@ -693,6 +706,23 @@ export class NewideBackendService {
 
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().retryExtraction(roleId, seq);
+  }
+
+  listMemoryContextDeliveries(
+    filter?: ContextDeliveryFilter,
+  ): Promise<ContextDeliveryItem[]> {
+    return this.requireBMemoryService().listContextDeliveries(filter);
+  }
+
+  getMemoryContextDelivery(
+    roleId: string,
+    deliveryId: string,
+  ): Promise<ContextDeliveryPayload | undefined> {
+    return this.requireBMemoryService().getContextDelivery(roleId, deliveryId);
+  }
+
+  listMemoryDriverFeedback(filter?: DriverFeedbackFilter): Promise<DriverFeedbackRecord[]> {
+    return this.requireBMemoryService().listDriverFeedback(filter);
   }
 
   searchAgentMemory(

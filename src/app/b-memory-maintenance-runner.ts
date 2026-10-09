@@ -5,20 +5,30 @@ import { pathToFileURL } from 'node:url';
 import { SCHEMA_VERSION, nowTimestamp } from '../core';
 import {
   applyUsageFeedback,
+  buildContextDeliveryItem,
+  buildDriverUsageFeedbackRecords,
+  createAgentMemoryScope,
+  contextDeliveryId,
+  contextDeliveryKey,
   LlmExperienceExtractor,
   LlmSkillPromotion,
-  createAgentMemoryScope,
   processPendingBuffer,
   promoteExperiencesForAgent,
   resolveMemoryAblationPolicy,
   type BufferRepository,
   type CallJournalPort,
+  type DriverReferencedExperience,
   type ExperienceExtractor,
   type LlmClient,
   type MemoryAblation,
+  type MemoryDeliveryRepository,
   type MemoryRepository,
 } from '../memory';
-import type { SkillRecord } from '../memory/schemas';
+import type {
+  ContextDeliveryItem,
+  DriverFeedbackRecord,
+  SkillRecord,
+} from '../memory/schemas';
 import type { UsageFeedbackEntry } from '../memory';
 import {
   isDriverStreamUsage,
@@ -38,6 +48,32 @@ export interface BMemoryMaintenanceRequest {
   workspace_path?: string;
 }
 
+/**
+ * Driver 使用反馈的提交请求（任务完成时由执行 facade 调用）。
+ *
+ * `references` 直接来自 DriverReturn.referenced_experiences：反馈只记录「Agent
+ * 说它用了什么」，不检查那条经验是否存在——引用不存在的经验是正常情况，
+ * 交给下游按 experience_id 归并。
+ */
+export interface BDriverFeedbackRequest {
+  task_id: string;
+  run_id: string;
+  role_id: string;
+  buffer_seq?: number;
+  references: readonly DriverReferencedExperience[];
+}
+
+/**
+ * 任务完成后的记忆加工归属。
+ *
+ * - `delivery`（生产默认）：本进程只提交上下文交付项与反馈 outbox，
+ *   Experience 提取 / Skill 晋升 / Persona 演化由外部 Memory Maintenance 系统负责。
+ * - `in_process_emulation`（实验专用）：在本进程内模拟下游系统，跑提取与
+ *   （B2/B3 的）晋升。只有消融臂需要它——没有真的记忆演化，各臂之间就没有
+ *   可比较的记忆差。
+ */
+export type BMemoryMaintenanceMode = 'delivery' | 'in_process_emulation';
+
 export interface BSkillPromotionRequest {
   role_id: string;
   requested_by: string;
@@ -52,7 +88,7 @@ export type BMemoryMaintenanceStatus =
 
 export interface BMemoryMaintenanceEvidence {
   maintenance_ref: string;
-  kind: 'experience_extraction' | 'skill_promotion';
+  kind: 'experience_extraction' | 'skill_promotion' | 'context_delivery';
   status: BMemoryMaintenanceStatus;
   role_id: string;
   task_id?: string;
@@ -63,6 +99,18 @@ export interface BMemoryMaintenanceEvidence {
   skills: unknown[];
   warnings: string[];
   error?: string;
+  /**
+   * 上下文交付证据（kind='context_delivery' 时）：交付项 id 与它引用的 Buffer 位置。
+   *
+   * 下游据此从 `memory.getContextDelivery` 或交付存储里取回完整
+   * DriverReturn + AgentContextSnapshot；这里只留引用，不留 payload 副本。
+   */
+  context_delivery?: {
+    delivery_id: string;
+    delivery_key: string;
+    memory_buffer_ref: string;
+    context_snapshot_ref?: string;
+  };
   /** 用后验证回写明细：逐条列出置信度增长 before/after（写入磁盘 evidence JSON） */
   usage_feedback?: UsageFeedbackEntry[];
   evidence_uri?: string;
@@ -73,6 +121,12 @@ export interface BMemoryMaintenanceEvidence {
 
 export interface BMemoryMaintenancePort {
   scheduleBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence>;
+  /**
+   * 记录 Driver 对既有经验的使用反馈，进 durable outbox 等下游归并。
+   *
+   * 与提取解耦：反馈不要求经验已经提取出来，也不在本进程改置信度。
+   */
+  recordDriverUsageFeedback(input: BDriverFeedbackRequest): Promise<DriverFeedbackRecord[]>;
 }
 
 export interface BMemoryMaintenanceEvidenceStore {
@@ -86,6 +140,19 @@ export interface BMemoryMaintenanceRunnerOptions {
   bufferRepository: BufferRepository;
   llm: LlmClient;
   evidenceStore: BMemoryMaintenanceEvidenceStore;
+  /**
+   * 上下文交付与反馈 outbox 的存储。
+   *
+   * 不注入时 delivery 模式仍能跑，但 scheduleBuffer 会返回一条明确说明
+   * 「本进程没有交付存储」的 failed evidence——不装配交付存储是配置错误，
+   * 不该伪装成静默跳过。in_process_emulation 模式不需要它。
+   */
+  deliveryRepository?: MemoryDeliveryRepository;
+  /**
+   * 强制指定加工归属；缺省按请求判定（带消融标签 = 实验模拟，否则 = 生产交付）。
+   * 显式给出时以它为准，测试用它把两条路径都钉死。
+   */
+  mode?: BMemoryMaintenanceMode;
   /** When set, completed maintenance rewrites summary.json token_usage for the run. */
   runsRoot?: string;
   /** 可选提取器注入（默认 LlmExperienceExtractor + 规则版降级）；测试注入失败提取器用。 */
@@ -106,21 +173,45 @@ export interface BMemoryMaintenanceRunnerOptions {
 }
 
 export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
-  private readonly extractor: ExperienceExtractor;
-  private readonly promoter: LlmSkillPromotion;
   private readonly promotionConfidenceThreshold: number;
   private readonly promotionAutoApprove: boolean;
   private readonly roleQueues = new Map<string, Promise<void>>();
   private readonly scheduleFlights = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
   private readonly jobs = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
+  /**
+   * 提取器与晋升器按需构造：生产 delivery 模式从不碰它们，也就没必要为一个
+   * 不会被调用的下游模拟器持有 LLM 适配器。
+   */
+  private lazyExtractor: ExperienceExtractor | undefined;
+  private lazyPromoter: LlmSkillPromotion | undefined;
 
   constructor(private readonly options: BMemoryMaintenanceRunnerOptions) {
-    this.extractor = options.extractor ?? new LlmExperienceExtractor(options.llm);
     this.promotionConfidenceThreshold = options.promotion?.confidenceThreshold ?? 0.95;
     this.promotionAutoApprove = options.promotion?.autoApprove === true;
-    this.promoter = new LlmSkillPromotion(options.llm, {
+  }
+
+  /**
+   * 本次请求走哪条路。
+   *
+   * 带 `memory_ablation` 的请求是一次消融实验：它要靠记忆在本进程内真的演化才
+   * 有可比较的记忆差，所以在本进程内模拟下游系统。不带标签的是生产运行——只有
+   * 交付与反馈，Experience/Skill/Persona 由外部 Memory Maintenance 系统负责。
+   */
+  private resolveMode(input: BMemoryMaintenanceRequest): BMemoryMaintenanceMode {
+    if (this.options.mode) return this.options.mode;
+    return input.memory_ablation ? 'in_process_emulation' : 'delivery';
+  }
+
+  private get extractor(): ExperienceExtractor {
+    this.lazyExtractor ??= this.options.extractor ?? new LlmExperienceExtractor(this.options.llm);
+    return this.lazyExtractor;
+  }
+
+  private get promoter(): LlmSkillPromotion {
+    this.lazyPromoter ??= new LlmSkillPromotion(this.options.llm, {
       confidenceThreshold: this.promotionConfidenceThreshold,
     });
+    return this.lazyPromoter;
   }
 
   scheduleBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence> {
@@ -140,6 +231,168 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
   }
 
   private async scheduleBufferOnce(
+    input: BMemoryMaintenanceRequest,
+    maintenanceRef: string,
+  ): Promise<BMemoryMaintenanceEvidence> {
+    if (this.resolveMode(input) === 'delivery') {
+      return this.submitContextDelivery(input, maintenanceRef);
+    }
+    // 实验路径：交付照做（登记上下文是任务流程的本职，谁消费与登记无关），
+    // 只是再在本进程模拟一遍下游消费与加工。
+    await this.submitContextDelivery(input, maintenanceRef).catch(() => undefined);
+    return this.scheduleEmulatedExtraction(input, maintenanceRef);
+  }
+
+  /**
+   * 生产路径：把这次 Buffer 上下文登记成一条交付项，交给外部 Memory Maintenance 系统。
+   *
+   * 不做任何加工、不调用 LLM。已经交付过的键直接返回既有交付项（幂等命中），
+   * 因此重放不会产生第二条交付，也不会把下游已推进的状态拽回 pending。
+   */
+  private async submitContextDelivery(
+    input: BMemoryMaintenanceRequest,
+    maintenanceRef: string,
+  ): Promise<BMemoryMaintenanceEvidence> {
+    const startedAt = nowTimestamp();
+    const outbox = this.options.deliveryRepository;
+    if (!outbox) {
+      return this.persist({
+        maintenance_ref: maintenanceRef,
+        kind: 'context_delivery',
+        status: 'failed',
+        ...input,
+        experiences: [],
+        skills: [],
+        warnings: [
+          'No MemoryDeliveryRepository is configured, so this context could not be handed to the downstream system.',
+        ],
+        error: 'Memory delivery repository is not configured.',
+        created_at: startedAt,
+        completed_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      });
+    }
+
+    const deliveryKey = contextDeliveryKey({
+      role_id: input.role_id,
+      buffer_seq: input.buffer_seq,
+    });
+    const deliveryId = contextDeliveryId(deliveryKey);
+    const existing = await outbox.getContextDelivery(input.role_id, deliveryId);
+    if (existing) {
+      return this.persist(this.deliveryEvidence(input, maintenanceRef, existing, startedAt, false));
+    }
+
+    if (!Number.isInteger(input.buffer_seq) || input.buffer_seq <= 0) {
+      return this.persist({
+        maintenance_ref: maintenanceRef,
+        kind: 'context_delivery',
+        status: 'skipped',
+        ...input,
+        experiences: [],
+        skills: [],
+        warnings: ['Agent execution did not produce a durable pending Buffer.'],
+        created_at: startedAt,
+        completed_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      });
+    }
+
+    const memory = createAgentMemoryScope(
+      this.options.repository,
+      this.options.bufferRepository,
+      input.role_id,
+    );
+    const pending = await memory.getPendingBuffer(input.buffer_seq);
+    if (!pending) {
+      return this.persist({
+        maintenance_ref: maintenanceRef,
+        kind: 'context_delivery',
+        status: 'skipped',
+        ...input,
+        experiences: [],
+        skills: [],
+        warnings: ['Pending Buffer is no longer available for delivery.'],
+        created_at: startedAt,
+        completed_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      });
+    }
+
+    const item = buildContextDeliveryItem({
+      role_id: input.role_id,
+      task_id: input.task_id,
+      buffer_seq: input.buffer_seq,
+      source_driver: pending.snapshot.source_driver,
+      context_snapshot_ref: pending.snapshot.context_snapshot_ref,
+    });
+    const submitted = await outbox.submitContextDelivery(item);
+    return this.persist(
+      this.deliveryEvidence(input, maintenanceRef, submitted.item, startedAt, submitted.created),
+    );
+  }
+
+  /** 交付证据：引用交付项与它的 Buffer 位置，不复制 payload。 */
+  private deliveryEvidence(
+    input: BMemoryMaintenanceRequest,
+    maintenanceRef: string,
+    item: ContextDeliveryItem,
+    startedAt: string,
+    created: boolean,
+  ): BMemoryMaintenanceEvidence {
+    return {
+      maintenance_ref: maintenanceRef,
+      kind: 'context_delivery',
+      status: 'scheduled',
+      task_id: input.task_id,
+      run_id: input.run_id,
+      role_id: input.role_id,
+      buffer_seq: input.buffer_seq,
+      experiences: [],
+      skills: [],
+      warnings: created
+        ? []
+        : ['Context was already delivered under the same key; the existing delivery was kept.'],
+      context_delivery: {
+        delivery_id: item.delivery_id,
+        delivery_key: item.delivery_key,
+        memory_buffer_ref: item.memory_buffer_ref,
+        ...(item.context_snapshot_ref !== undefined
+          ? { context_snapshot_ref: item.context_snapshot_ref }
+          : {}),
+      },
+      created_at: startedAt,
+      completed_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    };
+  }
+
+  /**
+   * 记录 Driver 的使用反馈到 durable outbox（生产与实验都走这里）。
+   *
+   * 与提取解耦：不要求经验已存在，也不在本进程改置信度；下游系统上线后按
+   * `feedback_id` 归并。重复提交同一份 DriverReturn 命中幂等键，只留一条。
+   */
+  async recordDriverUsageFeedback(
+    input: BDriverFeedbackRequest,
+  ): Promise<DriverFeedbackRecord[]> {
+    const outbox = this.options.deliveryRepository;
+    if (!outbox) return [];
+    const records = buildDriverUsageFeedbackRecords({
+      role_id: input.role_id,
+      task_id: input.task_id,
+      ...(input.buffer_seq !== undefined ? { buffer_seq: input.buffer_seq } : {}),
+      references: input.references,
+    });
+    const stored: DriverFeedbackRecord[] = [];
+    for (const record of records) {
+      const submitted = await outbox.submitDriverFeedback(record);
+      stored.push(submitted.item);
+    }
+    return stored;
+  }
+
+  private async scheduleEmulatedExtraction(
     input: BMemoryMaintenanceRequest,
     maintenanceRef: string,
   ): Promise<BMemoryMaintenanceEvidence> {
@@ -171,6 +424,13 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     return scheduled;
   }
 
+  /**
+   * 在本进程内跑一次提取 +（B2/B3 的）晋升 —— **实验专用路径**。
+   *
+   * 它模拟的是外部 Memory Maintenance 系统本来会做的事；生产运行不经过这里
+   * （生产只提交交付项，见 submitContextDelivery）。消融测试直接调用它，
+   * 以「标签驱动 + 显式调用」两种方式说明自己走的是实验路径。
+   */
   async processBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence> {
     const maintenanceRef = extractionRef(input);
     const existing = await this.options.evidenceStore.get(maintenanceRef);
@@ -438,6 +698,12 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     }
   }
 
+  /**
+   * 启动恢复：为每一条 pending Buffer 补交一次上下文交付。
+   *
+   * 不跑提取（生产路径本来就不跑）；因为交付键稳定，重启重放只会补齐缺失的
+   * 交付项，不会产生第二份。
+   */
   async replayPending(): Promise<BMemoryMaintenanceEvidence[]> {
     const results: BMemoryMaintenanceEvidence[] = [];
     const roleIds = (await this.options.repository.listAgentIds()).sort(compareCodeUnits);

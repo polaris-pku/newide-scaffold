@@ -377,6 +377,9 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           schema_version: SCHEMA_VERSION,
         };
       },
+      async recordDriverUsageFeedback() {
+        return [];
+      },
     };
     const { facade } = createFacade(
       new CapturingDriver('succeeded'),
@@ -421,6 +424,9 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           completed_at: '2026-07-21T00:00:01.000Z',
           schema_version: SCHEMA_VERSION,
         };
+      },
+      async recordDriverUsageFeedback() {
+        return [];
       },
     };
     // 第一轮：query_memory；第二轮：invoke_driver；第三轮：完成

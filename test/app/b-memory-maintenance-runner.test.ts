@@ -673,6 +673,10 @@ async function fixture(
     bufferRepository,
     llm,
     evidenceStore,
+    // 本文件测的是**实验路径**：本进程内模拟下游 Memory Maintenance 的提取与晋升。
+    // 生产路径只提交交付项（见 memory-delivery-contract.test.ts），所以这里必须
+    // 显式打开模拟，而不是依赖默认值。
+    mode: 'in_process_emulation',
     ...(extractor ? { extractor } : {}),
     ...(extra?.runsRoot ? { runsRoot: extra.runsRoot } : {}),
     ...(extra?.promotion ? { promotion: extra.promotion } : {}),

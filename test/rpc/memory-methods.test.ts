@@ -425,13 +425,18 @@ function reindexEvidence() {
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
     getMemoryCapabilities: () => ({
-      schema_version: 'newide.b-memory-capabilities.v2',
+      schema_version: 'newide.b-memory-capabilities.v3',
       skill_review: { mode: 'manual' },
       embedding: {
         provider: 'test',
         model: 'test-embedding',
         dimensions: 4,
         readiness: 'verified',
+      },
+      memory_maintenance: {
+        ownership: 'external',
+        context_delivery: { status: 'available' },
+        driver_feedback_outbox: { status: 'available' },
       },
       operations: {
         list_agents: { status: 'available' },
@@ -449,6 +454,9 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         get_buffer_state: { status: 'available' },
         get_pending_buffer: { status: 'available' },
         retry_extraction: { status: 'available' },
+        list_context_deliveries: { status: 'available' },
+        get_context_delivery: { status: 'available' },
+        list_driver_feedback: { status: 'available' },
         search_memory: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
@@ -577,6 +585,12 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     } as never),
     getMemoryPendingBuffer: async () => ({ snapshot: { task_id: 'task_001' } } as never),
     retryMemoryExtraction: async () => maintenance(),
+    listMemoryContextDeliveries: async () => [contextDelivery()],
+    getMemoryContextDelivery: async () => ({
+      delivery: contextDelivery(),
+      payload_available: true,
+    }),
+    listMemoryDriverFeedback: async () => [driverFeedback()],
     searchAgentMemory: async () => ({
       skills: [{ id: 'skill_1', similarity: 0.82 } as never],
       experiences: [{ id: 'experience_1', similarity: 0.71 } as never],
@@ -607,6 +621,44 @@ function maintenance() {
     created_at: '2026-07-21T00:00:00.000Z',
     completed_at: '2026-07-21T00:00:01.000Z',
     schema_version: 'v0',
+  };
+}
+
+function contextDelivery() {
+  return {
+    delivery_id: 'ctxdel_1',
+    delivery_key: 'role_ts_engineer:1:context-delivery.v1',
+    role_id: 'role_ts_engineer',
+    task_id: 'task_1',
+    buffer_seq: 1,
+    memory_buffer_ref: 'role_ts_engineer:1',
+    report_ref: 'report_1.json',
+    context_snapshot_ref: 'context_1.json',
+    source_driver: 'acp-external',
+    status: 'pending' as const,
+    schema_version: 'context-delivery.v1',
+    created_at: '2026-07-21T00:00:00.000Z',
+    updated_at: '2026-07-21T00:00:00.000Z',
+  };
+}
+
+function driverFeedback() {
+  return {
+    feedback_id: 'drvfb_1',
+    feedback_key: 'role_ts_engineer:task_1:experience_1:driver_usage:driver-usage.v1',
+    role_id: 'role_ts_engineer',
+    task_id: 'task_1',
+    buffer_seq: 1,
+    experience_id: 'experience_1',
+    applied: true,
+    effectiveness: 'fully_effective' as const,
+    note: 'used it',
+    observed_at: '2026-07-21T00:00:00.000Z',
+    feedback_source: 'driver_usage' as const,
+    event_version: 'driver-usage.v1',
+    status: 'pending' as const,
+    created_at: '2026-07-21T00:00:00.000Z',
+    updated_at: '2026-07-21T00:00:00.000Z',
   };
 }
 

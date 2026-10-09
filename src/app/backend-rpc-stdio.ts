@@ -279,6 +279,7 @@ export async function createProductionBackendService(
       new BMemoryMaintenanceRunner({
         repository: bRuntime.repository,
         bufferRepository: bRuntime.bufferRepository,
+        deliveryRepository: bRuntime.deliveryRepository,
         llm: memoryLlm,
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
@@ -329,6 +330,8 @@ export async function createProductionBackendService(
       resolveDriver: (roleId, runId) => driverRoutingService.resolveForRunRole(runId, roleId).handle,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
+      // 角色创建/删除时一并管理下游交付存储的生命周期
+      deliveryRepository: bRuntime.deliveryRepository,
       // 顶层上下文清理：任务结束时把该次 tool-calling 对话压成 AgentContextSnapshot，
       // 与 DriverReturn 成对落进同一条 Buffer，经验提取才看得到「为什么这么做」。
       // 复用 B 侧那个文本 LLM（与 memoryMaintenance 同一个），失败只是降级不留痕变留痕。
