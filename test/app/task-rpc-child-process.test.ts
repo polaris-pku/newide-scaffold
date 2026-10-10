@@ -1,7 +1,14 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -326,6 +333,79 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     }
   }, 20_000);
 
+  it('keeps the interrupted Run driver mapping when config changes before resume', async () => {
+    const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-driver-resume-runner-'));
+    const homeDir = mkdtempSync(path.join(os.tmpdir(), 'newide-driver-resume-home-'));
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-driver-resume-workspace-'));
+    const holdPath = path.join(runnerDir, 'hold-first-invocation');
+    const enteredPath = path.join(runnerDir, 'first-invocation-entered');
+    const runIds = new Set<string>();
+    const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
+    writeInterruptibleFakeDriver(runnerDir);
+    writeDriverConfig(homeDir, 'claude');
+    writeFileSync(holdPath, 'hold');
+    const firstClient = new RpcChildClient(spawnBackend(runnerDir, { HOME: homeDir }));
+    let resumedClient: RpcChildClient | undefined;
+
+    try {
+      const created = await firstClient.call<TaskSnapshot>('task.create', {
+        spec: 'Preserve the driver mapping across checkpoint resume',
+        completion_criteria: ['The task completes after an explicit resume'],
+        workspace_path: workspace,
+        session_id: 'session_driver_resume',
+      });
+      collectEvidence(created, runIds, marketDirectories);
+      await waitForFile(enteredPath);
+
+      await firstClient.kill();
+      rmSync(holdPath, { force: true });
+      writeDriverConfig(homeDir, 'codex');
+
+      resumedClient = new RpcChildClient(spawnBackend(runnerDir, { HOME: homeDir }));
+      await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
+      const blocked = await resumedClient.call<TaskSnapshot>('task.get', {
+        task_id: created.task.task_id,
+      });
+      expect(blocked.task.status).toBe('blocked');
+      collectEvidence(blocked, runIds, marketDirectories);
+
+      const resumed = await resumedClient.call<TaskSnapshot>('task.resume', {
+        task_id: created.task.task_id,
+      });
+      collectEvidence(resumed, runIds, marketDirectories);
+      const terminal = await waitForTerminalTask(resumedClient, created.task.task_id);
+      collectEvidence(terminal, runIds, marketDirectories);
+      expect(terminal.task.status).toBe('completed');
+
+      const driverIds = readFileSync(path.join(runnerDir, 'drivers.log'), 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+      expect(driverIds.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(driverIds)).toEqual(new Set(['claude']));
+
+      const resumedRunId = terminal.run_history[0]?.run_id;
+      if (!resumedRunId) throw new Error('resumed run id was not persisted');
+      const request = JSON.parse(
+        readFileSync(path.join('.newide', 'runs', resumedRunId, 'request.json'), 'utf8'),
+      ) as { driver_config?: { default_driver?: string } };
+      expect(request.driver_config?.default_driver).toBe('claude');
+    } finally {
+      await firstClient.close();
+      await resumedClient?.close();
+      rmSync(runnerDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+      for (const runId of runIds) {
+        rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+      }
+      for (const directory of marketDirectories) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  }, 20_000);
+
   it('replays a scoped pending Mailbox delivery across restarts', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-mailbox-rpc-runner-'));
     writeFakeDriver(runnerDir);
@@ -466,7 +546,10 @@ class RpcChildClient {
   }
 }
 
-function spawnBackend(runnerDir: string): ChildProcessWithoutNullStreams {
+function spawnBackend(
+  runnerDir: string,
+  environment: Record<string, string> = {},
+): ChildProcessWithoutNullStreams {
   return spawn(
     process.execPath,
     ['--import', 'tsx', path.join(process.cwd(), 'test/fixtures/task-rpc-server.ts')],
@@ -477,6 +560,7 @@ function spawnBackend(runnerDir: string): ChildProcessWithoutNullStreams {
         ACP_DRIVER_RUNNER_DIR: runnerDir,
         NEWIDE_COORDINATION_DB: path.join(runnerDir, 'coordination.sqlite'),
         NEWIDE_B_APP_STATE_ROOT: path.join(runnerDir, 'b-state'),
+        ...environment,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     },
@@ -601,6 +685,7 @@ process.stdin.on('data', chunk => body += chunk);
 process.stdin.on('end', () => {
   const input = JSON.parse(body);
   appendFileSync(new URL('./sessions.log', import.meta.url), String(input.session_id || '') + '\\n');
+  appendFileSync(new URL('./drivers.log', import.meta.url), String(process.env.ACP_AGENT_ID || '') + '\\n');
   const complete = () => {
     const created_at = new Date().toISOString();
     const suffix = createHash('sha256').update(JSON.stringify([input.task_id, input.prompt, input.session_id])).digest('hex').slice(0, 16);
@@ -621,4 +706,22 @@ process.stdout.on('error', () => process.exit(0));
 `,
   );
   writeFakeAcpRunnerBuild(runnerDir, { importFromRunnerRoot: 'fake.mjs' });
+}
+
+function writeDriverConfig(homeDir: string, defaultDriver: 'claude' | 'codex'): void {
+  const agentDir = path.join(homeDir, '.agent');
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(
+    path.join(agentDir, 'drivers.yaml'),
+    [
+      'version: 1',
+      `default_driver: ${defaultDriver}`,
+      'drivers:',
+      '  claude:',
+      '    agent: claude',
+      '  codex:',
+      '    agent: codex',
+      '',
+    ].join('\n'),
+  );
 }

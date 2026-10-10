@@ -752,6 +752,23 @@ describe('cross-process revision protection', () => {
     expect(serviceB.resolveForRunRole('run_later', 'reviewer').driver_id).toBe('codex');
   });
 
+  it('rehydrates a persisted routing snapshot for a checkpoint-resume Run', () => {
+    const projectRoot = makeTempDir();
+    writeProject(projectRoot);
+    const service = createService({ projectRoot });
+    const persisted = {
+      default_driver: 'claude',
+      drivers: { claude: 'claude', codex: 'codex' },
+      roles: { reviewer: 'codex' },
+    };
+
+    const frozen = service.freezeForRunSnapshot('run_resumed', persisted);
+
+    expect(frozen).toEqual(persisted);
+    expect(service.resolveForRunRole('run_resumed', 'reviewer').driver_id).toBe('codex');
+    expect(service.resolveForRunRole('run_resumed', 'proposer').driver_id).toBe('claude');
+  });
+
   it('releases the lock so consecutive writers can proceed', async () => {
     const projectRoot = makeTempDir();
     writeProject(projectRoot);
