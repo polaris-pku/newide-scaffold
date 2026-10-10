@@ -10,13 +10,21 @@ import {
   type ChangesetManifest,
 } from '../coordinator/changeset-manifest';
 import { buildDriverRunResultFromAgentExecution } from '../coordinator/agent-execution-driver-result';
-import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles } from '../coordinator/workspace-change-detector';
+import {
+  collectWorkspaceArtifacts,
+  mergeArtifacts,
+  snapshotWorkspaceFiles,
+} from '../coordinator/workspace-change-detector';
 import { buildRunOutputPaths } from '../coordinator/run-result';
 import { DeliverArtifactHandler } from '../coordinator/handlers/deliver-artifact-handler';
 import {
   evaluateCompletionCriteria,
   type CompletionCriteriaEvaluation,
 } from '../coordinator/completion-criteria-evaluator';
+import {
+  PLAN_SELF_CHECK_REQUIREMENT,
+  PLAN_STEP_LIST_REQUIREMENT,
+} from '../coordinator/plan-check';
 import {
   isMaterializableFileArtifact,
   readArtifactBytes,
@@ -910,7 +918,11 @@ async function executeFinalCouncilPlan(input: {
   dependencies: ProductionStageExecutorDependencies;
   councilRunId: string;
   phaseId: string;
-}): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[]; failed_attempts: number }> {
+}): Promise<{
+  result: AgentExecutionResult;
+  artifact_refs: ArtifactRef[];
+  failed_attempts: number;
+}> {
   const workspace = path.join(
     councilRunWorkspaceRoot(
       input.dependencies.councilRoot,
@@ -956,16 +968,18 @@ async function executeFinalCouncilPlan(input: {
     'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
     'Use paths relative to the current workspace for every product file; never construct an absolute path.',
     'Do not stop after rewriting or summarizing the Plan; produce the concrete implementation artifacts.',
+    ...PLAN_SELF_CHECK_REQUIREMENT,
     `Original Task: ${input.context.task_request.spec}`,
   ].join('\n');
-  const runImplementation = async (attempt: 1 | 2) => {
+  const runImplementation = async (
+    attempt: 1 | 2,
+    steer?: string,
+    recovery?: 'same_session_continuation',
+  ) => {
     const retryInstruction =
-      attempt === 1
+      attempt === 1 || !steer
         ? implementationInstruction
-        : [
-            implementationInstruction,
-            'RETRY: Resume this same Plan execution after a recoverable runtime interruption. Inspect the existing workspace, preserve completed work, and finish the remaining implementation.',
-          ].join('\n\n');
+        : [implementationInstruction, steer].join('\n\n');
     emit(input.context, 'agent.execution_requested', input.context.run_id, {
       phase: 'council_plan_execution',
       phase_id: phaseId,
@@ -974,7 +988,9 @@ async function executeFinalCouncilPlan(input: {
       session_id: input.primary.session_id,
       workspace_path: workspace,
       final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
-      ...(attempt === 2 ? { recovery: 'single_agent_continuation' } : {}),
+      // 原因如实透出：与 council.phase.started 的 recovery 必须一致，
+      // 否则同一件事在两个事件里给出两个说法。
+      ...(attempt === 2 && recovery ? { recovery } : {}),
     });
     return input.dependencies.agentExecutionFacade.runAgent(
       {
@@ -1002,16 +1018,19 @@ async function executeFinalCouncilPlan(input: {
   };
   let result = await runImplementation(1);
   let implementationArtifacts = implementationArtifactsFrom(result);
+  // 唯一的打回原因是运行时中断/可重试驱动失败。Plan 自检报告不参与判定，
+  // 因此它不会触发重试、也不会改变 run 结果（见 plan-check.ts）。
   if (shouldResumeFinalCouncilPlan(result, implementationArtifacts)) {
     recordFailure(result, 1, true);
     phaseId = createId('council_phase');
     emit(input.context, 'council.phase.started', phaseId, {
       council_run_id: input.councilRunId, phase_id: phaseId, phase: 'implementation', attempt: 2,
       agent_id: input.primary.agent_id ?? input.primary.role_id,
-      session_id: input.primary.session_id, recovery: 'same_session_continuation',
+      session_id: input.primary.session_id,
+      recovery: 'same_session_continuation',
       input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
     });
-    result = await runImplementation(2);
+    result = await runImplementation(2, PLAN_EXECUTION_INTERRUPTION_STEER, 'same_session_continuation');
     if (result.status === 'completed') {
       result = {
         ...result,
@@ -1061,8 +1080,16 @@ async function executeFinalCouncilPlan(input: {
     ),
     response: result.response,
   });
-  return { result, artifact_refs: implementationArtifacts, failed_attempts: failedAttempts };
+  return {
+    result,
+    artifact_refs: implementationArtifacts,
+    failed_attempts: failedAttempts,
+  };
 }
+
+/** 运行时中断的打回指令；同一次实现最多重试一次。 */
+const PLAN_EXECUTION_INTERRUPTION_STEER =
+  'RETRY: Resume this same Plan execution after a recoverable runtime interruption. Inspect the existing workspace, preserve completed work, and finish the remaining implementation.';
 
 function implementationArtifactsFrom(result: AgentExecutionResult): ArtifactRef[] {
   return result.artifact_refs.filter(
@@ -1174,6 +1201,7 @@ function agentExecutionInstruction(
       'Use your Persona, Skills, and Memory, but do not modify product files or implement the solution yet.',
       'Write the complete Plan to the relative path council-plan.md in the current workspace; never construct an absolute path.',
       'Include affected files, ordered steps, risks, and verification.',
+      ...PLAN_STEP_LIST_REQUIREMENT,
       `Original Task: ${context.task_request.spec}`,
     ].join('\n');
   }

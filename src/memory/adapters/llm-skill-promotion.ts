@@ -123,10 +123,9 @@ export class LlmSkillPromotion {
       const parsed = parseLlmResponse(raw);
 
       const now = nowTimestamp();
-      const skillId = randomUUID();
 
       const skill = {
-        id: skillId,
+        id: randomUUID(),
         description: parsed.description,
         description_embedding: candidate.description_embedding,
         content: parsed.content,
@@ -141,19 +140,23 @@ export class LlmSkillPromotion {
         updated_at: now,
       };
 
-      await memory.saveSkill(skill);
-      await memory.updateExperience({ ...candidate, promoted_to: skillId });
+      // 与 ruleBasedSkillPromotion 共用同一幂等键 (role_id, promoted_from)：晋升第二步
+      // （回写 Experience.promoted_to）失败后整条重试时复用已有 Skill，不新建重复技能。
+      const { skill: stored, created } = await memory.saveSkillIfAbsent(skill);
+      await memory.updateExperience({ ...candidate, promoted_to: stored.id });
 
       return {
         check: {
           eligible: true,
           auto_approved: false,
           reasons: [
-            `Experience "${candidate.description}" promoted via LLM refinement, confidence ${candidate.confidence}`,
+            created
+              ? `Experience "${candidate.description}" promoted via LLM refinement, confidence ${candidate.confidence}`
+              : `Experience "${candidate.description}" already had Skill ${stored.id}; reused it instead of creating a duplicate.`,
           ],
           blocking_rules: [],
         },
-        skill,
+        skill: stored,
       };
     } catch {
       const fallbackOptions: RuleBasedPromotionOptions = {

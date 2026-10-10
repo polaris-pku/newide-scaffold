@@ -425,13 +425,24 @@ function reindexEvidence() {
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
     getMemoryCapabilities: () => ({
-      schema_version: 'newide.b-memory-capabilities.v2',
+      schema_version: 'newide.b-memory-capabilities.v4',
       skill_review: { mode: 'manual' },
       embedding: {
         provider: 'test',
         model: 'test-embedding',
         dimensions: 4,
         readiness: 'verified',
+      },
+      memory_maintenance: {
+        ownership: 'external',
+        context_delivery: { status: 'available' },
+        driver_feedback_outbox: { status: 'available' },
+        claim: {
+          status: 'available',
+          isolation: 'process_mutex',
+          lease_ms: 60000,
+          max_attempts: 3,
+        },
       },
       operations: {
         list_agents: { status: 'available' },
@@ -449,6 +460,15 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         get_buffer_state: { status: 'available' },
         get_pending_buffer: { status: 'available' },
         retry_extraction: { status: 'available' },
+        list_context_deliveries: { status: 'available' },
+        get_context_delivery: { status: 'available' },
+        list_driver_feedback: { status: 'available' },
+        claim_delivery: { status: 'available' },
+        renew_delivery_claim: { status: 'available' },
+        ack_delivery: { status: 'available' },
+        retry_delivery: { status: 'available' },
+        restore_expired_deliveries: { status: 'available' },
+        list_retryable_deliveries: { status: 'available' },
         search_memory: { status: 'available' },
         market_search: { status: 'available' },
         market_import: { status: 'available' },
@@ -577,6 +597,32 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     } as never),
     getMemoryPendingBuffer: async () => ({ snapshot: { task_id: 'task_001' } } as never),
     retryMemoryExtraction: async () => maintenance(),
+    listMemoryContextDeliveries: async () => [contextDelivery()],
+    getMemoryContextDelivery: async () => ({
+      delivery: contextDelivery(),
+      payload_available: true,
+    }),
+    listMemoryDriverFeedback: async () => [driverFeedback()],
+    // 交付 claim 系列不在本文件覆盖（见 test/app/memory-delivery-claim-service.test.ts）；
+    // 这里保留显式占位，避免调用方以为它们已经接好
+    claimMemoryDelivery: async () => {
+      throw new Error('delivery claim is not wired in this test');
+    },
+    renewMemoryDeliveryClaim: async () => {
+      throw new Error('delivery claim renewal is not wired in this test');
+    },
+    ackMemoryDelivery: async () => {
+      throw new Error('delivery acknowledgement is not wired in this test');
+    },
+    retryMemoryDelivery: async () => {
+      throw new Error('delivery retry is not wired in this test');
+    },
+    restoreExpiredMemoryDeliveries: async () => {
+      throw new Error('expired delivery recovery is not wired in this test');
+    },
+    listRetryableMemoryDeliveries: async () => {
+      throw new Error('retryable delivery listing is not wired in this test');
+    },
     searchAgentMemory: async () => ({
       skills: [{ id: 'skill_1', similarity: 0.82 } as never],
       experiences: [{ id: 'experience_1', similarity: 0.71 } as never],
@@ -607,6 +653,44 @@ function maintenance() {
     created_at: '2026-07-21T00:00:00.000Z',
     completed_at: '2026-07-21T00:00:01.000Z',
     schema_version: 'v0',
+  };
+}
+
+function contextDelivery() {
+  return {
+    delivery_id: 'ctxdel_1',
+    delivery_key: 'role_ts_engineer:1:context-delivery.v1',
+    role_id: 'role_ts_engineer',
+    task_id: 'task_1',
+    buffer_seq: 1,
+    memory_buffer_ref: 'role_ts_engineer:1',
+    report_ref: 'report_1.json',
+    context_snapshot_ref: 'context_1.json',
+    source_driver: 'acp-external',
+    status: 'pending' as const,
+    schema_version: 'context-delivery.v1',
+    created_at: '2026-07-21T00:00:00.000Z',
+    updated_at: '2026-07-21T00:00:00.000Z',
+  };
+}
+
+function driverFeedback() {
+  return {
+    feedback_id: 'drvfb_1',
+    feedback_key: 'role_ts_engineer:task_1:experience_1:driver_usage:driver-usage.v1',
+    role_id: 'role_ts_engineer',
+    task_id: 'task_1',
+    buffer_seq: 1,
+    experience_id: 'experience_1',
+    applied: true,
+    effectiveness: 'fully_effective' as const,
+    note: 'used it',
+    observed_at: '2026-07-21T00:00:00.000Z',
+    feedback_source: 'driver_usage' as const,
+    event_version: 'driver-usage.v1',
+    status: 'pending' as const,
+    created_at: '2026-07-21T00:00:00.000Z',
+    updated_at: '2026-07-21T00:00:00.000Z',
   };
 }
 

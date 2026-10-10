@@ -1,7 +1,14 @@
 /** memory.* JSON-RPC methods backed by B's public board and application maintenance services. */
 import { z } from 'zod';
 import type { BMemoryMaintenanceEvidence } from '../app/b-memory-maintenance-runner';
-import type { AgentMetaPatch, BMemoryCapabilities } from '../app/b-memory-backend-service';
+import type {
+  AgentMetaPatch,
+  AckDeliveryPayload,
+  BMemoryCapabilities,
+  ContextDeliveryPayload,
+  DeliveryRecordPayload,
+  DeliveryStateSummary,
+} from '../app/b-memory-backend-service';
 import type { ReviewedSkill } from '../app/b-public-capabilities';
 import type {
   AgentBoardAgentView,
@@ -27,9 +34,16 @@ import type {
   UserRatingResult,
   MemoryOverview,
   DeadLetterEntry,
+  ContextDeliveryFilter,
+  DriverFeedbackFilter,
+  DeliveryChannel,
+  DeliveryClaimRequest,
+  DeliveryRecordLocator,
+  PendingBufferRead,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
-import type { AgentContextSnapshot, BufferMeta, BufferSnapshot } from '../memory/schemas';
+import { DeliveryStatusSchema } from '../memory/schemas';
+import type { BufferMeta, ContextDeliveryItem, DriverFeedbackRecord } from '../memory/schemas';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 
@@ -90,20 +104,63 @@ export interface MemoryMethodsService {
     rating: UserRating,
     note?: string,
   ): Promise<UserRatingResult>;
-  /** Buffer 状态总览（memory.getBufferState）；含死信详情（失败原因） */
+  /** Buffer 状态总览（memory.getBufferState）；含死信详情（失败原因）与交付视图 */
   getMemoryBufferState(roleId: string): Promise<{
     meta: BufferMeta;
     pending_seqs: number[];
     dead_letter_seqs: number[];
     dead_letters: DeadLetterEntry[];
+    delivery: DeliveryStateSummary;
   }>;
-  /** 查看 pending 缓冲区（memory.getPendingBuffer） */
-  getMemoryPendingBuffer(
-    roleId: string,
-    seq: number,
-  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined>;
+  /** 查看 pending 缓冲区（memory.getPendingBuffer）；含配对上下文的读取结果 */
+  getMemoryPendingBuffer(roleId: string, seq: number): Promise<PendingBufferRead | undefined>;
   /** 重试提取（memory.retryExtraction） */
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence>;
+  /**
+   * 下游交付：列出已提交的上下文交付项（memory.listContextDeliveries）。
+   * 下游系统的「有哪些活要干」入口。
+   */
+  listMemoryContextDeliveries(filter?: ContextDeliveryFilter): Promise<ContextDeliveryItem[]>;
+  /** 下游交付：按 id 取回完整 DriverReturn + AgentContextSnapshot（memory.getContextDelivery） */
+  getMemoryContextDelivery(
+    roleId: string,
+    deliveryId: string,
+  ): Promise<ContextDeliveryPayload | undefined>;
+  /** 下游 feedback outbox：列出 Driver 使用反馈（memory.listDriverFeedback） */
+  listMemoryDriverFeedback(filter?: DriverFeedbackFilter): Promise<DriverFeedbackRecord[]>;
+  /**
+   * 下游交付：claim 一条待投递项（memory.claimDelivery）。
+   * 给 id 就 claim 那一条，否则 claim 当前最该投递的一条；拿不到返回 undefined。
+   */
+  claimMemoryDelivery(
+    input: DeliveryClaimRequest & { id?: string | undefined },
+  ): Promise<DeliveryRecordPayload | undefined>;
+  /** 下游交付：延长自己持有的 lease（memory.renewDeliveryClaim） */
+  renewMemoryDeliveryClaim(
+    input: DeliveryRecordLocator & { owner: string; lease_ms?: number | undefined },
+  ): Promise<DeliveryRecordPayload | undefined>;
+  /** 下游交付：ack 一次交付（memory.ackDelivery）；context 通道附带源 Buffer 归档结果 */
+  ackMemoryDelivery(
+    input: DeliveryRecordLocator & {
+      owner?: string | undefined;
+      outcome: 'processed' | 'failed';
+      error?: string | undefined;
+      retryable?: boolean | undefined;
+      processor_version?: string | undefined;
+    },
+  ): Promise<AckDeliveryPayload | undefined>;
+  /** 下游交付：把 dead_letter 的人工放回 pending（memory.retryDelivery） */
+  retryMemoryDelivery(input: DeliveryRecordLocator): Promise<DeliveryRecordPayload | undefined>;
+  /** 下游交付：恢复 lease 过期的 processing（memory.restoreExpiredDeliveries） */
+  restoreExpiredMemoryDeliveries(options?: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  }): Promise<DeliveryRecordPayload[]>;
+  /** 下游交付：列出当前可投递的记录（memory.listRetryableDeliveries） */
+  listRetryableMemoryDeliveries(options?: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  }): Promise<DeliveryRecordPayload[]>;
   /** 单 Agent 内文本检索（memory.searchMemory）；召回项附相似度分数 */
   searchAgentMemory(
     roleId: string,
@@ -333,6 +390,75 @@ const bufferSeqParamsSchema = z
   .object({
     role_id: z.string().trim().min(1),
     seq: z.number().int().positive(),
+  })
+  .strict();
+const contextDeliveryFilterParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1).optional(),
+    task_id: z.string().trim().min(1).optional(),
+    status: DeliveryStatusSchema.optional(),
+  })
+  .strict();
+const contextDeliveryParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    delivery_id: z.string().trim().min(1),
+  })
+  .strict();
+const driverFeedbackFilterParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1).optional(),
+    task_id: z.string().trim().min(1).optional(),
+    experience_id: z.string().trim().min(1).optional(),
+    status: DeliveryStatusSchema.optional(),
+  })
+  .strict();
+const deliveryChannelSchema = z.enum(['context', 'feedback']);
+const deliveryScopeParamsSchema = z
+  .object({
+    channel: deliveryChannelSchema.optional(),
+    role_id: z.string().trim().min(1).optional(),
+  })
+  .strict();
+const claimDeliveryParamsSchema = z
+  .object({
+    channel: deliveryChannelSchema,
+    owner: z.string().trim().min(1),
+    /** 缺省用实现自己的 lease 时长（见 capabilities.memory_maintenance.claim） */
+    lease_ms: z.number().int().positive().optional(),
+    /** 给 id 就 claim 这一条；否则 claim 下一条到期的 */
+    id: z.string().trim().min(1).optional(),
+    role_id: z.string().trim().min(1).optional(),
+  })
+  .strict();
+const renewDeliveryClaimParamsSchema = z
+  .object({
+    channel: deliveryChannelSchema,
+    role_id: z.string().trim().min(1),
+    id: z.string().trim().min(1),
+    owner: z.string().trim().min(1),
+    lease_ms: z.number().int().positive().optional(),
+  })
+  .strict();
+const ackDeliveryParamsSchema = z
+  .object({
+    channel: deliveryChannelSchema,
+    role_id: z.string().trim().min(1),
+    id: z.string().trim().min(1),
+    owner: z.string().trim().min(1).optional(),
+    outcome: z.enum(['processed', 'failed']),
+    /** outcome='failed' 时的失败原因 */
+    error: z.string().trim().min(1).optional(),
+    /** 该失败能不能靠重投解决；缺省按不可重试（直接 dead_letter） */
+    retryable: z.boolean().optional(),
+    processor_version: z.string().trim().min(1).optional(),
+  })
+  .strict();
+const retryDeliveryParamsSchema = z
+  .object({
+    channel: deliveryChannelSchema,
+    role_id: z.string().trim().min(1),
+    id: z.string().trim().min(1),
   })
   .strict();
 const taskIdParamsSchema = z
@@ -620,6 +746,54 @@ export class MemoryRpcMethods {
       const parsed = parseParams(bufferSeqParamsSchema, params);
       const maintenance = await this.service.retryMemoryExtraction(parsed.role_id, parsed.seq);
       return { maintenance };
+    });
+    dispatcher.register('memory.listContextDeliveries', async (params) => {
+      const parsed = parseParams(contextDeliveryFilterParamsSchema, params ?? {});
+      const deliveries = await this.service.listMemoryContextDeliveries(parsed);
+      return { deliveries };
+    });
+    dispatcher.register('memory.getContextDelivery', async (params) => {
+      const parsed = parseParams(contextDeliveryParamsSchema, params);
+      const payload = await this.service.getMemoryContextDelivery(
+        parsed.role_id,
+        parsed.delivery_id,
+      );
+      return { payload };
+    });
+    dispatcher.register('memory.listDriverFeedback', async (params) => {
+      const parsed = parseParams(driverFeedbackFilterParamsSchema, params ?? {});
+      const feedback = await this.service.listMemoryDriverFeedback(parsed);
+      return { feedback };
+    });
+    dispatcher.register('memory.claimDelivery', async (params) => {
+      const parsed = parseParams(claimDeliveryParamsSchema, params);
+      const delivery = await this.service.claimMemoryDelivery(parsed);
+      return { delivery: delivery ?? null };
+    });
+    dispatcher.register('memory.renewDeliveryClaim', async (params) => {
+      const parsed = parseParams(renewDeliveryClaimParamsSchema, params);
+      const delivery = await this.service.renewMemoryDeliveryClaim(parsed);
+      return { delivery: delivery ?? null };
+    });
+    dispatcher.register('memory.ackDelivery', async (params) => {
+      const parsed = parseParams(ackDeliveryParamsSchema, params);
+      const delivery = await this.service.ackMemoryDelivery(parsed);
+      return { delivery: delivery ?? null };
+    });
+    dispatcher.register('memory.retryDelivery', async (params) => {
+      const parsed = parseParams(retryDeliveryParamsSchema, params);
+      const delivery = await this.service.retryMemoryDelivery(parsed);
+      return { delivery: delivery ?? null };
+    });
+    dispatcher.register('memory.restoreExpiredDeliveries', async (params) => {
+      const parsed = parseParams(deliveryScopeParamsSchema, params ?? {});
+      const restored = await this.service.restoreExpiredMemoryDeliveries(parsed);
+      return { restored };
+    });
+    dispatcher.register('memory.listRetryableDeliveries', async (params) => {
+      const parsed = parseParams(deliveryScopeParamsSchema, params ?? {});
+      const deliveries = await this.service.listRetryableMemoryDeliveries(parsed);
+      return { deliveries };
     });
     dispatcher.register('memory.reindex', async (params) => {
       const parsed = parseParams(reindexParamsSchema, params ?? {});

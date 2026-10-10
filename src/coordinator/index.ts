@@ -7,3 +7,4 @@ export * from './orchestrator';
 export * from './artifact-finalizer';
 export * from './worktree-materializer';
 export * from './integration-v0-flow';
+export * from './plan-check';

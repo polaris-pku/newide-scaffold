@@ -19,6 +19,7 @@ import type {
 } from '../../src/driver';
 import {
   InMemoryBufferRepository,
+  InMemoryMemoryDeliveryRepository,
   InMemoryRepository,
   type EmbeddingProvider,
   type LlmClient,
@@ -44,8 +45,13 @@ describe('B memory evolution end to end', () => {
     const maintenance = new BMemoryMaintenanceRunner({
       repository,
       bufferRepository,
+      deliveryRepository: new InMemoryMemoryDeliveryRepository(),
       llm: extractionLlm(),
       evidenceStore: new FileBMemoryMaintenanceEvidenceStore(path.join(root, 'maintenance')),
+      // 实验路径：本进程内模拟下游 Memory Maintenance，让记忆真的演化。
+      // 在线任务路径只交付上下文；加工由脚手架显式调用 processBuffer 触发
+      // （见 consumePendingAsMaintenance），生产路径见 memory-delivery-contract.test.ts。
+      mode: 'in_process_emulation',
     });
     const facade = new DriverRuntimeAgentExecutionFacade({
       driver,
@@ -57,8 +63,10 @@ describe('B memory evolution end to end', () => {
     });
 
     await facade.runAgent(request('task_001', 'Capture a reusable architecture lesson.'));
-    await maintenance.waitForIdle();
-    const firstEvidence = await maintenance.listEvidence('role_ts_engineer');
+    await consumePendingAsMaintenance(maintenance, bufferRepository, 'role_ts_engineer');
+    const firstEvidence = (await maintenance.listEvidence('role_ts_engineer')).filter(
+      (item) => item.kind === 'experience_extraction',
+    );
     expect(firstEvidence).toMatchObject([
       {
         kind: 'experience_extraction',
@@ -74,7 +82,7 @@ describe('B memory evolution end to end', () => {
     expect(firstExperienceId).toEqual(expect.any(String));
 
     await facade.runAgent(request('task_002', 'Apply the architecture lesson to the next task.'));
-    await maintenance.waitForIdle();
+    await consumePendingAsMaintenance(maintenance, bufferRepository, 'role_ts_engineer');
 
     const secondContext = parseDriverContext(driver.prompts[1]!.prompt) as {
       experiences: Array<{ id: string; content: string }>;
@@ -99,8 +107,12 @@ describe('B memory evolution end to end', () => {
     const maintenance = new BMemoryMaintenanceRunner({
       repository,
       bufferRepository,
+      deliveryRepository: new InMemoryMemoryDeliveryRepository(),
       llm: extractionLlm(),
       evidenceStore: new FileBMemoryMaintenanceEvidenceStore(path.join(root, 'maintenance')),
+      // 实验路径：本进程内模拟下游 Memory Maintenance，让记忆真的演化。
+      // 加工必须由脚手架显式调用 processBuffer 触发，scheduleBuffer 只登记交付。
+      mode: 'in_process_emulation',
     });
     const facade = new DriverRuntimeAgentExecutionFacade({
       driver,
@@ -112,7 +124,7 @@ describe('B memory evolution end to end', () => {
     });
 
     await facade.runAgent(request('task_promote_001', 'Capture a reusable architecture lesson.'));
-    await maintenance.waitForIdle();
+    await consumePendingAsMaintenance(maintenance, bufferRepository, 'role_ts_engineer');
     const [sourceExperience] = await repository.listExperiences('role_ts_engineer');
     expect(sourceExperience).toMatchObject({
       content: 'Keep B behind public application ports.',
@@ -239,8 +251,30 @@ describe('B memory evolution end to end', () => {
   });
 });
 
-function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {
-  const dispatcher = new JsonRpcDispatcher();
+/**
+ * 由脚手架扮演下游 Memory Maintenance 系统：对每条 pending Buffer 显式调用 processBuffer。
+ *
+ * 在线任务路径（facade → scheduleBuffer）只登记交付项，不会提取；加工必须显式触发。
+ */
+async function consumePendingAsMaintenance(
+  runner: BMemoryMaintenanceRunner,
+  bufferRepository: InMemoryBufferRepository,
+  roleId: string,
+): Promise<void> {
+  const seqs = await bufferRepository.listPendingBufferSeqs(roleId);
+  for (const seq of seqs) {
+    const pending = await bufferRepository.getPendingBuffer(roleId, seq);
+    await runner.processBuffer({
+      task_id: pending?.snapshot.source_task_id ?? `${roleId}:${String(seq)}`,
+      run_id: `maintenance:${roleId}:${String(seq)}`,
+      role_id: roleId,
+      buffer_seq: seq,
+    });
+  }
+  await runner.waitForIdle();
+}
+
+function memoryDispatcher(service: BMemoryBackendService): JsonRpcDispatcher {  const dispatcher = new JsonRpcDispatcher();
   new MemoryRpcMethods({
     getMemoryCapabilities: () => service.getCapabilities(),
     listMemoryAgents: () => service.listAgents(),

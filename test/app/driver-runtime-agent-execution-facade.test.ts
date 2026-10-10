@@ -23,11 +23,12 @@ import {
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
+  type AgentContextCleaner,
   type CallJournalEvent,
   type CallJournalPort,
   type ToolCallingClient,
 } from '../../src/memory';
-import type { ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
+import type { AgentContextSnapshot, ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
 import {
   MailboxDeliveryWorker,
   PersistentMailboxService,
@@ -376,6 +377,9 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           schema_version: SCHEMA_VERSION,
         };
       },
+      async recordDriverUsageFeedback() {
+        return [];
+      },
     };
     const { facade } = createFacade(
       new CapturingDriver('succeeded'),
@@ -401,6 +405,50 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
   });
 
+  /**
+   * Driver 自报了引用，但本进程没有 outbox：这是配置错误，不是「这次没有反馈」。
+   * 任务照旧完成（下游的事不该把任务判失败），但现场必须留一条能看见的原因——
+   * 否则这条数据是被悄悄丢掉的，事后无从追查。
+   */
+  it('没有 outbox 时丢下的 Driver feedback 会在 diagnostics 里留痕', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-feedback-missing-'));
+    const taskId = 'task_feedback_missing';
+    // 驱动侧报告文件是 DriverReturn 的一手来源：用它把「引用了哪条经验」喂进链路
+    await fs.writeFile(
+      path.join(workspace, `${taskId}_report.txt`),
+      JSON.stringify({
+        summary: 'Applied a remembered rule while implementing the change.',
+        artifacts: [],
+        decisions: [],
+        blockers: [],
+        referenced_experiences: [
+          {
+            experience_id: 'exp_elsewhere',
+            applied: true,
+            effectiveness: 'fully_effective',
+            note: 'saved a round of rework',
+          },
+        ],
+        assumptions: [],
+      }),
+      'utf8',
+    );
+
+    try {
+      // 不注入 memoryMaintenance：本进程根本没有反馈 outbox
+      const { facade } = createFacade(new CapturingDriver('succeeded'));
+      const result = await facade.runAgent(request(taskId, 'role_primary', workspace));
+
+      expect(result.status).toBe('completed');
+      // 一条都没写进去 + 明确的原因：0 不是「本次没有引用」的 0，而是「报了却没落盘」
+      expect(result.diagnostics.driver_feedback_recorded).toBe(0);
+      expect(String(result.diagnostics.driver_feedback_error)).toContain('not configured');
+      expect(result.diagnostics.driver_feedback_ids).toBeUndefined();
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('journals memory_query with request identity and forwards workspace to maintenance', async () => {
     const events: CallJournalEvent[] = [];
     const callJournal: CallJournalPort = { record: (event) => void events.push(event) };
@@ -420,6 +468,9 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           completed_at: '2026-07-21T00:00:01.000Z',
           schema_version: SCHEMA_VERSION,
         };
+      },
+      async recordDriverUsageFeedback() {
+        return [];
       },
     };
     // 第一轮：query_memory；第二轮：invoke_driver；第三轮：完成
@@ -482,7 +533,14 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     }
   });
 
-  it('applies memory_ablation B0/B1/B2 to retrieval and maintenance scheduling', async () => {
+  /**
+   * 消融标签只影响**检索**（include_skills / include_recent_experience），不影响生产执行
+   * 路径的处理边界：B0–B4 都要照常把这条 Buffer 登记成交付项交给下游。
+   *
+   * 曾经 `schedule_extraction` 为假（B0/B4）就整个跳过调度——那等于让一个请求字段把生产
+   * 路径的输出掐掉，Buffer 永远留在 pending、下游根本不知道有这条输入。
+   */
+  it('applies memory_ablation B0/B1/B2 to retrieval only — the maintenance boundary is label-independent', async () => {
     const roleId = 'implementer';
     const repository = new InMemoryRepository();
     await repository.initializeAgent({ role_id: roleId, name: roleId });
@@ -503,13 +561,13 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       }),
     );
 
-    const b0Requests: unknown[] = [];
-    const b0Maintenance: BMemoryMaintenancePort = {
+    const scheduled: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
+    const maintenance: BMemoryMaintenancePort = {
       async scheduleBuffer(input) {
-        b0Requests.push(input);
+        scheduled.push(input);
         return {
-          maintenance_ref: 'should_not_run',
-          kind: 'experience_extraction',
+          maintenance_ref: 'context_delivery_maint',
+          kind: 'context_delivery',
           status: 'scheduled',
           task_id: input.task_id,
           run_id: input.run_id,
@@ -524,75 +582,48 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         };
       },
     };
-    const b0 = await new DriverRuntimeAgentExecutionFacade({
-      driver: new CapturingDriver('succeeded'),
-      repository,
-      bufferRepository: new InMemoryBufferRepository(),
-      llm: invokeDriverLlm(),
-      memoryMaintenance: b0Maintenance,
-    }).runAgent({ ...request('task_b0', roleId), memory_ablation: 'B0' });
-    expect(b0.diagnostics.retrieval).toEqual({ experiences: 0, skills: 0 });
-    expect(b0Requests).toHaveLength(0);
-    expect(b0.diagnostics.memory_maintenance).toBeUndefined();
+    const runWithAblation = (taskId: string, ablation: 'B0' | 'B1' | 'B2' | 'B3' | 'B4') =>
+      new DriverRuntimeAgentExecutionFacade({
+        driver: new CapturingDriver('succeeded'),
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+        memoryMaintenance: maintenance,
+      }).runAgent({ ...request(taskId, roleId), memory_ablation: ablation });
 
-    const b1Requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
-    const b1 = await new DriverRuntimeAgentExecutionFacade({
-      driver: new CapturingDriver('succeeded'),
-      repository,
-      bufferRepository: new InMemoryBufferRepository(),
-      llm: invokeDriverLlm(),
-      memoryMaintenance: {
-        async scheduleBuffer(input) {
-          b1Requests.push(input);
-          return {
-            maintenance_ref: 'b1_maint',
-            kind: 'experience_extraction',
-            status: 'scheduled',
-            task_id: input.task_id,
-            run_id: input.run_id,
-            role_id: input.role_id,
-            buffer_seq: input.buffer_seq,
-            experiences: [],
-            skills: [],
-            warnings: [],
-            created_at: '2026-07-21T00:00:00.000Z',
-            completed_at: '2026-07-21T00:00:01.000Z',
-            schema_version: SCHEMA_VERSION,
-          };
-        },
-      },
-    }).runAgent({ ...request('task_b1', roleId), memory_ablation: 'B1' });
+    const b0 = await runWithAblation('task_b0', 'B0');
+    expect(b0.diagnostics.retrieval).toEqual({ experiences: 0, skills: 0 });
+
+    const b1 = await runWithAblation('task_b1', 'B1');
     expect(b1.diagnostics.retrieval).toMatchObject({ skills: 0 });
     expect((b1.diagnostics.retrieval as { experiences: number }).experiences).toBeGreaterThan(0);
-    expect(b1Requests[0]?.memory_ablation).toBe('B1');
 
-    const b2 = await new DriverRuntimeAgentExecutionFacade({
-      driver: new CapturingDriver('succeeded'),
-      repository,
-      bufferRepository: new InMemoryBufferRepository(),
-      llm: invokeDriverLlm(),
-      memoryMaintenance: {
-        async scheduleBuffer(input) {
-          return {
-            maintenance_ref: 'b2_maint',
-            kind: 'experience_extraction',
-            status: 'scheduled',
-            task_id: input.task_id,
-            run_id: input.run_id,
-            role_id: input.role_id,
-            buffer_seq: input.buffer_seq,
-            experiences: [],
-            skills: [],
-            warnings: [],
-            created_at: '2026-07-21T00:00:00.000Z',
-            completed_at: '2026-07-21T00:00:01.000Z',
-            schema_version: SCHEMA_VERSION,
-          };
-        },
-      },
-    }).runAgent({ ...request('task_b2', roleId), memory_ablation: 'B2' });
+    const b2 = await runWithAblation('task_b2', 'B2');
     expect((b2.diagnostics.retrieval as { skills: number }).skills).toBeGreaterThan(0);
     expect((b2.diagnostics.retrieval as { experiences: number }).experiences).toBeGreaterThan(0);
+
+    // B0/B4 曾是最容易被「标签改边界」掐掉的两臂，这里连同 B3 一起钉死：每臂都调度了一次，
+    // 都带了对应标签，返回的都只是交付项。
+    await runWithAblation('task_b3', 'B3');
+    const b4 = await runWithAblation('task_b4', 'B4');
+    expect(b4.diagnostics.retrieval).toMatchObject({ skills: 1, experiences: 1 });
+
+    expect(scheduled.map((input) => input.memory_ablation)).toEqual(['B0', 'B1', 'B2', 'B3', 'B4']);
+    expect(scheduled.map((input) => input.task_id)).toEqual([
+      'task_b0',
+      'task_b1',
+      'task_b2',
+      'task_b3',
+      'task_b4',
+    ]);
+    for (const evidence of [
+      b0.diagnostics.memory_maintenance,
+      b1.diagnostics.memory_maintenance,
+      b2.diagnostics.memory_maintenance,
+      b4.diagnostics.memory_maintenance,
+    ]) {
+      expect(evidence).toMatchObject({ kind: 'context_delivery', status: 'scheduled' });
+    }
   });
 
   it('preserves a completed Agent execution when B maintenance scheduling fails', async () => {
@@ -614,13 +645,45 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(result.status).toBe('completed');
     expect(result.diagnostics.memory_maintenance).toMatchObject({
       maintenance_ref: expect.stringMatching(/^b_maintenance_/),
-      kind: 'experience_extraction',
+      // 生产路径（无消融标签）失败的是「交付」，不是「本进程提取」——报成
+      // experience_extraction 就等于在说任务流程在提取，那是这条边界要拆掉的说法
+      kind: 'context_delivery',
       status: 'failed',
       task_id: 'task_maintenance_failure',
       run_id: 'run_task_maintenance_failure',
       role_id: 'proposer_a',
       buffer_seq: 1,
       error: 'maintenance evidence store unavailable',
+      warnings: ['Memory maintenance could not be scheduled; Agent execution was preserved.'],
+    });
+
+    // 报「哪条路径」看运行时而**不看请求**：给生产 runner 打上消融标签，走的仍然是交付，
+    // 失败的说法也仍然是交付——标签改不动路径，这条边界不能被一个请求字段捅穿。
+    const labelled = await facade.runAgent({
+      ...request('task_maintenance_labelled', 'proposer_a'),
+      memory_ablation: 'B2',
+    });
+    expect(labelled.diagnostics.memory_maintenance).toMatchObject({
+      kind: 'context_delivery',
+      status: 'failed',
+    });
+
+    // 打开进程内模拟的 runner 也一样：在线任务路径只登记交付，这条入口失败的就是交付。
+    // 加工路径（processBuffer）根本不在任务流程里，它的失败不该在这里出现。
+    const emulated = await createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+      new InMemoryRepository(),
+      {
+        async scheduleBuffer() {
+          throw new Error('maintenance evidence store unavailable');
+        },
+      },
+    ).facade.runAgent({ ...request('task_maintenance_emulated', 'proposer_a'), memory_ablation: 'B2' });
+    expect(emulated.diagnostics.memory_maintenance).toMatchObject({
+      kind: 'context_delivery',
+      status: 'failed',
     });
   });
 
@@ -940,6 +1003,82 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         experiences: [storedEligibleExperience],
       });
       expect(persisted.driver_invocation_context).toEqual(prompt);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('pairs the cleaned Agent context with the same memory_buffer_ref the evidence reports', async () => {
+    const roleId = 'context_pairing_role';
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-context-evidence-'));
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: roleId, name: roleId });
+    const buffer = new InMemoryBufferRepository();
+    const cleaner: AgentContextCleaner = {
+      async clean(input) {
+        return {
+          snapshot_id: randomUUID(),
+          source_task_id: input.source_task_id,
+          agent_id: input.agent_id,
+          thinking_trace: 'Considered a second code path, rejected it.',
+          planning_trace: 'Step 1: extend the existing serializer.',
+          driver_calls: input.driver_returns.map((call) => ({
+            call_id: call.call_id,
+            driver_id: call.driver_id,
+            driver_return_ref: 'placeholder.json',
+          })),
+          cleaned_at: nowTimestamp(),
+          original_token_count: 200,
+          cleaned_token_count: 60,
+          compression_ratio: 0.3,
+        } satisfies AgentContextSnapshot;
+      },
+    };
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository,
+      bufferRepository: buffer,
+      llm: invokeDriverLlm(),
+      contextCleaner: cleaner,
+      evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+    });
+
+    try {
+      const result = await facade.runAgent(request('task_context_pairing', roleId));
+
+      // 证据里的引用和真正落盘的那条 Buffer 说的是同一件事
+      const pending = await buffer.getPendingBuffer(roleId, 1);
+      expect(pending?.snapshot.context_snapshot_ref).toBe('1');
+      expect(pending?.agentContext?.source_task_id).toBe('task_context_pairing');
+      expect(pending?.agentContext?.driver_calls.map((call) => call.driver_return_ref)).toEqual([
+        'report_1.json',
+      ]);
+      expect(result.memory_buffer_ref).toBe(`${roleId}:1`);
+      expect(result.diagnostics).not.toHaveProperty('memory_context_warnings');
+
+      const persisted = JSON.parse(
+        await fs.readFile(path.join(root, `${result.context_pack_ref}.json`), 'utf-8'),
+      ) as { memory_buffer_ref: string; context_snapshot_paired: boolean };
+      expect(persisted.memory_buffer_ref).toBe(result.memory_buffer_ref);
+      expect(persisted.context_snapshot_paired).toBe(true);
+
+      // 降级路径：同一个 facade 换个没有清理器的实例，任务照样完成，但证据不再声称成对
+      const degraded = new DriverRuntimeAgentExecutionFacade({
+        driver: new CapturingDriver('succeeded'),
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+        evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+      });
+      const degradedResult = await degraded.runAgent(request('task_context_degraded', roleId));
+      const degradedEvidence = JSON.parse(
+        await fs.readFile(path.join(root, `${degradedResult.context_pack_ref}.json`), 'utf-8'),
+      ) as { context_snapshot_paired: boolean; context_snapshot_warnings?: string[] };
+      expect(degradedEvidence.context_snapshot_paired).toBe(false);
+      expect(String(degradedEvidence.context_snapshot_warnings?.join(' '))).toContain(
+        'AgentContextCleaner',
+      );
+      expect(degradedResult.diagnostics.context_snapshot_paired).toBe(false);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

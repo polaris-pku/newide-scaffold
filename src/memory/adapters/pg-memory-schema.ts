@@ -28,8 +28,18 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
       id UUID PRIMARY KEY,
       role_id TEXT NOT NULL REFERENCES memory_agents(role_id) ON DELETE CASCADE,
       payload JSONB NOT NULL,
-      description_embedding vector(${dimensions}) NOT NULL
+      description_embedding vector(${dimensions}) NOT NULL,
+      promoted_from UUID
     );
+  `);
+
+  // 晋升幂等的锚点：一条经验最多对应一条技能。列与索引都对已存在的库做 IF NOT EXISTS
+  // 迁移（列在 payload JSONB 里也有，这里是把它提升为一等公民好让唯一约束能生效）。
+  await pool.query(`ALTER TABLE memory_skills ADD COLUMN IF NOT EXISTS promoted_from UUID;`);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_skills_promoted_from_uniq
+      ON memory_skills (role_id, promoted_from) WHERE promoted_from IS NOT NULL;
   `);
 
   await pool.query(`
@@ -37,6 +47,9 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
       ON memory_skills (role_id);
   `);
 
+  // 经验的主键 id 就是幂等保存的锚点：两个 memory maintenance worker 同时处理同一条 Buffer
+  // 时，提取出的经验带着同一个稳定 id（见 stableExperienceId），靠这个主键 + ON CONFLICT
+  // DO NOTHING 收敛成一条，而不是靠「先查再插」——后者并发下会各插一次。
   await pool.query(`
     CREATE TABLE IF NOT EXISTS memory_experiences (
       id UUID PRIMARY KEY,

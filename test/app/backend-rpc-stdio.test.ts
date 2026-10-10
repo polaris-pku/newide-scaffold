@@ -23,7 +23,10 @@ import type { NewideBackendService } from '../../src/app/newide-backend-service'
 import type { AppRunEvent } from '../../src/app/run-registry';
 import { TaskProcessor } from '../../src/coordination';
 import {
+  FileBufferRepository,
+  FileMemoryDeliveryRepository,
   InMemoryBufferRepository,
+  InMemoryMemoryDeliveryRepository,
   InMemoryRepository,
   type LlmClient,
   type ToolCallingClient,
@@ -375,6 +378,75 @@ describe('backend RPC stdio entrypoint', () => {
       expect(bRuntime.close).toHaveBeenCalledOnce();
     } finally {
       releaseIdle();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('starts even when an Agent has an unreadable pending Buffer report', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'newide-corrupt-buffer-startup-'));
+    const agentStateRoot = path.join(root, 'agent-state');
+    const repository = new InMemoryRepository();
+    const bufferRepository = new FileBufferRepository({ agentStateRoot });
+    const deliveryRepository = new FileMemoryDeliveryRepository({ agentStateRoot });
+    await repository.initializeAgent({ role_id: 'role_ts_engineer', name: 'TypeScript Engineer' });
+    await bufferRepository.ensureAgent('role_ts_engineer');
+    await deliveryRepository.ensureAgent('role_ts_engineer');
+    await bufferRepository.saveBufferSnapshot('role_ts_engineer', {
+      task_id: 'task_corrupt_startup',
+      task_description: 'A task whose report file got corrupted on disk.',
+      driver_return: {
+        summary: 'Completed.',
+        artifacts: [],
+        decisions: [],
+        blockers: [],
+        referenced_experiences: [],
+        assumptions: [],
+      },
+      source_task_id: 'task_corrupt_startup',
+      source_driver: 'acp-external',
+      received_at: new Date().toISOString(),
+      retry_count: 0,
+      extraction_status: 'pending',
+    });
+    // 上一次进程留下了半截报告：这条读不出来，但它是唯一坏的，不该连坐启动
+    writeFileSync(
+      path.join(agentStateRoot, 'role_ts_engineer', 'buffer', 'pending', 'report_1.json'),
+      '{ not json',
+      'utf8',
+    );
+    const bRuntime: BackendBRuntime = {
+      repository,
+      bufferRepository,
+      deliveryRepository,
+      app_state_root: root,
+      market_agent_ids: ['role_ts_engineer'],
+      embedding_info: { provider: 'test fixture', readiness: 'host_managed' },
+      close: async () => undefined,
+    };
+
+    try {
+      writeFileSync(path.join(root, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(root);
+
+      // readiness 照常通过：坏记录是运维要修的事实，不是后端起不来的理由
+      const service = await createProductionBackendService(
+        { ACP_DRIVER_RUNNER_DIR: root, NEWIDE_COORDINATION_DB: ':memory:' },
+        { bRuntime, agentLlm: invokeDriverLlm() },
+      );
+
+      // 但故障本身留在维护证据里，能看出是哪条 Buffer、为什么
+      await expect(service.listMemoryMaintenance('role_ts_engineer')).resolves.toEqual([
+        expect.objectContaining({
+          kind: 'context_delivery',
+          status: 'failed',
+          role_id: 'role_ts_engineer',
+          buffer_seq: 1,
+          error: expect.stringContaining('Unreadable buffer report'),
+        }),
+      ]);
+
+      await service.close();
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -953,6 +1025,7 @@ function createInMemoryBRuntime(close = async () => undefined): BackendBRuntime 
   return {
     repository: new InMemoryRepository(),
     bufferRepository: new InMemoryBufferRepository(),
+    deliveryRepository: new InMemoryMemoryDeliveryRepository(),
     app_state_root: path.join(process.cwd(), '.newide'),
     market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
     close,

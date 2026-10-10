@@ -3,12 +3,14 @@ import { Pool } from 'pg';
 import { LiteLLMClient } from '../litellm';
 import {
   FileBufferRepository,
+  FileMemoryDeliveryRepository,
   HashEmbeddingProvider,
   LiteLLMEmbeddingProvider,
   PgMemoryRepository,
   createPGlitePool,
   type BufferRepository,
   type EmbeddingProvider,
+  type MemoryDeliveryRepository,
   type MemoryRepository,
 } from '../memory';
 import { seedSkills } from './seed-skills';
@@ -62,6 +64,13 @@ export interface BEmbeddingRuntimeInfo {
 export interface BackendBRuntime {
   readonly repository: MemoryRepository;
   readonly bufferRepository: BufferRepository;
+  /**
+   * 上下文交付与反馈 outbox 的存储。
+   *
+   * 与 bufferRepository 同处 `{app_state_root}/b/agent-state` 下的 role 目录树，
+   * 所以角色的创建/删除两条生命周期一起走。
+   */
+  readonly deliveryRepository: MemoryDeliveryRepository;
   readonly embedding?: EmbeddingProvider;
   readonly app_state_root: string;
   readonly market_agent_ids: readonly string[];
@@ -93,13 +102,18 @@ export async function createProductionBRuntime(
 
   try {
     storage = options.storage ?? (await createDefaultStorage(env, options, appStateRoot));
-    const bufferRepository = new FileBufferRepository({
-      agentStateRoot: path.join(appStateRoot, 'b', 'agent-state'),
-    });
+    const agentStateRoot = path.join(appStateRoot, 'b', 'agent-state');
+    const bufferRepository = new FileBufferRepository({ agentStateRoot });
     await seedCatalog(storage.repository, bufferRepository);
+    const deliveryRepository = new FileMemoryDeliveryRepository({ agentStateRoot });
+    // 启动恢复：上一次进程在 processing 里退出时留下的 lease 必须回到可交付队列。
+    // 不做这一步，那些交付项要等到有人手动调用 restore 才会再次被投递——而
+    // 「进程崩过」正是最需要自动恢复的场景。
+    await deliveryRepository.restoreExpiredDeliveryClaims();
     return {
       repository: storage.repository,
       bufferRepository,
+      deliveryRepository,
       ...(storage.embedding ? { embedding: storage.embedding } : {}),
       app_state_root: appStateRoot,
       // 目录以 DB 当前注册的 Agent 为准（含历史运行创建的 Agent），而非硬编码种子；

@@ -165,6 +165,25 @@ describe('RuleBasedExperienceExtractor', () => {
 
     expect(result.experiences.at(0)!.content).toContain('login token was expired');
   });
+
+  it('没有上下文快照也不产出归属：候选经验不含 agent_id，source_task_id 只作溯源', async () => {
+    const snapshot = makeBuffer({
+      summary: 'Done',
+      decisions: [{ point: 'Method', options: ['X'], chosen: 'X', reason: 'only option' }],
+    });
+
+    const extractor = new RuleBasedExperienceExtractor();
+    const result = await extractor.extract(snapshot);
+
+    // 归属只有 Buffer 所属 Agent（memory.role_id）说得准，提取器拿不到它。候选经验里
+    // **没有** agent_id 字段——既不会写成空串，也不可能拿 source_task_id 顶替（把经验挂到
+    // 一个根本不是 Agent 的 id 上）；最终 ExperienceRecord.agent_id 由持久化层按 role_id 补齐。
+    const candidate = result.experiences.at(0)!;
+    expect('agent_id' in candidate).toBe(false);
+    // 任务溯源字段照旧保留
+    expect(snapshot.source_task_id).toBe('task_001');
+    expect(candidate.source_task_id).toBe('task_001');
+  });
 });
 
 describe('confidence calculation', () => {

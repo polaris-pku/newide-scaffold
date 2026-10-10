@@ -21,10 +21,12 @@ import {
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type {
+  ExperienceSaveResult,
   MarketImportResult,
   MarketSearchOptions,
   MemoryRepository,
   MemoryVectorSearchOptions,
+  SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
@@ -281,6 +283,40 @@ export class InMemoryRepository implements MemoryRepository {
     store.metrics.experience_count = store.experiences.length;
   }
 
+  /**
+   * 幂等保存经验：唯一键 `Experience.id`，与 PG 的 `ON CONFLICT (id) DO NOTHING` 语义一致。
+   *
+   * 并发来源是**两个独立 worker 同时处理同一个 (role_id, buffer_seq)**：稳定 id 只能让
+   * 「顺序重试」认得出同一条，认不出并发重入。所以「检查 → 写入」之间不能有 await——先算
+   * 好 embedding，再做一次**同步**的查-写：await 之后再查一次，命中的话认输、返回对手写进去
+   * 的那条。JS 单线程下「最后一次同步检查 + push」不会被插队，并发调用因此只留一条经验，
+   * 且两个调用方都拿到同一条已持久化的记录。
+   */
+  async saveExperienceIfAbsent(
+    role_id: string,
+    experience: ExperienceRecord,
+  ): Promise<ExperienceSaveResult> {
+    const store = this.requireStore(role_id);
+    const existing = findExperienceById(store.experiences, experience.id);
+    if (existing) {
+      return { experience: existing, created: false };
+    }
+
+    const stored = await this.withDescriptionEmbedding(experience);
+
+    // await 之后重查：并发的另一次调用可能已经写进去了
+    const raced = findExperienceById(store.experiences, stored.id);
+    if (raced) {
+      return { experience: raced, created: false };
+    }
+
+    store.experiences.push(stored);
+    store.handle.experience_count = store.experiences.length;
+    store.handle.owned_exps.push(stored.id);
+    store.metrics.experience_count = store.experiences.length;
+    return { experience: stored, created: true };
+  }
+
   async saveSkill(role_id: string, skill: SkillRecord): Promise<void> {
     const store = this.requireStore(role_id);
     const stored = await this.withDescriptionEmbedding(skill);
@@ -289,6 +325,42 @@ export class InMemoryRepository implements MemoryRepository {
     store.handle.owned_skills.push(stored.id);
     store.metrics.skill_count = store.skills.length;
     store.metrics.promoted_skill_count += 1;
+  }
+
+  /**
+   * 幂等保存晋升技能：唯一键 `(role_id, promoted_from)`，与 PG 的 ON CONFLICT 语义一致。
+   *
+   * 「检查 → 写入」之间不能有 await，否则并发的两次晋升会各自查不到、各自写入，攒出成对的
+   * 重复技能。这里因此先算好 embedding，再做一次**同步**的查-写：await 之后再查一次，
+   * 命中的话认输、返回对手写进去的那条。JS 单线程下「最后一次同步检查 + push」不会被
+   * 插队，所以并发调用只会产生一条技能。
+   */
+  async saveSkillIfAbsent(role_id: string, skill: SkillRecord): Promise<SkillSaveResult> {
+    const store = this.requireStore(role_id);
+    if (skill.promoted_from === undefined) {
+      await this.saveSkill(role_id, skill);
+      return { skill, created: true };
+    }
+
+    const existing = findSkillByPromotedFrom(store.skills, skill.promoted_from);
+    if (existing) {
+      return { skill: existing, created: false };
+    }
+
+    const stored = await this.withDescriptionEmbedding(skill);
+
+    // await 之后重查：并发的另一次调用可能已经写进去了
+    const raced = findSkillByPromotedFrom(store.skills, stored.promoted_from!);
+    if (raced) {
+      return { skill: raced, created: false };
+    }
+
+    store.skills.push(stored);
+    store.handle.skill_count = store.skills.length;
+    store.handle.owned_skills.push(stored.id);
+    store.metrics.skill_count = store.skills.length;
+    store.metrics.promoted_skill_count += 1;
+    return { skill: stored, created: true };
   }
 
   async savePersona(role_id: string, persona: PersonaDef): Promise<void> {
@@ -434,6 +506,27 @@ export class InMemoryRepository implements MemoryRepository {
     }
     return undefined;
   }
+}
+
+/**
+ * 在同 role 的技能列表里找一条 `promoted_from` 指向给定经验的技能。
+ *
+ * 这是晋升幂等键的查询侧：`(role_id, promoted_from)` 唯一。列表本身已经按 role 隔离，
+ * 所以只需要比 promoted_from。
+ */
+function findSkillByPromotedFrom(
+  skills: readonly SkillRecord[],
+  promoted_from: string,
+): SkillRecord | undefined {
+  return skills.find((skill) => skill.promoted_from === promoted_from);
+}
+
+/** 幂等保存经验的查询侧：唯一键是 Experience.id。 */
+function findExperienceById(
+  experiences: readonly ExperienceRecord[],
+  id: string,
+): ExperienceRecord | undefined {
+  return experiences.find((experience) => experience.id === id);
 }
 
 async function rankByVectorSimilarity<T extends SkillRecord | ExperienceRecord>(

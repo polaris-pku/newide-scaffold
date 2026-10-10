@@ -114,13 +114,27 @@ export async function disposeRetiredAssets(
 export const MAX_INHERITED_EXPERIENCES = 2;
 
 /**
+ * 替代 Agent 的 role_id：由源 role_id 决定，**不依赖创建是否成功**。
+ *
+ * 调用方在创建之前就要知道这个名字，才能在创建中途失败时按同一个名字把半成品拆干净，
+ * 也才能在重试时认出「上一轮已经建到一半的那个」。
+ */
+export function replacementRoleIdFor(sourceRoleId: string): string {
+  return `${sourceRoleId}__replacement`;
+}
+
+/**
  * 创建替代 Agent（§14）。
  *
  * - 'clean_slate'：纯白板。继承来源 Agent 的前 2 个 tags，不继承经验。
  * - 'seeded_slate'：带种子。继承 tags + persona_seed，并继承至多 2 条
  *   Level A 经验（confidence >= 0.9 且 referenced_count >= 3）。
  *
- * 新 role_id = `${source.role_id}__replacement`。
+ * 新 role_id = `${source.role_id}__replacement`（见 replacementRoleIdFor）。
+ *
+ * 本函数只写主实体与其名下经验；Buffer / 交付存储由 AgentManager 在实例化时配齐。
+ * 中途失败时**主实体与其名下经验会留在仓库里**——清理是调用方的事（AgentManager 按
+ * 逆序回滚），所以这里不捕获异常、也不假装原子。
  */
 export async function createReplacementAgent(
   repository: MemoryRepository,
@@ -128,7 +142,7 @@ export async function createReplacementAgent(
   experiences: ExperienceRecord[],
   strategy: 'clean_slate' | 'seeded_slate',
 ): Promise<string> {
-  const roleId = `${source.role_id}__replacement`;
+  const roleId = replacementRoleIdFor(source.role_id);
   const baseTags = source.tags ?? [];
   const tags = strategy === 'clean_slate' ? baseTags.slice(0, 2) : [...baseTags];
   const personaSeed =

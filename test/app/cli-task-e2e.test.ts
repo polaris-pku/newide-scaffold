@@ -1,13 +1,13 @@
 /**
- * CLI task E2E — 用真实生产组合实际执行一次任务。
+ * CLI task E2E — 用真实生产组合实际执行一次任务，验证交付边界。
  *
- * 目标不是单元测试某个函数，而是验证 memory-cycle 的依赖注入重构
- * （extractBuffer/promoteExperiencesForAgent 改传 extractor/promoter 实例）
- * 在完整 C→B→A 生产链路上没有破坏行为：
+ * 验证的是「任务流程只生产输入，外部系统拥有记忆更新」这条边界在完整
+ * C→B→A 生产链路上成立：
  *
  *   1. 任务跑完（run 达到 completed，agent.execution_completed 落盘）
- *   2. B maintenance 自动用 LlmExperienceExtractor 提取经验并持久化
- *   3. 显式 promoteSkills 通过 LlmSkillPromotion 把高置信度经验晋升为 Skill
+ *   2. 本进程**不**提取经验、不晋升、不演化 Persona（没有消融标签 = 生产路径）
+ *   3. 下游能按稳定引用读回完整 DriverReturn + AgentContextSnapshot
+ *   4. 人工入口 memory.promoteSkills 仍在，但主链没有隐式副作用
  *
  * 复用 backend-rpc-stdio.test.ts 的注入配方：fake ACP driver runner +
  * in-memory B runtime + mock LLM，走 createProductionBackendService 真实组合。
@@ -22,6 +22,7 @@ import type { BackendBRuntime } from '../../src/app/production-b-runtime';
 import type { BMemoryMaintenanceEvidence } from '../../src/app/b-memory-maintenance-runner';
 import {
   InMemoryBufferRepository,
+  InMemoryMemoryDeliveryRepository,
   InMemoryRepository,
   type EmbeddingProvider,
   type LlmClient,
@@ -38,7 +39,7 @@ afterEach(async () => {
 });
 
 describe('CLI task E2E through the production composition', () => {
-  it('runs one task: experience auto-extracted by maintenance and promoted to a Skill', async () => {
+  it('runs one task: hands the downstream system a delivery and never waits for it', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-cli-task-e2e-'));
     roots.push(root);
     const runnerDir = path.join(root, 'runner');
@@ -61,6 +62,7 @@ describe('CLI task E2E through the production composition', () => {
     const bRuntime: BackendBRuntime = {
       repository,
       bufferRepository,
+      deliveryRepository: new InMemoryMemoryDeliveryRepository(),
       app_state_root: path.join(root, '.newide'),
       market_agent_ids: [...WORKSPACE_AGENT_IDS],
       embedding_info: {
@@ -129,49 +131,44 @@ describe('CLI task E2E through the production composition', () => {
       const agentId = executionCompleted?.payload?.agent_id as string;
       expect(WORKSPACE_AGENT_IDS).toContain(agentId);
 
-      // ── 2. maintenance 自动提取经验并持久化 ──
-      const maintenance = await waitForMaintenance(
-        service,
-        agentId,
-        created.run_id,
-        10_000,
-      );
-      expect(maintenance.status).toBe('completed');
-      expect(maintenance.kind).toBe('experience_extraction');
-      expect(maintenance.experiences.length).toBeGreaterThan(0);
+      // ── 2. 任务流程不在本进程加工记忆 ──
+      // 生产路径只交付上下文；Experience 提取 / Skill 晋升 / Persona 演化由外部
+      // Memory Maintenance 系统负责。这条运行没有任何消融标签，所以走后一条路。
+      expect(await repository.listExperiences(agentId)).toEqual([]);
+      expect(await repository.listSkills(agentId)).toEqual([]);
 
-      const experiences = await repository.listExperiences(agentId);
-      const promotedCandidate = experiences.find(
-        (experience) => experience.confidence > 0.95,
+      const deliveryEvidence = (await service.listMemoryMaintenance(agentId)).find(
+        (item) => item.run_id === created.run_id,
       );
-      expect(promotedCandidate).toBeDefined();
-      expect(promotedCandidate).toMatchObject({
-        content: 'Fake ACP completed the request.',
-        promoted_to: undefined,
+      expect(deliveryEvidence).toMatchObject({
+        kind: 'context_delivery',
+        status: 'scheduled',
+        role_id: agentId,
       });
 
-      // ── 3. 显式晋升：评测配置将高置信度正经验自动批准为可复用 Skill ──
+      // ── 3. 下游能从稳定引用读回完整输入 ──
+      const deliveries = await service.listMemoryContextDeliveries({ role_id: agentId });
+      expect(deliveries).toHaveLength(1);
+      const delivery = deliveries[0]!;
+      expect(delivery.task_id).toBe(executionCompleted?.payload?.task_id ?? delivery.task_id);
+      expect(delivery.memory_buffer_ref).toBe(`${agentId}:${String(delivery.buffer_seq)}`);
+      expect(delivery.context_snapshot_ref).toBe(String(delivery.buffer_seq));
+
+      const payload = await service.getMemoryContextDelivery(agentId, delivery.delivery_id);
+      expect(payload?.payload_available).toBe(true);
+      // DriverReturn 由驱动器自报（fake ACP 未给六字段报告，转换器按构造补全）
+      expect(String(payload?.driver_return?.summary)).toContain('claude-fake');
+      expect(payload?.driver_return?.artifacts).toHaveLength(1);
+      // 上下文集成了对：清理器把顶层对话压成了 thinking/planning 两段
+      expect(String(payload?.agent_context?.thinking_trace)).toContain('Cleaned the top-level');
+      expect(payload?.agent_context?.source_task_id).toBe(delivery.task_id);
+
+      // ── 4. 人工晋升入口仍在，但主链没有隐式副作用：没有经验可晋升就是空结果 ──
       const promotion = await service.promoteMemorySkills(agentId, 'cli-task-e2e');
       expect(promotion.status).toBe('completed');
       expect(promotion.kind).toBe('skill_promotion');
-      expect(promotion.skills.length).toBeGreaterThan(0);
-
-      const promotedSkill = promotion.skills[0];
-      expect(promotedSkill).toMatchObject({
-        review_status: 'approved',
-        reviewed_by: 'system:auto-approval',
-        reviewed_at: expect.any(String),
-        promoted_from: promotedCandidate!.id,
-        content: 'Fake ACP completed the request.',
-        market_status: 'available',
-      });
-
-      const storedSkills = await repository.listSkills(agentId);
-      expect(storedSkills.some((skill) => skill.id === promotedSkill?.id)).toBe(true);
-      const storedExperience = (await repository.listExperiences(agentId)).find(
-        (experience) => experience.id === promotedCandidate!.id,
-      );
-      expect(storedExperience?.promoted_to).toBe(promotedSkill?.id);
+      expect(promotion.skills).toEqual([]);
+      expect(await repository.listSkills(agentId)).toEqual([]);
 
       // 晋升证据已通过真实的 FileBMemoryMaintenanceEvidenceStore 落盘
       // （组合根在 bRuntime.app_state_root/b/maintenance 下构造）。
@@ -188,27 +185,6 @@ describe('CLI task E2E through the production composition', () => {
     }
   }, 30_000);
 });
-
-async function waitForMaintenance(
-  service: Awaited<ReturnType<typeof createProductionBackendService>>,
-  roleId: string,
-  runId: string,
-  timeoutMs: number,
-): Promise<BMemoryMaintenanceEvidence> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const evidence = (await service.listMemoryMaintenance(roleId)).find(
-      (item) => item.kind === 'experience_extraction' && item.run_id === runId,
-    );
-    if (evidence && ['completed', 'skipped', 'failed'].includes(evidence.status)) {
-      return evidence;
-    }
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for B maintenance for run ${runId}`);
-    }
-    await sleep(200);
-  }
-}
 
 function invokeDriverLlm(): ToolCallingClient {
   let sequence = 0;
@@ -244,30 +220,43 @@ function invokeDriverLlm(): ToolCallingClient {
   };
 }
 
+/**
+ * B 侧文本 LLM 的替身。
+ *
+ * 按**提示词里问的是什么**分派，不按调用次序分派：这条链上现在有三个消费者
+ * （上下文清理 / 经验提取 / 技能晋升），谁先谁后是执行路径的实现细节，
+ * 用奇偶轮次认人会在下一个消费者接进来时静默答错题。
+ */
 function memoryMaintenanceLlm(): LlmClient {
-  let calls = 0;
   return {
-    async complete() {
-      calls += 1;
-      if (calls % 2 === 1) {
-        // LlmExperienceExtractor 的提取响应
+    async complete(input) {
+      const userMessage = input.messages.find((message) => message.role === 'user')?.content ?? '';
+      if (userMessage.includes('## Raw Agent Context')) {
+        // LlmContextCleaner 的清理响应
         return JSON.stringify({
-          experiences: [
-            {
-              description: 'CLI task E2E reusable lesson',
-              content: 'Fake ACP completed the request.',
-              type: 'positive',
-              confidence: 0.99,
-              tags: ['cli-e2e'],
-            },
-          ],
+          thinking_trace: 'Cleaned the top-level context for the CLI task E2E run.',
+          planning_trace: 'Step 1: delegate to the driver. Step 2: report the lesson.',
         });
       }
-      // LlmSkillPromotion 的晋升响应
+      if (userMessage.includes('## Experience to promote')) {
+        // LlmSkillPromotion 的晋升响应
+        return JSON.stringify({
+          description: 'Promoted CLI task E2E lesson',
+          content: 'Fake ACP completed the request.',
+          tags: ['cli-e2e', 'promoted'],
+        });
+      }
+      // LlmExperienceExtractor 的提取响应
       return JSON.stringify({
-        description: 'Promoted CLI task E2E lesson',
-        content: 'Fake ACP completed the request.',
-        tags: ['cli-e2e', 'promoted'],
+        experiences: [
+          {
+            description: 'CLI task E2E reusable lesson',
+            content: 'Fake ACP completed the request.',
+            type: 'positive',
+            confidence: 0.99,
+            tags: ['cli-e2e'],
+          },
+        ],
       });
     },
   };

@@ -22,6 +22,7 @@ import {
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
+  type AgentContextCleaner,
   type AgentTaskRequest,
   type AgentHandle,
   type BufferRepository,
@@ -31,11 +32,14 @@ import {
   type CreateAgentSpec,
   type DispatchTaskResult,
   type DriverContext,
+  type DriverReferencedExperience,
   type DriverTask,
   type EmbeddingProvider,
   type LlmClient,
+  type MemoryDeliveryRepository,
   type MemoryRetrievalResult,
   type MemoryRepository,
+  type MemoryCycleResult,
   type RetireOptions,
   type RetireResult,
   type RetirementEvaluator,
@@ -89,6 +93,7 @@ import type {
   BMemoryMaintenanceEvidence,
   BMemoryMaintenancePort,
 } from './b-memory-maintenance-runner';
+import type { DriverFeedbackRecord } from '../memory/schemas';
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
   driver: DriverRuntimeHandle;
@@ -107,7 +112,17 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
+  /**
+   * 顶层上下文清理器（可选）：注入后每次任务结束时把该次 tool-calling 对话清理成
+   * AgentContextSnapshot，与 DriverReturn 成对落进同一条 Buffer。
+   *
+   * 生产组合根注入 LlmContextCleaner；不注入则 Buffer 只落 DriverReturn，经验提取
+   * 走既有的无上下文降级路径——那条路径仍然能跑，但下游看不到「为什么这么做」。
+   */
+  contextCleaner?: AgentContextCleaner;
   embedding?: EmbeddingProvider;
+  /** 下游交付存储：交给基座 AgentManager 做角色创建/删除的生命周期清理 */
+  deliveryRepository?: MemoryDeliveryRepository;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
   /** 进程内调用留档（B1）：注入后 memory_query 调用收尾写 P1 journal；缺省不留档 */
@@ -161,6 +176,12 @@ interface InvocationContext {
   collaboration_brief?: string;
   driver_attempts: number;
   abortObserved: boolean;
+}
+
+/** Driver 使用反馈的提交结果；`error` 只进诊断，不影响任务状态。 */
+interface DriverFeedbackOutcome {
+  recorded: DriverFeedbackRecord[];
+  error?: string;
 }
 
 const AGENT_RUNTIME_POLICY_ID = 'b-persona-tools-v1';
@@ -238,8 +259,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         tools,
         maxToolCalls: this.options.mailbox ? 6 : 4,
         ...(this.options.callJournal ? { callJournal: this.options.callJournal } : {}),
+        ...(this.options.contextCleaner ? { contextCleaner: this.options.contextCleaner } : {}),
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
+      ...(this.options.deliveryRepository
+        ? { deliveryRepository: this.options.deliveryRepository }
+        : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
       retirementEvaluator: createToolRetirementEvaluator(this.options.llm),
     });
@@ -565,7 +590,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ? await snapshotWorkspaceFiles(input.workspace_path)
         : undefined;
       const rawDispatch = await this.invocationContext.run(invocation, () =>
-        manager.dispatchTask(runtimeRoleId, task),
+        // retrieval 随任务一起交给 Agent：Agent 自己不检索（记忆是经 driver_context
+        // 直达 Driver 的），但它要如实把这批结果填进 MemoryCycleResult——否则那个
+        // 返回值无论真假都是一对空数组，读的人分不出「没检索到」和「没检索」。
+        manager.dispatchTask(runtimeRoleId, { ...task, retrieval }),
       );
       const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
       const workspaceArtifacts = await collectWorkspaceArtifacts(
@@ -1067,6 +1095,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       runtimeRoleId,
       dispatched.cycle.buffer_seq,
     );
+    // 反馈与上下文交付走两条独立通道：交付是给下游做提取的输入，反馈是给下游
+    // 判断 Skill 晋升的输入。两者都不拦任务，也都不等待下游。
+    const driverFeedback = await this.recordDriverFeedback(
+      input,
+      runtimeRoleId,
+      dispatched.cycle.buffer_seq,
+      dispatched.cycle.buffer_snapshot.driver_return.referenced_experiences,
+    );
     if (!execution) {
       return this.buildNoExecutionResult(
         input,
@@ -1077,6 +1113,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         workspaceArtifacts,
         memoryMaintenance,
         mailboxOutcomes,
+        driverFeedback,
       );
     }
 
@@ -1127,6 +1164,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         },
         promotion: dispatched.cycle.promotion.check,
         agent_runtime: agentRuntime,
+        ...memoryContextDiagnostics(dispatched.cycle),
+        ...driverFeedbackDiagnostics(driverFeedback),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1155,6 +1194,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     workspaceArtifacts: ArtifactRef[],
     memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
     mailboxOutcomes: readonly MailboxToolOutcome[],
+    driverFeedback: DriverFeedbackOutcome,
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
@@ -1218,6 +1258,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           skills: dispatched.cycle.retrieval.skills.length,
         },
         agent_runtime: agentRuntime,
+        ...memoryContextDiagnostics(dispatched.cycle),
+        ...driverFeedbackDiagnostics(driverFeedback),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1241,11 +1283,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     runtimeRoleId: string,
     bufferSeq: number,
   ): Promise<BMemoryMaintenanceEvidence | undefined> {
-    if (!this.options.memoryMaintenance) return undefined;
-    const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
-    if (!ablationPolicy.schedule_extraction) return undefined;
+    const maintenance = this.options.memoryMaintenance;
+    if (!maintenance) return undefined;
+    // 消融标签**不在这里分流**：这条路径无论 B0–B4 都只把 Buffer 登记成一条交付项交出去。
+    // 曾经 `schedule_extraction` 为假（B0/B4）就整个跳过——那等于让一个请求字段把生产路径
+    // 的输出掐掉，Buffer 会永远留在 pending、下游根本不知道有这条输入。标签只影响检索
+    // （include_skills / include_recent_experience），不影响「任务流程照常生产输入」。
     try {
-      return await this.options.memoryMaintenance.scheduleBuffer({
+      return await maintenance.scheduleBuffer({
         task_id: input.task_id,
         run_id: input.run_id,
         role_id: runtimeRoleId,
@@ -1258,7 +1303,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const completedAt = nowTimestamp();
       return {
         maintenance_ref: createId('b_maintenance'),
-        kind: 'experience_extraction',
+        // 这条路径只做交付（scheduleBuffer 在两种 mode 下都只登记交付项），失败的是
+        // 「交付」而不是「本进程提取」。报成 experience_extraction 就等于在说任务流程
+        // 在提取——那正是这条边界要拆掉的说法。
+        kind: 'context_delivery',
         status: 'failed',
         task_id: input.task_id,
         run_id: input.run_id,
@@ -1271,6 +1319,50 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         created_at: completedAt,
         completed_at: completedAt,
         schema_version: SCHEMA_VERSION,
+      };
+    }
+  }
+
+  /**
+   * 把 Driver 对既有经验的使用反馈写进下游 outbox。
+   *
+   * 与提取解耦：不查经验是否存在、不调 scheduleBuffer、更不在本进程改置信度。
+   * 引用一条还不存在的经验是正常情况（跨 agent / 已处置 / 下游尚未提取），
+   * 反馈先落 outbox，等下游按 feedback_id 归并。
+   *
+   * best-effort：写失败只记进 diagnostics，绝不让一个已经完成的 Agent 任务
+   * 因为下游的事变成失败。但「没写」这件事必须看得见——Driver 自报了引用却因为
+   * 本进程没配 outbox 而丢弃，是配置错误，不是「本次没有反馈」；两者都报成空
+   * 就等于把丢数据伪装成没数据。
+   */
+  private async recordDriverFeedback(
+    input: AgentExecutionRequest,
+    runtimeRoleId: string,
+    bufferSeq: number,
+    references: readonly DriverReferencedExperience[],
+  ): Promise<DriverFeedbackOutcome> {
+    if (references.length === 0) return { recorded: [] };
+    // 消融标签同样不改这条边界：Driver 自报了引用却因为「这一臂是 B0/B4」而把反馈丢掉，
+    // 就是静默丢数据——反馈必须幂等且不能悄无声息地少。标签只影响检索。
+    if (!this.options.memoryMaintenance) {
+      return {
+        recorded: [],
+        error: 'B memory maintenance is not configured; driver feedback was not recorded.',
+      };
+    }
+    try {
+      const recorded = await this.options.memoryMaintenance.recordDriverUsageFeedback({
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: runtimeRoleId,
+        ...(bufferSeq > 0 ? { buffer_seq: bufferSeq } : {}),
+        references,
+      });
+      return { recorded };
+    } catch (error) {
+      return {
+        recorded: [],
+        error: error instanceof Error ? error.message : String(error),
       };
     }
   }
@@ -1307,6 +1399,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
     });
     const contextPackRef = `context_pack_${createHash('sha256').update(identity).digest('hex').slice(0, 24)}`;
+    const contextWarnings = memoryContextWarnings(dispatched.cycle);
     const evidence: AgentContextPackEvidence = {
       context_pack_id: contextPackRef,
       task_id: input.task_id,
@@ -1328,6 +1421,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       driver_context: dispatched.cycle.driver_context,
       ...(driverInvocationContext ? { driver_invocation_context: driverInvocationContext } : {}),
       agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
+      // 配对与否由真正写盘的那一侧决定：cycle 里 Buffer 快照带 context_snapshot_ref
+      // 才说明 context_{seq}.json 确实落下了，而不是「我们打算清理」。
+      context_snapshot_paired: contextSnapshotPaired(dispatched.cycle),
+      ...(contextWarnings ? { context_snapshot_warnings: contextWarnings } : {}),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
@@ -1488,6 +1585,49 @@ function withRetrievedMemory(
       },
       driver_context: driverContext,
     },
+  };
+}
+
+/**
+ * AgentContextSnapshot 是否真的和这次 Buffer 成对落了盘。
+ *
+ * 判据是 Buffer 快照自己的 context_snapshot_ref——那是写入侧在真写下了 context 文件
+ * 才会填的字段。写在这里而不是另记一个「清理成功」标志，是为了不让「打算清理」和
+ * 「清理结果落了盘」在证据里长得一样。
+ */
+function contextSnapshotPaired(cycle: MemoryCycleResult): boolean {
+  return cycle.buffer_snapshot.context_snapshot_ref !== undefined;
+}
+
+/** cycle.warnings 中属于上下文清理的那些；没有则返回 undefined（调用方据此省略字段）。 */
+function memoryContextWarnings(cycle: MemoryCycleResult): string[] | undefined {
+  const warnings = cycle.warnings?.filter((warning) => warning.startsWith('context_cleaning'));
+  return warnings && warnings.length > 0 ? warnings : undefined;
+}
+
+/** 把上下文降级原因放进执行诊断：任务照样完成，但现场要留一句为什么。 */
+function memoryContextDiagnostics(cycle: MemoryCycleResult): Record<string, unknown> {
+  const warnings = memoryContextWarnings(cycle);
+  if (!warnings) return {};
+  return {
+    context_snapshot_paired: contextSnapshotPaired(cycle),
+    memory_context_warnings: warnings,
+  };
+}
+
+/**
+ * 把反馈提交结果放进执行诊断。
+ *
+ * 只在真有反馈可报时才出现这两个键——「这次没有引用任何经验」和「报了但没写进去」
+ * 是两件事，混成同一个空值就分不出来了。
+ */
+function driverFeedbackDiagnostics(outcome: DriverFeedbackOutcome): Record<string, unknown> {
+  if (outcome.error === undefined && outcome.recorded.length === 0) return {};
+  return {
+    driver_feedback_recorded: outcome.recorded.length,
+    ...(outcome.error === undefined
+      ? { driver_feedback_ids: outcome.recorded.map((record) => record.feedback_id) }
+      : { driver_feedback_error: outcome.error }),
   };
 }
 

@@ -31,6 +31,9 @@ export interface CompletionCriteriaEvaluation {
  * A materialized final artifact completes the current product flow. When a real
  * Gate is configured, criterion-scoped evidence may additionally attest it as
  * verified without changing whether the Task completed.
+ *
+ * 这里刻意不看执行者的 Plan 自检报告：那条路径已按实测结论下线（见 plan-check.ts）。
+ * 「计划遵循情况」是给人读的证据，不是 outcome 的输入。
  */
 export function evaluateCompletionCriteria(
   input: CompletionCriteriaEvaluationInput,

@@ -223,11 +223,11 @@ export const BufferMetaSchema = z.object({
   last_extraction_report_count: z.number().int().min(0).optional(),
   /** 最近一次提取生成的经验数 */
   last_extraction_experiences_created: z.number().int().min(0).optional(),
-  /** 当前写入游标（下一个 seq = cursor + 1） */
+  /** 当前写入游标（下一个 seq = cursor + 1；记的是分配过的 seq 上界，只前进） */
   cursor: z.number().int().min(0),
-  /** 累计已处理的条目数 */
+  /** 累计已处理的条目数（文件实现里 = processed/ 分区里的报告条数，按目录重算） */
   total_processed: z.number().int().min(0),
-  /** 累计死信条目数 */
+  /** 累计死信条目数（文件实现里 = dead_letter/ 分区里的报告条数，按目录重算） */
   total_dead_letters: z.number().int().min(0),
   /** 累计已清理的上下文数 */
   total_cleaned: z.number().int().min(0).optional(),
@@ -609,3 +609,133 @@ export const ExtractResultSchema = z.object({
   skills_promoted: z.number().int().min(0),
 });
 export type ExtractResult = z.infer<typeof ExtractResultSchema>;
+
+// ═══════════════════════════════════════════
+//  Memory Delivery（上游交付契约）
+// ═══════════════════════════════════════════
+
+/**
+ * 交付状态机。取值与 Buffer 的 ExtractionStatus 一致——上下文交付项与反馈
+ * outbox 共用同一套状态语义（见 工作包 C），但这里讲的是「交付给了下游」，
+ * 所以不复用抽取那边的名字。
+ */
+export const DeliveryStatusSchema = z.enum([
+  'pending',
+  'processing',
+  'processed',
+  'dead_letter',
+]);
+export type DeliveryStatus = z.infer<typeof DeliveryStatusSchema>;
+
+/** 上下文交付契约的版本；引用语义变化时递增，交付键随之改变 */
+export const CONTEXT_DELIVERY_SCHEMA_VERSION = 'context-delivery.v1';
+/** Driver 使用反馈契约的版本；反馈键与 event_version 都取自它 */
+export const DRIVER_FEEDBACK_EVENT_VERSION = 'driver-usage.v1';
+
+/**
+ * 上下文交付项与反馈 outbox 共用的**状态机字段**。
+ *
+ * 两条通道必须走同一套 claim/lease/retry 语义，所以这些字段只在这里定义一次，
+ * 再由两个 schema 各自展开——两条通道的字段集合不可能漂移。
+ *
+ * `attempt_count` 给 `.default(0)`：工作包 B 落盘的历史记录没有这个字段，
+ * 默认值是它们的真实语义（还没投递过），不必写迁移脚本。
+ */
+const deliveryLifecycleFields = {
+  /** 交付状态；推进规则见 services/delivery-lifecycle.ts */
+  status: DeliveryStatusSchema,
+  /** 已发起的投递次数（claim 一次算一次），达到重试上限后进 dead_letter */
+  attempt_count: z.number().int().min(0).default(0),
+  /** 当前持有者最后一次 claim 的时刻 */
+  claimed_at: z.iso.datetime().optional(),
+  /** 当前持有者标识（下游消费者自己给；本仓不解释它的含义） */
+  claim_owner: z.string().optional(),
+  /** 本次 lease 的到期时刻；过期即可被 restoreExpired* 放回队列 */
+  lease_expires_at: z.iso.datetime().optional(),
+  /** 退避后的最早可再投递时刻；缺席表示立即可投递 */
+  next_retry_at: z.iso.datetime().optional(),
+  /** 最近一次失败原因（dead_letter 时保留最后一次） */
+  last_error: z.string().optional(),
+  /** 下游 processor 的版本位（由外部系统在 ack 时填充） */
+  processor_version: z.string().optional(),
+  created_at: z.iso.datetime(),
+  updated_at: z.iso.datetime(),
+};
+
+/**
+ * 上下文交付项 — 一次 Agent 任务完成后交付给外部 Memory Maintenance 系统的输入。
+ *
+ * 只存**稳定引用**，不复制 payload：DriverReturn 与 AgentContextSnapshot 各只有
+ * 一份，仍在 Buffer 的 `report_<seq>.json` / `context_<seq>.json` 里。下游读到这条
+ * 记录就知道该去取哪一份，而不会拿到与 Buffer 漂移的第二份副本。
+ *
+ * `delivery_key = role_id:buffer_seq:context_schema_version` 是幂等键：同一份
+ * 上下文重复提交只会留下一条交付记录。
+ */
+export const ContextDeliveryItemSchema = z.object({
+  /** 文件名安全 id（由 delivery_key 哈希而来） */
+  delivery_id: z.string(),
+  /** 稳定幂等键：`{role_id}:{buffer_seq}:{context_schema_version}` */
+  delivery_key: z.string(),
+  /** 产出该上下文的 Agent */
+  role_id: z.string(),
+  /** 来源任务 */
+  task_id: z.string(),
+  /** 该任务在 Buffer 中的序号 */
+  buffer_seq: z.number().int().positive(),
+  /** Buffer 引用：`{role_id}:{buffer_seq}`（与 memory_buffer_ref 同源） */
+  memory_buffer_ref: z.string(),
+  /** DriverReturn 在 Buffer 中的文件名（report_<seq>.json） */
+  report_ref: z.string(),
+  /** AgentContextSnapshot 在 Buffer 中的文件名；缺失表示本次没有上下文快照 */
+  context_snapshot_ref: z.string().optional(),
+  /** 执行该任务的 Driver 标识 */
+  source_driver: z.string(),
+  /** 契约版本；下游据此判断自己能不能消费这条 */
+  schema_version: z.string(),
+  ...deliveryLifecycleFields,
+});
+export type ContextDeliveryItem = z.infer<typeof ContextDeliveryItemSchema>;
+
+/** Driver 使用反馈的来源；用户评分与 Driver 自报是两条独立来源，各有幂等键 */
+export const DriverFeedbackSourceSchema = z.enum(['driver_usage', 'user_rating']);
+export type DriverFeedbackSource = z.infer<typeof DriverFeedbackSourceSchema>;
+
+/**
+ * Driver 使用反馈记录 — Agent 对某条既有经验的使用事实。
+ *
+ * 刻意独立于 Experience 是否存在：Driver 可能引用跨 agent 或已被处置的经验，
+ * 反馈先落到 outbox，等下游系统上线/补全后再按 `feedback_id` 归并。
+ *
+ * `feedback_id` 由 `role_id + task_id + experience_id + feedback_source +
+ * event_version` 派生：同一份 DriverReturn 重复提交只会得到同一条反馈，
+ * 既不会重复累计使用效果，也不会覆盖已知的更高质量反馈。
+ */
+export const DriverFeedbackRecordSchema = z.object({
+  /** 文件名安全 id（由 feedback_key 哈希而来） */
+  feedback_id: z.string(),
+  /** 稳定幂等键：`{role_id}:{task_id}:{experience_id}:{source}:{event_version}` */
+  feedback_key: z.string(),
+  /** 上报该反馈的 Agent */
+  role_id: z.string(),
+  /** 产生该使用记录的任务 */
+  task_id: z.string(),
+  /** 该任务在 Buffer 中的序号（用户评分路径可能没有） */
+  buffer_seq: z.number().int().min(0).optional(),
+  /** 被引用的经验 id（可以指向尚不存在的经验） */
+  experience_id: z.string(),
+  /** 本次任务是否实际应用了该经验 */
+  applied: z.boolean(),
+  /** 该经验在本次任务中的效果 */
+  effectiveness: EffectivenessSchema,
+  /** 备注原文 */
+  note: z.string(),
+  /** 观察到该使用事实的时刻 */
+  observed_at: z.iso.datetime(),
+  /** 反馈来源 */
+  feedback_source: DriverFeedbackSourceSchema,
+  /** 契约事件版本（见 DRIVER_FEEDBACK_EVENT_VERSION） */
+  event_version: z.string(),
+  ...deliveryLifecycleFields,
+});
+export type DriverFeedbackRecord = z.infer<typeof DriverFeedbackRecordSchema>;

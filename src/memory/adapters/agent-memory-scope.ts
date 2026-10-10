@@ -6,7 +6,12 @@
  */
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { BufferRepository } from '../ports/buffer-repository';
-import type { MemoryRepository, MemoryVectorSearchOptions } from '../ports/memory-repository';
+import type {
+  MemoryRepository,
+  MemoryVectorSearchOptions,
+  SkillSaveResult,
+  ExperienceSaveResult,
+} from '../ports/memory-repository';
 import type {
   AgentHandle,
   AgentMetrics,
@@ -17,7 +22,7 @@ import type {
   PersonaDef,
   SkillRecord,
 } from '../schemas';
-import type { SaveBufferResult } from '../ports/buffer-repository';
+import type { PendingBufferRead, SaveBufferResult } from '../ports/buffer-repository';
 
 class ScopedAgentMemory implements AgentMemoryScope {
   constructor(
@@ -69,13 +74,7 @@ class ScopedAgentMemory implements AgentMemoryScope {
     return this.buffer.listPendingBufferSeqs(this.role_id);
   }
 
-  getPendingBuffer(seq: number): Promise<
-    | {
-        snapshot: BufferSnapshot;
-        agentContext?: AgentContextSnapshot;
-      }
-    | undefined
-  > {
+  getPendingBuffer(seq: number): Promise<PendingBufferRead | undefined> {
     return this.buffer.getPendingBuffer(this.role_id, seq);
   }
 
@@ -91,8 +90,16 @@ class ScopedAgentMemory implements AgentMemoryScope {
     return this.repository.saveExperience(this.role_id, experience);
   }
 
+  saveExperienceIfAbsent(experience: ExperienceRecord): Promise<ExperienceSaveResult> {
+    return this.repository.saveExperienceIfAbsent(this.role_id, experience);
+  }
+
   saveSkill(skill: SkillRecord): Promise<void> {
     return this.repository.saveSkill(this.role_id, skill);
+  }
+
+  saveSkillIfAbsent(skill: SkillRecord): Promise<SkillSaveResult> {
+    return this.repository.saveSkillIfAbsent(this.role_id, skill);
   }
 
   savePersona(persona: PersonaDef): Promise<void> {

@@ -606,6 +606,7 @@ function fakeMaintenance(): BMemoryMaintenanceCapabilities {
     scheduleBuffer: async () => {
       throw new Error('maintenance is not used in this test');
     },
+    recordDriverUsageFeedback: async () => [],
     listEvidence: async () => [],
     promoteSkills: async () => {
       throw new Error('maintenance is not used in this test');

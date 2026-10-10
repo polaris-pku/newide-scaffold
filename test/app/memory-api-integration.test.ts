@@ -98,10 +98,13 @@ describe('memory.* full API integration (M7)', () => {
     const call = (id: number, method: string, params: unknown): Promise<RpcResponse> =>
       dispatcher.dispatch({ jsonrpc: '2.0', id, method, params }) as Promise<RpcResponse>;
 
-    // 1. capabilities v2 且关键能力可用
+    // 1. capabilities v3 且关键能力可用
     const capabilities = await call(1, 'memory.getCapabilities', {});
     expect(capabilities.result!.capabilities).toMatchObject({
-      schema_version: 'newide.b-memory-capabilities.v2',
+      schema_version: 'newide.b-memory-capabilities.v4',
+      memory_maintenance: {
+        ownership: 'external',
+      },
       operations: {
         create_agent: { status: 'available' },
         create_skill: { status: 'available' },
@@ -315,6 +318,7 @@ function fakeMaintenance(
         schema_version: 'v0',
       };
     },
+    recordDriverUsageFeedback: async () => [],
     listEvidence: async () => [],
     promoteSkills: async () => {
       throw new Error('promoteSkills is not used in the integration flow');

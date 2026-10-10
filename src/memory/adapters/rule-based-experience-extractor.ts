@@ -15,13 +15,8 @@
 import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import type { ExperienceExtractor } from '../ports/experience-extractor';
-import type {
-  BufferSnapshot,
-  AgentContextSnapshot,
-  ExperienceRecord,
-  DriverReturn,
-} from '../schemas';
-import type { ExtractionOutput } from '../types';
+import type { BufferSnapshot, AgentContextSnapshot, DriverReturn } from '../schemas';
+import type { CandidateExperience, ExtractionOutput } from '../types';
 
 // ═══════════════════════════════════════════
 //  Confidence helpers
@@ -96,7 +91,7 @@ function buildExperience(opts: {
   type: 'positive' | 'negative';
   confidence: number;
   tags: string[];
-}): ExperienceRecord {
+}): CandidateExperience {
   return {
     id: randomUUID(),
     description: opts.description,
@@ -104,7 +99,11 @@ function buildExperience(opts: {
     content: opts.content,
     confidence: opts.confidence,
     tags: opts.tags,
-    agent_id: opts.agentContext?.agent_id ?? opts.snapshot.source_task_id,
+    // 归属不在这里定，这里也**不产出**归属字段：一条 Buffer 属于哪个 Agent 只有
+    // memory.role_id 说得准，提取器拿不到它（无上下文快照时连 agentContext 都没有）。
+    // 填一个占位值就会让直接使用提取器的维护系统把经验挂错人；**更不要拿
+    // source_task_id 顶替**——那是任务溯源字段，不是归属。agent_id 由
+    // persistExtractedExperiences 按 memory.role_id 统一补齐。
     linked_negative_exp: undefined,
     promoted_to: undefined,
     assumptions: undefined,
@@ -133,7 +132,7 @@ export class RuleBasedExperienceExtractor implements ExperienceExtractor {
   ): Promise<ExtractionOutput> {
     const dr = snapshot.driver_return;
     const now = nowTimestamp();
-    const experiences: ExperienceRecord[] = [];
+    const experiences: CandidateExperience[] = [];
 
     // 1. positive: decisions + assumptions
     const positiveContent = buildPositiveContent(dr, agentContext);

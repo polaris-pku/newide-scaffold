@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { ruleBasedSkillPromotion } from '../services/skill-promotion';
+import { persistExtractedExperiences, stableExperienceId } from '../services/memory-cycle';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { InMemoryBufferRepository } from '../adapters/in-memory-buffer-repository';
 import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
-import type { ExperienceRecord } from '../schemas';
+import type { ExperienceSaveResult } from '../ports/memory-repository';
+import type { ExperienceRecord, SkillRecord } from '../schemas';
+import type { CandidateExperience } from '../types';
 import type { AgentTaskRequest } from '../agent-types';
 
 // ═══════════════════════════════════════════
@@ -35,6 +38,12 @@ const defaultTask: AgentTaskRequest = {
   spec: 'Test task',
   task_id: 'task_001',
 };
+
+/** 提取器产出的候选经验：与 ExperienceRecord 同形，但没有归属（agent_id） */
+function makeCandidate(overrides: Partial<CandidateExperience> = {}): CandidateExperience {
+  const { agent_id: _agent_id, ...candidate } = makeExperience();
+  return { ...candidate, ...overrides };
+}
 
 /** 将经验存入 repository，模拟 processPendingBuffer 中 saveExperience 在 promote 之前执行 */
 async function seedExperience(
@@ -216,3 +225,223 @@ describe('ruleBasedSkillPromotion', () => {
     expect(result.skill!.version).toBe('1.0.0');
   });
 });
+
+/**
+ * 晋升是两步写：先存 Skill、再把 Experience 的 promoted_to 指过去。第二步失败后重试（或
+ * 两个调用并发）若每次都新建 Skill，就会攒出成对的重复技能，而 Experience 的 promoted_to
+ * 只能指向其中一个——另一个变成没有任何来源的孤儿。幂等键是 (role_id, promoted_from)。
+ */
+describe('ruleBasedSkillPromotion：幂等', () => {
+  let repository: FlakyUpdateRepository;
+  let bufferRepository: InMemoryBufferRepository;
+  let memory: AgentMemoryScope;
+
+  beforeEach(async () => {
+    repository = new FlakyUpdateRepository();
+    bufferRepository = new InMemoryBufferRepository();
+    await repository.initializeAgent({ role_id: 'role_test', name: 'Test Agent', tags: [] });
+    await bufferRepository.ensureAgent('role_test');
+    memory = createAgentMemoryScope(repository, bufferRepository, 'role_test');
+  });
+
+  it('updateExperience 失败后重试：复用已有 Skill，不生成第二个', async () => {
+    const experience = makeExperience({ confidence: 0.99 });
+    await repository.saveExperience('role_test', experience);
+    repository.failNextUpdate = true;
+
+    // 第一次：Skill 存进去了，回写 promoted_to 失败 → 整条抛出
+    await expect(ruleBasedSkillPromotion(memory, defaultTask, [experience])).rejects.toThrow(
+      'update failed',
+    );
+    expect(await repository.listSkills('role_test')).toHaveLength(1);
+    const created = (await repository.listSkills('role_test'))[0]!;
+
+    // 重试：experience 仍未被标记晋升（第二步没成功），但 Skill 已存在 → 复用
+    const retried = await ruleBasedSkillPromotion(memory, defaultTask, [experience]);
+    expect(retried.check.eligible).toBe(true);
+    expect(retried.skill!.id).toBe(created.id);
+    expect(retried.check.reasons.join(' ')).toContain('reused');
+
+    const skills = await repository.listSkills('role_test');
+    expect(skills).toHaveLength(1);
+    // promoted_to 指向唯一那个 Skill
+    const stored = (await repository.listExperiences('role_test')).find(
+      (item) => item.id === experience.id,
+    );
+    expect(stored!.promoted_to).toBe(skills[0]!.id);
+  });
+
+  it('并发晋升同一条 Experience：只产生一条 Skill，promoted_to 指向它', async () => {
+    const experience = makeExperience({ confidence: 0.99 });
+    await repository.saveExperience('role_test', experience);
+
+    const [left, right] = await Promise.all([
+      ruleBasedSkillPromotion(memory, defaultTask, [experience]),
+      ruleBasedSkillPromotion(memory, defaultTask, [experience]),
+    ]);
+
+    expect(left.skill!.id).toBe(right.skill!.id);
+    const skills = await repository.listSkills('role_test');
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.promoted_from).toBe(experience.id);
+
+    const stored = (await repository.listExperiences('role_test')).find(
+      (item) => item.id === experience.id,
+    );
+    expect(stored!.promoted_to).toBe(skills[0]!.id);
+  });
+
+  it('saveSkillIfAbsent：promoted_from 为空时退化为普通保存，不做去重', async () => {
+    const now = new Date().toISOString();
+    const skill: SkillRecord = {
+      id: '00000000-0000-0000-0000-0000000000a1',
+      description: 'Imported skill',
+      description_embedding: [0.1, 0.2, 0.3],
+      content: 'Content',
+      version: '1.0.0',
+      review_status: 'pending',
+      tags: [],
+      promoted_at: now,
+      agent_id: 'role_test',
+      created_at: now,
+      updated_at: now,
+    };
+
+    const first = await repository.saveSkillIfAbsent('role_test', skill);
+    const second = await repository.saveSkillIfAbsent('role_test', skill);
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(true);
+    expect(await repository.listSkills('role_test')).toHaveLength(2);
+  });
+});
+
+/**
+ * 提取落库的并发幂等。
+ *
+ * 提取的粒度是**整条 Buffer**：一个 worker 处理 (role_id, buffer_seq) 时要把它提取出的
+ * 全部经验写进去。稳定 id（stableExperienceId）只让**顺序重试**认得出「这条已经写过」，
+ * 认不出**并发重入**——两个独立的 Memory Maintenance worker 同时处理同一条 Buffer 时，
+ * 「先 listExperiences 再 saveExperience」是两次独立往返，两边都看不见对方那条：内存实现
+ * 会攒出重复 id，PG 实现会有一方撞主键被抛异常。所以检查与写入必须在存储层原子完成。
+ */
+describe('提取落库的并发幂等（saveExperienceIfAbsent / persistExtractedExperiences）', () => {
+  let repository: InMemoryRepository;
+  let bufferRepository: InMemoryBufferRepository;
+  let memory: AgentMemoryScope;
+
+  beforeEach(async () => {
+    repository = new InMemoryRepository();
+    bufferRepository = new InMemoryBufferRepository();
+    await repository.initializeAgent({ role_id: 'role_test', name: 'Test Agent', tags: [] });
+    await bufferRepository.ensureAgent('role_test');
+    memory = createAgentMemoryScope(repository, bufferRepository, 'role_test');
+  });
+
+  async function countOnce(): Promise<void> {
+    const handle = await repository.getAgent('role_test');
+    const metrics = await repository.getMetrics('role_test');
+    const stored = await repository.listExperiences('role_test');
+    expect(stored).toHaveLength(new Set(stored.map((item) => item.id)).size);
+    expect(handle.experience_count).toBe(stored.length);
+    expect(metrics.experience_count).toBe(stored.length);
+    expect(handle.owned_exps).toHaveLength(stored.length);
+    expect(new Set(handle.owned_exps).size).toBe(stored.length);
+  }
+
+  it('saveExperienceIfAbsent 并发保存同一 id：只留一条，两个调用方拿到同一条，计数只加一次', async () => {
+    const experience = makeExperience();
+
+    const [left, right] = await Promise.all([
+      repository.saveExperienceIfAbsent('role_test', experience),
+      repository.saveExperienceIfAbsent('role_test', experience),
+    ]);
+
+    // 一个真正写入，另一个幂等命中——谁都不收到冲突异常
+    expect([left.created, right.created].filter(Boolean)).toHaveLength(1);
+    expect(left.experience.id).toBe(experience.id);
+    expect(right.experience.id).toBe(experience.id);
+    await expect(repository.listExperiences('role_test')).resolves.toHaveLength(1);
+    await countOnce();
+  });
+
+  it('两个 worker 并发处理同一条 Buffer：只留一批经验，两边拿到同一批，计数只加一次', async () => {
+    const candidates = [makeCandidate(), makeCandidate(), makeCandidate()];
+
+    const [left, right] = await Promise.all([
+      persistExtractedExperiences(memory, 1, candidates),
+      persistExtractedExperiences(memory, 1, candidates),
+    ]);
+
+    // 两边都拿到底层**持久化过**的那一批：id 是稳定 id，不是各写各的瞬时产物
+    const expectedIds = candidates.map((_, index) => stableExperienceId('role_test', 1, index));
+    expect(left.experiences.map((item) => item.id)).toEqual(expectedIds);
+    expect(right.experiences.map((item) => item.id)).toEqual(expectedIds);
+    expect(left.created + right.created).toBe(candidates.length);
+    expect(left.already_present + right.already_present).toBe(candidates.length);
+
+    const stored = await repository.listExperiences('role_test');
+    expect(stored).toHaveLength(candidates.length);
+    // agent_id 的权威仍是 memory.role_id：候选里的任何取值都不参与归属
+    expect(stored.every((item) => item.agent_id === 'role_test')).toBe(true);
+    await countOnce();
+  });
+
+  it('部分写入失败后重试整条 Buffer：已写的那条不重复，缺的补上', async () => {
+    const flaky = new FlakyExperienceRepository();
+    await flaky.initializeAgent({ role_id: 'role_test', name: 'Test Agent' });
+    const scope = createAgentMemoryScope(flaky, bufferRepository, 'role_test');
+    const candidates = [makeCandidate(), makeCandidate(), makeCandidate()];
+
+    // 第 2 次写入失败：整条 Buffer 只落了第一条，调用方收到异常（不吞）
+    flaky.failOnCall = 2;
+    await expect(persistExtractedExperiences(scope, 5, candidates)).rejects.toThrow(
+      'experience write failed',
+    );
+    await expect(flaky.listExperiences('role_test')).resolves.toHaveLength(1);
+
+    // 重试整条 Buffer：第一条命中稳定 id 被跳过，只剩两条真正写入，最终正好三条
+    flaky.failOnCall = null;
+    const retried = await persistExtractedExperiences(scope, 5, candidates);
+    expect(retried.created).toBe(2);
+    expect(retried.already_present).toBe(1);
+    await expect(flaky.listExperiences('role_test')).resolves.toHaveLength(3);
+
+    const handle = await flaky.getAgent('role_test');
+    expect(handle.experience_count).toBe(3);
+    expect(new Set(handle.owned_exps).size).toBe(3);
+  });
+});
+
+/** updateExperience 可以按需失败一次的仓库（模拟晋升第二步失败） */
+class FlakyUpdateRepository extends InMemoryRepository {
+  failNextUpdate = false;
+
+  override async updateExperience(
+    role_id: string,
+    experience: ExperienceRecord,
+  ): Promise<void> {
+    if (this.failNextUpdate) {
+      this.failNextUpdate = false;
+      throw new Error('update failed');
+    }
+    return super.updateExperience(role_id, experience);
+  }
+}
+
+/** saveExperienceIfAbsent 可以按调用序号失败一次的仓库（模拟「整条 Buffer 写到一半」） */
+class FlakyExperienceRepository extends InMemoryRepository {
+  /** 第 N 次 saveExperienceIfAbsent 调用抛错（从 1 起数）；null = 不注入失败 */
+  failOnCall: number | null = null;
+  private calls = 0;
+
+  override async saveExperienceIfAbsent(
+    role_id: string,
+    experience: ExperienceRecord,
+  ): Promise<ExperienceSaveResult> {
+    this.calls += 1;
+    if (this.failOnCall === this.calls) {
+      throw new Error('experience write failed');
+    }
+    return super.saveExperienceIfAbsent(role_id, experience);
+  }
+}

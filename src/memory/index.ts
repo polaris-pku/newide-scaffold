@@ -64,6 +64,11 @@ export {
   FileBufferRepository,
   type FileBufferRepositoryOptions,
 } from './adapters/file-buffer-repository';
+export { InMemoryMemoryDeliveryRepository } from './adapters/in-memory-memory-delivery';
+export {
+  FileMemoryDeliveryRepository,
+  type FileMemoryDeliveryRepositoryOptions,
+} from './adapters/file-memory-delivery';
 
 // ════════════════════════════════════════════════════════
 //  3. LLM 客户端适配器
@@ -133,6 +138,17 @@ export {
   type UsageFeedbackResult,
 } from './services/usage-feedback';
 export {
+  buildContextDeliveryItem,
+  buildDriverUsageFeedbackRecords,
+  contextDeliveryId,
+  contextDeliveryKey,
+  driverFeedbackId,
+  driverFeedbackKey,
+  type ContextDeliveryInput,
+  type DriverFeedbackInput,
+  type DriverReferencedExperience,
+} from './services/context-delivery';
+export {
   computeMemoryOverview,
   type MemoryOverview,
 } from './services/memory-overview';
@@ -167,6 +183,9 @@ export {
   ingestTaskBuffer,
   processPendingBuffer,
   extractBuffer,
+  persistExtractedExperiences,
+  stableExperienceId,
+  type PersistedExtraction,
   promoteExperiences,
   extractBufferForAgent,
   promoteExperiencesForAgent,
@@ -189,6 +208,7 @@ export {
 export {
   disposeRetiredAssets,
   createReplacementAgent,
+  replacementRoleIdFor,
   type RetireOptions,
   type RetireResult,
   type RetireAssetDisposition,
@@ -207,8 +227,10 @@ export {
   type MarketSearchQuery,
 } from './services/skill-market';
 export type {
+  ExperienceSaveResult,
   MarketSearchOptions,
   MarketImportResult,
+  SkillSaveResult,
   TransferSkillToMarketOptions,
 } from './ports/memory-repository';
 /** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
@@ -364,10 +386,34 @@ export { createMockCompetitionClaimEvaluator } from './adapters/mock-competition
 // ════════════════════════════════════════════════════════
 
 export type {
+  AgentContextReadStatus,
+  BufferArchiveOutcome,
+  BufferLocation,
   BufferRepository,
   DeadLetterEntry,
+  PendingBufferRead,
   SaveBufferResult,
+  StoredBuffer,
 } from './ports/buffer-repository';
+export type {
+  MemoryDeliveryRepository,
+  ContextDeliveryFilter,
+  DriverFeedbackFilter,
+  DeliverySubmitResult,
+  DeliveryChannel,
+  DeliveryClaimRequest,
+  DeliveryRecordLocator,
+  DeliveryRepositoryPolicy,
+  ClaimedDelivery,
+  ClaimedContextDelivery,
+  ClaimedDriverFeedback,
+} from './ports/memory-delivery';
+export {
+  DEFAULT_DELIVERY_LEASE_MS,
+  DEFAULT_DELIVERY_LOCK_TTL_MS,
+  DEFAULT_DELIVERY_RETRY_POLICY,
+  type DeliveryRetryPolicy,
+} from './services/delivery-lifecycle';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';

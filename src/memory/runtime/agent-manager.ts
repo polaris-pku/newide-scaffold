@@ -9,9 +9,11 @@ import {
   MARKET_POOL_ROLE_ID,
   type AgentHandle,
   type CreateAgentSpec,
+  type ExperienceRecord,
   type RetiredReason,
 } from '../schemas';
 import type { BufferRepository } from '../ports/buffer-repository';
+import type { MemoryDeliveryRepository } from '../ports/memory-delivery';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { AgentTaskRequest } from '../agent-types';
 import type { MemoryCycleResult } from '../types';
@@ -32,6 +34,7 @@ import {
   buildAgentArchive,
   createReplacementAgent,
   disposeRetiredAssets,
+  replacementRoleIdFor,
 } from '../services/retirement';
 import { Agent } from './agent';
 import { createId, nowTimestamp } from '../../core';
@@ -50,6 +53,12 @@ export interface AgentManagerOptions {
   embedding?: EmbeddingProvider;
   retirementEvaluator?: RetirementEvaluator;
   retirementDetector?: RetirementDetector;
+  /**
+   * 下游交付存储（可选）：与 bufferRepository 同生命周期——角色创建时初始化、
+   * 硬删除时一并清理。缺省表示本进程没有交付存储（测试/无下游场景），
+   * 对 Agent 的创建与派发行为没有影响。
+   */
+  deliveryRepository?: MemoryDeliveryRepository;
 }
 
 /**
@@ -169,6 +178,7 @@ export class AgentManager {
       if (!this.agents.has(role_id)) {
         await this.repository.ensureAgent(role_id);
         await this.bufferRepository.ensureAgent(role_id);
+        await this.options.deliveryRepository?.ensureAgent(role_id);
         const memory = createAgentMemoryScope(this.repository, this.bufferRepository, role_id);
         const tools = {
           ...this.options.tools,
@@ -182,9 +192,54 @@ export class AgentManager {
 
   async createAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
     await this.repository.initializeAgent(spec);
-    const agent = await this.instantiateAgent(spec.role_id);
+    let agent: Agent;
+    try {
+      agent = await this.instantiateAgent(spec.role_id);
+    } catch (error) {
+      // 主 Agent 已落库，从属存储（buffer / delivery）却没配齐——这是个半初始化 Agent，
+      // 必须回滚而不是留着：listAgentIds 会把它当成正常 Agent 发现，派发时却因为没有
+      // buffer 存储而炸。回滚按初始化逆序做（delivery → buffer → 主实体），失败不静默吞：
+      // 尽量都拆，拆不动的并进错误消息，原始错误留在 cause 上供上层按类型判断。
+      const cleanupErrors = await this.rollbackAgentCreation(spec.role_id);
+      if (cleanupErrors.length === 0) {
+        throw error;
+      }
+      throw new Error(
+        `Agent creation failed for ${spec.role_id} (${errorMessage(error)}); ` +
+          `the partial Agent could not be fully rolled back: ${cleanupErrors.join('; ')}`,
+        { cause: error },
+      );
+    }
     this.agents.set(spec.role_id, agent);
     return agent.getHandle();
+  }
+
+  /**
+   * createAgent 的补偿：按初始化的**逆序**拆掉已经建起来的部分。
+   *
+   * 每一步都幂等（deleteAgent 对不存在的存储静默成功），所以「哪一步真正建成功了」不需要
+   * 事先知道；主实体可能根本没建起来（initializeAgent 成功、后面任何一步失败前它都在，
+   * 但 deleteAgent 对已删的实体抛 Agent not found）——那种情形按已完成处理。拆不动的错误
+   * 收集起来交给调用方，绝不在这里吞掉。
+   */
+  private async rollbackAgentCreation(role_id: string): Promise<string[]> {
+    const steps: ReadonlyArray<[string, () => Promise<unknown>]> = [
+      ['delivery storage', async () => this.options.deliveryRepository?.deleteAgent(role_id)],
+      ['buffer storage', async () => this.bufferRepository.deleteAgent(role_id)],
+      ['Agent record', async () => this.repository.deleteAgent(role_id)],
+    ];
+    const errors: string[] = [];
+    for (const [label, cleanup] of steps) {
+      try {
+        await cleanup();
+      } catch (error) {
+        if (isMissingAgentError(error)) continue;
+        errors.push(`${label}: ${errorMessage(error)}`);
+      }
+    }
+    // 内存实例一并驱逐：半初始化的 Agent 绝不能留在 map 里被竞标/派发选中
+    this.agents.delete(role_id);
+    return errors;
   }
 
   /**
@@ -219,8 +274,12 @@ export class AgentManager {
           `all of its skills, experiences and persona`,
       );
     }
-    await this.repository.deleteAgent(role_id);
+    // 先清从属存储、最后删主实体：主实体的存在就是「还有清理没做完」的标记。反过来
+    // （先删实体）一旦后续清理失败，实体已经没了、再没人能重新发现这个 Agent，Buffer 与
+    // 交付存储就成了永远清不掉的孤儿。从属删除各自幂等，所以任何一步失败都能整段重跑。
     await this.bufferRepository.deleteAgent(role_id);
+    await this.options.deliveryRepository?.deleteAgent(role_id);
+    await this.repository.deleteAgent(role_id);
     this.agents.delete(role_id);
   }
 
@@ -230,6 +289,7 @@ export class AgentManager {
    */
   private async instantiateAgent(role_id: string): Promise<Agent> {
     await this.bufferRepository.ensureAgent(role_id);
+    await this.options.deliveryRepository?.ensureAgent(role_id);
     const memory = createAgentMemoryScope(this.repository, this.bufferRepository, role_id);
 
     // 自动注入 QueryMemoryTool（需要 AgentMemoryScope，只能在这里创建）
@@ -656,12 +716,21 @@ export class AgentManager {
    *
    * 可选创建替代 Agent（clean_slate / seeded_slate），须在删除源实体之前创建。
    *
-   * 对已归档（退休完成、实体已删）Agent 幂等：返回归档摘要，不做重复处置。
+   * 对已归档（退休完成、实体已删）Agent 幂等：返回归档摘要，不重复处置资产；
+   * 同时幂等地补做完上次可能没做完的从属存储清理（见 completeRetirementCleanup）。
    */
   async retireAgent(role_id: string, options: RetireOptions = {}): Promise<RetireResult> {
-    // 已归档（退休完成、实体已删）→ 幂等返回归档摘要
+    if (role_id === MARKET_POOL_ROLE_ID) {
+      throw new Error(`Cannot retire market pool agent: ${role_id}`);
+    }
+
+    // 已归档（退休完成、实体已删）→ 幂等返回归档摘要。但**先把可能没做完的收尾补齐**：
+    // 若上一次归档写成功、随后的从属清理或实体删除中途失败，实体还在——这里不能只是
+    // 「早就退休了」地一走了之，否则 Buffer / 交付存储会永远留在盘上（实体一删就再没人
+    // 能重新发现它）。completeRetirementCleanup 幂等，重跑安全，不会重复处置资产。
     const archived = await this.repository.getAgentArchive(role_id).catch(() => null);
     if (archived) {
+      await this.completeRetirementCleanup(role_id);
       return {
         role_id,
         status: 'retired',
@@ -678,12 +747,15 @@ export class AgentManager {
     if (!handle) {
       throw new Error(`Agent not found: ${role_id}`);
     }
-    if (role_id === MARKET_POOL_ROLE_ID) {
-      throw new Error(`Cannot retire market pool agent: ${role_id}`);
-    }
 
-    // 记录退休意图（reason / replacement），供后续 finalize（含 dispatchTask 自动触发）读取
-    this.pendingRetirement.set(role_id, options);
+    // 记录退休意图（reason / replacement），供后续 finalize（含 dispatchTask 自动触发）读取。
+    // **合并而不是覆盖**：finalize 中途失败后重试时，调用方通常只会再喊一次 retireAgent
+    // 而不带参数，覆盖会把上一轮记下的 replacement 意图抹掉——那等于把「替代 Agent 建失败」
+    // 悄悄降级成「不建替代 Agent」。这里保留已记录的选项，只让本次显式给出的字段生效。
+    this.pendingRetirement.set(role_id, {
+      ...(this.pendingRetirement.get(role_id) ?? {}),
+      ...options,
+    });
 
     // 兼容旧数据：实体仍为 retired（未归档）→ 直接归档并删除
     if (handle.status === 'retired') {
@@ -714,6 +786,10 @@ export class AgentManager {
    * 退休 finalize：资产处置 → 归档 → 删除实体 → 驱逐内存实例。
    *
    * reason / replacement 从 pendingRetirement 读取（首次 retireAgent 调用时记录）。
+   *
+   * 这个方法是**可重跑**的：任何一步抛出，pendingRetirement 都还留着，源 Agent 也还在
+   * （Phase 1 只把它标成 draining），调用方再喊一次 retireAgent 就能接着做。因此这里
+   * 只在真正走完归档 + 收尾之后才清掉退休意图。
    */
   private async finalizeRetirement(
     role_id: string,
@@ -722,7 +798,6 @@ export class AgentManager {
     const retireOptions = this.pendingRetirement.get(role_id) ?? {};
     const reason = retireOptions.reason ?? 'manual';
     const retiredAt = nowTimestamp();
-    this.pendingRetirement.delete(role_id);
 
     // Phase 2: 资产处置（skills 入市；低置信经验删除，高置信经验随后随实体级联删除）
     const [skills, experiences] = await Promise.all([
@@ -738,19 +813,14 @@ export class AgentManager {
     // 替代 Agent 必须在删除源实体之前创建（需要读取 source handle / experiences）
     let replacementRoleId: string | undefined;
     if (retireOptions.replacement && retireOptions.replacement !== 'none') {
-      replacementRoleId = await createReplacementAgent(
-        this.repository,
+      replacementRoleId = await this.createReplacementAgentSafely(
         handle,
         experiences,
         retireOptions.replacement,
       );
-      // 让替代 Agent 立即进入内存 map，可被后续竞标/派发使用
-      if (!this.agents.has(replacementRoleId)) {
-        this.agents.set(replacementRoleId, await this.instantiateAgent(replacementRoleId));
-      }
     }
 
-    // Phase 3: 归档 + 删除实体 + 驱逐
+    // Phase 3: 归档 → 幂等收尾（从属存储 + 主实体 + 驱逐）
     const archive = buildAgentArchive(handle, {
       retired_at: retiredAt,
       retired_reason: reason,
@@ -758,9 +828,9 @@ export class AgentManager {
       ...(replacementRoleId ? { replacement_role_id: replacementRoleId } : {}),
     });
     await this.repository.archiveAgent(role_id, archive);
-    await this.repository.deleteAgent(role_id);
-    await this.bufferRepository.deleteAgent(role_id);
-    this.agents.delete(role_id);
+    await this.completeRetirementCleanup(role_id);
+    // 走到这里才会有第二次执行也做不成的事：清掉退休意图，避免重试时又建一个替代 Agent
+    this.pendingRetirement.delete(role_id);
 
     return {
       role_id,
@@ -770,6 +840,67 @@ export class AgentManager {
       asset_disposition: assetDisposition,
       ...(replacementRoleId ? { replacement_role_id: replacementRoleId } : {}),
     };
+  }
+
+  /**
+   * 建替代 Agent，并保证**要么建成一个能用的，要么什么都不留**。
+   *
+   * 主实体（MemoryRepository）、名下继承的经验、从属存储（Buffer / 交付）、内存实例分属
+   * 四处，没有跨存储事务。半途失败如果放着不管，就会留下一个「在仓库里、不在 agents map
+   * 里、Buffer/Delivery 也没配齐」的替代 Agent：listAgentIds 会把它当正常 Agent 发现，
+   * 派发时却因为存储不齐而炸。所以这里任一步失败都按初始化的逆序整段回滚
+   * （delivery → buffer → 主实体，主实体的存在就是「还没清完」的标记），再把原始错误
+   * 抛出去——源 Agent 仍在、退休意图也仍在，调用方可以重试整次退休。
+   *
+   * 重试幂等：role_id 由源 role_id 决定（replacementRoleIdFor），上一轮若已建出主实体就
+   * 复用它，只补齐从属存储与内存实例，不会因为「已存在」而失败。
+   */
+  private async createReplacementAgentSafely(
+    source: AgentHandle,
+    experiences: ExperienceRecord[],
+    strategy: 'clean_slate' | 'seeded_slate',
+  ): Promise<string> {
+    const roleId = replacementRoleIdFor(source.role_id);
+    try {
+      const existing = await this.repository.getAgent(roleId).catch(() => null);
+      if (!existing) {
+        await createReplacementAgent(this.repository, source, experiences, strategy);
+      }
+      // 主实体齐了还不够：从属存储没配齐的替代 Agent 与「半初始化」是同一件事
+      if (!this.agents.has(roleId)) {
+        this.agents.set(roleId, await this.instantiateAgent(roleId));
+      }
+      return roleId;
+    } catch (error) {
+      const cleanupErrors = await this.rollbackAgentCreation(roleId);
+      if (cleanupErrors.length === 0) {
+        throw error;
+      }
+      throw new Error(
+        `Replacement Agent creation failed for ${roleId} (${errorMessage(error)}); ` +
+          `the partial replacement could not be fully rolled back: ${cleanupErrors.join('; ')}`,
+        { cause: error },
+      );
+    }
+  }
+
+  /**
+   * 退休收尾的幂等清理：Buffer → Delivery → 主实体 → 内存驱逐。
+   *
+   * 顺序是**先清从属存储、最后删主实体**。反过来（先删实体）会把「实体没了、Buffer 还在」
+   * 变成一个再也重试不了的状态：实体一删，就没人能重新发现这个 Agent 了。保持实体在，
+   * 它本身就是「还没清完」的标记，重跑安全。从属删除各自幂等；主实体可能已被删（重复收尾），
+   * 那种 Agent not found 视为已完成。归档摘要在调用方手里，这里只负责把存储清干净。
+   */
+  private async completeRetirementCleanup(role_id: string): Promise<void> {
+    await this.bufferRepository.deleteAgent(role_id);
+    await this.options.deliveryRepository?.deleteAgent(role_id);
+    try {
+      await this.repository.deleteAgent(role_id);
+    } catch (error) {
+      if (!isMissingAgentError(error)) throw error;
+    }
+    this.agents.delete(role_id);
   }
 
   /**
@@ -822,6 +953,20 @@ function preRetiredResult(role_id: string, reason: RetiredReason): RetireResult 
     retired_reason: reason,
     pending: true,
   };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 「这个 Agent 本来就不在」——重试一个已经做完的删除时该被当成成功，而不是失败。
+ *
+ * repository.deleteAgent 对不存在的实体抛 `Agent not found`（与 Buffer / 交付存储那两份
+ * 幂等的 deleteAgent 不同）。收尾流程里它出现只有一种含义：这一步之前已经做过了。
+ */
+function isMissingAgentError(error: unknown): boolean {
+  return /Agent not found/.test(errorMessage(error));
 }
 
 export type { RetireOptions, RetireResult } from '../services/retirement';

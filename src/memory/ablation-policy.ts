@@ -9,6 +9,13 @@
  * production setting, but nothing new is written back. Use it when an
  * experiment needs a stable memory read surface — every run sees the seeded
  * skills and whatever experiences already exist, and no run adds more.
+ *
+ * 字段分工（改动过，别再按旧语义读）：
+ * - `include_skills` / `include_recent_experience` 影响**检索**，在线路径读它们。
+ * - `schedule_extraction` / `promote_skills` 只影响**进程内模拟**（in-process
+ *   emulation）那条实验/维护入口。生产在线路径不受它们影响：它只把 Buffer 登记成一条
+ *   上下文交付项交给下游，既不提取也不晋升——「什么都不写回」由下游是否消费决定，
+ *   而不是由一个请求字段把生产路径的输出掐掉。
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 

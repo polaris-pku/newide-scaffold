@@ -30,6 +30,14 @@ export interface AgentContextPackEvidence {
   /** Exact merged context serialized into A's DriverPrompt. */
   driver_invocation_context?: unknown;
   agent_runtime: AgentRuntimePromptEvidence;
+  /**
+   * AgentContextSnapshot 是否与本 Buffer 成对落盘（Buffer 的 context_snapshot_ref 存在）。
+   *
+   * false 表示这次只有 DriverReturn 进了 Buffer，经验提取只能看到「做了什么」而看不到
+   * 「为什么」——原因见 context_snapshot_warnings；缺字段的是旧证据，按未记录处理。
+   */
+  context_snapshot_paired?: boolean;
+  context_snapshot_warnings?: string[];
   created_at: string;
   schema_version: string;
 }

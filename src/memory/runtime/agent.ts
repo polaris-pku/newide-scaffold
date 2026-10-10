@@ -14,10 +14,11 @@
  * const agent = new Agent(memory, { llm, tools: [...] });
  * ```
  */
-import type { AgentHandle, DriverReturn, AgentStatus } from '../schemas';
+import type { AgentHandle, DriverReturn, AgentStatus, AgentContextSnapshot } from '../schemas';
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { AgentLoopState, AgentTaskRequest } from '../agent-types';
 import type { CallJournalPort } from '../ports/call-journal';
+import type { AgentContextCleaner } from '../ports/agent-context-cleaner';
 import type { MemoryCycleResult } from '../types';
 import type { CompetitionClaimEvaluator } from '../ports/competition-claim-evaluator';
 import type { AgentCompetitionClaim } from '../competition-types';
@@ -50,6 +51,15 @@ export interface AgentToolConfig {
    * 缺省不留档，行为与不注入时完全一致。
    */
   callJournal?: CallJournalPort;
+  /**
+   * 任务结束时把顶层 Agent 原始上下文清理成 AgentContextSnapshot 的清理器（可选）。
+   *
+   * 传了就与 DriverReturn 成对落进同一条 Buffer（context_{seq}.json ↔ report_{seq}.json），
+   * 经验提取因此能同时看到「做了什么」和「为什么这么做」；不传或清理失败则只落
+   * DriverReturn，提取按既有的无上下文路径降级，并在 cycle.warnings 里记明原因。
+   * 生产组合根注入 LlmContextCleaner，测试/无 LLM 场景注入 NullContextCleaner。
+   */
+  contextCleaner?: AgentContextCleaner;
 }
 
 // ──────────────────────────────────────────────
@@ -69,6 +79,14 @@ export class Agent {
   private loopMessages: ToolCallMessage[] | null = null;
   /** 最后一次 invoke_driver 的返回（写入 buffer 时需要） */
   private lastDriverReturn: DriverReturn | undefined;
+  /**
+   * 本次任务中每一次 invoke_driver 的调用记录。
+   *
+   * 与 lastDriverReturn 分开：落进 Buffer 的 driver_return 只有最后那一次，
+   * 但上下文快照的 driver_calls 要如实列出本次调了几次、分别是谁。
+   */
+  private driverInvocations: Array<{ call_id: string; driver_id: string; driver_return: DriverReturn }> =
+    [];
   /** 已执行轮次（防死循环） */
   private loopRound: number = 0;
   /** 任务完成后的 cycle 结果，供 runOnce 包装使用 */
@@ -286,7 +304,13 @@ export class Agent {
 
           // 记录最后一次 invoke_driver 的返回
           if (tool.name === 'invoke_driver') {
-            this.lastDriverReturn = result as DriverReturn;
+            const driverReturn = result as DriverReturn;
+            this.lastDriverReturn = driverReturn;
+            this.driverInvocations.push({
+              call_id: toolCall.id,
+              driver_id: task.source_driver ?? 'mock-driver',
+              driver_return: driverReturn,
+            });
           }
 
           const content =
@@ -366,6 +390,7 @@ export class Agent {
     this.currentTask = task;
     this.state = 'running';
     this.lastDriverReturn = undefined;
+    this.driverInvocations = [];
     this.loopRound = 0;
     this.lastCycleResult = null;
 
@@ -465,6 +490,7 @@ export class Agent {
     this.currentTask = null;
     this.loopMessages = null;
     this.lastDriverReturn = undefined;
+    this.driverInvocations = [];
     this.loopRound = 0;
   }
 
@@ -489,6 +515,11 @@ export class Agent {
   /**
    * 写入 pending buffer，不做提取和晋升。
    *
+   * DriverReturn 与清理后的 AgentContextSnapshot 在这里成对落进同一条 Buffer：
+   * 两者共用一个 seq，于是经验提取器读 context_{seq}.json 时，看到的必然是
+   * report_{seq}.json 里那次执行的上下文。清理缺席/失败不拦任务，只落一条
+   * warnings 说明降级原因——「没有上下文」与「上下文是空的」不能长得一样。
+   *
    * 经验提取和技能晋升游离于 Agent 执行循环之外，由后续的 BufferProcessor
    * 异步处理，确保 Agent 的在线路径不被后处理阻塞。
    */
@@ -511,6 +542,16 @@ export class Agent {
       assumptions: [],
     };
 
+    const warnings: string[] = [];
+    const agentContext = await this.cleanAgentContext(task_id, warnings);
+    const retrieval = task.retrieval;
+    if (!retrieval) {
+      warnings.push(
+        'retrieval_unavailable: the task request carried no memory retrieval result, ' +
+          'so this cycle reports an empty retrieval.',
+      );
+    }
+
     // 写入 pending buffer（仅存储，不处理）
     const ingested = await writePendingBuffer(
       this.memory,
@@ -524,18 +565,22 @@ export class Agent {
         retry_count: 0,
         extraction_status: 'pending',
       },
-      undefined,
+      agentContext,
     );
+
+    // task.retrieval 缺席时如实返回空数组（上面已记明原因），不编造检索结果。
+    const skills = retrieval?.skills ?? [];
+    const experiences = retrieval?.experiences ?? [];
 
     return {
       agent_id: this.memory.role_id,
       persona,
       skills_before,
-      retrieval: { skills: [], experiences: [] },
+      retrieval: { skills: [...skills], experiences: [...experiences] },
       driver_context: {
         task_instruction: task.spec,
-        skills: [],
-        experiences: [],
+        skills: [...skills],
+        experiences: [...experiences],
       },
       buffer_snapshot: ingested.snapshot,
       buffer_seq: ingested.seq,
@@ -557,8 +602,74 @@ export class Agent {
           blocking_rules: ['extraction and promotion are handled offline'],
         },
       },
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
   }
+
+  /**
+   * 清理本次任务的顶层上下文，产出可写入 Buffer 的 AgentContextSnapshot。
+   *
+   * raw_context 取本次 tool-calling 对话（loopMessages 每个任务重置，故全部属于本任务），
+   * driver_returns 取本次实际发生过的 invoke_driver 调用。清理器缺席、返回 null 或抛错
+   * 都只记一条降级 warning 并返回 undefined——返回 undefined 意味着 Buffer 里不会有
+   * context 文件、context_snapshot_ref 也保持缺失，下游据此走既有的无上下文降级路径。
+   */
+  private async cleanAgentContext(
+    task_id: string,
+    warnings: string[],
+  ): Promise<AgentContextSnapshot | undefined> {
+    const cleaner = this.toolConfig?.contextCleaner;
+    if (!cleaner) {
+      warnings.push(
+        'context_cleaning_failed: no AgentContextCleaner is configured, ' +
+          'so this Buffer carries only the DriverReturn.',
+      );
+      return undefined;
+    }
+    try {
+      const snapshot = await cleaner.clean({
+        agent_id: this.memory.role_id,
+        source_task_id: task_id,
+        raw_context: serializeLoopContext(this.loopMessages ?? []),
+        driver_returns: this.driverInvocations.map((invocation) => ({ ...invocation })),
+      });
+      if (!snapshot) {
+        warnings.push(
+          'context_cleaning_failed: the cleaner produced no snapshot; ' +
+            'this Buffer carries only the DriverReturn.',
+        );
+        return undefined;
+      }
+      return snapshot;
+    } catch (error) {
+      warnings.push(
+        `context_cleaning_failed: ${error instanceof Error ? error.message : String(error)}; ` +
+          'this Buffer carries only the DriverReturn.',
+      );
+      return undefined;
+    }
+  }
+}
+
+/**
+ * 把本次 tool-calling 对话摊平成清理器的 raw_context。
+ *
+ * 只做序列化，不做筛选：清理器的职责是判断哪些值得留（thinking/planning），
+ * 这里先把原样交给它，免得「上游以为不重要」把信号提前抹掉。
+ */
+function serializeLoopContext(messages: readonly ToolCallMessage[]): string {
+  return messages
+    .map((message) => {
+      const parts: string[] = [`### ${message.role}`];
+      if (message.content) {
+        parts.push(message.content);
+      }
+      for (const call of message.tool_calls ?? []) {
+        parts.push(`tool_call ${call.function.name}(${call.function.arguments})`);
+      }
+      return parts.join('\n');
+    })
+    .join('\n\n');
 }
 
 /** 从 QueryMemoryOutput 提取结果摘要（防御式取数：字段缺失时退回通用描述） */
