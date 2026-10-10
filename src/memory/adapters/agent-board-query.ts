@@ -4,10 +4,15 @@
  * 委托 MemoryRepository 读取实体，组装对外 DTO（剔除 embedding、
  * linked_negative_exp），并在 getAgent 内计算派生指标。
  * 实现 Port 见 ports/agent-board-query.ts。
+ *
+ * `getAgent` 另有一处**跨来源叠加**：角色的累计用量不由档案提供，而由账本按 `role_id`
+ * 求和后取（见 `ports/role-token-usage.ts` 的长注释）。它只在这一处只读投影里发生，
+ * 不写回档案。
  */
-import type { AgentStatus, ExperienceRecord, SkillRecord } from '../schemas';
+import type { AgentMetrics, AgentStatus, ExperienceRecord, SkillRecord } from '../schemas';
 import { calculateDerivedMetrics } from '../schemas';
 import type { MemoryRepository } from '../ports/memory-repository';
+import type { RoleTokenUsageReader } from '../ports/role-token-usage';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
@@ -64,7 +69,14 @@ export function toExperienceView(e: ExperienceRecord): ExperienceView {
 }
 
 export class RepositoryAgentBoardQuery implements AgentBoardQuery {
-  constructor(private readonly repository: MemoryRepository) {}
+  constructor(
+    private readonly repository: MemoryRepository,
+    /**
+     * 角色累计用量的取数口。**缺省表示不叠加**——档案里的 `token_cost_total` 原样透出
+     * （生产装配点会接上账本；测试与不关心用量的调用方可以不传）。
+     */
+    private readonly roleTokenUsage?: RoleTokenUsageReader,
+  ) {}
 
   async listAgents(status?: AgentStatus): Promise<AgentBoardListItem[]> {
     const ids = await this.repository.listAgentIds();
@@ -83,10 +95,11 @@ export class RepositoryAgentBoardQuery implements AgentBoardQuery {
   }
 
   async getAgent(role_id: string): Promise<AgentBoardAgentView> {
-    const [handle, rawMetrics] = await Promise.all([
+    const [handle, persistedMetrics] = await Promise.all([
       this.repository.getAgent(role_id),
       this.repository.getMetrics(role_id),
     ]);
+    const rawMetrics = this.withBilledTokens(role_id, persistedMetrics);
     const derived = calculateDerivedMetrics(rawMetrics);
     return {
       role_id: handle.role_id,
@@ -99,6 +112,23 @@ export class RepositoryAgentBoardQuery implements AgentBoardQuery {
       metrics: { raw: rawMetrics, derived },
       created_at: handle.created_at,
     };
+  }
+
+  /**
+   * 把账本上该角色的计费 token 合计叠进档案的 `token_cost_total`。
+   *
+   * 为什么是覆盖一个叫「成本」的字段：那个字段今天**没有写入方**（只有
+   * `memory-repository-seeds.ts` 把它初始化成 0），而前端恰恰把这一格当 token 数渲染
+   * （Agent Board 的「开销 · 累计 N token」）。所以这不是把成本口径偷换成 token，而是让
+   * 一个**已经**按 token 显示的格子有真数。要名实相符就得新增 token 计数字段，那要同时动
+   * schema 与前端。
+   *
+   * 取不到（`undefined`）时**原样返回**：账本里没有这个角色的行 ≠ 这个角色花了 0。
+   */
+  private withBilledTokens(role_id: string, metrics: AgentMetrics): AgentMetrics {
+    const billedTokens = this.roleTokenUsage?.totalBilledTokens(role_id);
+    if (billedTokens === undefined) return metrics;
+    return { ...metrics, token_cost_total: billedTokens };
   }
 
   async listSkills(role_id: string, filter?: SkillListFilter): Promise<SkillView[]> {
