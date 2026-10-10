@@ -64,6 +64,22 @@ export interface TransferSkillToMarketOptions {
   market_status?: MarketStatus;
 }
 
+/** saveSkillIfAbsent 的结果：实际存储的 Skill 与「本次是否新建」 */
+export interface SkillSaveResult {
+  /** 仓库里最终生效的那条 Skill（命中已有条目时是已有那条） */
+  skill: SkillRecord;
+  /** true = 本次新建；false = 幂等命中（同 (role_id, promoted_from) 已有条目） */
+  created: boolean;
+}
+
+/** saveExperienceIfAbsent 的结果：实际存储的 Experience 与「本次是否新建」 */
+export interface ExperienceSaveResult {
+  /** 仓库里最终生效的那条 Experience（命中已有条目时是已有那条） */
+  experience: ExperienceRecord;
+  /** true = 本次新建（计数已加）；false = 幂等命中（同 id 已有条目，什么都没改） */
+  created: boolean;
+}
+
 export interface MemoryRepository {
   /** 确保 Agent 存在（不存在则用种子数据初始化） */
   ensureAgent(role_id: string): Promise<void>;
@@ -165,8 +181,53 @@ export interface MemoryRepository {
 
   /** 持久化一条经验记录 */
   saveExperience(role_id: string, experience: ExperienceRecord): Promise<void>;
+  /**
+   * 幂等保存一条**从 Buffer 提取而来**的经验：以 `Experience.id` 为唯一键。
+   *
+   * 提取落库的粒度是整条 Buffer（第 N 条保存失败就得整条重试），而**两个独立的 Memory
+   * Maintenance worker 可以同时处理同一个 `(role_id, buffer_seq)`**——稳定 id 只解决了
+   * 「顺序重试写重了」，解决不了「并发重入」：两个 worker 各自 list 一遍都看不到对方那条，
+   * 于是各写一次，内存实现攒出重复 id，PG 实现撞主键把一个 worker 打成异常。
+   *
+   * 所以「查有没有 + 写进去」必须在存储层原子完成，调用方拿不到冲突异常：
+   *
+   * - 同 id 已存在：不新建、不计数（`experience_count` 与 `owned_exps` 都不动），
+   *   返回仓库里已有的那一条（并发下返回的可能就是对手刚写进去的）；
+   * - 同 id 不存在：按普通保存写入，计数加一。
+   *
+   * PG 用主键 + `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`；内存实现让
+   * 「最后一次同步检查 + push」之间没有 await。`agent_id` 的归属权威仍是调用方传入的
+   * `role_id`（提取路径由 persistExtractedExperiences 定死），本方法不改写它。
+   *
+   * **聚合根一致**：经验落库与 Agent 聚合根（`experience_count` / `owned_exps` /
+   * `metrics.experience_count`）的推进必须在同一事务内、且以数据库侧的原子增量为准，
+   * 不能「先 getAgent/getMetrics 读出来、在内存副本上 +1、再整份 JSON 覆盖回去」。
+   * 不同 id 的并发写入是这条约束的关键场景：逐条读改写会让后写的一方用旧快照覆盖先写的
+   * 一方，留下「库里有 N 条、聚合根只记 1 条」的漂移。
+   */
+  saveExperienceIfAbsent(
+    role_id: string,
+    experience: ExperienceRecord,
+  ): Promise<ExperienceSaveResult>;
   /** 持久化一条技能记录 */
   saveSkill(role_id: string, skill: SkillRecord): Promise<void>;
+  /**
+   * 幂等保存一条**由经验晋升而来**的技能：以 `(role_id, promoted_from)` 为唯一键。
+   *
+   * 晋升是两步写（先存 Skill、再把 Experience 的 promoted_to 指过去），第二步失败后重试
+   * 会再次存 Skill。没有幂等键就会攒出成对的重复技能，且 Experience 的 promoted_to 只能
+   * 指向其中一个，另一个变成没有任何来源的孤儿。实现必须让「查 + 写」是原子的（PG 用唯一
+   * 约束 + ON CONFLICT，内存实现用无 await 间隔的同键检查），并发调用也只产生一条技能。
+   *
+   * `promoted_from` 为空（市场导入等）时退化为普通保存。
+   *
+   * **聚合根一致**：技能落库与 Agent 聚合根（`skill_count` / `owned_skills` /
+   * `metrics.skill_count` / `metrics.promoted_skill_count`）的推进必须在同一事务内、且以
+   * 数据库侧的原子增量为准。来源**不同**的并发晋升是这条约束的关键场景：逐条读改写会让
+   * 后写的一方用旧快照覆盖先写的一方，留下「库里有 N 条技能、聚合根只记 1 条」的漂移。
+   * 计数只在真正新建时递增，幂等命中不重复计数。
+   */
+  saveSkillIfAbsent(role_id: string, skill: SkillRecord): Promise<SkillSaveResult>;
   /** 覆盖写入当前 Persona 快照（如 Persona 演化后 version+1） */
   savePersona(role_id: string, persona: PersonaDef): Promise<void>;
   /** 更新已有技能（如消融实验 auto-approve） */

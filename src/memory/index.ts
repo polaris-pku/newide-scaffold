@@ -183,6 +183,9 @@ export {
   ingestTaskBuffer,
   processPendingBuffer,
   extractBuffer,
+  persistExtractedExperiences,
+  stableExperienceId,
+  type PersistedExtraction,
   promoteExperiences,
   extractBufferForAgent,
   promoteExperiencesForAgent,
@@ -205,6 +208,7 @@ export {
 export {
   disposeRetiredAssets,
   createReplacementAgent,
+  replacementRoleIdFor,
   type RetireOptions,
   type RetireResult,
   type RetireAssetDisposition,
@@ -223,8 +227,10 @@ export {
   type MarketSearchQuery,
 } from './services/skill-market';
 export type {
+  ExperienceSaveResult,
   MarketSearchOptions,
   MarketImportResult,
+  SkillSaveResult,
   TransferSkillToMarketOptions,
 } from './ports/memory-repository';
 /** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
@@ -380,9 +386,14 @@ export { createMockCompetitionClaimEvaluator } from './adapters/mock-competition
 // ════════════════════════════════════════════════════════
 
 export type {
+  AgentContextReadStatus,
+  BufferArchiveOutcome,
+  BufferLocation,
   BufferRepository,
   DeadLetterEntry,
+  PendingBufferRead,
   SaveBufferResult,
+  StoredBuffer,
 } from './ports/buffer-repository';
 export type {
   MemoryDeliveryRepository,

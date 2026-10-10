@@ -93,7 +93,6 @@ import type {
   BMemoryMaintenanceEvidence,
   BMemoryMaintenancePort,
 } from './b-memory-maintenance-runner';
-import { resolveMaintenanceMode } from './b-memory-maintenance-runner';
 import type { DriverFeedbackRecord } from '../memory/schemas';
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
@@ -1284,11 +1283,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     runtimeRoleId: string,
     bufferSeq: number,
   ): Promise<BMemoryMaintenanceEvidence | undefined> {
-    if (!this.options.memoryMaintenance) return undefined;
-    const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
-    if (!ablationPolicy.schedule_extraction) return undefined;
+    const maintenance = this.options.memoryMaintenance;
+    if (!maintenance) return undefined;
+    // 消融标签**不在这里分流**：这条路径无论 B0–B4 都只把 Buffer 登记成一条交付项交出去。
+    // 曾经 `schedule_extraction` 为假（B0/B4）就整个跳过——那等于让一个请求字段把生产路径
+    // 的输出掐掉，Buffer 会永远留在 pending、下游根本不知道有这条输入。标签只影响检索
+    // （include_skills / include_recent_experience），不影响「任务流程照常生产输入」。
     try {
-      return await this.options.memoryMaintenance.scheduleBuffer({
+      return await maintenance.scheduleBuffer({
         task_id: input.task_id,
         run_id: input.run_id,
         role_id: runtimeRoleId,
@@ -1301,11 +1303,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const completedAt = nowTimestamp();
       return {
         maintenance_ref: createId('b_maintenance'),
-        // 报成这次实际走的路径：生产路径失败的是「交付」，不是「提取」
-        kind:
-          resolveMaintenanceMode(input) === 'delivery'
-            ? 'context_delivery'
-            : 'experience_extraction',
+        // 这条路径只做交付（scheduleBuffer 在两种 mode 下都只登记交付项），失败的是
+        // 「交付」而不是「本进程提取」。报成 experience_extraction 就等于在说任务流程
+        // 在提取——那正是这条边界要拆掉的说法。
+        kind: 'context_delivery',
         status: 'failed',
         task_id: input.task_id,
         run_id: input.run_id,
@@ -1330,7 +1331,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
    * 反馈先落 outbox，等下游按 feedback_id 归并。
    *
    * best-effort：写失败只记进 diagnostics，绝不让一个已经完成的 Agent 任务
-   * 因为下游的事变成失败。
+   * 因为下游的事变成失败。但「没写」这件事必须看得见——Driver 自报了引用却因为
+   * 本进程没配 outbox 而丢弃，是配置错误，不是「本次没有反馈」；两者都报成空
+   * 就等于把丢数据伪装成没数据。
    */
   private async recordDriverFeedback(
     input: AgentExecutionRequest,
@@ -1338,9 +1341,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     bufferSeq: number,
     references: readonly DriverReferencedExperience[],
   ): Promise<DriverFeedbackOutcome> {
-    if (!this.options.memoryMaintenance || references.length === 0) return { recorded: [] };
-    const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
-    if (!ablationPolicy.schedule_extraction) return { recorded: [] };
+    if (references.length === 0) return { recorded: [] };
+    // 消融标签同样不改这条边界：Driver 自报了引用却因为「这一臂是 B0/B4」而把反馈丢掉，
+    // 就是静默丢数据——反馈必须幂等且不能悄无声息地少。标签只影响检索。
+    if (!this.options.memoryMaintenance) {
+      return {
+        recorded: [],
+        error: 'B memory maintenance is not configured; driver feedback was not recorded.',
+      };
+    }
     try {
       const recorded = await this.options.memoryMaintenance.recordDriverUsageFeedback({
         task_id: input.task_id,

@@ -431,6 +431,223 @@ describe('production stage executors', () => {
     });
   });
 
+  it('archives the executor Plan self-check without judging it', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'newide-plan-selfcheck-'));
+    const workspace = path.join(root, 'workspace');
+    await mkdir(workspace, { recursive: true });
+    const councilRoot = path.join(root, 'council');
+    // Plan 只有一份「有序步骤」清单：没有机器可读块，因为没有任何东西会解析它。
+    const planText = [
+      '# Final plan',
+      '',
+      '1. Create src/result.ts exporting result.',
+      '2. Create src/extra.ts exporting extra.',
+      '',
+    ].join('\n');
+    const events: Event[] = [];
+    const implementationInstructions: string[] = [];
+
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        if (input.context_policy === 'council_plan_execution') {
+          // 只写一个文件，却自报两个步骤都做完：系统不该因此降级、也不该打回。
+          implementationInstructions.push(input.driver_instruction ?? input.instruction);
+          const relative = 'src/result.ts';
+          const absolute = path.join(input.workspace_path!, ...relative.split('/'));
+          await mkdir(path.dirname(absolute), { recursive: true });
+          await writeFile(absolute, 'export const result = 1;\n', 'utf8');
+          return scriptedPlanResult(
+            input,
+            workspaceFileArtifact(input.role_id, 'council_plan_execution', input.workspace_path!, relative),
+            planSelfCheck([
+              '1. Create src/result.ts exporting result. - done, src/result.ts:1',
+              '2. Create src/extra.ts exporting extra. - done, src/extra.ts:1',
+            ]),
+          );
+        }
+        if (input.council_seat === 'synthesizer') {
+          return scriptedPlanResult(
+            input,
+            fileArtifact('artifact_final_plan', 'final-plan.md', planText),
+            'synthesis complete',
+          );
+        }
+        if (input.council_seat === 'reviewer') {
+          return scriptedPlanResult(
+            input,
+            fileArtifact('artifact_reviewer', 'reviews.json', reviewPayload(input)),
+            'review complete',
+          );
+        }
+        return scriptedPlanResult(
+          input,
+          fileArtifact(`artifact_${input.role_id}_plan`, 'council-plan.md', '# proposal'),
+          'plan complete',
+        );
+      },
+    };
+    const resolver = new AgentBoardCouncilParticipantResolver({
+      boardQuery: boardQuery([
+        boardAgent('role_primary'),
+        boardAgent('role_deputy'),
+        boardAgent('role_reviewer'),
+        boardAgent('role_synthesizer'),
+      ]),
+      allowedAgentIds: ['role_primary', 'role_deputy', 'role_reviewer', 'role_synthesizer'],
+      seatAssignments: {
+        proposer0: 'role_primary',
+        proposer1: 'role_deputy',
+        reviewer: 'role_reviewer',
+        synthesizer: 'role_synthesizer',
+      },
+    });
+    const councilProvider = createCouncilStrategyProvider(
+      new SynthesisAgentCouncilProvider({
+        agentExecutionFacade,
+        councilRoot,
+        participantResolver: resolver,
+      }),
+      'plan_first',
+    );
+    const executors = createProductionStageExecutors({
+      selectAgentHandler: {
+        execute: async (input) => ({
+          winner_agent_id: 'role_primary',
+          winner_bid_id: 'bid_checklist',
+          ledger_ref: 'file:///market/ledger.json',
+          audit_ref: 'file:///market/audit.json',
+          ledger: {
+            ledger_id: 'ledger_checklist',
+            task_id: input.task_id,
+            seed: input.seed,
+            policy_version: 'market-v0',
+            bids: [],
+            winner_bid_id: 'bid_checklist',
+            winner_agent_id: 'role_primary',
+            created_at: nowTimestamp(),
+            schema_version: SCHEMA_VERSION,
+          },
+          audit: {
+            audit_id: 'audit_checklist',
+            task_id: input.task_id,
+            winner_agent_id: 'role_primary',
+            winner_bid_id: 'bid_checklist',
+            entries: [],
+            created_at: nowTimestamp(),
+            schema_version: SCHEMA_VERSION,
+          },
+          market_task: {
+            task_id: input.task_id,
+            task_description: input.task_description,
+            requirement_profile: {
+              persona_keywords: [],
+              preferred_skill_tags: [],
+              preferred_experience_tags: [],
+            },
+            context: { urgency: 0.5, exploration_level: 0.3 },
+          },
+        }),
+      },
+      agentExecutionFacade,
+      councilProvider,
+      gateExecutor: {
+        execute: async () => ({ hook_point: 'task.completed', matched: false, gate_results: [] }),
+      },
+      bootstrapAgentIds: ['role_primary', 'role_deputy', 'role_reviewer', 'role_synthesizer'],
+      auctionEnabled: false,
+      primaryAgentId: 'role_primary',
+      runsRoot: path.join(root, 'runs'),
+      councilRoot,
+      worktreesRoot: path.join(root, 'worktrees'),
+    });
+    const common = {
+      task_id: 'task_checklist',
+      run_id: 'run_checklist',
+      mode: 'council' as const,
+      task_request: { spec: 'implement result.ts', completion_criteria: [] },
+      workspace_path: workspace,
+      on_event: (event: Event) => events.push(event),
+    };
+
+    const selected = await executors.select_agent.execute({
+      ...common,
+      cursor_input: { cursor: 'select_agent', seed: 'run_checklist', candidate_ids: [] },
+    });
+    const executed = await executors.execute_agent.execute({
+      ...common,
+      cursor_input: { cursor: 'execute_agent', winner_agent_id: selected.winner_agent_id },
+    });
+    const council = await executors.council.execute({
+      ...common,
+      session_id: executed.session_id,
+      cursor_input: {
+        cursor: 'council',
+        trigger: 'explicit_mode',
+        candidate_manifest_ref: executed.changeset_ref,
+      },
+    });
+
+    // 自检是执行者自己的显式动作：指令要求先取证再逐条核对。
+    expect(implementationInstructions).toHaveLength(1);
+    const instruction = implementationInstructions[0]!;
+    expect(instruction).toContain(
+      're-open the Plan file and every product file you changed',
+    );
+    expect(instruction).toContain('Judge nothing from memory');
+    expect(instruction).toContain('"Plan check" section');
+    expect(instruction).toContain('Do not round up');
+
+    // 机器不解析自检：没有任何 plan.checklist.* 事件，也没有第二个实现回合。
+    expect(events.filter((event) => event.event_type.startsWith('plan.checklist'))).toHaveLength(0);
+    expect(
+      events.filter((event) => event.event_type === 'agent.execution_requested'),
+    ).toHaveLength(2); // 计划回合 + 实现回合，仅此而已
+
+    const state = JSON.parse(
+      await readFile(
+        path.join(root, 'runs', 'run_checklist', 'production-stage-state.json'),
+        'utf8',
+      ),
+    ) as {
+      plan_checklist?: unknown;
+      selection: { council_run_result: { plan_execution?: Record<string, unknown> } };
+    };
+    expect(state.plan_checklist).toBeUndefined();
+    expect(state.selection.council_run_result.plan_execution).not.toHaveProperty(
+      'plan_checklist',
+    );
+
+    const gated = await executors.gate.execute({
+      ...common,
+      cursor_input: {
+        cursor: 'gate',
+        subject_ref: council.changeset_ref,
+        phase: 'post_council',
+        changeset_ref: council.changeset_ref,
+        expected_sha256: council.expected_sha256,
+      },
+    });
+    expect(gated.status).toBe('allowed');
+    const gateState = JSON.parse(
+      await readFile(path.join(root, 'runs', 'run_checklist', 'production-stage-state.json'), 'utf8'),
+    ) as { gate: { completion_evaluation: { outcome: { status: string; reason: string } } } };
+    // 关键回归锁：自报撒了谎（只写了一个文件却说两步都完成），
+    // 系统不采信这个自报、也不惩罚它 —— outcome 仍然是 completed。
+    expect(gateState.gate.completion_evaluation.outcome).toMatchObject({
+      status: 'completed',
+    });
+    expect(gateState.gate.completion_evaluation.outcome.reason).not.toContain('Plan coverage');
+
+    // 自检段落随回复原样归档，供人阅读：这就是「计划遵循情况」的全部证据链。
+    const completed = events.find(
+      (event) =>
+        event.event_type === 'agent.execution_completed' &&
+        event.payload.phase === 'council_plan_execution',
+    );
+    expect(String(completed?.payload.response)).toContain('## Plan check');
+    expect(String(completed?.payload.response)).toContain('Create src/extra.ts');
+  });
+
   it('connects real selection, Agent, Gate, manifest and idempotent Deliver boundaries', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
     const workspace = path.join(root, 'workspace');
@@ -986,4 +1203,61 @@ function planFirstTargetPath(input: AgentExecutionRequest): string | undefined {
   if (input.council_seat === 'reviewer') return 'reviews.json';
   if (input.council_seat === 'synthesizer') return 'final-plan.md';
   return undefined;
+}
+
+/** 执行者按照指令写出的「计划核对」段落：自由文本，没有任何机器格式。 */
+function planSelfCheck(lines: readonly string[]): string {
+  return [
+    'Implementation complete.',
+    '',
+    '## Plan check',
+    '',
+    ...lines.map((line) => `- ${line}`),
+  ].join('\n');
+}
+
+/** 指向真实工作区文件的产物：核对依据是真实文件，而不是产物声明。 */
+function workspaceFileArtifact(
+  roleId: string,
+  policy: string,
+  workspace: string,
+  relativePath: string,
+): ArtifactRef {
+  const absolutePath = path.join(workspace, ...relativePath.split('/'));
+  return {
+    artifact_id: `artifact_${roleId}_${policy}_${relativePath.replace(/[^A-Za-z0-9]+/g, '_')}`,
+    type: 'file',
+    producer_id: roleId,
+    content: {
+      kind: 'file',
+      content_ref: pathToFileURL(absolutePath).href,
+      target_path: relativePath,
+    },
+    created_at: nowTimestamp(),
+    schema_version: SCHEMA_VERSION,
+  };
+}
+
+function scriptedPlanResult(
+  input: AgentExecutionRequest,
+  artifact: ArtifactRef,
+  response: string,
+): AgentExecutionResult {
+  const policy = input.context_policy ?? 'plan';
+  return {
+    agent_run_id: `agent_run_${input.role_id}_${policy}`,
+    agent_id: input.role_id,
+    role_id: input.role_id,
+    context_pack_ref: `context_pack_${input.role_id}`,
+    driver_run_result_id: `driver_result_${input.role_id}`,
+    artifact_refs: [artifact],
+    transcript_ref: transcriptArtifact(`transcript_${input.role_id}_${policy}`),
+    session_id: input.session_id ?? 'session_primary',
+    response,
+    tool_events: [],
+    diagnostics: { driver_id: 'acp-external' },
+    status: 'completed',
+    created_at: nowTimestamp(),
+    schema_version: SCHEMA_VERSION,
+  };
 }

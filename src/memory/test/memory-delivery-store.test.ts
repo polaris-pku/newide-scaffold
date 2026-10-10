@@ -8,7 +8,7 @@
  *   3. deleteAgent 清干净
  *   4. 文件实现跨实例存活（重启后交付项还在），损坏记录不阻断列举
  */
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -204,5 +204,95 @@ describe('FileMemoryDeliveryRepository（下游已推进的状态）', () => {
     const replayed = await store.submitContextDelivery(first);
     expect(replayed.created).toBe(false);
     expect(replayed.item.status).toBe('processed');
+  });
+});
+
+/**
+ * 首次提交的跨进程竞态。
+ *
+ * 两个实例就是两个进程：同进程的串行链不共享，「谁先发布」只能由文件系统裁决。
+ * 这里真正要证明的是三件事——磁盘上最终只有一条记录；两个调用都**成功**返回
+ * （不允许出现「记录已经落盘、调用却因为临时文件冲突而失败」）；输的那个读回
+ * 赢家写下的内容，而不是把自己那份当成结果。
+ */
+describe('FileMemoryDeliveryRepository（首次提交竞态）', () => {
+  it('两个进程同时首次提交同一条交付：一个创建、一个读回同一条', async () => {
+    const root = await tempRoot();
+    const first = new FileMemoryDeliveryRepository({ agentStateRoot: root });
+    const second = new FileMemoryDeliveryRepository({ agentStateRoot: root });
+    await first.ensureAgent('role_race');
+
+    const item = deliveryFor('role_race', 'task_race');
+    // 两份内容只有时间戳不同：调用方各自的 created_at 就是「它是不是赢家」的指纹
+    const contender = { ...item, created_at: '2020-01-01T00:00:00.000Z', updated_at: '2020-01-01T00:00:00.000Z' };
+    const [a, b] = await Promise.all([
+      first.submitContextDelivery(item),
+      second.submitContextDelivery(contender),
+    ]);
+
+    expect([a.created, b.created].sort()).toEqual([false, true]);
+    const stored = await first.getContextDelivery('role_race', item.delivery_id);
+    expect(stored).toMatchObject({ delivery_key: item.delivery_key, status: 'pending' });
+    // 两个调用看到的都是磁盘上那一份；输家没有坚持自己那份时间戳
+    expect(a.item.created_at).toBe(stored!.created_at);
+    expect(b.item.created_at).toBe(stored!.created_at);
+
+    // 目标目录只有一条记录，也没有残留的临时文件
+    const entries = await readdir(join(root, 'role_race', 'delivery', 'context'));
+    expect(entries).toEqual([`${item.delivery_id}.json`]);
+  });
+
+  it('两个进程同时首次提交同一条反馈：一个创建、一个读回同一条', async () => {
+    const root = await tempRoot();
+    const first = new FileMemoryDeliveryRepository({ agentStateRoot: root });
+    const second = new FileMemoryDeliveryRepository({ agentStateRoot: root });
+    await first.ensureAgent('role_race');
+
+    const record = feedbackFor('role_race', 'task_race', 'exp_race');
+    const contender = {
+      ...record,
+      observed_at: '2020-01-01T00:00:00.000Z',
+      created_at: '2020-01-01T00:00:00.000Z',
+      updated_at: '2020-01-01T00:00:00.000Z',
+    };
+    const [a, b] = await Promise.all([
+      first.submitDriverFeedback(record),
+      second.submitDriverFeedback(contender),
+    ]);
+
+    expect([a.created, b.created].sort()).toEqual([false, true]);
+    const stored = await first.getDriverFeedback('role_race', record.feedback_id);
+    expect(stored).toMatchObject({ feedback_key: record.feedback_key, status: 'pending' });
+    expect(a.item.created_at).toBe(stored!.created_at);
+    expect(b.item.created_at).toBe(stored!.created_at);
+
+    const entries = await readdir(join(root, 'role_race', 'delivery', 'feedback'));
+    expect(entries).toEqual([`${record.feedback_id}.json`]);
+  });
+
+  it('多个进程并发首次提交同一个键：恰好一个创建，其余全部读回', async () => {
+    const root = await tempRoot();
+    const stores = Array.from(
+      { length: 5 },
+      () => new FileMemoryDeliveryRepository({ agentStateRoot: root }),
+    );
+    await stores[0]!.ensureAgent('role_swarm');
+
+    const items = Array.from({ length: stores.length }, (_unused, index) => ({
+      ...deliveryFor('role_swarm', 'task_swarm'),
+      created_at: `2020-01-0${String(index + 1)}T00:00:00.000Z`,
+      updated_at: `2020-01-0${String(index + 1)}T00:00:00.000Z`,
+    }));
+    const results = await Promise.all(
+      stores.map(async (store, index) => store.submitContextDelivery(items[index]!)),
+    );
+
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    const stored = await stores[0]!.getContextDelivery('role_swarm', items[0]!.delivery_id);
+    for (const result of results) {
+      expect(result.item.created_at).toBe(stored!.created_at);
+    }
+    const entries = await readdir(join(root, 'role_swarm', 'delivery', 'context'));
+    expect(entries).toEqual([`${items[0]!.delivery_id}.json`]);
   });
 });

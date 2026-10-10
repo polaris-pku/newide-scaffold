@@ -28,7 +28,11 @@ import { LiteLLMClient } from '../../../litellm/contract';
 import { RuleBasedExperienceExtractor } from '../../adapters/rule-based-experience-extractor';
 import { createAgentMemoryScope } from '../../adapters/agent-memory-scope';
 import { RepositoryAgentBoardQuery } from '../../adapters/agent-board-query';
-import { ingestTaskBuffer, processPendingBuffer } from '../../services/memory-cycle';
+import {
+  ingestTaskBuffer,
+  persistExtractedExperiences,
+  processPendingBuffer,
+} from '../../services/memory-cycle';
 import { nowTimestamp } from '../../../core';
 import type {
   BufferSnapshot,
@@ -264,10 +268,10 @@ suitePg('E2E: FileBuffer → 提取 → PG 入库 → BoardQuery', () => {
       console.log(`      content: ${exp.content.slice(0, 80)}...`);
     }
 
-    // 保存到 PG
-    for (const exp of output.experiences) {
-      await memory.saveExperience(exp);
-    }
+    // 保存到 PG：走统一的落库入口（稳定身份 + 归属按 role_id 补齐 + 幂等跳过）。
+    // 提取器的产出是候选经验（没有 agent_id），直接 saveExperience 会缺归属。
+    const persisted = await persistExtractedExperiences(memory, 1, output.experiences);
+    output.experiences = persisted.experiences;
 
     // 标记 buffer 已处理
     await memory.markBufferProcessed(1);

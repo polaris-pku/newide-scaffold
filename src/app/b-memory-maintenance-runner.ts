@@ -68,25 +68,16 @@ export interface BDriverFeedbackRequest {
  *
  * - `delivery`（生产默认）：本进程只提交上下文交付项与反馈 outbox，
  *   Experience 提取 / Skill 晋升 / Persona 演化由外部 Memory Maintenance 系统负责。
- * - `in_process_emulation`（实验专用）：在本进程内模拟下游系统，跑提取与
- *   （B2/B3 的）晋升。只有消融臂需要它——没有真的记忆演化，各臂之间就没有
- *   可比较的记忆差。
+ * - `in_process_emulation`（实验专用）：放行 processBuffer —— 由调用方显式调用它，在
+ *   本进程内模拟下游系统的提取与（B2/B3 的）晋升。只有消融臂需要它——没有真的记忆
+ *   演化，各臂之间就没有可比较的记忆差。
+ *
+ * **它不改变 scheduleBuffer 的行为**：那条在线任务路径在两个模式下都只登记交付项。
+ * 归属**只在构造 runner 时决定**（见 BMemoryMaintenanceRunnerOptions.mode），不看请求字段：
+ * 请求里的 `memory_ablation` 是实验运行的标签，普通任务流程也能填，若拿它去切换路径，
+ * 「任务流程只生产输入」这条边界就被一个请求字段捅穿了。
  */
 export type BMemoryMaintenanceMode = 'delivery' | 'in_process_emulation';
-
-/**
- * 由请求本身判定加工归属。
- *
- * 单独导出，是因为调用方也要按同一判据汇报结果：任务收尾在 scheduleBuffer
- * 抛错时会写一条 failed evidence，它的 `kind` 必须和这次实际走的路径一致——
- * 生产路径的交付失败报成 `experience_extraction`，就等于在说「任务流程在提取」，
- * 而这正是本计划要拆掉的那条边界。
- */
-export function resolveMaintenanceMode(
-  input: Pick<BMemoryMaintenanceRequest, 'memory_ablation'>,
-): BMemoryMaintenanceMode {
-  return input.memory_ablation ? 'in_process_emulation' : 'delivery';
-}
 
 export interface BSkillPromotionRequest {
   role_id: string;
@@ -134,6 +125,14 @@ export interface BMemoryMaintenanceEvidence {
 }
 
 export interface BMemoryMaintenancePort {
+  /**
+   * 在线任务路径的入口：为这条 Buffer 登记一条**上下文交付项**，交给外部 Memory
+   * Maintenance 系统。
+   *
+   * 结果是 context_delivery；本方法在任何 mode 下都不提取、不晋升。加工由维护/实验方
+   * 显式调用 processBuffer 触发（见 BMemoryMaintenanceRunner）。失败证据也因此永远属于
+   * 交付路径——调用方不必（也无法）从实现里反推「这条失败是哪条路径的」。
+   */
   scheduleBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence>;
   /**
    * 记录 Driver 对既有经验的使用反馈，进 durable outbox 等下游归并。
@@ -163,8 +162,11 @@ export interface BMemoryMaintenanceRunnerOptions {
    */
   deliveryRepository?: MemoryDeliveryRepository;
   /**
-   * 强制指定加工归属；缺省按请求判定（带消融标签 = 实验模拟，否则 = 生产交付）。
-   * 显式给出时以它为准，测试用它把两条路径都钉死。
+   * 加工归属。缺省 `delivery`（生产：只交付，不加工）。
+   *
+   * `in_process_emulation` 是**实验专用入口**，只能从这里打开——请求字段打不开它。它放行
+   * 显式的 processBuffer 调用；scheduleBuffer 在两种模式下都只登记交付项。消融臂的脚手架
+   * 在构造 runner 时显式传它、并显式调用 processBuffer，生产组合根（backend-rpc-stdio）不传。
    */
   mode?: BMemoryMaintenanceMode;
   /** When set, completed maintenance rewrites summary.json token_usage for the run. */
@@ -187,11 +189,12 @@ export interface BMemoryMaintenanceRunnerOptions {
 }
 
 export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
+  /** 本运行时实际走的加工归属。构造时定死，请求字段改不动它。 */
+  readonly mode: BMemoryMaintenanceMode;
   private readonly promotionConfidenceThreshold: number;
   private readonly promotionAutoApprove: boolean;
   private readonly roleQueues = new Map<string, Promise<void>>();
   private readonly scheduleFlights = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
-  private readonly jobs = new Map<string, Promise<BMemoryMaintenanceEvidence>>();
   /**
    * 提取器与晋升器按需构造：生产 delivery 模式从不碰它们，也就没必要为一个
    * 不会被调用的下游模拟器持有 LLM 适配器。
@@ -200,19 +203,9 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
   private lazyPromoter: LlmSkillPromotion | undefined;
 
   constructor(private readonly options: BMemoryMaintenanceRunnerOptions) {
+    this.mode = options.mode ?? 'delivery';
     this.promotionConfidenceThreshold = options.promotion?.confidenceThreshold ?? 0.95;
     this.promotionAutoApprove = options.promotion?.autoApprove === true;
-  }
-
-  /**
-   * 本次请求走哪条路。
-   *
-   * 带 `memory_ablation` 的请求是一次消融实验：它要靠记忆在本进程内真的演化才
-   * 有可比较的记忆差，所以在本进程内模拟下游系统。不带标签的是生产运行——只有
-   * 交付与反馈，Experience/Skill/Persona 由外部 Memory Maintenance 系统负责。
-   */
-  private resolveMode(input: BMemoryMaintenanceRequest): BMemoryMaintenanceMode {
-    return this.options.mode ?? resolveMaintenanceMode(input);
   }
 
   private get extractor(): ExperienceExtractor {
@@ -243,17 +236,29 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     return scheduling;
   }
 
+  /**
+   * 在线任务路径的唯一动作：把这条 Buffer 登记成一条上下文交付项。
+   *
+   * **无论 mode 是什么，这里都不提取、不晋升。** 进程内模拟曾经挂在这一步上，那正是要拆掉的
+   * 形状：一个「登记交付」的调用顺手在调用方眼皮底下跑了提取与晋升，任务流程与记忆演化的
+   * 边界就只剩一句注释。实验/维护方要跑加工，显式调 processBuffer（那是另一个入口，由
+   * 构造 runner 时的 mode 决定是否放行）。
+   */
   private async scheduleBufferOnce(
     input: BMemoryMaintenanceRequest,
     maintenanceRef: string,
   ): Promise<BMemoryMaintenanceEvidence> {
-    if (this.resolveMode(input) === 'delivery') {
-      return this.submitContextDelivery(input, maintenanceRef);
-    }
-    // 实验路径：交付照做（登记上下文是任务流程的本职，谁消费与登记无关），
-    // 只是再在本进程模拟一遍下游消费与加工。
-    await this.submitContextDelivery(input, maintenanceRef).catch(() => undefined);
-    return this.scheduleEmulatedExtraction(input, maintenanceRef);
+    const evidence = await this.submitContextDelivery(input, maintenanceRef);
+    return this.withWarning(evidence, emulationUnavailableNotice(input, this.mode));
+  }
+
+  /** 把一条补充警告挂到已经落盘的证据上（同一 maintenance_ref，不新建证据）。 */
+  private async withWarning(
+    evidence: BMemoryMaintenanceEvidence,
+    warning: string | undefined,
+  ): Promise<BMemoryMaintenanceEvidence> {
+    if (!warning) return evidence;
+    return this.persist({ ...evidence, warnings: [...evidence.warnings, warning] });
   }
 
   /**
@@ -332,6 +337,29 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
       });
     }
 
+    // 声明过 context_snapshot_ref 却读不出上下文：这是一条坏掉的输入，不是「本次没有上下文」。
+    // 首次交付也必须拦下它——否则半份 payload（只有 DriverReturn）会被写进 outbox，下游拿到
+    // 手还以为输入是完整的。返回 failed evidence 并带上原因，不登记交付项。
+    // replayPending 对同一形态的处理与此一致（见那里的逐条隔离），首次与重放因此行为统一。
+    if (pending.agentContextStatus === 'unreadable') {
+      const reason =
+        pending.agentContextError ??
+        `Agent context for Buffer ${input.role_id}:${String(input.buffer_seq)} could not be read.`;
+      return this.persist({
+        maintenance_ref: maintenanceRef,
+        kind: 'context_delivery',
+        status: 'failed',
+        ...input,
+        experiences: [],
+        skills: [],
+        warnings: [reason],
+        error: reason,
+        created_at: startedAt,
+        completed_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      });
+    }
+
     const item = buildContextDeliveryItem({
       role_id: input.role_id,
       task_id: input.task_id,
@@ -385,12 +413,22 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
    *
    * 与提取解耦：不要求经验已存在，也不在本进程改置信度；下游系统上线后按
    * `feedback_id` 归并。重复提交同一份 DriverReturn 命中幂等键，只留一条。
+   *
+   * 没有交付存储时**必须报错**，不能返回空数组：调用方拿到 `[]` 与拿到
+   * 「写了 0 条反馈」是同一件事，于是「这台机器根本没配 outbox、Driver 的使用
+   * 事实全丢了」会被伪装成「这次没有可记的反馈」。任务不会因此失败——执行 facade
+   * 把它降级成 diagnostics 里的一条 error（见 driverFeedbackDiagnostics）。
    */
   async recordDriverUsageFeedback(
     input: BDriverFeedbackRequest,
   ): Promise<DriverFeedbackRecord[]> {
     const outbox = this.options.deliveryRepository;
-    if (!outbox) return [];
+    if (!outbox) {
+      if (input.references.length === 0) return [];
+      throw new Error(
+        'Driver feedback outbox is not available: this runtime has no MemoryDeliveryRepository configured.',
+      );
+    }
     const records = buildDriverUsageFeedbackRecords({
       role_id: input.role_id,
       task_id: input.task_id,
@@ -405,47 +443,43 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     return stored;
   }
 
-  private async scheduleEmulatedExtraction(
-    input: BMemoryMaintenanceRequest,
-    maintenanceRef: string,
-  ): Promise<BMemoryMaintenanceEvidence> {
-    const active = this.jobs.get(maintenanceRef);
-    if (active) {
-      return (
-        (await this.options.evidenceStore.get(maintenanceRef)) ??
-        this.scheduledEvidence(input, maintenanceRef)
-      );
-    }
-    const existing = await this.options.evidenceStore.get(maintenanceRef);
-    if (existing?.status === 'completed' || existing?.status === 'skipped') return existing;
-
-    const scheduled = await this.persist(this.scheduledEvidence(input, maintenanceRef));
-    const job = this.enqueueRole(input.role_id, () => this.processBuffer(input)).catch(
-      async (error: unknown) =>
-        this.persist({
-          ...scheduled,
-          status: 'failed',
-          error: error instanceof Error ? error.message : String(error),
-          completed_at: nowTimestamp(),
-        }),
-    );
-    this.jobs.set(maintenanceRef, job);
-    const clearJob = () => {
-      if (this.jobs.get(maintenanceRef) === job) this.jobs.delete(maintenanceRef);
-    };
-    void job.then(clearJob, clearJob);
-    return scheduled;
+  /**
+   * 在本进程内跑一次提取 +（B2/B3 的）晋升 —— **实验/维护专用入口，由外部显式调用**。
+   *
+   * 它模拟的是外部 Memory Maintenance 系统本来会做的事。生产运行不经过这里：生产只提交
+   * 交付项（见 submitContextDelivery），scheduleBuffer 也不会顺手调它。实验脚手架在构造
+   * runner 时把 `mode: 'in_process_emulation'` 打开，然后对每条 pending Buffer 显式调用
+   * 本方法；没打开的运行时直接返回一条 failed evidence，说明本进程不做加工。
+   *
+   * 与 scheduleBuffer 的分工是这条边界的关键：一个**登记输入**，一个**消费输入**。
+   */
+  processBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence> {
+    return this.enqueueRole(input.role_id, () => this.runInProcessMaintenance(input));
   }
 
-  /**
-   * 在本进程内跑一次提取 +（B2/B3 的）晋升 —— **实验专用路径**。
-   *
-   * 它模拟的是外部 Memory Maintenance 系统本来会做的事；生产运行不经过这里
-   * （生产只提交交付项，见 submitContextDelivery）。消融测试直接调用它，
-   * 以「标签驱动 + 显式调用」两种方式说明自己走的是实验路径。
-   */
-  async processBuffer(input: BMemoryMaintenanceRequest): Promise<BMemoryMaintenanceEvidence> {
+  private async runInProcessMaintenance(
+    input: BMemoryMaintenanceRequest,
+  ): Promise<BMemoryMaintenanceEvidence> {
     const maintenanceRef = extractionRef(input);
+    if (this.mode !== 'in_process_emulation') {
+      const at = nowTimestamp();
+      return this.persist({
+        maintenance_ref: maintenanceRef,
+        kind: 'experience_extraction',
+        status: 'failed',
+        ...input,
+        experiences: [],
+        skills: [],
+        warnings: [
+          'In-process memory emulation is not enabled in this runtime; Experience extraction did not run.',
+        ],
+        error:
+          'BMemoryMaintenanceRunner was not constructed for in-process emulation (mode !== in_process_emulation).',
+        created_at: at,
+        completed_at: at,
+        schema_version: SCHEMA_VERSION,
+      });
+    }
     const existing = await this.options.evidenceStore.get(maintenanceRef);
     if (existing?.status === 'completed') return existing;
 
@@ -480,6 +514,29 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
         experiences: [],
         skills: [],
         warnings: ['Pending Buffer is no longer available for extraction.'],
+        created_at: startedAt,
+        completed_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      });
+    }
+
+    // in-process emulation 路径同样不许消费损坏上下文：声明过引用却读不出来时拒绝提取，
+    // 如实报 failed evidence，而不是把半份输入（只有 DriverReturn）当完整输入喂给提取器。
+    // 这里刻意不置死信——坏的是数据不是提取过程，让它留在 pending 上每次都被看见，
+    // 由人去修（与 replayPending 对坏记录的处理一致）。
+    if (pending.agentContextStatus === 'unreadable') {
+      const reason =
+        pending.agentContextError ??
+        `Agent context for Buffer ${input.role_id}:${String(input.buffer_seq)} could not be read.`;
+      return this.persist({
+        maintenance_ref: maintenanceRef,
+        kind: 'experience_extraction',
+        status: 'failed',
+        ...input,
+        experiences: [],
+        skills: [],
+        warnings: [reason],
+        error: reason,
         created_at: startedAt,
         completed_at: nowTimestamp(),
         schema_version: SCHEMA_VERSION,
@@ -716,30 +773,105 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
    *
    * 不跑提取（生产路径本来就不跑）；因为交付键稳定，重启重放只会补齐缺失的
    * 交付项，不会产生第二份。
+   *
+   * 逐条隔离：一条读不出来的 pending 记录只该影响它自己——报告损坏（getPendingBuffer
+   * 抛错）与**声明了 context_snapshot_ref 却读不出上下文**都算，后者同样单独记一条 failed
+   * evidence 并跳过，而不是降级成「本次没有上下文」把半份输入交给下游。启动恢复跑在
+   * readiness 路径上（backend-rpc-stdio 把它的异常当作后端起不来的理由），而一条坏记录
+   * 既不是这个进程的错、也不是它有能力修的——把整次恢复连坐掉只会让所有 Agent 一起起不来。
+   * 因此每条失败单独记成一条 failed evidence（含 role / seq / 原因），余下的 Agent 与 Buffer
+   * 照常重放；真的全局坏掉（如仓储列不出 Agent）仍然抛出。
+   *
+   * 重放不了的坏报告会留在 pending 上，于是每次启动都会再报一遍——这是刻意留的：
+   * 它是需要人去修的现场，安静地跳过才是把故障藏起来。
    */
   async replayPending(): Promise<BMemoryMaintenanceEvidence[]> {
     const results: BMemoryMaintenanceEvidence[] = [];
     const roleIds = (await this.options.repository.listAgentIds()).sort(compareCodeUnits);
     for (const roleId of roleIds) {
-      const memory = createAgentMemoryScope(
-        this.options.repository,
-        this.options.bufferRepository,
-        roleId,
-      );
-      for (const seq of await memory.listPendingBufferSeqs()) {
-        const pending = await memory.getPendingBuffer(seq);
-        if (!pending) continue;
-        results.push(
-          await this.scheduleBuffer({
-            task_id: pending.snapshot.source_task_id,
-            run_id: `replay:${pending.snapshot.source_task_id}`,
-            role_id: roleId,
-            buffer_seq: seq,
-          }),
-        );
+      let seqs: number[];
+      try {
+        seqs = await this.options.bufferRepository.listPendingBufferSeqs(roleId);
+      } catch (error) {
+        results.push(await this.persistReplayFailure(roleId, undefined, error));
+        continue;
+      }
+      for (const seq of seqs) {
+        try {
+          const pending = await this.options.bufferRepository.getPendingBuffer(roleId, seq);
+          if (!pending) continue;
+          // 声明了 context_snapshot_ref 却读不出上下文：这是**这一条**记录坏了，不是「本次
+          // 没有上下文」。它照「坏记录」处理——单独记一条 failed evidence 并跳过，余下的
+          // Agent 与 Buffer 照常重放；把它当成没有上下文放过，等于让下游拿到半份输入还以为
+          // 是完整的。坏文件留在原地，所以每次启动都会再报一遍，等人去修。
+          if (pending.agentContextStatus === 'unreadable') {
+            results.push(
+              await this.persistReplayFailure(
+                roleId,
+                seq,
+                new Error(
+                  pending.agentContextError ??
+                    `Agent context for Buffer ${roleId}:${String(seq)} could not be read.`,
+                ),
+              ),
+            );
+            continue;
+          }
+          results.push(
+            await this.scheduleBuffer({
+              task_id: pending.snapshot.source_task_id,
+              run_id: `replay:${pending.snapshot.source_task_id}`,
+              role_id: roleId,
+              buffer_seq: seq,
+            }),
+          );
+        } catch (error) {
+          results.push(await this.persistReplayFailure(roleId, seq, error));
+        }
       }
     }
     return results;
+  }
+
+  /** 一条坏记录的重放诊断：任务流程照旧，故障及其原因如实留在重放结果里。 */
+  private replayFailureEvidence(
+    roleId: string,
+    seq: number | undefined,
+    error: unknown,
+  ): BMemoryMaintenanceEvidence {
+    const at = nowTimestamp();
+    return {
+      maintenance_ref: `b_maintenance_${randomUUID()}`,
+      kind: 'context_delivery',
+      status: 'failed',
+      role_id: roleId,
+      ...(seq !== undefined ? { buffer_seq: seq } : {}),
+      experiences: [],
+      skills: [],
+      warnings: [
+        seq === undefined
+          ? 'Startup replay could not list pending Buffers for this Agent; other Agents were replayed.'
+          : `Startup replay skipped Buffer ${roleId}:${String(seq)}; other Buffers were replayed.`,
+      ],
+      error: error instanceof Error ? error.message : String(error),
+      created_at: at,
+      completed_at: at,
+      schema_version: SCHEMA_VERSION,
+    };
+  }
+
+  private async persistReplayFailure(
+    roleId: string,
+    seq: number | undefined,
+    error: unknown,
+  ): Promise<BMemoryMaintenanceEvidence> {
+    const evidence = this.replayFailureEvidence(roleId, seq, error);
+    try {
+      return await this.persist(evidence);
+    } catch {
+      // 证据存储本身写不进去时仍要把诊断交回调用方，别让它变成第二个异常
+      return evidence;
+    }
   }
 
   listEvidence(roleId?: string): Promise<BMemoryMaintenanceEvidence[]> {
@@ -747,32 +879,12 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
   }
 
   async waitForIdle(): Promise<void> {
-    while (this.scheduleFlights.size > 0 || this.jobs.size > 0 || this.roleQueues.size > 0) {
+    while (this.scheduleFlights.size > 0 || this.roleQueues.size > 0) {
       await Promise.allSettled([
         ...this.scheduleFlights.values(),
-        ...this.jobs.values(),
         ...this.roleQueues.values(),
       ]);
     }
-  }
-
-  private scheduledEvidence(
-    input: BMemoryMaintenanceRequest,
-    maintenanceRef: string,
-  ): BMemoryMaintenanceEvidence {
-    const createdAt = nowTimestamp();
-    return {
-      maintenance_ref: maintenanceRef,
-      kind: 'experience_extraction',
-      status: 'scheduled',
-      ...input,
-      experiences: [],
-      skills: [],
-      warnings: [],
-      created_at: createdAt,
-      completed_at: createdAt,
-      schema_version: SCHEMA_VERSION,
-    };
   }
 
   private enqueueRole<T>(roleId: string, operation: () => Promise<T>): Promise<T> {
@@ -901,4 +1013,24 @@ function compareCodeUnits(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+/**
+ * 请求带了消融标签、但本运行时是生产交付路径 —— 留一条警告，不悄悄降级。
+ *
+ * 消融臂没有进程内模拟就没有记忆演化，各臂之间也就没有可比较的记忆差；把这件事
+ * 静默吞掉，实验结论会在事后完全无法解释。标签本身不改变行为：它只是请求方的意图，
+ * 而进程内模拟只能由构造 runner 时显式打开（见 BMemoryMaintenanceRunnerOptions.mode）。
+ */
+function emulationUnavailableNotice(
+  input: BMemoryMaintenanceRequest,
+  mode: BMemoryMaintenanceMode,
+): string | undefined {
+  if (!input.memory_ablation || mode === 'in_process_emulation') return undefined;
+  return (
+    `Request carries memory_ablation=${input.memory_ablation} but in-process memory emulation is ` +
+    `not enabled in this runtime; only the context delivery item was submitted. ` +
+    `The ablation label does not switch paths: construct the runner with ` +
+    `mode: 'in_process_emulation' and call processBuffer explicitly to run the experiment path.`
+  );
 }

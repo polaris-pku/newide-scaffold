@@ -11,7 +11,7 @@
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { BufferTriggerPolicy } from '../ports/buffer-trigger-policy';
 import type { ExperienceExtractor } from '../ports/experience-extractor';
-import type { ProcessPendingResult } from '../services/memory-cycle';
+import { persistExtractedExperiences, type ProcessPendingResult } from '../services/memory-cycle';
 
 export class ExperienceExtractorProcessor {
   constructor(
@@ -73,9 +73,10 @@ export class ExperienceExtractorProcessor {
 
     const extraction = await this.extractor.extract(pending.snapshot, pending.agentContext);
 
-    for (const experience of extraction.experiences) {
-      await memory.saveExperience(experience);
-    }
+    // 与 processPendingBuffer 走同一条落库规则：稳定身份 + 归属校正 + 幂等跳过。
+    // 这里也按整条 Buffer 重试，所以「保存中途失败 → 重跑」的重复写入必须同样被挡住。
+    const persisted = await persistExtractedExperiences(memory, seq, extraction.experiences);
+    extraction.experiences = persisted.experiences;
 
     await memory.markBufferProcessed(seq);
 

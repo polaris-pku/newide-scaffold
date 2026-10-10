@@ -15,12 +15,23 @@ import type {
 import type { MemoryRetrievalResult } from './services/memory-query';
 
 /**
+ * 提取器产出的候选经验：除归属（agent_id）外的全部 ExperienceRecord 字段。
+ *
+ * 归属**不在提取结果里**——一条 Buffer 属于哪个 Agent 只有 `memory.role_id` 说得准，
+ * 提取器（尤其 LLM 版）拿不到它。让它填一个占位值，哪怕只是空串，也等于把「这条经验
+ * 归谁」交给一个不知道答案的人：任何直接使用提取器的维护系统都会照着占位值落库。
+ * 最终 ExperienceRecord 的 agent_id 由持久化层（persistExtractedExperiences）按
+ * `memory.role_id` 补齐，`source_task_id` 只作溯源、不参与归属。
+ */
+export type CandidateExperience = Omit<ExperienceRecord, 'agent_id'>;
+
+/**
  * 经验提取操作的输出。
  * 由 ExperienceExtractor 从 buffer 原材料中解析产生。
  */
 export interface ExtractionOutput {
-  /** 本次提取出的经验记录列表 */
-  experiences: ExperienceRecord[];
+  /** 本次提取出的候选经验列表（不含归属；落库时才由 role_id 决定 agent_id） */
+  experiences: CandidateExperience[];
   /** 提取摘要统计（新建/更新/晋升计数等） */
   result: ExtractResult;
   /**

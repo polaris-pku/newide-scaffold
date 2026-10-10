@@ -10,6 +10,7 @@
  *   5. 实验路径（消融标签 / 显式 emulation）才在本进程模拟下游
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -35,7 +36,7 @@ import {
   type LlmClient,
   type ToolCallingClient,
 } from '../../src/memory';
-import type { BufferSnapshot } from '../../src/memory/schemas';
+import type { BufferSnapshot, AgentContextSnapshot } from '../../src/memory/schemas';
 
 const roots: string[] = [];
 
@@ -79,7 +80,7 @@ async function writePending(
   bufferRepository: InMemoryBufferRepository,
   taskId: string,
   references: BufferSnapshot['driver_return']['referenced_experiences'] = [],
-  contextRef?: string,
+  agentContext?: AgentContextSnapshot,
 ): Promise<number> {
   const memory = createAgentMemoryScope(repository, bufferRepository, ROLE);
   const snapshot: BufferSnapshot = {
@@ -95,18 +96,51 @@ async function writePending(
     },
     source_task_id: taskId,
     source_driver: 'acp-external',
-    ...(contextRef !== undefined ? { context_snapshot_ref: contextRef } : {}),
     received_at: new Date().toISOString(),
     retry_count: 0,
     extraction_status: 'pending',
   };
-  return (await memory.saveBufferSnapshot(snapshot)).seq;
+  // 声明 context_snapshot_ref 的唯一正当方式是**真的配一份上下文**（saveBufferSnapshot
+  // 会自动写 ref）；只声明引用却不给上下文，读回来就是 unreadable，交付必须在首次提交时
+  // 就拒绝它（见 submitContextDelivery）——所以这里用成对的上下文构造，而不是伪造一个 ref。
+  return (await memory.saveBufferSnapshot(snapshot, agentContext)).seq;
 }
 
-/** 只答「提取」的 LLM：交付路径根本不该走到这里 */
-function extractionLlm(): LlmClient {
+function sampleAgentContext(): AgentContextSnapshot {
+  return {
+    snapshot_id: randomUUID(),
+    source_task_id: 'task_deliver',
+    agent_id: ROLE,
+    thinking_trace: 'Reasoning trace',
+    planning_trace: 'Planning trace',
+    driver_calls: [
+      { call_id: 'call_001', driver_id: 'acp-external', driver_return_ref: 'report_1.json' },
+    ],
+    cleaned_at: new Date().toISOString(),
+    original_token_count: 1000,
+    cleaned_token_count: 400,
+    compression_ratio: 0.4,
+  };
+}
+
+/**
+ * 只答「提取」的 LLM：交付路径根本不该走到这里。
+ *
+ * 带一个会合点：`parties` 个调用都答完才一起放行。用它把两个 worker 的提取对齐到同一
+ * 时刻——不对齐的话，先启动的那个可能整条流程（提取 → 入库 → 归档）都跑完了，另一个才
+ * 读到 pending，于是「并发重入」根本没发生，测的就不是并发下的入库了。
+ */
+function extractionLlm(parties = 1): LlmClient {
+  let arrivals = 0;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   return {
     async complete() {
+      arrivals += 1;
+      if (arrivals >= parties) release?.();
+      await gate;
       return JSON.stringify({
         experiences: [
           {
@@ -125,7 +159,13 @@ function extractionLlm(): LlmClient {
 describe('memory delivery contract (工作包 B)', () => {
   it('生产路径只登记交付项：不提取经验、不晋升、不演化 Persona', async () => {
     const { runner, repository, bufferRepository, delivery } = await fixture();
-    const seq = await writePending(repository, bufferRepository, 'task_deliver', [], '1');
+    const seq = await writePending(
+      repository,
+      bufferRepository,
+      'task_deliver',
+      [],
+      sampleAgentContext(),
+    );
 
     const evidence = await runner.scheduleBuffer({
       task_id: 'task_deliver',
@@ -227,6 +267,43 @@ describe('memory delivery contract (工作包 B)', () => {
     expect(evidence.error).toContain('Memory delivery repository is not configured');
   });
 
+  it('没有 outbox 时 Driver feedback 报错，而不是伪装成「本次没有反馈」', async () => {
+    const { runner, repository, bufferRepository } = await fixture({
+      deliveryRepository: undefined,
+    });
+    const seq = await writePending(repository, bufferRepository, 'task_no_outbox');
+    const references = [
+      {
+        experience_id: 'exp_referenced',
+        applied: true,
+        effectiveness: 'fully_effective' as const,
+        note: 'used it',
+      },
+    ];
+
+    // 有东西要写却写不进去：必须是错误。返回空数组会让调用方以为「Driver 这次没引用经验」
+    await expect(
+      runner.recordDriverUsageFeedback({
+        task_id: 'task_no_outbox',
+        run_id: 'run_no_outbox',
+        role_id: ROLE,
+        buffer_seq: seq,
+        references,
+      }),
+    ).rejects.toThrow(/no MemoryDeliveryRepository/);
+
+    // 没有引用时本来就没有可丢的东西，安静返回空列表
+    await expect(
+      runner.recordDriverUsageFeedback({
+        task_id: 'task_no_outbox',
+        run_id: 'run_no_outbox',
+        role_id: ROLE,
+        buffer_seq: seq,
+        references: [],
+      }),
+    ).resolves.toEqual([]);
+  });
+
   it('经验尚不存在时也保存 Driver feedback，之后可按稳定 id 归并', async () => {
     const { runner, repository, bufferRepository, delivery } = await fixture();
     const references = [
@@ -300,7 +377,7 @@ describe('memory delivery contract (工作包 B)', () => {
     expect(stored).toHaveLength(1);
   });
 
-  it('默认不模拟下游；显式 emulation 与消融标签才在本进程提取', async () => {
+  it('消融标签改不动路径：进程内模拟只能由构造 runner 时显式打开', async () => {
     const production = await fixture();
     const emulated = await fixture({ mode: 'in_process_emulation' });
 
@@ -315,14 +392,35 @@ describe('memory delivery contract (工作包 B)', () => {
       'task_emulated',
     );
 
-    await production.runner.scheduleBuffer({
+    // 生产 runner 收到消融标签也照旧只交付。标签是请求方的意图，不是本进程的行为开关——
+    // 拿它去切换路径，普通任务流程就能用一个请求字段把提取/晋升拐进来，这条边界也就没了。
+    const labelled = await production.runner.scheduleBuffer({
       task_id: 'task_production',
       run_id: 'run_production',
       role_id: ROLE,
       buffer_seq: productionSeq,
+      memory_ablation: 'B3',
     });
-    // 消融标签是实验运行的标记：它需要记忆真的演化，否则各臂之间没有可比的记忆差
+    expect(labelled.kind).toBe('context_delivery');
+    // 也不能静默降级：没有进程内模拟就没有记忆演化，各臂之间没有可比的记忆差，
+    // 实验结论事后无从解释。降级这件事本身要留在 evidence 里。
+    expect(labelled.warnings.join(' ')).toContain('memory_ablation=B3');
+    expect(labelled.warnings.join(' ')).toContain('in-process memory emulation is not enabled');
+
+    // 实验路径也不是 scheduleBuffer 的副作用：即便 runner 打开了进程内模拟，在线任务
+    // 入口仍然只登记交付；要跑提取必须像下游系统那样**显式**调 processBuffer。
     await emulated.runner.scheduleBuffer({
+      task_id: 'task_emulated',
+      run_id: 'run_emulated',
+      role_id: ROLE,
+      buffer_seq: emulatedSeq,
+      memory_ablation: 'B3',
+    });
+    await emulated.runner.waitForIdle();
+    // 只登记交付，没有提取
+    await expect(emulated.repository.listExperiences(ROLE)).resolves.toEqual([]);
+
+    await emulated.runner.processBuffer({
       task_id: 'task_emulated',
       run_id: 'run_emulated',
       role_id: ROLE,
@@ -337,6 +435,126 @@ describe('memory delivery contract (工作包 B)', () => {
     await expect(
       emulated.delivery.listContextDeliveries({ role_id: ROLE }),
     ).resolves.toHaveLength(1);
+  });
+
+  it('生产 delivery 路径不调用 extractor：LLM 一响就说明走错了路', async () => {
+    const extractorCalls: number[] = [];
+    const { runner, repository, bufferRepository } = await fixture({
+      llm: {
+        async complete() {
+          throw new Error('delivery path must not call the LLM');
+        },
+      },
+      extractor: {
+        async extract() {
+          extractorCalls.push(1);
+          throw new Error('delivery path must not call the extractor');
+        },
+      },
+    });
+    const seq = await writePending(repository, bufferRepository, 'task_no_extract');
+
+    const evidence = await runner.scheduleBuffer({
+      task_id: 'task_no_extract',
+      run_id: 'run_no_extract',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    await runner.waitForIdle();
+
+    expect(evidence).toMatchObject({ kind: 'context_delivery', status: 'scheduled' });
+    expect(extractorCalls).toEqual([]);
+    // 提取与晋升的产物都为空：没有 Experience，也没有 Skill
+    await expect(repository.listExperiences(ROLE)).resolves.toEqual([]);
+    await expect(repository.listSkills(ROLE)).resolves.toEqual([]);
+    // Buffer 留在 pending 等下游处理，本进程不做归档
+    await expect(bufferRepository.getBufferMeta(ROLE)).resolves.toMatchObject({
+      pending_count: 1,
+      total_processed: 0,
+    });
+  });
+
+  it('两个 worker 同时处理同一条 Buffer：经验只落一份，双方都不收到冲突异常', async () => {
+    // 两个 worker 共用一份「等两边都提取完再放行」的 LLM：不把提取对齐，先跑的那个可能
+    // 整条流程都结束了，并发重入根本没发生，这条用例也就白测了
+    const llm = extractionLlm(2);
+    const first = await fixture({ mode: 'in_process_emulation', llm });
+    const seq = await writePending(
+      first.repository,
+      first.bufferRepository,
+      'task_two_workers',
+      [],
+      sampleAgentContext(),
+    );
+
+    // 第二个 worker：**同一个仓库**、独立实例（各自一条 enqueueRole 队列）。两个 Memory
+    // Maintenance 进程共享存储时就是这副样子——各自的队列挡不住对方，只能靠稳定 id +
+    // 存储层的原子幂等写入收敛。
+    const root = await mkdtemp(path.join(os.tmpdir(), 'newide-delivery-worker-b-'));
+    roots.push(root);
+    const second = new BMemoryMaintenanceRunner({
+      repository: first.repository,
+      bufferRepository: first.bufferRepository,
+      deliveryRepository: first.delivery,
+      llm,
+      mode: 'in_process_emulation',
+      evidenceStore: new FileBMemoryMaintenanceEvidenceStore(path.join(root, 'evidence')),
+    });
+
+    const request = {
+      task_id: 'task_two_workers',
+      run_id: 'run_two_workers',
+      role_id: ROLE,
+      buffer_seq: seq,
+    };
+    const [left, right] = await Promise.all([
+      first.runner.processBuffer(request),
+      second.processBuffer(request),
+    ]);
+
+    // 交错顺序无所谓（谁先读到 pending、谁先落库都可能），结论必须一样：仓库里只有一份
+    expect([left.status, right.status]).toContain('completed');
+    const experiences = await first.repository.listExperiences(ROLE);
+    expect(experiences).toHaveLength(1);
+    // 归属仍由 role_id 定死，计数只加一次（owned_exps 也没有重复项）
+    expect(experiences[0]?.agent_id).toBe(ROLE);
+    await expect(first.repository.getAgent(ROLE)).resolves.toMatchObject({
+      experience_count: 1,
+      owned_exps: [experiences[0]?.id],
+    });
+    await expect(first.repository.getMetrics(ROLE)).resolves.toMatchObject({
+      experience_count: 1,
+    });
+    // 谁都没把别人的成功报成冲突：失败的那一侧只能是因为「Buffer 已经被处理走了」
+    for (const evidence of [left, right]) {
+      if (evidence.status === 'failed') {
+        expect(evidence.error ?? '').not.toMatch(/duplicate|conflict|unique/i);
+      }
+    }
+    // Buffer 只被消费一次
+    await expect(first.bufferRepository.listPendingBufferSeqs(ROLE)).resolves.toEqual([]);
+    await expect(first.bufferRepository.getBufferMeta(ROLE)).resolves.toMatchObject({
+      total_processed: 1,
+      total_dead_letters: 0,
+    });
+  });
+
+  it('生产 runner 直接调 processBuffer：拒绝在本进程提取，如实报 failed', async () => {
+    const { runner, repository, bufferRepository } = await fixture();
+    const seq = await writePending(repository, bufferRepository, 'task_guard');
+
+    const result = await runner.processBuffer({
+      task_id: 'task_guard',
+      run_id: 'run_guard',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+
+    expect(result).toMatchObject({ kind: 'experience_extraction', status: 'failed' });
+    expect(result.error).toContain('in_process_emulation');
+    // 拒绝得干脆：一条经验都没写，Buffer 也照旧留在 pending
+    await expect(repository.listExperiences(ROLE)).resolves.toEqual([]);
+    await expect(bufferRepository.listPendingBufferSeqs(ROLE)).resolves.toEqual([seq]);
   });
 
   it('任务结束时把 Driver 的使用反馈写进 outbox —— 引用的经验还不存在也照收', async () => {
@@ -400,6 +618,108 @@ describe('memory delivery contract (工作包 B)', () => {
       feedback_source: 'driver_usage',
       status: 'pending',
     });
+  });
+
+  it('生产任务路径装上抛错的 extractor/LLM/晋升配置也不会被调用', async () => {
+    const calls: string[] = [];
+    const { runner, repository, bufferRepository, delivery } = await fixture({
+      // 下游模拟器用到的三样东西全部换成「一碰就抛」：生产路径只要碰到其中任何一个就会炸
+      extractor: {
+        async extract() {
+          calls.push('extract');
+          throw new Error('production task flow must not extract');
+        },
+      },
+      llm: {
+        async complete() {
+          calls.push('llm');
+          throw new Error('production task flow must not call the maintenance LLM');
+        },
+      },
+      promotion: { confidenceThreshold: 0.1, autoApprove: true },
+    });
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'newide-delivery-decouple-'));
+    roots.push(workspace);
+    const taskId = 'task_decoupled_flow';
+    await writeFile(
+      path.join(workspace, `${taskId}_report.txt`),
+      JSON.stringify({
+        summary: 'Completed without touching memory evolution.',
+        artifacts: [],
+        decisions: [],
+        blockers: [],
+        referenced_experiences: [],
+        assumptions: [],
+      }),
+      'utf8',
+    );
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: stubDriver(),
+      repository,
+      bufferRepository,
+      llm: invokeDriverOnceLlm(),
+      memoryMaintenance: runner,
+      deliveryRepository: delivery,
+    });
+
+    // B2 是「标签曾经会开启进程内晋升」的那一臂：现在标签改不动任何东西
+    const result = await facade.runAgent({
+      task_id: taskId,
+      run_id: `run_${taskId}`,
+      role_id: ROLE,
+      instruction: 'Implement the change.',
+      workspace_path: workspace,
+      session_id: 'session_decoupled',
+      input_artifact_refs: [],
+      context_policy: 'default',
+      memory_ablation: 'B2',
+      schema_version: SCHEMA_VERSION,
+    });
+
+    await runner.waitForIdle();
+    expect(result.status).toBe('completed');
+    expect(result.diagnostics.memory_maintenance).toMatchObject({
+      kind: 'context_delivery',
+      status: 'scheduled',
+    });
+    // 一次都没碰到：没有提取、没有 LLM、没有晋升
+    expect(calls).toEqual([]);
+    await expect(repository.listExperiences(ROLE)).resolves.toEqual([]);
+    await expect(repository.listSkills(ROLE)).resolves.toEqual([]);
+    // Buffer 留在 pending 等下游 ack；下游要的输入已经登记好
+    await expect(bufferRepository.getBufferMeta(ROLE)).resolves.toMatchObject({
+      pending_count: 1,
+      total_processed: 0,
+    });
+    await expect(delivery.listContextDeliveries({ role_id: ROLE })).resolves.toHaveLength(1);
+  });
+
+  /**
+   * 消融标签是**给定实验臂**的标记，不是本进程的行为开关。B0–B4 五臂走的是同一条生产边界：
+   * 登记一条交付项、不写记忆、Buffer 留在 pending。
+   */
+  it('B0–B4 标签本身不改变生产 runner 的处理边界', async () => {
+    for (const ablation of ['B0', 'B1', 'B2', 'B3', 'B4'] as const) {
+      const { runner, repository, bufferRepository, delivery } = await fixture();
+      const seq = await writePending(repository, bufferRepository, `task_${ablation}`);
+
+      const evidence = await runner.scheduleBuffer({
+        task_id: `task_${ablation}`,
+        run_id: `run_${ablation}`,
+        role_id: ROLE,
+        buffer_seq: seq,
+        memory_ablation: ablation,
+      });
+
+      expect(evidence).toMatchObject({ kind: 'context_delivery', status: 'scheduled' });
+      await expect(delivery.listContextDeliveries({ role_id: ROLE })).resolves.toHaveLength(1);
+      await expect(repository.listExperiences(ROLE)).resolves.toEqual([]);
+      await expect(repository.listSkills(ROLE)).resolves.toEqual([]);
+      await expect(bufferRepository.getBufferMeta(ROLE)).resolves.toMatchObject({
+        pending_count: 1,
+        total_processed: 0,
+      });
+    }
   });
 });
 

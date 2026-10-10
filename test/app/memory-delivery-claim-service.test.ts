@@ -11,10 +11,11 @@
  * 以及一条边界：下游怎么失败都不改 Task/Run 与 Buffer 的状态——交付状态是独立的
  * 事实，不是任务终态的一部分。
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   BMemoryMaintenanceRunner,
   FileBMemoryMaintenanceEvidenceStore,
@@ -23,6 +24,7 @@ import {
 import { BMemoryBackendService } from '../../src/app/b-memory-backend-service';
 import type { BMemoryMaintenanceCapabilities } from '../../src/app/b-public-capabilities';
 import {
+  FileBufferRepository,
   FileMemoryDeliveryRepository,
   InMemoryBufferRepository,
   InMemoryMemoryDeliveryRepository,
@@ -30,10 +32,15 @@ import {
   RepositoryAgentBoardQuery,
   createAgentMemoryScope,
   reviewSkill,
+  type BufferRepository,
   type LlmClient,
   type MemoryDeliveryRepository,
 } from '../../src/memory';
-import type { BufferSnapshot, DriverFeedbackRecord } from '../../src/memory/schemas';
+import type {
+  AgentContextSnapshot,
+  BufferSnapshot,
+  DriverFeedbackRecord,
+} from '../../src/memory/schemas';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../../src/rpc/json-rpc-dispatcher';
 import { MemoryRpcMethods, type MemoryMethodsService } from '../../src/rpc/memory-methods';
 
@@ -62,8 +69,9 @@ interface Fixture {
   service: BMemoryBackendService;
   runner: BMemoryMaintenanceRunner;
   repository: InMemoryRepository;
-  bufferRepository: InMemoryBufferRepository;
+  bufferRepository: BufferRepository;
   delivery: MemoryDeliveryRepository;
+  agentStateRoot: string;
 }
 
 async function fixture(
@@ -71,15 +79,18 @@ async function fixture(
     root?: string;
     delivery?: MemoryDeliveryRepository;
     evidenceStore?: BMemoryMaintenanceEvidenceStore;
+    /** 注入文件缓冲仓储，覆盖「归档后交付仍可读」的真实目录布局 */
+    bufferRepository?: BufferRepository;
   } = {},
 ): Promise<Fixture> {
   const root = options.root ?? (await tempRoot());
+  const agentStateRoot = path.join(root, 'agent-state');
   const repository = new InMemoryRepository();
-  const bufferRepository = new InMemoryBufferRepository();
+  const bufferRepository = options.bufferRepository ?? new InMemoryBufferRepository();
   const delivery =
     options.delivery ??
     new FileMemoryDeliveryRepository({
-      agentStateRoot: path.join(root, 'agent-state'),
+      agentStateRoot,
       retryPolicy: FAST_RETRY,
     });
   await repository.initializeAgent({ role_id: ROLE, name: ROLE });
@@ -106,7 +117,18 @@ async function fixture(
     {},
     repository,
   );
-  return { service, runner, repository, bufferRepository, delivery };
+  return { service, runner, repository, bufferRepository, delivery, agentStateRoot };
+}
+
+/** 与内存夹具同一套行为，但缓冲区落在真实目录树上（pending/processed/dead_letter） */
+async function fileBackedFixture(): Promise<Fixture> {
+  const root = await tempRoot();
+  return fixture({
+    root,
+    bufferRepository: new FileBufferRepository({
+      agentStateRoot: path.join(root, 'agent-state'),
+    }),
+  });
 }
 
 function extractionLlm(): LlmClient {
@@ -118,8 +140,18 @@ function extractionLlm(): LlmClient {
 }
 
 /** 写一条待投递的 Buffer（走真实 AgentMemoryScope），返回它的 seq */
-async function writePendingBuffer(f: Fixture, taskId: string): Promise<number> {
+async function writePendingBuffer(
+  f: Fixture,
+  taskId: string,
+  agentContext?: AgentContextSnapshot,
+  /**
+   * 显式的 context_snapshot_ref。缺省跟 agentContext 走：有上下文才声明引用。
+   * 需要构造「声明了引用却没有上下文」这种损坏形态时才显式传值。
+   */
+  contextRef?: string | undefined,
+): Promise<number> {
   const memory = createAgentMemoryScope(f.repository, f.bufferRepository, ROLE);
+  const ref = contextRef ?? (agentContext ? '1' : undefined);
   const snapshot: BufferSnapshot = {
     task_id: taskId,
     task_description: 'Deliver context downstream.',
@@ -133,12 +165,29 @@ async function writePendingBuffer(f: Fixture, taskId: string): Promise<number> {
     },
     source_task_id: taskId,
     source_driver: 'acp-external',
-    context_snapshot_ref: '1',
+    ...(ref !== undefined ? { context_snapshot_ref: ref } : {}),
     received_at: new Date().toISOString(),
     retry_count: 0,
     extraction_status: 'pending',
   };
-  return (await memory.saveBufferSnapshot(snapshot)).seq;
+  return (await memory.saveBufferSnapshot(snapshot, agentContext)).seq;
+}
+
+function sampleAgentContext(roleId: string): AgentContextSnapshot {
+  return {
+    snapshot_id: randomUUID(),
+    source_task_id: 'task_delivery',
+    agent_id: roleId,
+    thinking_trace: 'Reasoning trace',
+    planning_trace: 'Planning trace',
+    driver_calls: [
+      { call_id: 'call_001', driver_id: 'acp-external', driver_return_ref: 'report_1.json' },
+    ],
+    cleaned_at: new Date().toISOString(),
+    original_token_count: 1000,
+    cleaned_token_count: 400,
+    compression_ratio: 0.4,
+  };
 }
 
 /** 走真实任务收尾路径登记一条交付项，返回它的 buffer seq */
@@ -298,6 +347,558 @@ describe('交付 claim / ack（服务层）', () => {
     // 上下文那条仍然安安静静地等着
     expect(await f.service.listRetryableDeliveries({ channel: 'context', role_id: ROLE })).toHaveLength(1);
     expect(await f.service.listRetryableDeliveries({ channel: 'feedback', role_id: ROLE })).toHaveLength(0);
+  });
+});
+
+describe('交付 ack 与源 Buffer 的生命周期', () => {
+  it('ack processed 后源 Buffer 离开 pending，交付 payload 仍完整可取（内存缓冲区）', async () => {
+    const f = await fixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+
+    // 下游已经拿着这份上下文干活了：它不该再占着待办队列
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).not.toContain(seq);
+    expect(state.meta).toMatchObject({ pending_count: 0, total_processed: 1 });
+    expect(state.delivery.context).toMatchObject({ processed: 1, pending: 0 });
+
+    // 归档不等于交付失效：payload 仍按 delivery_id 取回，且是完整的两半
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    expect(payload).toMatchObject({ payload_available: true });
+    expect(payload?.driver_return?.summary).toBe('Completed.');
+    expect(payload?.agent_context?.snapshot_id).toBe(agentContext.snapshot_id);
+  });
+
+  it('文件缓冲区：ack 后报告与上下文一起搬到 processed，交付仍读得回完整 payload', async () => {
+    const f = await fileBackedFixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+
+    const bufferRoot = path.join(f.agentStateRoot, ROLE, 'buffer');
+    await expect(readdir(path.join(bufferRoot, 'pending'))).resolves.toEqual([]);
+    expect((await readdir(path.join(bufferRoot, 'processed'))).sort()).toEqual([
+      'context_1.json',
+      'report_1.json',
+    ]);
+
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    expect(payload).toMatchObject({ payload_available: true });
+    expect(payload?.driver_return?.summary).toBe('Completed.');
+    expect(payload?.agent_context?.snapshot_id).toBe(agentContext.snapshot_id);
+  });
+
+  it('Buffer 进了死信，交付仍按 delivery_id 读得回完整 payload', async () => {
+    const f = await fixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    // 加工侧把这条 Buffer 打了死信：交付项自己没有被处理过，payload 不能跟着失效
+    await f.bufferRepository.markBufferDeadLetter(ROLE, seq, 'extractor failed');
+
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    expect(payload).toMatchObject({ payload_available: true });
+    expect(payload?.driver_return?.summary).toBe('Completed.');
+    expect(payload?.agent_context?.snapshot_id).toBe(agentContext.snapshot_id);
+
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.dead_letter_seqs).toEqual([seq]);
+    expect(state.delivery.context).toMatchObject({ pending: 1, dead_letter: 0 });
+  });
+
+  it('ack failed 不动 Buffer：待办还在，重试才有意义', async () => {    const f = await fixture();
+    const seq = await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    const archiveSpy = vi.spyOn(f.bufferRepository, 'archiveBuffer');
+
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const failedAck = await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'failed',
+      error: 'downstream unavailable',
+      retryable: true,
+    });
+
+    // 失败路径根本不走归档：没有 archive 结论，也没有归档动作
+    expect(failedAck?.channel === 'context' ? 'archive' in failedAck : true).toBe(false);
+    expect(archiveSpy).not.toHaveBeenCalled();
+
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).toContain(seq);
+    expect(state.meta).toMatchObject({ pending_count: 1, total_processed: 0 });
+  });
+
+  it('归档之后 replayPending 不再为这条 Buffer 补交交付', async () => {
+    const f = await fixture();
+    const seq = await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+
+    await expect(f.runner.replayPending()).resolves.toEqual([]);
+    await expect(f.service.listContextDeliveries({ role_id: ROLE })).resolves.toHaveLength(1);
+    expect((await f.service.getBufferState(ROLE)).pending_seqs).not.toContain(seq);
+  });
+});
+
+describe('ack 与源 Buffer 归档的一致性（两个存储，没有跨存储事务）', () => {
+  it('ack processed 且归档成功：archive=archived，Buffer 移入 processed，无归档缺口', async () => {
+    const f = await fileBackedFixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const acked = await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+
+    expect(acked?.channel === 'context' ? acked.archive : undefined).toEqual({ status: 'archived' });
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).not.toContain(seq);
+    expect(state.meta).toMatchObject({ pending_count: 0, total_processed: 1 });
+    expect(state.delivery.archive_backlog).toEqual([]);
+  });
+
+  /**
+   * 归档是 ack 之后的后续动作：ack 的成功语义只覆盖交付状态（下游确实处理完了，
+   * 不能回滚），归档失败必须原样报出来——既不能吞掉，也不能伪装成「全都成功」。
+   * 缺口的最终状态是「交付 processed + Buffer 仍 pending」，可查询、可重试。
+   */
+  it('归档 I/O 失败不被吞掉：ack 仍成功，但结果与状态都如实报出，且可修复', async () => {
+    const f = await fixture();
+    const seq = await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    const spy = vi
+      .spyOn(f.bufferRepository, 'markBufferProcessed')
+      .mockRejectedValue(new Error('EIO: simulated archive I/O failure'));
+
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const acked = await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+    spy.mockRestore();
+
+    // 交付状态照常推进（不能回滚下游已经做完的事）……
+    expect(acked?.channel === 'context' ? acked.delivery.status : undefined).toBe('processed');
+    // ……但归档结果不能看起来完全成功
+    const archive = acked?.channel === 'context' ? acked.archive : undefined;
+    expect(archive).toMatchObject({ status: 'failed' });
+    expect(archive?.status === 'failed' ? archive.message : '').toContain(
+      'simulated archive I/O failure',
+    );
+
+    // 最终状态：交付 processed，Buffer 仍在 pending —— 这就是定义好的一致性策略
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).toContain(seq);
+    expect(state.delivery.context).toMatchObject({ processed: 1, pending: 0 });
+    // 缺口不只是这次调用的返回值：后端状态里查得到，重启后也一样
+    expect(state.delivery.archive_backlog).toEqual([
+      expect.objectContaining({
+        delivery_id: item!.delivery_id,
+        buffer_seq: seq,
+        task_id: 'task_delivery',
+      }),
+    ]);
+
+    // 运维拿 archive_backlog 里的 seq 调 retryExtraction 即可补做归档
+    const repair = await f.service.retryExtraction(ROLE, seq);
+    expect(repair.warnings.join(' ')).toContain('Archived Buffer');
+    const repaired = await f.service.getBufferState(ROLE);
+    expect(repaired.pending_seqs).not.toContain(seq);
+    expect(repaired.delivery.archive_backlog).toEqual([]);
+  });
+
+  /**
+   * 配对 Buffer 的归档缺口：交付已 processed，归档却因为**配对的上下文搬不动**而没落地。
+   * 关键不变量是报告那一半不能被先搬走——report 留在 pending，缺口才由持久状态本身
+   * （交付 processed + Buffer 仍 pending）推导出来，重启后照样看得见、拿 seq 就能补做。
+   */
+  it('配对 context 搬不动：归档缺口可发现，补回上下文后 retryExtraction 可修复', async () => {
+    const f = await fileBackedFixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    // 交付之后把配对的上下文弄丢：归档时 context 搬不动，报告就不该被先搬走
+    const contextPath = path.join(f.agentStateRoot, ROLE, 'buffer', 'pending', 'context_1.json');
+    const contextJson = await readFile(contextPath, 'utf8');
+    await rm(contextPath);
+
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const acked = await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+
+    // 交付状态照常推进（不回滚下游），但归档结果必须如实报失败
+    expect(acked?.channel === 'context' ? acked.delivery.status : undefined).toBe('processed');
+    expect(acked?.channel === 'context' ? acked.archive : undefined).toMatchObject({
+      status: 'failed',
+    });
+
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).toContain(seq);
+    expect(state.delivery.archive_backlog).toEqual([
+      expect.objectContaining({ delivery_id: item!.delivery_id, buffer_seq: seq }),
+    ]);
+
+    // 运维把丢掉的上下文补回来 → 归档缺口可被 retryExtraction 补做
+    await writeFile(contextPath, contextJson, 'utf8');
+    const repair = await f.service.retryExtraction(ROLE, seq);
+    expect(repair.warnings.join(' ')).toContain('Archived Buffer');
+
+    const repaired = await f.service.getBufferState(ROLE);
+    expect(repaired.pending_seqs).not.toContain(seq);
+    expect(repaired.delivery.archive_backlog).toEqual([]);
+  });
+
+  it('重复 ack 幂等：不二次归档、不改终态', async () => {
+    const f = await fixture();
+    await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    const request = {
+      channel: 'context' as const,
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed' as const,
+    };
+
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const first = await f.service.ackDelivery(request);
+    expect(first?.channel === 'context' ? first.archive : undefined).toEqual({ status: 'archived' });
+
+    const archiveSpy = vi.spyOn(f.bufferRepository, 'archiveBuffer');
+    const second = await f.service.ackDelivery(request);
+
+    // 第二次什么也没发生：completeDelivery 只对 processing 生效
+    expect(second).toBeUndefined();
+    expect(archiveSpy).not.toHaveBeenCalled();
+
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.meta).toMatchObject({ pending_count: 0, total_processed: 1 });
+    expect(state.delivery.context).toMatchObject({ processed: 1 });
+    expect(state.delivery.archive_backlog).toEqual([]);
+  });
+});
+
+/**
+ * 「没有上下文」与「有上下文却读不出来」在下游看都是 agent_context 缺席，含义却相反：
+ * 前者是历史 Buffer 的正常形态（允许降级），后者是一份**声明过**的上下文丢了。
+ * 这里的用例把两种情形与三种损坏形态（文件缺失 / JSON 损坏 / schema 不匹配）分开钉死。
+ */
+describe('getContextDelivery：上下文损坏不被误判为「没有上下文」', () => {
+  it('配对完整：payload_available=true，报告与上下文两半都在', async () => {
+    const f = await fileBackedFixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    expect(payload).toMatchObject({ payload_available: true });
+    expect(payload?.payload_warning).toBeUndefined();
+    expect(payload?.driver_return?.summary).toBe('Completed.');
+    expect(payload?.agent_context?.snapshot_id).toBe(agentContext.snapshot_id);
+  });
+
+  it('没有声明引用的历史 Buffer 且无 context 文件：保持兼容降级', async () => {
+    const f = await fileBackedFixture();
+    // 没有 agentContext、也没有 context_snapshot_ref：写入侧本来就没做上下文清理
+    const seq = await writePendingBuffer(f, 'task_delivery');
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    expect(item?.context_snapshot_ref).toBeUndefined();
+
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    // 报告照给，没有 agent_context 也不报 warning：这是允许的降级路径
+    expect(payload).toMatchObject({ payload_available: true });
+    expect(payload?.payload_warning).toBeUndefined();
+    expect(payload?.driver_return?.summary).toBe('Completed.');
+    expect(payload?.agent_context).toBeUndefined();
+  });
+
+  it.each([
+    { form: 'JSON 损坏', write: '{ not json' },
+    { form: 'schema 不匹配', write: '{"snapshot_id":"not-a-uuid"}' },
+  ])('声明了引用但 context $form：不得报「完整 payload 可用」', async ({ write }) => {
+    const f = await fileBackedFixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    await writeFile(
+      path.join(f.agentStateRoot, ROLE, 'buffer', 'pending', 'context_1.json'),
+      write,
+      'utf8',
+    );
+
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    expect(payload?.payload_available).toBe(false);
+    expect(payload?.payload_warning).toMatch(/context_1\.json/);
+    expect(payload?.agent_context).toBeUndefined();
+    // DriverReturn 仍可单独读取，只是明确告诉你另一半不可用
+    expect(payload?.driver_return?.summary).toBe('Completed.');
+  });
+
+  it('声明了引用但 context 文件缺失：报不可用，而不是「本次没有上下文」', async () => {
+    const f = await fileBackedFixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    await rm(path.join(f.agentStateRoot, ROLE, 'buffer', 'pending', 'context_1.json'));
+
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    expect(payload?.payload_available).toBe(false);
+    expect(payload?.payload_warning).toMatch(/context_snapshot_ref=1/);
+  });
+
+  it('归档（processed 分区）之后上下文损坏：同样报不可用，不静默丢一半', async () => {
+    const f = await fileBackedFixture();
+    const agentContext = sampleAgentContext(ROLE);
+    const seq = await writePendingBuffer(f, 'task_delivery', agentContext);
+    await f.runner.scheduleBuffer({
+      task_id: 'task_delivery',
+      run_id: 'run_task_delivery',
+      role_id: ROLE,
+      buffer_seq: seq,
+    });
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+
+    await writeFile(
+      path.join(f.agentStateRoot, ROLE, 'buffer', 'processed', 'context_1.json'),
+      '{ not json',
+      'utf8',
+    );
+    const payload = await f.service.getContextDelivery(ROLE, item!.delivery_id);
+    expect(payload?.payload_available).toBe(false);
+    expect(payload?.payload_warning).toMatch(/context_1\.json/);
+    expect(payload?.driver_return?.summary).toBe('Completed.');
+  });
+});
+
+describe('两处死信的独立恢复（memory.retryExtraction）', () => {
+  it('仅 Buffer 在死信：恢复 Buffer，不碰本来就在 pending 的交付', async () => {
+    const f = await fixture();
+    const seq = await deliverOnce(f);
+    await f.bufferRepository.markBufferDeadLetter(ROLE, seq, 'extractor failed');
+
+    const evidence = await f.service.retryExtraction(ROLE, seq);
+    expect(evidence.status).toBe('scheduled');
+
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).toContain(seq);
+    expect(state.dead_letter_seqs).toEqual([]);
+    expect(state.delivery.context).toMatchObject({ pending: 1, dead_letter: 0 });
+    // 交付没有被重试复制成第二条
+    await expect(f.service.listContextDeliveries({ role_id: ROLE })).resolves.toHaveLength(1);
+  });
+
+  it('仅交付在死信：恢复交付，Buffer 留在 pending（旧实现会在这里抛错）', async () => {
+    const f = await fixture();
+    const seq = await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'failed',
+      error: 'permanent downstream error',
+      retryable: false,
+    });
+
+    await f.service.retryExtraction(ROLE, seq);
+
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.delivery.context).toMatchObject({ pending: 1, dead_letter: 0 });
+    expect(await f.service.listRetryableDeliveries({ role_id: ROLE })).toHaveLength(1);
+    // Buffer 那侧原本就在 pending：计数不能被恢复流程再加一次
+    expect(state.pending_seqs).toEqual([seq]);
+    expect(state.meta.pending_count).toBe(1);
+  });
+
+  it('两者同时死信：一次调用把两边都放回队列', async () => {
+    const f = await fixture();
+    const seq = await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+
+    // 让交付项进死信（不可重试的失败）
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'failed',
+      error: 'permanent downstream error',
+      retryable: false,
+    });
+    // Buffer 那条也进死信（提取失败的历史路径）
+    await f.bufferRepository.markBufferDeadLetter(ROLE, seq, 'extraction failed');
+
+    await f.service.retryExtraction(ROLE, seq);
+
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).toContain(seq);
+    expect(state.dead_letter_seqs).not.toContain(seq);
+    expect(state.delivery.context.dead_letter).toBe(0);
+    expect(state.delivery.context.pending).toBe(1);
+    expect(await f.service.listRetryableDeliveries({ role_id: ROLE })).toHaveLength(1);
+  });
+
+  it('重复 retry 幂等：交付不复制、Buffer 不重复计数', async () => {
+    const f = await fixture();
+    const seq = await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    await f.bufferRepository.markBufferDeadLetter(ROLE, seq, 'extraction failed');
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'failed',
+      error: 'permanent downstream error',
+      retryable: false,
+    });
+
+    await f.service.retryExtraction(ROLE, seq);
+    await f.service.retryExtraction(ROLE, seq);
+    await f.service.retryExtraction(ROLE, seq);
+
+    await expect(f.service.listContextDeliveries({ role_id: ROLE })).resolves.toHaveLength(1);
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).toEqual([seq]);
+    expect(state.meta.pending_count).toBe(1);
+    expect(state.delivery.context).toMatchObject({ pending: 1, dead_letter: 0 });
+  });
+
+  it('已 processed 的交付不会被重试拉回队列', async () => {
+    const f = await fixture();
+    const seq = await deliverOnce(f);
+    const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    await f.service.ackDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: item!.delivery_id,
+      owner: 'downstream',
+      outcome: 'processed',
+    });
+
+    // Buffer 已随 ack 归档，没有可恢复的死信：如实报 skipped 而不是抛错
+    const evidence = await f.service.retryExtraction(ROLE, seq);
+    expect(evidence.status).toBe('skipped');
+    expect(evidence.warnings.join(' ')).toContain('neither pending nor dead-lettered');
+
+    const [still] = await f.service.listContextDeliveries({ role_id: ROLE });
+    expect(still).toMatchObject({ status: 'processed', attempt_count: 1 });
+    const state = await f.service.getBufferState(ROLE);
+    expect(state.pending_seqs).not.toContain(seq);
+    expect(await f.service.listRetryableDeliveries({ role_id: ROLE })).toHaveLength(0);
   });
 });
 

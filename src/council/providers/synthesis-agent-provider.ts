@@ -41,6 +41,7 @@ import {
 } from '../plan-artifact';
 import { proposalReportFields } from '../proposal-adapter';
 import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles, type WorkspaceFileSnapshot } from '../../coordinator/workspace-change-detector';
+import { PLAN_STEP_LIST_REQUIREMENT } from '../../coordinator/plan-check';
 import type { SapTaskBridge } from '../../coordination/sap-task-bridge';
 
 export type CouncilRoleFailureCode =
@@ -1479,6 +1480,7 @@ function buildProposalInstruction(
     'Do not modify product files or implement the solution.',
     'Write the complete Plan to the relative path council-plan.md in the current role workspace; never construct an absolute path.',
     'Include affected files, ordered steps, risks, and verification.',
+    ...PLAN_STEP_LIST_REQUIREMENT,
   ].join(' ');
 }
 
@@ -1522,6 +1524,7 @@ function buildSynthesisInstruction(
       'Use the relative path final-plan.md in the current role workspace; never construct an absolute path.',
       'Do not implement the Plan or modify product files.',
       'The final Plan must identify affected files, ordered steps, risks, and verification.',
+      ...PLAN_STEP_LIST_REQUIREMENT,
     ].join(' ');
   }
   return [

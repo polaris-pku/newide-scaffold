@@ -116,18 +116,18 @@ import type {
   DeliveryChannel,
   DeliveryClaimRequest,
   DeliveryRecordLocator,
+  PendingBufferRead,
 } from '../memory';
 import type {
   SkillRecord,
   BufferMeta,
-  BufferSnapshot,
-  AgentContextSnapshot,
   ContextDeliveryItem,
   DriverFeedbackRecord,
 } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type {
   AgentMetaPatch,
+  AckDeliveryPayload,
   BMemoryBackendService,
   ContextDeliveryPayload,
   DeliveryRecordPayload,
@@ -706,7 +706,7 @@ export class NewideBackendService {
   getMemoryPendingBuffer(
     roleId: string,
     seq: number,
-  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined> {
+  ): Promise<PendingBufferRead | undefined> {
     return this.requireBMemoryService().getPendingBuffer(roleId, seq);
   }
 
@@ -751,7 +751,7 @@ export class NewideBackendService {
       retryable?: boolean | undefined;
       processor_version?: string | undefined;
     },
-  ): Promise<DeliveryRecordPayload | undefined> {
+  ): Promise<AckDeliveryPayload | undefined> {
     return this.requireBMemoryService().ackDelivery(input);
   }
 

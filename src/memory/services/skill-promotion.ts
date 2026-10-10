@@ -11,6 +11,9 @@
  *   4. 晋升后 SkillRecord.review_status 为 'pending'（需人工审核；测评自动批准走
  *      B 服务 autoApprovePromotedSkills 或 maintenance runner 的 promotion.autoApprove）
  *   5. 原 experience 的 promoted_to 指向新 skill.id
+ *
+ * 幂等：晋升以 `(role_id, promoted_from)` 为唯一键（见 saveSkillIfAbsent）。「先存 Skill、
+ * 再回写 experience.promoted_to」第二步失败后重试时复用已有 Skill，不会攒出重复技能。
  */
 import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
@@ -77,10 +80,9 @@ export async function ruleBasedSkillPromotion(
   }
 
   const now = nowTimestamp();
-  const skillId = randomUUID();
 
   const skill = {
-    id: skillId,
+    id: randomUUID(),
     description: candidate.description,
     description_embedding: candidate.description_embedding,
     content: candidate.content,
@@ -95,18 +97,24 @@ export async function ruleBasedSkillPromotion(
     updated_at: now,
   };
 
-  await memory.saveSkill(skill);
-  await memory.updateExperience({ ...candidate, promoted_to: skillId });
+  // 幂等键是 (role_id, promoted_from)，不是这条随机 id：晋升是「先存 Skill、再回写
+  // Experience.promoted_to」两步，第二步失败后整条重试。若每次都新建 Skill，重试就会
+  // 攒出成对的重复技能，而 Experience 的 promoted_to 只能指向其中一个（另一个没人引用）。
+  // 存储层因此按 promoted_from 复用已有技能；并发晋升同一 Experience 也只会留下一条。
+  const { skill: stored, created } = await memory.saveSkillIfAbsent(skill);
+  await memory.updateExperience({ ...candidate, promoted_to: stored.id });
 
   return {
     check: {
       eligible: true,
       auto_approved: false,
       reasons: [
-        `Experience "${candidate.description}" promoted with confidence ${candidate.confidence}`,
+        created
+          ? `Experience "${candidate.description}" promoted with confidence ${candidate.confidence}`
+          : `Experience "${candidate.description}" already had Skill ${stored.id}; reused it instead of creating a duplicate.`,
       ],
       blocking_rules: [],
     },
-    skill,
+    skill: stored,
   };
 }

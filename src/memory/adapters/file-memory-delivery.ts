@@ -14,10 +14,25 @@
  * - 拿不到锁时短暂重试，超过预算就按「本次跳过」返回（不是错误，是并发下的正常结果）；
  * - 锁文件带 `acquired_at`，超过 TTL 视为持有者已崩溃并接管，避免一次崩溃永久锁死；
  * - 释放前核对 token，避免删掉别人重新建立的锁。
- * 单次写的原子性仍由临时文件 + rename 保证：任何时刻磁盘上要么是旧的完整记录，
+ * 单次写的原子性由「唯一临时文件 + rename」保证：任何时刻磁盘上要么是旧的完整记录，
  * 要么是新的完整记录，不存在半完成状态。
+ *
+ * 首次提交不走状态机（记录当时还不存在，没有可争用的读写对），但**必须自己保证
+ * 唯一性**：内容先写进唯一临时文件，再用 `link` 原子发布，只有目标缺席时才会成功。
+ * 拿锁去保提交是行不通的——抢不到锁在 claim 路径上是「本次跳过」，在提交路径上却是
+ * 「这份交付没登记」，语义完全不同。
  */
-import { mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import {
+  link,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import {
@@ -113,16 +128,19 @@ export class FileMemoryDeliveryRepository implements MemoryDeliveryRepository {
     assertSafeRoleId(item.role_id);
     const filePath = this.recordPath('context', item.role_id, item.delivery_id);
     // 提交只在文件**缺席**时写，因此不会覆盖下游已经推进过的状态——这正是
-    // 「上游重放不把下游拽回去」的实现方式。两路并发创建同一个键时写入内容可能
-    // 各自带一个 created_at，所以写完之后以磁盘上的那一份为准返回。
+    // 「上游重放不把下游拽回去」的实现方式。两个进程同时首次提交同一个键时，
+    // 由文件系统裁决谁是创建者：输的那个读回赢家写下的那一份（可能已经带上了
+    // 下游推进的状态），如实报 created:false。
     const existing = await readJson(filePath, ContextDeliveryItemSchema);
     if (existing) {
       return { item: existing, created: false };
     }
     ContextDeliveryItemSchema.parse(item);
-    await writeJsonAtomic(filePath, item);
+    if ((await publishJsonIfAbsent(filePath, item)) === 'created') {
+      return { item, created: true };
+    }
     const stored = await readJson(filePath, ContextDeliveryItemSchema);
-    return { item: stored ?? item, created: true };
+    return { item: stored ?? item, created: false };
   }
 
   async getContextDelivery(
@@ -151,9 +169,11 @@ export class FileMemoryDeliveryRepository implements MemoryDeliveryRepository {
       return { item: existing, created: false };
     }
     DriverFeedbackRecordSchema.parse(record);
-    await writeJsonAtomic(filePath, record);
+    if ((await publishJsonIfAbsent(filePath, record)) === 'created') {
+      return { item: record, created: true };
+    }
     const stored = await readJson(filePath, DriverFeedbackRecordSchema);
-    return { item: stored ?? record, created: true };
+    return { item: stored ?? record, created: false };
   }
 
   async getDriverFeedback(
@@ -568,9 +588,16 @@ async function readJson<T>(
   }
 }
 
+/**
+ * 状态转移的原子落地：写唯一临时文件后 rename。
+ *
+ * 临时名带 pid 与 uuid，是为了让「同一份记录的两次写」永远不共用同一个中间文件——
+ * 共用 `${file}.tmp` 时，第二个写者会把第一个的内容覆盖掉，随后先发布的那次
+ * rename 反而把别人的内容搬上台面（或干脆在 tmp 已被搬走后失败）。
+ */
 async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp`;
+  const tmpPath = uniqueTmpPath(filePath);
   await writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
   try {
     await rename(tmpPath, filePath);
@@ -578,6 +605,54 @@ async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
     await unlink(filePath).catch(() => undefined);
     await rename(tmpPath, filePath);
   }
+}
+
+/**
+ * 只在目标缺席时发布一条记录。
+ *
+ * 内容先整份写进唯一临时文件，再用 `link` 原子发布：目标已存在时 link 报 EEXIST，
+ * 于是「谁是创建者」完全由文件系统裁决，两个进程不可能都以为自己创建成功，也不会
+ * 出现「记录已经落盘、调用却因为临时文件冲突而失败」。发布成功的一刻，目标要么
+ * 不存在、要么是一份完整记录。
+ *
+ * 不支持硬链接的文件系统（部分网络盘）退到 `open(..., 'wx')` 独占创建：排他性一样，
+ * 只是内容不再经由临时文件落地。
+ */
+async function publishJsonIfAbsent(filePath: string, data: unknown): Promise<'created' | 'exists'> {
+  await mkdir(dirname(filePath), { recursive: true });
+  const payload = `${JSON.stringify(data, null, 2)}\n`;
+  const tmpPath = uniqueTmpPath(filePath);
+  await writeFile(tmpPath, payload, 'utf8');
+  try {
+    await link(tmpPath, filePath);
+    return 'created';
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return 'exists';
+    return (await createExclusively(filePath, payload)) ? 'created' : 'exists';
+  } finally {
+    await unlink(tmpPath).catch(() => undefined);
+  }
+}
+
+/** `open(..., 'wx')` 独占创建：已存在即 EEXIST，返回 false 表示这次没写 */
+async function createExclusively(filePath: string, payload: string): Promise<boolean> {
+  try {
+    const handle = await open(filePath, 'wx');
+    try {
+      await handle.writeFile(payload, 'utf8');
+    } finally {
+      await handle.close();
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+/** 与目标同目录的唯一临时文件：同目录才能保证 rename 是原子替换 */
+function uniqueTmpPath(filePath: string): string {
+  return `${filePath}.${String(process.pid)}.${randomUUID()}.tmp`;
 }
 
 function matchesContextFilter(

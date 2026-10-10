@@ -19,13 +19,8 @@ import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import type { LlmClient } from '../ports/llm-client';
 import type { ExperienceExtractor } from '../ports/experience-extractor';
-import type {
-  BufferSnapshot,
-  AgentContextSnapshot,
-  ExperienceRecord,
-  DriverReturn,
-} from '../schemas';
-import type { ExtractionOutput } from '../types';
+import type { BufferSnapshot, AgentContextSnapshot, DriverReturn } from '../schemas';
+import type { CandidateExperience, ExtractionOutput } from '../types';
 import { RuleBasedExperienceExtractor } from './rule-based-experience-extractor';
 import { EXTRACTOR_SYSTEM_PROMPT } from '../prompts/experience-extractor';
 
@@ -132,10 +127,8 @@ function buildExtractionPrompt(dr: DriverReturn, agentContext?: AgentContextSnap
 function toExperienceRecords(
   items: LlmExperienceItem[],
   snapshot: BufferSnapshot,
-  agentContext?: AgentContextSnapshot,
-): ExperienceRecord[] {
+): CandidateExperience[] {
   const now = nowTimestamp();
-  const agent_id = agentContext?.agent_id ?? snapshot.source_task_id;
 
   return items.map((item) => ({
     id: randomUUID(),
@@ -144,7 +137,11 @@ function toExperienceRecords(
     content: item.content,
     confidence: item.confidence,
     tags: item.tags,
-    agent_id,
+    // 归属不在这里定，这里也**不产出**归属字段：一条 Buffer 属于哪个 Agent 只有
+    // memory.role_id 说得准，提取器拿不到它（无上下文快照时连 agentContext 都没有）。
+    // 填一个占位值就会让直接使用提取器的维护系统把经验挂错人；**更不要拿
+    // source_task_id 顶替**——那是任务溯源字段，不是归属。agent_id 由
+    // persistExtractedExperiences 按 memory.role_id 统一补齐。
     linked_negative_exp: undefined,
     promoted_to: undefined,
     assumptions: undefined,
@@ -188,7 +185,7 @@ export class LlmExperienceExtractor implements ExperienceExtractor {
 
       const parsed = parseLlmResponse(raw);
 
-      const experiences = toExperienceRecords(parsed.experiences, snapshot, agentContext);
+      const experiences = toExperienceRecords(parsed.experiences, snapshot);
 
       return {
         experiences,

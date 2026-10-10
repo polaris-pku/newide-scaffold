@@ -30,10 +30,12 @@ import {
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type {
+  ExperienceSaveResult,
   MarketImportResult,
   MarketSearchOptions,
   MemoryRepository,
   MemoryVectorSearchOptions,
+  SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
@@ -62,6 +64,87 @@ function toPgVector(values: number[]): string {
 }
 
 /**
+ * 插入一条 Experience 之后推进 Agent 聚合根：计数 +1，owned_exps 追加该 id。
+ *
+ * 为什么整段用 SQL 表达而不是「读出来 → 在内存副本上改 → 整份 JSON 写回」：
+ * 两个维护 worker 并发处理**不同**记录时，两边都会读到同一份旧 handle/metrics，各自
+ * 算出 +1、各自覆盖回去，后写的那个把先写的整个抹掉——库里两条 Experience，聚合根只记
+ * 一条。这里让数据库对**当前行**做增量：SET 表达式直接引用 handle/metrics，UPDATE 持有
+ * 的行锁保证它读到的是最新提交的版本，因此谁都不会覆盖谁；owned_exps 用「包含检查 +
+ * 追加」既不丢也不重复。这些语义对 pg.Pool 与 PGlite 是同一套 SQL。
+ */
+const EXPERIENCE_AGGREGATE_BUMP_SQL = `
+  UPDATE memory_agents
+  SET handle = jsonb_set(
+        jsonb_set(
+          jsonb_set(
+            handle,
+            '{owned_exps}',
+            CASE
+              WHEN COALESCE(handle->'owned_exps', '[]'::jsonb) @> jsonb_build_array($2::text)
+                THEN handle->'owned_exps'
+              ELSE COALESCE(handle->'owned_exps', '[]'::jsonb) || jsonb_build_array($2::text)
+            END,
+            true
+          ),
+          '{experience_count}',
+          to_jsonb(COALESCE((handle->>'experience_count')::int, 0) + 1),
+          true
+        ),
+        '{metric,experience_count}',
+        to_jsonb(COALESCE((handle->'metric'->>'experience_count')::int, 0) + 1),
+        false
+      ),
+      metrics = jsonb_set(
+        metrics,
+        '{experience_count}',
+        to_jsonb(COALESCE((metrics->>'experience_count')::int, 0) + 1),
+        true
+      )
+  WHERE role_id = $1
+`;
+
+/**
+ * 插入一条 Skill 之后推进 Agent 聚合根：skill_count / promoted_skill_count +1、
+ * owned_skills 追加该 id。与 EXPERIENCE_AGGREGATE_BUMP_SQL 同一套路数、同一组理由。
+ */
+const SKILL_AGGREGATE_BUMP_SQL = `
+  UPDATE memory_agents
+  SET handle = jsonb_set(
+        jsonb_set(
+          jsonb_set(
+            handle,
+            '{owned_skills}',
+            CASE
+              WHEN COALESCE(handle->'owned_skills', '[]'::jsonb) @> jsonb_build_array($2::text)
+                THEN handle->'owned_skills'
+              ELSE COALESCE(handle->'owned_skills', '[]'::jsonb) || jsonb_build_array($2::text)
+            END,
+            true
+          ),
+          '{skill_count}',
+          to_jsonb(COALESCE((handle->>'skill_count')::int, 0) + 1),
+          true
+        ),
+        '{metric,skill_count}',
+        to_jsonb(COALESCE((handle->'metric'->>'skill_count')::int, 0) + 1),
+        false
+      ),
+      metrics = jsonb_set(
+        jsonb_set(
+          metrics,
+          '{skill_count}',
+          to_jsonb(COALESCE((metrics->>'skill_count')::int, 0) + 1),
+          true
+        ),
+        '{promoted_skill_count}',
+        to_jsonb(COALESCE((metrics->>'promoted_skill_count')::int, 0) + 1),
+        true
+      )
+  WHERE role_id = $1
+`;
+
+/**
  * 读取表内 description_embedding 列的 vector(N) 维度；列不存在返回 undefined。
  * 用于检测 embedding 模型切换后的维度漂移（migrateVectorColumnDimensions）。
  */
@@ -87,6 +170,8 @@ export class PgMemoryRepository implements MemoryRepository {
   private readonly embedding: EmbeddingProvider;
   private readonly autoMigrate: boolean;
   private schemaReady: Promise<void> | undefined;
+  /** 每个 role 一条排队链，见 withRoleLock */
+  private readonly roleQueues = new Map<string, Promise<unknown>>();
 
   constructor(options: PgMemoryRepositoryOptions) {
     this.pool = options.pool;
@@ -497,71 +582,210 @@ export class PgMemoryRepository implements MemoryRepository {
     await this.ensureSchema();
     const stored = await this.withDescriptionEmbedding(experience);
     ExperienceRecordSchema.parse(stored);
+    await this.withRoleLock(role_id, () =>
+      this.insertExperienceRow(role_id, stored, { onConflictDoNothing: false }),
+    );
+  }
 
-    const handle = await this.getAgent(role_id);
-    const metrics = await this.getMetrics(role_id);
+  /**
+   * 幂等保存经验：唯一键是主键 `id`，靠 `ON CONFLICT (id) DO NOTHING` 让「查有没有 + 写进去」
+   * 在数据库里原子完成。
+   *
+   * 与 saveSkillIfAbsent 同一套路数、同一组理由：两个独立 worker 可能同时处理同一个
+   * `(role_id, buffer_seq)`，而「先 listExperiences 再逐条 saveExperience」是两次独立往返，
+   * 两边都查不到对方那条，于是 PG 这一侧会有一方撞主键被抛异常、内存那一侧会攒出重复 id。
+   * 撞上（rowCount === 0）时**不计数**，读回仓库里已有那条交给调用方——两个 worker 因此都
+   * 拿到同一条已持久化的经验，谁都不会收到冲突异常。
+   *
+   * 不同 id 的并发写入走的是另一条路径（两次都真正插入），聚合根的计数与 owned_exps 由
+   * EXPERIENCE_AGGREGATE_BUMP_SQL 在事务内对当前行增量得出，不会互相覆盖。
+   */
+  async saveExperienceIfAbsent(
+    role_id: string,
+    experience: ExperienceRecord,
+  ): Promise<ExperienceSaveResult> {
+    await this.ensureSchema();
+    const stored = await this.withDescriptionEmbedding(experience);
+    ExperienceRecordSchema.parse(stored);
+    return this.withRoleLock(role_id, () =>
+      this.insertExperienceRow(role_id, stored, { onConflictDoNothing: true }),
+    );
+  }
 
-    handle.experience_count += 1;
-    handle.owned_exps.push(stored.id);
-    metrics.experience_count += 1;
-
+  /**
+   * 事务内完成「插一条 Experience + 推进聚合根」两件事，任一步失败整条回滚。
+   *
+   * `onConflictDoNothing` 打开时同 id 命中不报错、不计数，回读已有那条返回（幂等路径）；
+   * 关闭时同 id 命中按主键冲突抛出（普通保存路径）。
+   */
+  private async insertExperienceRow(
+    role_id: string,
+    stored: ExperienceRecord,
+    options: { onConflictDoNothing: boolean },
+  ): Promise<ExperienceSaveResult> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO memory_experiences (id, role_id, payload, description_embedding)
-         VALUES ($1, $2, $3::jsonb, $4::vector)`,
+         VALUES ($1, $2, $3::jsonb, $4::vector)
+         ${options.onConflictDoNothing ? 'ON CONFLICT (id) DO NOTHING' : ''}
+         RETURNING id`,
         [stored.id, role_id, JSON.stringify(stored), toPgVector(stored.description_embedding)],
       );
-      await client.query(
-        `UPDATE memory_agents
-         SET handle = $2::jsonb, metrics = $3::jsonb
-         WHERE role_id = $1`,
-        [role_id, JSON.stringify(handle), JSON.stringify(metrics)],
-      );
+
+      if (inserted.rowCount === 0) {
+        // 已经有一条同 id 的经验：这次什么都不改（不计数）。用 COMMIT 而不是 ROLLBACK——
+        // 回滚会把并发那一侧刚插进去的行一起带走，剩下的读回就成了空。
+        await client.query('COMMIT');
+        const existing = await this.findExperienceById(stored.id);
+        if (!existing || existing.role_id !== role_id) {
+          throw new Error(
+            existing
+              ? `Experience ${stored.id} conflicted but is owned by ${existing.role_id}, not ${role_id}`
+              : `Experience ${stored.id} conflicted but could not be read back`,
+          );
+        }
+        return { experience: existing.experience, created: false };
+      }
+
+      // 只有真正插进去才计数。计数失败（如 Agent 行不存在）连同上面的 INSERT 一起回滚，
+      // 不会留下「有记录、没计数」的孤儿。
+      const bumped = await client.query(EXPERIENCE_AGGREGATE_BUMP_SQL, [role_id, stored.id]);
+      if (bumped.rowCount === 0) {
+        throw new Error(`Agent not found: ${role_id}`);
+      }
       await client.query('COMMIT');
+      return { experience: stored, created: true };
     } catch (error) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
       client.release();
     }
   }
 
+  /** 按主键读回一条经验（`ON CONFLICT` 的查询侧），连带它属于哪个 role。 */
+  private async findExperienceById(
+    id: string,
+  ): Promise<{ role_id: string; experience: ExperienceRecord } | undefined> {
+    const result = await this.pool.query<{ role_id: string; payload: unknown }>(
+      `SELECT role_id, payload FROM memory_experiences WHERE id = $1`,
+      [id],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return { role_id: row.role_id, experience: ExperienceRecordSchema.parse(row.payload) };
+  }
+
   async saveSkill(role_id: string, skill: SkillRecord): Promise<void> {
     await this.ensureSchema();
     const stored = await this.withDescriptionEmbedding(skill);
     SkillRecordSchema.parse(stored);
+    await this.withRoleLock(role_id, () =>
+      this.insertSkillRow(role_id, stored, { onConflictDoNothing: false }),
+    );
+  }
 
-    const handle = await this.getAgent(role_id);
-    const metrics = await this.getMetrics(role_id);
+  /**
+   * 幂等保存晋升技能：唯一键 `(role_id, promoted_from)`，由部分唯一索引
+   * `memory_skills_promoted_from_uniq` 保证，写入用 ON CONFLICT DO NOTHING。
+   *
+   * 晋升是「先存 Skill、再回写 Experience.promoted_to」两步，第二步失败后重试会再次
+   * 走到这里。靠数据库的唯一约束而不是「先查再插」：后者在并发下两次都查不到、各自插入，
+   * 攒出成对的重复技能。冲突时回读已有那条返回，Experience 的 promoted_to 因此永远指向
+   * 同一个技能。计数只在真正新建时才递增。
+   *
+   * 来源**不同**的并发晋升是另一条路径（两次都真正插入），聚合根的 skill_count 与
+   * owned_skills 由 SKILL_AGGREGATE_BUMP_SQL 在事务内对当前行增量得出，不会互相覆盖。
+   */
+  async saveSkillIfAbsent(role_id: string, skill: SkillRecord): Promise<SkillSaveResult> {
+    await this.ensureSchema();
+    const stored = await this.withDescriptionEmbedding(skill);
+    SkillRecordSchema.parse(stored);
+    // promoted_from 为空（市场导入等）没有幂等键可用，退化为普通保存
+    return this.withRoleLock(role_id, () =>
+      this.insertSkillRow(role_id, stored, {
+        onConflictDoNothing: stored.promoted_from !== undefined,
+      }),
+    );
+  }
 
-    handle.skill_count += 1;
-    handle.owned_skills.push(stored.id);
-    metrics.skill_count += 1;
-    metrics.promoted_skill_count += 1;
-
+  /**
+   * 事务内完成「插一条 Skill + 推进聚合根」两件事，任一步失败整条回滚。
+   *
+   * 语义与 insertExperienceRow 一致，唯一键换成部分唯一索引 `(role_id, promoted_from)`。
+   */
+  private async insertSkillRow(
+    role_id: string,
+    stored: SkillRecord,
+    options: { onConflictDoNothing: boolean },
+  ): Promise<SkillSaveResult> {
+    const promotedFrom = stored.promoted_from ?? null;
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(
-        `INSERT INTO memory_skills (id, role_id, payload, description_embedding)
-         VALUES ($1, $2, $3::jsonb, $4::vector)`,
-        [stored.id, role_id, JSON.stringify(stored), toPgVector(stored.description_embedding)],
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO memory_skills (id, role_id, payload, description_embedding, promoted_from)
+         VALUES ($1, $2, $3::jsonb, $4::vector, $5)
+         ${
+           options.onConflictDoNothing
+             ? 'ON CONFLICT (role_id, promoted_from) WHERE promoted_from IS NOT NULL DO NOTHING'
+             : ''
+         }
+         RETURNING id`,
+        [
+          stored.id,
+          role_id,
+          JSON.stringify(stored),
+          toPgVector(stored.description_embedding),
+          promotedFrom,
+        ],
       );
-      await client.query(
-        `UPDATE memory_agents
-         SET handle = $2::jsonb, metrics = $3::jsonb
-         WHERE role_id = $1`,
-        [role_id, JSON.stringify(handle), JSON.stringify(metrics)],
-      );
+
+      if (inserted.rowCount === 0) {
+        // 已经有一条同源的技能：这次什么都不改（不计数）。用 COMMIT 而不是 ROLLBACK——
+        // 回滚会把并发那一侧刚插进去的行一起带走，剩下的读回就成了空。
+        await client.query('COMMIT');
+        if (promotedFrom === null) {
+          // 只会发生在「没挂 ON CONFLICT 子句却报冲突」这种不该出现的组合上
+          throw new Error(`Skill ${stored.id} conflicted without a promoted_from key`);
+        }
+        const existing = await this.findSkillByPromotedFrom(role_id, promotedFrom);
+        if (!existing) {
+          throw new Error(
+            `Skill for promoted_from=${promotedFrom} conflicted but could not be read back`,
+          );
+        }
+        return { skill: existing, created: false };
+      }
+
+      const bumped = await client.query(SKILL_AGGREGATE_BUMP_SQL, [role_id, stored.id]);
+      if (bumped.rowCount === 0) {
+        throw new Error(`Agent not found: ${role_id}`);
+      }
       await client.query('COMMIT');
+      return { skill: stored, created: true };
     } catch (error) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
       client.release();
     }
+  }
+
+  /** 读回一条 `promoted_from` 指向给定经验的技能（部分唯一索引的查询侧）。 */
+  private async findSkillByPromotedFrom(
+    role_id: string,
+    promoted_from: string,
+  ): Promise<SkillRecord | undefined> {
+    const result = await this.pool.query<{ payload: unknown }>(
+      `SELECT payload FROM memory_skills WHERE role_id = $1 AND promoted_from = $2`,
+      [role_id, promoted_from],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return SkillRecordSchema.parse(row.payload);
   }
 
   async savePersona(role_id: string, persona: PersonaDef): Promise<void> {
@@ -800,6 +1024,31 @@ export class PgMemoryRepository implements MemoryRepository {
       throw new Error(`Agent not found: ${role_id}`);
     }
     return row;
+  }
+
+  /**
+   * 同一 role 上的写操作排队执行（按调用顺序串成一条链，先到先得）。
+   *
+   * 为什么需要它：生产默认走 PGlite，而 PGlite 只有一个连接——`connect()` 交回的是同一个
+   * 会话，两个 worker 的 BEGIN/COMMIT 会互相插进对方的事务里，「插入 + 聚合根更新」这种
+   * 多语句事务因此不是隔离边界。进程内按 role 串行化之后，事务边界才真正成立，插入与
+   * 计数才能同生共死（见 insertExperienceRow / insertSkillRow）。
+   *
+   * 跨进程那一侧（外部 PostgreSQL）不靠这把锁：计数与 owned_* 的更新本身就是数据库侧对
+   * 当前行的原子增量，即使两个调用方各在一条连接上也读不到对方的旧快照。
+   */
+  private async withRoleLock<T>(role_id: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.roleQueues.get(role_id) ?? Promise.resolve();
+    const running = previous.then(operation, operation);
+    const settled = running.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.roleQueues.set(role_id, settled);
+    void settled.then(() => {
+      if (this.roleQueues.get(role_id) === settled) this.roleQueues.delete(role_id);
+    });
+    return running;
   }
 
   private async withDescriptionEmbedding<T extends SkillRecord | ExperienceRecord>(

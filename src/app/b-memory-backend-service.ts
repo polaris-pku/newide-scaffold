@@ -3,6 +3,7 @@ import {
   type AgentBoardListItem,
   type AgentHandle,
   applyUserRating,
+  type BufferArchiveOutcome,
   type CreateAgentSpec,
   createSkill,
   deleteExperience,
@@ -19,6 +20,7 @@ import {
   marketSearch,
   type MemoryRepository,
   mergePersonaPatch,
+  type PendingBufferRead,
   type PersonaPatch,
   publishSkillToMarket,
   regeneratePersona,
@@ -66,6 +68,8 @@ import type {
   PersonaDef,
   SkillRecord,
 } from '../memory/schemas';
+
+import { SCHEMA_VERSION, createId, nowTimestamp } from '../core';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
 import type { BPublicCapabilities, ReviewedSkill } from './b-public-capabilities';
 import { filterLegacyCouncilPseudoAgents } from './council-legacy-agent-filter';
@@ -171,10 +175,41 @@ export interface BMemoryCapabilities {
 /** getContextDelivery 的返回：交付项本身 + 从 Buffer 现取的完整输入 */
 export interface ContextDeliveryPayload {
   delivery: ContextDeliveryItem;
-  /** Buffer 是否仍在 pending；false 表示 payload 暂时取不到（不是空上下文） */
+  /** Buffer 快照是否取得到；false 表示 payload 现在拿不出来（不是空上下文） */
   payload_available: boolean;
+  /**
+   * payload_available=false 时的一句说明。两种情形都会带：
+   * - 记录在但整份读不出来（报告损坏）；
+   * - 报告读得出来，但配对 AgentContextSnapshot「声明过却读不出来」（见 payload 说明）。
+   *   此时 `driver_return` 仍会给出——DriverReturn 单独可读，缺的是另一半。
+   */
+  payload_warning?: string;
   driver_return?: BufferSnapshot['driver_return'];
   agent_context?: AgentContextSnapshot;
+}
+
+/**
+ * ack 的返回：交付项 + 源 Buffer 归档结果。
+ *
+ * 归档结果放进 ack 的返回值，是因为「交付已 processed、Buffer 还留在 pending」是需要被
+ * 看见的一致性缺口：ack 不能回滚（下游确实处理完了），归档却可能没落地。调用方据此决定
+ * 要不要重试归档（见 retryExtraction 与 getBufferState 的 archive_backlog），而不是拿到一个
+ * 看起来完全成功的结果、却永远读不到那条本该被归档的 Buffer。
+ *
+ * `archive` 只在 `outcome: 'processed'` 且交付状态确实推进到 processed 时出现——那时
+ * `delivery.status === 'processed'`。失败路径（退避重试或进 dead_letter）不碰 Buffer，
+ * 没有归档这一步；feedback 通道不引用源 Buffer，同样没有。
+ */
+export type AckDeliveryPayload =
+  | { channel: 'context'; delivery: ContextDeliveryItem; archive?: BufferArchiveOutcome }
+  | { channel: 'feedback'; feedback: DriverFeedbackRecord };
+
+/** 一条归档缺口：交付已 processed，但源 Buffer 还留在 pending */
+export interface DeliveryArchiveBacklogEntry {
+  delivery_id: string;
+  task_id: string;
+  buffer_seq: number;
+  updated_at: string;
 }
 
 /** claim / ack 的返回：交付项本身，按通道放在各自的字段下 */
@@ -208,6 +243,15 @@ export interface DeliveryStateSummary {
   context: DeliveryStatusCounts;
   feedback: DeliveryStatusCounts;
   dead_letters: DeliveryDeadLetterEntry[];
+  /**
+   * 归档缺口：交付已 processed、源 Buffer 却还留在 pending。
+   *
+   * 这一格存在是因为 delivery 与 Buffer 在两个存储里、没有跨存储事务：ack 成功只保证
+   * 交付状态推进了，Buffer 归档是另一次写。缺口由**持久状态本身**推导出来（不是一份
+   * 单独记的日志），所以重启后照样看得见；运维拿这里的 seq 调 retryExtraction 即可补做
+   * 归档（见 BMemoryBackendService.retryExtraction）。
+   */
+  archive_backlog: DeliveryArchiveBacklogEntry[];
 }
 
 /** Agent 元数据更新补丁（与 MemoryRepository.updateAgentMeta 对齐） */
@@ -674,20 +718,24 @@ export class BMemoryBackendService {
     delivery: DeliveryStateSummary;
   }> {
     const repository = this.requireRepository('Buffer state');
-    const [meta, pending_seqs, dead_letter_seqs, dead_letters, delivery] = await Promise.all([
+    const [meta, pending_seqs, dead_letter_seqs, dead_letters] = await Promise.all([
       this.capabilities.bufferRepository.getBufferMeta(roleId),
       this.capabilities.bufferRepository.listPendingBufferSeqs(roleId),
       this.capabilities.bufferRepository.listDeadLetterSeqs(roleId),
       this.capabilities.bufferRepository.listDeadLetterEntries(roleId),
-      this.describeDeliveryState(roleId),
     ]);
+    // 归档缺口要拿 pending 列表来推：交付档案自己看不出源 Buffer 有没有搬走
+    const delivery = await this.describeDeliveryState(roleId, pending_seqs);
     // roleId 必须存在（避免对不存在 Agent 的探针）
     await repository.getAgent(roleId);
     return { meta, pending_seqs, dead_letter_seqs, dead_letters, delivery };
   }
 
-  /** 交付视图：两条通道各自的状态计数 + 死信摘要 */
-  private async describeDeliveryState(roleId: string): Promise<DeliveryStateSummary> {
+  /** 交付视图：两条通道各自的状态计数 + 死信摘要 + 归档缺口 */
+  private async describeDeliveryState(
+    roleId: string,
+    pendingSeqs: readonly number[],
+  ): Promise<DeliveryStateSummary> {
     const repository = this.capabilities.deliveryRepository;
     if (!repository) {
       return {
@@ -695,6 +743,7 @@ export class BMemoryBackendService {
         context: emptyDeliveryStatusCounts(),
         feedback: emptyDeliveryStatusCounts(),
         dead_letters: [],
+        archive_backlog: [],
       };
     }
     const [context, feedback] = await Promise.all([
@@ -723,55 +772,124 @@ export class BMemoryBackendService {
           updated_at: record.updated_at,
         })),
     ];
+    const stillPending = new Set(pendingSeqs);
+    const archive_backlog: DeliveryArchiveBacklogEntry[] = context
+      .filter((item) => item.status === 'processed' && stillPending.has(item.buffer_seq))
+      .map((item) => ({
+        delivery_id: item.delivery_id,
+        task_id: item.task_id,
+        buffer_seq: item.buffer_seq,
+        updated_at: item.updated_at,
+      }));
     return {
       available: true,
       context: countDeliveryStatus(context),
       feedback: countDeliveryStatus(feedback),
       dead_letters,
+      archive_backlog,
     };
   }
 
   /** 查看一条 pending 缓冲区快照（memory.getPendingBuffer）。 */
-  async getPendingBuffer(roleId: string, seq: number): Promise<{
-    snapshot: BufferSnapshot;
-    agent_context?: AgentContextSnapshot;
-  } | undefined> {
+  async getPendingBuffer(roleId: string, seq: number): Promise<PendingBufferRead | undefined> {
     this.requireRepository('Pending buffer');
     return this.capabilities.bufferRepository.getPendingBuffer(roleId, seq);
   }
 
   /**
-   * 重试交付（memory.retryExtraction）：死信缓冲区恢复到 pending 后重新提交交付项。
+   * 重试交付（memory.retryExtraction）：把这条 Buffer 名下**各自独立**的两处死信放回队列。
    *
    * 名字沿用历史接口，但语义是「恢复这条 Buffer 的下游交付」——本仓不执行
    * Experience 提取，下游系统怎么消费、什么时候消费都不由这里决定。
    *
-   * 因此交付项如果已经进过死信，要一并放回队列：只把 Buffer 挪回去而让交付项留在
-   * 死信里，返回的 `scheduled` 就是假的。两处死信是各自独立的（Buffer 一条、交付
-   * 一条），这条 RPC 同时恢复它们。
+   * 两处死信彼此独立，因此各自判断、各自恢复，谁都不阻塞谁：
+   * - Buffer 在死信里 → 恢复回 pending；本来就在 pending → 不动它；
+   * - 交付在死信里 → 放回 pending 并清零次数；已 pending / 已 processed → 不动它
+   *   （processed 是终止态，重试不得把一条已经处理完的交付再投一次）；
+   * - 「Buffer 进了死信而交付还 pending」与「交付进了死信而 Buffer 还 pending」
+   *   都是正常形态，各自恢复那一条即可。
+   *
+   * Buffer 既不在 pending 也不在死信（已被归档或删除）时如实返回一条 skipped
+   * 证据并写明原因，而不是抛错：运维需要看到的是「这条没什么可恢复的」，不是一句
+   * 「找不到死信」把整次恢复操作打断。
+   *
+   * 此外还负责补做**归档缺口**：交付已 processed 而 Buffer 仍留在 pending 时，把 Buffer
+   * 归档走（见 getBufferState 的 archive_backlog）。补做结果同样写进 warnings。
    */
   async retryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
     const repository = this.requireRepository('Extraction retry');
     await repository.getAgent(roleId);
-    await this.capabilities.bufferRepository.restoreDeadLetter(roleId, seq);
+    const bufferRepository = this.capabilities.bufferRepository;
+    const warnings: string[] = [];
     const deliveryRepository = this.capabilities.deliveryRepository;
+    const deliveryId = contextDeliveryId(contextDeliveryKey({ role_id: roleId, buffer_seq: seq }));
+
+    // 归档缺口修复排在最前：交付已经 processed、Buffer 却仍留在 pending，说明上一次 ack
+    // 之后的归档没落地（两个存储之间没有事务，ack 成功不代表 Buffer 搬走了）。这正是
+    // getBufferState 里 archive_backlog 列出来的那批记录。放在死信恢复之前，是因为这一步
+    // 只对「本来就留在 pending」的记录有意义——刚被恢复回来的 Buffer 该继续等下游。
     if (deliveryRepository) {
-      await deliveryRepository.retryDeadLetterDelivery({
+      const repair = await this.repairDeliveredBufferArchive(roleId, seq, deliveryId);
+      if (repair) warnings.push(repair);
+    }
+
+    if ((await bufferRepository.listDeadLetterSeqs(roleId)).includes(seq)) {
+      try {
+        await bufferRepository.restoreDeadLetter(roleId, seq);
+      } catch (error) {
+        // 恢复失败（如死信记录损坏）不该拦下交付那一侧的恢复
+        warnings.push(
+          `Buffer ${roleId}:${String(seq)} could not be restored from dead letter ` +
+            `(${error instanceof Error ? error.message : String(error)}).`,
+        );
+      }
+    }
+
+    if (deliveryRepository) {
+      const retried = await deliveryRepository.retryDeadLetterDelivery({
         channel: 'context',
         role_id: roleId,
-        id: contextDeliveryId(contextDeliveryKey({ role_id: roleId, buffer_seq: seq })),
+        id: deliveryId,
       });
+      if (!retried) {
+        const existing = await deliveryRepository.getContextDelivery(roleId, deliveryId);
+        warnings.push(
+          existing === undefined
+            ? 'No context delivery has been submitted for this Buffer yet.'
+            : `Context delivery is ${existing.status}; it was left untouched.`,
+        );
+      }
     }
-    const pending = await this.capabilities.bufferRepository.getPendingBuffer(roleId, seq);
+
+    const pending = await bufferRepository.getPendingBuffer(roleId, seq);
     if (!pending) {
-      throw new Error(`Pending buffer not found after restore: seq=${seq}`);
+      const completedAt = nowTimestamp();
+      warnings.push('Buffer is neither pending nor dead-lettered, so nothing was scheduled.');
+      return {
+        maintenance_ref: createId('b_maintenance'),
+        kind: 'context_delivery',
+        status: 'skipped',
+        role_id: roleId,
+        buffer_seq: seq,
+        experiences: [],
+        skills: [],
+        warnings,
+        created_at: completedAt,
+        completed_at: completedAt,
+        schema_version: SCHEMA_VERSION,
+      };
     }
-    return this.capabilities.maintenance.scheduleBuffer({
+
+    const evidence = await this.capabilities.maintenance.scheduleBuffer({
       task_id: pending.snapshot.source_task_id,
       run_id: `retry:${roleId}:${String(seq)}`,
       role_id: roleId,
       buffer_seq: seq,
     });
+    // 恢复明细只随返回值给调用方（持久化的那份是 runner 自己写的，两处不合并）
+    return warnings.length > 0
+      ? { ...evidence, warnings: [...warnings, ...evidence.warnings] }
+      : evidence;
   }
 
   /**
@@ -789,8 +907,16 @@ export class BMemoryBackendService {
    *
    * payload 从 Buffer 现取现读，不存第二份副本——DriverReturn 与
    * AgentContextSnapshot 的唯一事实来源始终是 `report_<seq>` / `context_<seq>`。
-   * Buffer 已不在 pending（被恢复流程挪走或已被清理）时如实返回
-   * `payload_available: false`，而不是给一个看起来完整的空壳。
+   * 读的是**任意分区**（pending / processed / dead_letter）：下游 ack 之后 Buffer
+   * 会被归档离开 pending，而交付项本身仍然有效，交付的 payload 不能跟着消失。
+   *
+   * 三种「取不全」必须分开说，不能都塌成「本来就没有上下文」：
+   * - 快照真的不在了（已被删除、或这个 seq 从未落过盘）→ `payload_available: false`，无 payload；
+   * - 快照在、但它声明的 AgentContextSnapshot 读不出来（缺失 / 损坏 / schema 不匹配）
+   *   → `payload_available: false` + `payload_warning`，DriverReturn 照给：报告那一半是好的，
+   *   缺的是另一半；
+   * - 历史 Buffer 本来就没有上下文（没有 context_snapshot_ref）→ `payload_available: true`，
+   *   只是没有 `agent_context`，这是允许的兼容性降级。
    */
   async getContextDelivery(
     roleId: string,
@@ -801,19 +927,38 @@ export class BMemoryBackendService {
       deliveryId,
     );
     if (!delivery) return undefined;
-    const pending = await this.capabilities.bufferRepository.getPendingBuffer(
-      roleId,
-      delivery.buffer_seq,
-    );
-    if (!pending) {
-      return { delivery, payload_available: false };
+    try {
+      const stored = await this.capabilities.bufferRepository.getStoredBuffer(
+        roleId,
+        delivery.buffer_seq,
+      );
+      if (!stored) {
+        return { delivery, payload_available: false };
+      }
+      // 声明过引用却读不出来：DriverReturn 仍可单独读取，但「完整 payload 可用」是假的
+      if (stored.agentContextStatus === 'unreadable') {
+        return {
+          delivery,
+          payload_available: false,
+          payload_warning:
+            stored.agentContextError ??
+            'The AgentContextSnapshot paired with this delivery could not be read.',
+          driver_return: stored.snapshot.driver_return,
+        };
+      }
+      return {
+        delivery,
+        payload_available: true,
+        driver_return: stored.snapshot.driver_return,
+        ...(stored.agentContext ? { agent_context: stored.agentContext } : {}),
+      };
+    } catch (error) {
+      return {
+        delivery,
+        payload_available: false,
+        payload_warning: error instanceof Error ? error.message : String(error),
+      };
     }
-    return {
-      delivery,
-      payload_available: true,
-      driver_return: pending.snapshot.driver_return,
-      ...(pending.agentContext ? { agent_context: pending.agentContext } : {}),
-    };
   }
 
   /**
@@ -864,6 +1009,19 @@ export class BMemoryBackendService {
    *
    * `outcome: 'processed'` 表示下游处理完成；`'failed'` 需要给出 error 与
    * retryable —— 可重试的错误在退避后回到队列，不可重试或已用满次数的进 dead_letter。
+   *
+   * 上下文交付被确认完成时，源 Buffer 一并归档离开 pending：下游已经拿着这份上下文
+   * 干活了，再让它无限期占着待办队列只会把「还有多少活没干」这个数字说错。这是下游
+   * 动作的**结果**，不是任务流程在等下游——Task/Run 的终态早已写定，交付状态与 Buffer
+   * 归档都不参与其中。失败路径**不动** Buffer：留着重试才有意义。
+   *
+   * 归档的一致性策略（两个存储，没有跨存储事务）：
+   * ack 的成功语义**只覆盖交付状态**——`completeDelivery` 落了盘，下游处理完成就是既定
+   * 事实，不会因为 Buffer 搬不动而回滚；因此归档结果不回滚 ack，而是作为判别式随返回值
+   * 交给调用方（见 AckDeliveryPayload 与 BufferArchiveOutcome）。归档真的没落地时返回
+   * `archive.status='failed'`，缺口同时出现在 getBufferState 的 `archive_backlog` 里，
+   * 运维可用 retryExtraction 补做。重复 ack 是幂等的：completeDelivery 只对 processing
+   * 生效，第二次直接返回 undefined，也就不会再归档一次。
    */
   async ackDelivery(
     input: DeliveryRecordLocator & {
@@ -873,7 +1031,7 @@ export class BMemoryBackendService {
       retryable?: boolean | undefined;
       processor_version?: string | undefined;
     },
-  ): Promise<DeliveryRecordPayload | undefined> {
+  ): Promise<AckDeliveryPayload | undefined> {
     const repository = this.requireDeliveryRepository('Delivery acknowledgement');
     if (input.outcome === 'processed') {
       const completed = await repository.completeDelivery({
@@ -883,7 +1041,16 @@ export class BMemoryBackendService {
         owner: input.owner,
         processor_version: input.processor_version,
       });
-      return completed ? toDeliveryPayload(completed) : undefined;
+      if (!completed) return undefined;
+      // feedback 通道没有源 Buffer，没有归档这一步
+      if (completed.channel === 'feedback') {
+        return { channel: 'feedback', feedback: completed.item };
+      }
+      return {
+        channel: 'context',
+        delivery: completed.item,
+        archive: await this.archiveDeliveredBuffer(completed.item.role_id, completed.item.buffer_seq),
+      };
     }
     const failed = await repository.failDelivery({
       channel: input.channel,
@@ -894,6 +1061,51 @@ export class BMemoryBackendService {
       retryable: input.retryable ?? false,
     });
     return failed ? toDeliveryPayload(failed) : undefined;
+  }
+
+  /**
+   * 把已经交付完成的上下文对应的 Buffer 移出 pending，并把结果讲清楚（不再吞掉）。
+   *
+   * 归档只清理队列，不改变 ack 的成功语义：交付说的是「下游处理完了」，这件事已经成真。
+   * 但「Buffer 早就不在 pending」（已被别的路径归档 / 进了死信 / 压根没落过盘）与
+   * 「归档动作真的失败了」是两回事，前者无需修复、后者不能当成无事发生——所以这里交给
+   * BufferRepository.archiveBuffer 判类，调用方从返回值就能看出是哪一种。
+   */
+  private archiveDeliveredBuffer(
+    roleId: string,
+    bufferSeq: number,
+  ): Promise<BufferArchiveOutcome> {
+    return this.capabilities.bufferRepository.archiveBuffer(roleId, bufferSeq);
+  }
+
+  /**
+   * 补做一次「交付已 processed、Buffer 还留在 pending」的归档，把结果交给调用方写进 warnings。
+   *
+   * 只在交付确实处于 processed 时才动：交付还没被处理时，Buffer 留在 pending 是正常形态，
+   * 把它归档走等于替下游做了决定。没有缺口（或 Buffer 已到终局）返回 undefined。
+   */
+  private async repairDeliveredBufferArchive(
+    roleId: string,
+    seq: number,
+    deliveryId: string,
+  ): Promise<string | undefined> {
+    const deliveryRepository = this.capabilities.deliveryRepository;
+    if (!deliveryRepository) return undefined;
+    const delivery = await deliveryRepository.getContextDelivery(roleId, deliveryId);
+    if (delivery?.status !== 'processed') return undefined;
+    const outcome = await this.capabilities.bufferRepository.archiveBuffer(roleId, seq);
+    switch (outcome.status) {
+      case 'archived':
+        return `Archived Buffer ${roleId}:${String(seq)}: its delivery had been acknowledged without the archive landing.`;
+      case 'already_archived':
+      case 'not_pending':
+        // 已到终局（processed / dead_letter）：归档缺口本来就不存在
+        return undefined;
+      case 'missing':
+        return `Delivery ${deliveryId} is processed but Buffer ${roleId}:${String(seq)} is in no partition; there is nothing left to archive.`;
+      case 'failed':
+        return `Buffer ${roleId}:${String(seq)} is still pending after a repair attempt: ${outcome.message}`;
+    }
   }
 
   /** 人工重试：把 dead_letter 的交付项放回 pending（memory.retryDelivery） */

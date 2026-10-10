@@ -223,11 +223,11 @@ export const BufferMetaSchema = z.object({
   last_extraction_report_count: z.number().int().min(0).optional(),
   /** 最近一次提取生成的经验数 */
   last_extraction_experiences_created: z.number().int().min(0).optional(),
-  /** 当前写入游标（下一个 seq = cursor + 1） */
+  /** 当前写入游标（下一个 seq = cursor + 1；记的是分配过的 seq 上界，只前进） */
   cursor: z.number().int().min(0),
-  /** 累计已处理的条目数 */
+  /** 累计已处理的条目数（文件实现里 = processed/ 分区里的报告条数，按目录重算） */
   total_processed: z.number().int().min(0),
-  /** 累计死信条目数 */
+  /** 累计死信条目数（文件实现里 = dead_letter/ 分区里的报告条数，按目录重算） */
   total_dead_letters: z.number().int().min(0),
   /** 累计已清理的上下文数 */
   total_cleaned: z.number().int().min(0).optional(),

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { BMemoryMaintenanceEvidence } from '../app/b-memory-maintenance-runner';
 import type {
   AgentMetaPatch,
+  AckDeliveryPayload,
   BMemoryCapabilities,
   ContextDeliveryPayload,
   DeliveryRecordPayload,
@@ -38,16 +39,11 @@ import type {
   DeliveryChannel,
   DeliveryClaimRequest,
   DeliveryRecordLocator,
+  PendingBufferRead,
 } from '../memory';
 import { RetiredReasonSchema, type SkillRecord } from '../memory/schemas';
 import { DeliveryStatusSchema } from '../memory/schemas';
-import type {
-  AgentContextSnapshot,
-  BufferMeta,
-  BufferSnapshot,
-  ContextDeliveryItem,
-  DriverFeedbackRecord,
-} from '../memory/schemas';
+import type { BufferMeta, ContextDeliveryItem, DriverFeedbackRecord } from '../memory/schemas';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 
@@ -116,11 +112,8 @@ export interface MemoryMethodsService {
     dead_letters: DeadLetterEntry[];
     delivery: DeliveryStateSummary;
   }>;
-  /** 查看 pending 缓冲区（memory.getPendingBuffer） */
-  getMemoryPendingBuffer(
-    roleId: string,
-    seq: number,
-  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined>;
+  /** 查看 pending 缓冲区（memory.getPendingBuffer）；含配对上下文的读取结果 */
+  getMemoryPendingBuffer(roleId: string, seq: number): Promise<PendingBufferRead | undefined>;
   /** 重试提取（memory.retryExtraction） */
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence>;
   /**
@@ -146,7 +139,7 @@ export interface MemoryMethodsService {
   renewMemoryDeliveryClaim(
     input: DeliveryRecordLocator & { owner: string; lease_ms?: number | undefined },
   ): Promise<DeliveryRecordPayload | undefined>;
-  /** 下游交付：ack 一次交付（memory.ackDelivery） */
+  /** 下游交付：ack 一次交付（memory.ackDelivery）；context 通道附带源 Buffer 归档结果 */
   ackMemoryDelivery(
     input: DeliveryRecordLocator & {
       owner?: string | undefined;
@@ -155,7 +148,7 @@ export interface MemoryMethodsService {
       retryable?: boolean | undefined;
       processor_version?: string | undefined;
     },
-  ): Promise<DeliveryRecordPayload | undefined>;
+  ): Promise<AckDeliveryPayload | undefined>;
   /** 下游交付：把 dead_letter 的人工放回 pending（memory.retryDelivery） */
   retryMemoryDelivery(input: DeliveryRecordLocator): Promise<DeliveryRecordPayload | undefined>;
   /** 下游交付：恢复 lease 过期的 processing（memory.restoreExpiredDeliveries） */
