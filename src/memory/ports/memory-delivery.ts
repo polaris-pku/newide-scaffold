@@ -93,8 +93,10 @@ export interface DeliveryRepositoryPolicy extends DeliveryRetryPolicy {
    * claim 的并发隔离级别：
    * - `process_mutex`：只在同进程内保证不重复投递（内存实现）
    * - `exclusive_lock_file`：跨进程用独占锁文件串行化同一记录的 claim
+   * - `conditional_update`：靠存储自身的条件更新（SQL `UPDATE ... WHERE 状态未变`）
+   *   裁决同刻的多个 claim，单条语句即临界区，多进程多连接同样成立
    */
-  claim_isolation: 'process_mutex' | 'exclusive_lock_file';
+  claim_isolation: 'process_mutex' | 'exclusive_lock_file' | 'conditional_update';
 }
 
 export interface MemoryDeliveryRepository {

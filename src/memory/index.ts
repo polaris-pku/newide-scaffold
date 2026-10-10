@@ -414,6 +414,59 @@ export {
   DEFAULT_DELIVERY_RETRY_POLICY,
   type DeliveryRetryPolicy,
 } from './services/delivery-lifecycle';
+
+// ════════════════════════════════════════════════════════
+//  2b. Memory Maintenance：交付/反馈以外的维护侧持久化
+//      维护 run 是观测与审计实体；三种后端共用同一套转移规则。
+// ════════════════════════════════════════════════════════
+
+export { PgMemoryDeliveryRepository } from './adapters/pg-memory-delivery';
+export {
+  classifyDeliveryFailure,
+  isRetryableDeliveryFailure,
+  type DeliveryFailureClassification,
+} from './services/delivery-error-classification';
+export {
+  ensurePgMaintenanceSchema,
+  CONTEXT_DELIVERY_TABLE,
+  DRIVER_FEEDBACK_TABLE,
+  MAINTENANCE_RUN_TABLE,
+} from './adapters/pg-maintenance-schema';
+export { InMemoryMaintenanceRunStore } from './adapters/in-memory-maintenance-run-store';
+export {
+  FileMaintenanceRunStore,
+  type FileMaintenanceRunStoreOptions,
+} from './adapters/file-maintenance-run-store';
+export {
+  PgMaintenanceRunStore,
+  type PgMaintenanceRunStoreOptions,
+} from './adapters/pg-maintenance-run-store';
+export type {
+  MaintenanceRunStore,
+  StartMaintenanceRunInput,
+  FinishMaintenanceRunInput,
+  MaintenanceRunQuery,
+} from './ports/maintenance-run-store';
+export type {
+  MaintenanceFailure,
+  MaintenanceFailureCode,
+  MaintenanceJobType,
+  MaintenanceRun,
+  MaintenanceRunCounts,
+  MaintenanceRunStatus,
+} from './schemas';
+export {
+  EMPTY_MAINTENANCE_RUN_COUNTS,
+  applyMaintenanceRunLimit,
+  compareMaintenanceRuns,
+  completeMaintenanceRun,
+  createMaintenanceRun,
+  createMaintenanceRunId,
+  failMaintenanceRun,
+  isMaintenanceRunTerminal,
+  mergeMaintenanceRunCounts,
+  selectMaintenanceRuns,
+} from './services/maintenance-run-lifecycle';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';

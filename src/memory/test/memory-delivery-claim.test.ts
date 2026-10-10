@@ -1,8 +1,9 @@
 /**
  * 交付 claim / lease / 重试测试（工作包 C）
  *
- * 两条通道（context / feedback）共用一套状态机，两个适配器（内存 / 文件）也必须给出
- * 同一套行为——否则测试替身会掩盖生产差异。所以整个套件按适配器参数化跑两遍。
+ * 两条通道（context / feedback）共用一套状态机，三个适配器（内存 / 文件 /
+ * PGlite+PostgreSQL）也必须给出同一套行为——否则测试替身会掩盖生产差异。所以整个
+ * 套件按适配器参数化跑三遍，矩阵定义在 test/maintenance-adapters.ts。
  *
  * 覆盖的状态转移：
  *
@@ -19,9 +20,15 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * PGlite 是 WASM 引擎：建库本身要一秒起步。整仓并行跑测试时，这份启动成本会挤进
+ * 单测默认的 5s 预算，于是整条腿偶发超时（失败者每次都不一样，正是超时的形状）。
+ * 这里给本文件放宽超时——测的是契约语义，不是「PGlite 在负载下多久起来」。
+ */
+vi.setConfig({ testTimeout: 30_000 });
 import { FileMemoryDeliveryRepository } from '../adapters/file-memory-delivery';
-import { InMemoryMemoryDeliveryRepository } from '../adapters/in-memory-memory-delivery';
 import {
   buildContextDeliveryItem,
   buildDriverUsageFeedbackRecords,
@@ -32,10 +39,16 @@ import type {
   ClaimedDriverFeedback,
   MemoryDeliveryRepository,
 } from '../ports/memory-delivery';
+import {
+  DELIVERY_ADAPTERS,
+  insertLegacyContextDeliveryRow,
+  resetPgMaintenanceTables,
+} from './maintenance-adapters';
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+  await resetPgMaintenanceTables();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -51,22 +64,6 @@ function at(offsetMs: number): string {
   return new Date(Date.parse(T0) + offsetMs).toISOString();
 }
 const LEASE = 60_000;
-
-interface AdapterCase {
-  name: string;
-  create: (root: string) => MemoryDeliveryRepository;
-}
-
-const ADAPTERS: AdapterCase[] = [
-  {
-    name: 'FileMemoryDeliveryRepository',
-    create: (root) => new FileMemoryDeliveryRepository({ agentStateRoot: root }),
-  },
-  {
-    name: 'InMemoryMemoryDeliveryRepository',
-    create: () => new InMemoryMemoryDeliveryRepository(),
-  },
-];
 
 const ROLE = 'role_claim';
 
@@ -120,9 +117,9 @@ function claimOne(
   });
 }
 
-describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
+describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('两个消费者同时 claim 同一条：只有一个拿到', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
 
     const [first, second] = await Promise.all([
@@ -139,7 +136,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('claimNext 只投递一次，且跳过还没到退避时刻的记录', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
 
     const [first, second] = await Promise.all([
@@ -174,7 +171,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('lease 过期后回到可投递队列（崩溃恢复），期间不动还活着的 lease', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer_a', 0));
 
@@ -205,7 +202,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('连续可重试失败达到上限后进 dead_letter，保留原因与次数', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
 
     let nowMs = 0;
@@ -248,7 +245,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('不可重试的失败直接进 dead_letter，不消耗剩余次数', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer', 0));
 
@@ -268,7 +265,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('complete 是终止态：不再被投递，也不能再失败或重试', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer', 0));
 
@@ -305,7 +302,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('只有持有者能续租与完成，且过期后不再续租', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer_a', 0));
 
@@ -355,7 +352,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('人工 retry 把 dead_letter 放回 pending 并清零次数', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer', 0));
     asContext(
@@ -381,7 +378,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('feedback outbox 走同一套状态机', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     await store.ensureAgent(ROLE);
     const record = feedbackFor(ROLE, 'task_1', 'exp_1');
     await store.submitDriverFeedback(record);
@@ -415,7 +412,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('下游已推进的状态不会被上游重放拽回去', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const item = deliveryFor(ROLE, 'task_1');
     await store.ensureAgent(ROLE);
     await store.submitContextDelivery(item);
@@ -434,7 +431,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('listRetryableDeliveries 只给得到期的那部分', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     await store.ensureAgent(ROLE);
     await store.submitContextDelivery(deliveryFor(ROLE, 'task_1', 1));
     await store.submitContextDelivery(deliveryFor(ROLE, 'task_2', 2));
@@ -559,5 +556,83 @@ describe('FileMemoryDeliveryRepository — 锁文件与崩溃', () => {
     expect(all).toHaveLength(1);
     expect(all[0]).toMatchObject({ status: 'processed', attempt_count: 2 });
     void resumed;
+  });
+});
+
+describe('PgMemoryDeliveryRepository（重启恢复与迁移）', () => {
+  /** 同一份进程内数据库上换一个适配器实例 = 换了进程、存储没变 */
+  const pg = DELIVERY_ADAPTERS.find((adapter) =>
+    adapter.name.startsWith('PgMemoryDeliveryRepository'),
+  )!;
+
+  it('重启后 pending / 过期 processing / dead_letter 三种记录都还在，且按各自语义恢复', async () => {
+    const first = await pg.create('');
+    const pending = deliveryFor(ROLE, 'task_pending', 1);
+    const expired = deliveryFor(ROLE, 'task_expired', 2);
+    const dead = deliveryFor(ROLE, 'task_dead', 3);
+    await first.ensureAgent(ROLE);
+    await first.submitContextDelivery(pending);
+    await first.submitContextDelivery(expired);
+    await first.submitContextDelivery(dead);
+
+    // 一条被 claim 后进程消失（lease 留在库里，没人再续）
+    asContext(await claimOne(first, expired.delivery_id, 'consumer_gone', 0));
+    // 一条按不可重试失败进死信
+    asContext(await claimOne(first, dead.delivery_id, 'consumer', 0));
+    await first.failDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: dead.delivery_id,
+      owner: 'consumer',
+      error: 'schema cannot be parsed',
+      retryable: false,
+      now: at(1_000),
+    });
+
+    // 重启：新实例、同一份存储
+    const restarted = await pg.reopen('', first);
+
+    // 三种记录都读得到，状态如实
+    expect(await restarted.getContextDelivery(ROLE, pending.delivery_id)).toMatchObject({
+      status: 'pending',
+      attempt_count: 0,
+    });
+    expect(await restarted.getContextDelivery(ROLE, expired.delivery_id)).toMatchObject({
+      status: 'processing',
+      claim_owner: 'consumer_gone',
+    });
+    expect(await restarted.getContextDelivery(ROLE, dead.delivery_id)).toMatchObject({
+      status: 'dead_letter',
+      last_error: 'schema cannot be parsed',
+    });
+
+    // 启动恢复把过期 lease 放回队列；死信与 pending 都不受影响
+    const restored = await restarted.restoreExpiredDeliveryClaims({ now: at(LEASE) });
+    expect(restored).toHaveLength(1);
+    expect(asContext(restored[0]).item.delivery_id).toBe(expired.delivery_id);
+    expect(await restarted.getContextDelivery(ROLE, dead.delivery_id)).toMatchObject({
+      status: 'dead_letter',
+    });
+
+    // 恢复后的那条能被下一个消费者取走，全程只有三条记录
+    const resumed = asContext(await claimOne(restarted, expired.delivery_id, 'consumer_b', LEASE));
+    expect(resumed.item).toMatchObject({ status: 'processing', attempt_count: 2 });
+    expect(await restarted.listContextDeliveries({ role_id: ROLE })).toHaveLength(3);
+  });
+
+  it('旧记录（工作包 B 落盘的形状）缺 attempt_count 等字段时按默认值读入并可投递', async () => {
+    const store = await pg.create('');
+    const legacy = deliveryFor(ROLE, 'task_legacy', 1);
+    await store.ensureAgent(ROLE);
+    // 工作包 C 之前的落盘形状：状态机字段一个都没有，只有 status 与时间戳
+    await insertLegacyContextDeliveryRow(legacy);
+
+    expect(await store.getContextDelivery(ROLE, legacy.delivery_id)).toMatchObject({
+      status: 'pending',
+      // 缺省的 attempt_count 就是它的真实语义：还没投递过。不必写迁移脚本
+      attempt_count: 0,
+    });
+    const claimed = asContext(await claimOne(store, legacy.delivery_id, 'consumer', 0));
+    expect(claimed.item).toMatchObject({ status: 'processing', attempt_count: 1 });
   });
 });
