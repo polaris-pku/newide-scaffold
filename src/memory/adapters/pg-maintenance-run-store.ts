@@ -139,9 +139,27 @@ export class PgMaintenanceRunStore implements MaintenanceRunStore {
     return result.rowCount === 1 ? next : undefined;
   }
 
+  /**
+   * 懒建表：成功才留下缓存。
+   *
+   * 把 `ensurePgMaintenanceSchema()` 的 promise 直接缓存是错的——首次建表因数据库暂时
+   * 不可用而失败时，缓存里是一个 rejected promise，之后每次调用都会拿到同一个失败结果，
+   * 这个 store 就**永久**不可用了。因此失败时清掉缓存，下一次调用重新初始化。
+   *
+   * 并发行为与 PgMemoryDeliveryRepository 一致：`schemaReady` 只在没有在途初始化时才
+   * 被赋值，所以并发的首次调用共用同一份 promise，DDL 只执行一次；而「重新初始化」
+   * 只可能发生在失败清理之后，不存在旧失败的清理抹掉新一次成功结果的交错。
+   *
+   * 原始错误照旧抛出，调用方看到的是真正的失败原因。
+   */
   private async ensureSchema(): Promise<void> {
     if (!this.autoMigrate) return;
-    this.schemaReady ??= ensurePgMaintenanceSchema(this.pool);
+    if (!this.schemaReady) {
+      this.schemaReady = ensurePgMaintenanceSchema(this.pool).catch((error: unknown) => {
+        this.schemaReady = undefined;
+        throw error;
+      });
+    }
     await this.schemaReady;
   }
 }

@@ -22,7 +22,7 @@ import {
   ensurePgMaintenanceSchema,
 } from '../adapters/pg-maintenance-schema';
 import { createPGlitePool } from '../adapters/pglite-pool';
-import type { SqlPool } from '../ports/sql-pool';
+import type { SqlClient, SqlPool } from '../ports/sql-pool';
 import type { ContextDeliveryItem } from '../schemas';
 import type { MemoryDeliveryRepository } from '../ports/memory-delivery';
 import type { MaintenanceRunStore } from '../ports/maintenance-run-store';
@@ -81,6 +81,47 @@ export async function insertLegacyContextDeliveryRow(item: ContextDeliveryItem):
       JSON.stringify(item),
     ],
   );
+}
+
+/**
+ * 可开关的故障池 + 语句计数：用来验证「首次建表失败不会把适配器永久锁死」。
+ *
+ * `failing` 打开时所有 query（含事务客户端的 query）都立刻失败，模拟数据库暂时不可用；
+ * 关掉之后原样透传，模拟数据库恢复。同时统计匹配给定关键字的语句条数——并发的首次
+ * 初始化只该让 DDL 真的跑一遍，靠计数才看得出来。
+ */
+export interface ControlledPool {
+  pool: SqlPool;
+  setFailing(failing: boolean): void;
+  countStatements(keyword: string): number;
+}
+
+export function createControlledPool(inner: SqlPool): ControlledPool {
+  let failing = false;
+  const statements: string[] = [];
+  const guard = <T>(text: string, run: () => Promise<T>): Promise<T> => {
+    statements.push(text);
+    return failing ? Promise.reject(new Error('database is temporarily unavailable')) : run();
+  };
+  return {
+    pool: {
+      query: <T>(text: string, params?: unknown[]) =>
+        guard(text, () => inner.query<T>(text, params)),
+      connect: async (): Promise<SqlClient> => {
+        const client = await inner.connect();
+        return {
+          query: <T>(text: string, params?: unknown[]) =>
+            guard(text, () => client.query<T>(text, params)),
+          release: () => client.release(),
+        };
+      },
+      end: () => inner.end(),
+    },
+    setFailing: (value: boolean) => {
+      failing = value;
+    },
+    countStatements: (keyword: string) => statements.filter((text) => text.includes(keyword)).length,
+  };
 }
 
 export interface DeliveryAdapterCase {

@@ -36,6 +36,7 @@ export async function ensurePgMaintenanceSchema(pool: SqlPool): Promise<void> {
       attempt_count INTEGER NOT NULL DEFAULT 0,
       claimed_at TEXT,
       claim_owner TEXT,
+      claim_token TEXT,
       lease_expires_at TEXT,
       next_retry_at TEXT,
       created_at TEXT NOT NULL,
@@ -43,6 +44,13 @@ export async function ensurePgMaintenanceSchema(pool: SqlPool): Promise<void> {
       payload JSONB NOT NULL
     );
   `);
+
+  // 上一版建过的表没有 claim_token：CAST 与 fencing 都需要它是一等列，对已存在的库补上。
+  // 旧行的该列为 NULL，语义是「这条 processing 记录没有凭据」——照 delivery-lifecycle
+  // 的恢复策略，它只能等租约过期被回收后重新 claim，任何人都不可能凭它写终态。
+  await pool.query(
+    `ALTER TABLE ${CONTEXT_DELIVERY_TABLE} ADD COLUMN IF NOT EXISTS claim_token TEXT;`,
+  );
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS memory_context_deliveries_due_idx
@@ -69,6 +77,7 @@ export async function ensurePgMaintenanceSchema(pool: SqlPool): Promise<void> {
       attempt_count INTEGER NOT NULL DEFAULT 0,
       claimed_at TEXT,
       claim_owner TEXT,
+      claim_token TEXT,
       lease_expires_at TEXT,
       next_retry_at TEXT,
       created_at TEXT NOT NULL,
@@ -76,6 +85,10 @@ export async function ensurePgMaintenanceSchema(pool: SqlPool): Promise<void> {
       payload JSONB NOT NULL
     );
   `);
+
+  await pool.query(
+    `ALTER TABLE ${DRIVER_FEEDBACK_TABLE} ADD COLUMN IF NOT EXISTS claim_token TEXT;`,
+  );
 
   // 归并查询的落点：按关联键找「这条经验的反馈有没有先到」（role_id + experience_id），
   // 以及按状态找还没归并的积压（status + next_retry_at）。

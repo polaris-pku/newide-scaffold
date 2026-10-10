@@ -28,8 +28,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  * 这里给本文件放宽超时——测的是契约语义，不是「PGlite 在负载下多久起来」。
  */
 vi.setConfig({ testTimeout: 30_000 });
+import { PgMaintenanceRunStore } from '../adapters/pg-maintenance-run-store';
 import {
   RUN_STORE_ADAPTERS,
+  createControlledPool,
+  pgMaintenancePool,
   resetPgMaintenanceTables,
 } from './maintenance-adapters';
 
@@ -232,6 +235,31 @@ describe.each(RUN_STORE_ADAPTERS)('$name — 维护 run 契约', ({ create, reop
       'mr_list_1',
       'mr_list_2',
     ]);
+  });
+
+  it('首次建表失败不会把 store 永久锁死：清掉缓存后下一次调用能恢复', async () => {
+    const controlled = createControlledPool(await pgMaintenancePool());
+    const store = new PgMaintenanceRunStore({ pool: controlled.pool });
+
+    controlled.setFailing(true);
+    await expect(store.get('mr_flaky')).rejects.toThrow(/temporarily unavailable/);
+
+    // 数据库恢复后必须能重新初始化。若把 rejected promise 缓存下来，这里会一直失败
+    controlled.setFailing(false);
+    await expect(store.get('mr_flaky')).resolves.toBeUndefined();
+    await expect(
+      store.start({ job_type: 'context_delivery', worker_id: 'w', run_id: 'mr_flaky', now: at(0) }),
+    ).resolves.toMatchObject({ run_id: 'mr_flaky', status: 'running' });
+  });
+
+  it('并发的首次初始化共用一份流程：DDL 只真的执行一遍', async () => {
+    const controlled = createControlledPool(await pgMaintenancePool());
+    const store = new PgMaintenanceRunStore({ pool: controlled.pool });
+
+    await Promise.all([store.get('a'), store.get('b'), store.get('c')]);
+
+    // 一次 ensurePgMaintenanceSchema 会发出三张表的 CREATE TABLE；三倍就是初始化跑了三遍
+    expect(controlled.countStatements('CREATE TABLE')).toBe(3);
   });
 
   it('持久化后端：重启后 run 还在，且能继续收尾', async () => {

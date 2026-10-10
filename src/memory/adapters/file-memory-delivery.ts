@@ -46,6 +46,7 @@ import {
   DEFAULT_DELIVERY_LOCK_TTL_MS,
   DEFAULT_DELIVERY_LEASE_MS,
   DEFAULT_DELIVERY_RETRY_POLICY,
+  newClaimToken,
   type DeliveryRetryPolicy,
 } from '../services/delivery-lifecycle';
 import {
@@ -219,9 +220,15 @@ export class FileMemoryDeliveryRepository implements MemoryDeliveryRepository {
   }
 
   async renewDeliveryClaim(
-    input: DeliveryRecordLocator & { owner: string; lease_ms?: number; now?: string },
+    input: DeliveryRecordLocator & {
+      claim_token: string;
+      owner?: string;
+      lease_ms?: number;
+      now?: string;
+    },
   ): Promise<ClaimedDelivery | undefined> {
     const args = {
+      claim_token: input.claim_token,
       owner: input.owner,
       lease_ms: input.lease_ms ?? this.policy.lease_ms,
       now: input.now ?? nowTimestamp(),
@@ -236,12 +243,14 @@ export class FileMemoryDeliveryRepository implements MemoryDeliveryRepository {
 
   async completeDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string;
       processor_version?: string;
       now?: string;
     },
   ): Promise<ClaimedDelivery | undefined> {
     const args = {
+      claim_token: input.claim_token,
       owner: input.owner,
       processor_version: input.processor_version,
       now: input.now ?? nowTimestamp(),
@@ -256,6 +265,7 @@ export class FileMemoryDeliveryRepository implements MemoryDeliveryRepository {
 
   async failDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string;
       error: string;
       retryable: boolean;
@@ -263,6 +273,7 @@ export class FileMemoryDeliveryRepository implements MemoryDeliveryRepository {
     },
   ): Promise<ClaimedDelivery | undefined> {
     const args = {
+      claim_token: input.claim_token,
       owner: input.owner,
       error: input.error,
       retryable: input.retryable,
@@ -329,9 +340,17 @@ export class FileMemoryDeliveryRepository implements MemoryDeliveryRepository {
 
   // ── 内部 ────────────────────────────────────────────────────────
 
+  /**
+   * claim 的入参：每次调用生成一个新的 fencing token。
+   *
+   * `claimNextDelivery` 会拿同一份入参逐条尝试候选记录——token 相同不影响正确性，
+   * 因为一次 claimNext 至多有一条记录真的被写进去，其余候选读到的还是 pending。
+   * 关键是**下一次** claim 一定是新 token：旧的持有者因此再也写不进被接手的那条。
+   */
   private claimInput(input: DeliveryClaimRequest) {
     return {
       owner: input.owner,
+      claim_token: newClaimToken(),
       now: input.now ?? nowTimestamp(),
       lease_ms: input.lease_ms ?? this.policy.lease_ms,
       policy: this.policy,

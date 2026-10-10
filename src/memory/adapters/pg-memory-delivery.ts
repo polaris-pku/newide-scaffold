@@ -27,6 +27,7 @@ import {
   DEFAULT_DELIVERY_LEASE_MS,
   DEFAULT_DELIVERY_RETRY_POLICY,
   claimDeliveryRecord,
+  newClaimToken,
   compareDeliveryCandidates,
   completeDeliveryRecord,
   expireDeliveryClaimRecord,
@@ -175,10 +176,9 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
   async claimDelivery(
     input: DeliveryClaimRequest & { role_id: string; id: string },
   ): Promise<ClaimedDelivery | undefined> {
-    const now = input.now ?? nowTimestamp();
-    const lease_ms = input.lease_ms ?? this.policy.lease_ms;
+    const claim = this.claimInput(input);
     return this.transition(this.tableOf(input.channel), input.role_id, input.id, (record) =>
-      claimDeliveryRecord(record, { owner: input.owner, now, lease_ms, policy: this.policy }),
+      claimDeliveryRecord(record, claim),
     );
   }
 
@@ -189,14 +189,16 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
    * 这不该让整次 claim 空手而归（与文件实现「抢不到锁就试下一条」同一形状）。
    */
   async claimNextDelivery(input: DeliveryClaimRequest): Promise<ClaimedDelivery | undefined> {
-    const now = input.now ?? nowTimestamp();
-    const lease_ms = input.lease_ms ?? this.policy.lease_ms;
+    const claim = this.claimInput(input);
     const table = this.tableOf(input.channel);
-    const candidates = await this.scanDue(table, input.role_id, now);
+    const candidates = await this.scanDue(table, input.role_id, claim.now);
     candidates.sort(compareDeliveryCandidates);
     for (const candidate of candidates) {
-      const claimed = await this.transition(table, candidate.role_id, candidate.id, (record) =>
-        claimDeliveryRecord(record, { owner: input.owner, now, lease_ms, policy: this.policy }),
+      const claimed = await this.transition(
+        table,
+        candidate.role_id,
+        candidate.id,
+        (record) => claimDeliveryRecord(record, claim),
       );
       if (claimed) return claimed;
     }
@@ -204,17 +206,28 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
   }
 
   async renewDeliveryClaim(
-    input: DeliveryRecordLocator & { owner: string; lease_ms?: number; now?: string },
+    input: DeliveryRecordLocator & {
+      claim_token: string;
+      owner?: string;
+      lease_ms?: number;
+      now?: string;
+    },
   ): Promise<ClaimedDelivery | undefined> {
     const now = input.now ?? nowTimestamp();
     const lease_ms = input.lease_ms ?? this.policy.lease_ms;
     return this.transition(this.tableOf(input.channel), input.role_id, input.id, (record) =>
-      renewDeliveryClaimRecord(record, { owner: input.owner, now, lease_ms }),
+      renewDeliveryClaimRecord(record, {
+        claim_token: input.claim_token,
+        owner: input.owner,
+        now,
+        lease_ms,
+      }),
     );
   }
 
   async completeDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string;
       processor_version?: string;
       now?: string;
@@ -223,6 +236,7 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
     const now = input.now ?? nowTimestamp();
     return this.transition(this.tableOf(input.channel), input.role_id, input.id, (record) =>
       completeDeliveryRecord(record, {
+        claim_token: input.claim_token,
         owner: input.owner,
         now,
         processor_version: input.processor_version,
@@ -232,6 +246,7 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
 
   async failDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string;
       error: string;
       retryable: boolean;
@@ -241,6 +256,7 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
     const now = input.now ?? nowTimestamp();
     return this.transition(this.tableOf(input.channel), input.role_id, input.id, (record) =>
       failDeliveryRecord(record, {
+        claim_token: input.claim_token,
         owner: input.owner,
         error: input.error,
         retryable: input.retryable,
@@ -300,11 +316,31 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
   // ── 内部：单条记录的读 / 条件写 ──────────────────────────────────
 
   /**
+   * claim 的入参：每次调用生成一个新的 fencing token（与文件、内存实现一致）。
+   *
+   * `claimNextDelivery` 拿同一份入参逐条尝试候选——token 相同不影响正确性，
+   * 一次 claimNext 至多有一条真的被写进去；关键是下一次 claim 一定是新 token。
+   */
+  private claimInput(input: DeliveryClaimRequest) {
+    return {
+      owner: input.owner,
+      claim_token: newClaimToken(),
+      now: input.now ?? nowTimestamp(),
+      lease_ms: input.lease_ms ?? this.policy.lease_ms,
+      policy: this.policy,
+    };
+  }
+
+  /**
    * 状态转移的唯一入口：读 → 纯规则算下一条 → **条件更新**。
    *
-   * 条件里的 (status, updated_at, attempt_count, claim_owner, lease_expires_at) 合起来
-   * 是这条记录的乐观锁令牌：自己在读之后没被别人改过才写得进去。写不进就是「这次
-   * 什么都没做」——与文件实现抢不到锁、内存实现排在别人后面是同一件事。
+   * 条件里的 (status, updated_at, attempt_count, claim_owner, claim_token,
+   * lease_expires_at) 合起来是这条记录的乐观锁令牌：自己在读之后没被别人改过才写得
+   * 进去。写不进就是「这次什么都没做」——与文件实现抢不到锁、内存实现排在别人后面
+   * 是同一件事。
+   *
+   * claim_token 必须在里面：它每次 claim 都变，于是「记录已经被别人接手」这件事在
+   * 数据库这一层就能被判出来，而不是只在纯规则里判过一次、落库时又放行。
    */
   private async transition(
     table: ChannelTable,
@@ -336,17 +372,20 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
     const result = await this.pool.query<{ payload: unknown }>(
       `UPDATE ${table.table} SET
          status = $1, attempt_count = $2, claimed_at = $3, claim_owner = $4,
-         lease_expires_at = $5, next_retry_at = $6, updated_at = $7, payload = $8::jsonb
-       WHERE ${table.idColumn} = $9 AND role_id = $10
-         AND status = $11 AND updated_at = $12 AND attempt_count = $13
-         AND claim_owner IS NOT DISTINCT FROM $14
-         AND lease_expires_at IS NOT DISTINCT FROM $15
+         claim_token = $5, lease_expires_at = $6, next_retry_at = $7, updated_at = $8,
+         payload = $9::jsonb
+       WHERE ${table.idColumn} = $10 AND role_id = $11
+         AND status = $12 AND updated_at = $13 AND attempt_count = $14
+         AND claim_owner IS NOT DISTINCT FROM $15
+         AND claim_token IS NOT DISTINCT FROM $16
+         AND lease_expires_at IS NOT DISTINCT FROM $17
        RETURNING payload`,
       [
         next.status,
         next.attempt_count,
         next.claimed_at ?? null,
         next.claim_owner ?? null,
+        next.claim_token ?? null,
         next.lease_expires_at ?? null,
         next.next_retry_at ?? null,
         next.updated_at,
@@ -357,6 +396,7 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
         current.updated_at,
         current.attempt_count,
         current.claim_owner ?? null,
+        current.claim_token ?? null,
         current.lease_expires_at ?? null,
       ],
     );
@@ -470,7 +510,13 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
     return toCandidates(table, result.rows);
   }
 
-  /** lease 已过期仍停在 processing 的记录 */
+  /**
+   * lease 已过期、或**根本没有 lease** 却停在 processing 的记录。
+   *
+   * 条件必须与 delivery-lifecycle 的 `isDeliveryClaimExpired` 逐字对应：无租约的
+   * processing 算过期（更早版本留下的记录只能这样回收）。这里少写这一支，那些记录
+   * 在数据库后端就永远捞不出来——纯规则判它过期、SQL 却把它滤掉，两边就漂了。
+   */
   private async scanExpired(
     table: ChannelTable,
     role_id: string | undefined,
@@ -478,7 +524,8 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
   ): Promise<Candidate[]> {
     await this.ensureSchema();
     const params: unknown[] = [now];
-    let where = `status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $1`;
+    let where = `status = 'processing'
+      AND (lease_expires_at IS NULL OR lease_expires_at <= $1)`;
     if (role_id !== undefined) {
       params.push(role_id);
       where += ` AND role_id = $${String(params.length)}`;
@@ -492,9 +539,29 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
     return toCandidates(table, result.rows);
   }
 
+  /**
+   * 懒建表：成功才留下缓存。
+   *
+   * 直接把 `ensurePgMaintenanceSchema()` 的 promise 存进 `schemaReady` 是错的——首次
+   * 建表因数据库暂时不可用而失败时，被缓存的是一个 rejected promise，之后每一次调用
+   * 都会拿到同一个失败结果，这个适配器就**永久**不可用了（连重试的机会都没有）。
+   * 因此失败时清掉缓存，让下一次调用重新走一遍初始化。
+   *
+   * 并发行为：`schemaReady` 只在「此刻没有在途初始化」时才被赋值，所以任何时刻至多
+   * 有一份在途 promise，并发的首次调用共用它、DDL 只真的执行一次。失败路径同理——能
+   * 走到「重新初始化」这一步的前提是缓存已经被清空，而清空只发生在这次失败的处理里，
+   * 因此不存在「旧失败的清理动作抹掉新一次成功结果」的交错。
+   *
+   * 原始错误照旧抛出：调用方要看见的是「连接不上」而不是「schema 没准备好」。
+   */
   private async ensureSchema(): Promise<void> {
     if (!this.autoMigrate) return;
-    this.schemaReady ??= ensurePgMaintenanceSchema(this.pool);
+    if (!this.schemaReady) {
+      this.schemaReady = ensurePgMaintenanceSchema(this.pool).catch((error: unknown) => {
+        this.schemaReady = undefined;
+        throw error;
+      });
+    }
     await this.schemaReady;
   }
 
@@ -523,6 +590,7 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
           attempt_count: String(item.attempt_count),
           claimed_at: item.claimed_at ?? null,
           claim_owner: item.claim_owner ?? null,
+          claim_token: item.claim_token ?? null,
           lease_expires_at: item.lease_expires_at ?? null,
           next_retry_at: item.next_retry_at ?? null,
           created_at: item.created_at,
@@ -552,6 +620,7 @@ export class PgMemoryDeliveryRepository implements MemoryDeliveryRepository {
           attempt_count: String(feedback.attempt_count),
           claimed_at: feedback.claimed_at ?? null,
           claim_owner: feedback.claim_owner ?? null,
+          claim_token: feedback.claim_token ?? null,
           lease_expires_at: feedback.lease_expires_at ?? null,
           next_retry_at: feedback.next_retry_at ?? null,
           created_at: feedback.created_at,
