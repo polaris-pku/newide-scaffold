@@ -504,7 +504,11 @@ export async function createProductionBackendService(
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
       mailboxStore: coordinationStore,
-      participantSessions,
+      // Ephemeral Driver sessions are intentionally not recoverable across a
+      // backend restart. Checkpoint resume must still restore the Task and
+      // workspace, but it must not reject the package because the old ACP
+      // session is absent from the new process.
+      ...(ephemeralAcpSessions ? {} : { participantSessions }),
       sapBridge,
       aapBridge,
     });

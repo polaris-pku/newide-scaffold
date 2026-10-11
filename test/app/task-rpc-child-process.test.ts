@@ -345,7 +345,12 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     writeInterruptibleFakeDriver(runnerDir);
     writeDriverConfig(homeDir, 'claude');
     writeFileSync(holdPath, 'hold');
-    const firstClient = new RpcChildClient(spawnBackend(runnerDir, { HOME: homeDir }));
+    const firstClient = new RpcChildClient(
+      spawnBackend(runnerDir, {
+        HOME: homeDir,
+        NEWIDE_EPHEMERAL_ACP_SESSIONS: '1',
+      }),
+    );
     let resumedClient: RpcChildClient | undefined;
 
     try {
@@ -362,7 +367,12 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       rmSync(holdPath, { force: true });
       writeDriverConfig(homeDir, 'codex');
 
-      resumedClient = new RpcChildClient(spawnBackend(runnerDir, { HOME: homeDir }));
+      resumedClient = new RpcChildClient(
+        spawnBackend(runnerDir, {
+          HOME: homeDir,
+          NEWIDE_EPHEMERAL_ACP_SESSIONS: '1',
+        }),
+      );
       await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
       const blocked = await resumedClient.call<TaskSnapshot>('task.get', {
         task_id: created.task.task_id,
@@ -690,7 +700,7 @@ process.stdin.on('end', () => {
     const created_at = new Date().toISOString();
     const suffix = createHash('sha256').update(JSON.stringify([input.task_id, input.prompt, input.session_id])).digest('hex').slice(0, 16);
     const artifact = { artifact_id: 'artifact_' + suffix, type: 'driver_result', uri: 'artifact://fake/resumed', producer_id: 'fake-acp', task_id: input.task_id, created_at, schema_version: input.schema_version };
-    process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: input.session_id, status: 'succeeded', response: 'Resumed fake ACP completed.', artifacts: [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
+    process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: input.session_id || 'session_ephemeral', status: 'succeeded', response: 'Resumed fake ACP completed.', artifacts: [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
   };
   const hold = new URL('./hold-first-invocation', import.meta.url);
   if (!existsSync(hold)) return complete();
