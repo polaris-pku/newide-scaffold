@@ -146,6 +146,8 @@ export interface DriverRoutingServiceOptions {
 /** 只暴露 Run 冻结所需的端口，供 `NewideBackendService` 注入。 */
 export interface RunDriverRoutingPort {
   freezeForRun(runId: string): PersistedDriverConfig;
+  /** Restore a persisted Run snapshot when creating a checkpoint-resume Run. */
+  freezeForRunSnapshot?(runId: string, snapshot: PersistedDriverConfig): PersistedDriverConfig;
 }
 
 /**
@@ -250,6 +252,27 @@ export class DriverRoutingService implements DriverRoutingPort {
     const snapshot = this.snapshotForRun();
     this.runSnapshots.set(runId, snapshot);
     return snapshot;
+  }
+
+  /**
+   * Rebind a newly-created resume Run to the routing snapshot persisted by its
+   * interrupted predecessor. A restart must not silently adopt a newer global
+   * role mapping merely because the backend process was recreated.
+   */
+  freezeForRunSnapshot(
+    runId: string,
+    snapshot: PersistedDriverConfig,
+  ): PersistedDriverConfig {
+    const existing = this.runSnapshots.get(runId);
+    if (existing) return existing;
+    assertPersistedDriverSnapshot(snapshot, this.registry);
+    const frozen = {
+      default_driver: snapshot.default_driver,
+      drivers: { ...snapshot.drivers },
+      ...(snapshot.roles ? { roles: { ...snapshot.roles } } : {}),
+    };
+    this.runSnapshots.set(runId, frozen);
+    return frozen;
   }
 
   /** 某个 Run 冻结的 routing 投影；未冻结（老 Run / 本进程外创建）返回 undefined。 */
@@ -706,6 +729,27 @@ function configFromRunSnapshot(snapshot: PersistedDriverConfig): DriverConfig {
     ),
     ...(snapshot.roles ? { roles: { ...snapshot.roles } } : {}),
   };
+}
+
+function assertPersistedDriverSnapshot(
+  snapshot: PersistedDriverConfig,
+  registry: Pick<DriverRuntimeRegistry, 'get'>,
+): void {
+  if (!snapshot.default_driver || !snapshot.drivers[snapshot.default_driver]) {
+    throw new Error(
+      `Persisted driver snapshot has no configured default driver "${snapshot.default_driver}"`,
+    );
+  }
+  for (const driverId of Object.keys(snapshot.drivers)) {
+    registry.get(driverId);
+  }
+  for (const [roleId, driverId] of Object.entries(snapshot.roles ?? {})) {
+    if (!snapshot.drivers[driverId]) {
+      throw new Error(
+        `Persisted driver snapshot maps role "${roleId}" to unknown driver "${driverId}"`,
+      );
+    }
+  }
 }
 
 function compareCodeUnits(left: string, right: string): number {

@@ -87,6 +87,7 @@ import type {
 } from '../mailbox';
 import type { DriverStreamEvent } from '../driver/contract';
 import type { DriverRoutingPort } from '../driver';
+import type { PersistedDriverConfig } from '../driver';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
@@ -300,6 +301,8 @@ interface RunLineage {
    * falls back to the default select_agent cursor and silently restarts.
    */
   cursor_input?: TaskCursorInput;
+  /** Driver routing frozen by the interrupted Run; checkpoint resume must inherit it. */
+  driver_config?: PersistedDriverConfig;
 }
 
 interface PendingRunStart {
@@ -914,6 +917,9 @@ export class NewideBackendService {
     }
     const resumePackage = this.taskProcessor.buildResumePackage(taskId);
     const resume = this.taskProcessor.getTaskResumeContext(taskId);
+    const interruptedRequest = await this.requestStore
+      .load(resume.interrupted_run_id)
+      .catch(() => undefined);
     const restore = this.restoreResumeWorkspace(taskId, resumePackage);
     if (restore.status !== 'restored') {
       throw new TaskResumeAnchorError(
@@ -938,6 +944,9 @@ export class NewideBackendService {
         resume_checkpoint_id: resume.checkpoint_id,
         requested_resume_cursor: resume.resume_cursor,
         cursor_input: resume.cursor_input,
+        ...(interruptedRequest?.driver_config
+          ? { driver_config: interruptedRequest.driver_config }
+          : {}),
       },
     );
     return this.getTask(taskId);
@@ -1057,6 +1066,7 @@ export class NewideBackendService {
         run_intent: { type: 'create' },
         restarted_from_run_id: runId,
         persist_restarted_from_run_id: persistRestartLineage,
+        ...(request.driver_config ? { driver_config: request.driver_config } : {}),
       },
     );
     return { ...created, restarted_from_run_id: runId };
@@ -1087,7 +1097,7 @@ export class NewideBackendService {
     this.registry.create({ ...identity, mode, controller });
     this.runWorkspaces.set(identity.run_id, workspacePath);
     // 在本 Run 的第一个阶段跑起来之前冻结 routing：此后无论 UI 怎么改，本 Run 都用这一份。
-    const driverConfig = this.driverRouting?.freezeForRun(identity.run_id);
+    const driverConfig = this.freezeDriverConfig(identity.run_id, lineage?.driver_config);
     this.registry.subscribe(identity.run_id, (event) => {
       void this.auditWriter.append(event).catch(() => undefined);
       this.notifyTaskListeners(identity.task_id, event);
@@ -1633,7 +1643,10 @@ export class NewideBackendService {
             identity = created;
             settlePendingStart();
             // legacy 路径同样在 Run 创建点冻结 routing：编排器与 facade 共用这一份投影。
-            const legacyDriverConfig = this.driverRouting?.freezeForRun(created.run_id);
+            const legacyDriverConfig = this.freezeDriverConfig(
+              created.run_id,
+              lineage?.driver_config,
+            );
             this.terminalRuns.set(created.run_id, terminalRun);
             this.runWorkspaces.set(created.run_id, workspacePath);
             this.registry.create({ ...created, mode, controller });
@@ -1773,6 +1786,22 @@ export class NewideBackendService {
       void terminalRun.then(() => this.terminalRuns.delete(identity?.run_id ?? ''));
       void terminalRun.then(() => this.runWorkspaces.delete(identity?.run_id ?? ''));
     });
+  }
+
+  private freezeDriverConfig(
+    runId: string,
+    persisted?: PersistedDriverConfig,
+  ): PersistedDriverConfig | undefined {
+    if (!this.driverRouting) return undefined;
+    if (persisted) {
+      if (!this.driverRouting.freezeForRunSnapshot) {
+        throw new Error(
+          'Checkpoint resume cannot preserve driver routing: the routing port lacks snapshot rehydration',
+        );
+      }
+      return this.driverRouting.freezeForRunSnapshot(runId, persisted);
+    }
+    return this.driverRouting.freezeForRun(runId);
   }
 
   private async closeGracefully(): Promise<void> {
