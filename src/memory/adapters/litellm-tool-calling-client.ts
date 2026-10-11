@@ -106,7 +106,7 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
       return createAnthropic({
         ...(apiKey ? { apiKey } : {}),
         ...(process.env.ANTHROPIC_BASE_URL
-          ? { baseURL: process.env.ANTHROPIC_BASE_URL.replace(/\/+$/, '') }
+          ? { baseURL: normalizeAnthropicBaseUrl(process.env.ANTHROPIC_BASE_URL) }
           : {}),
       })(modelId) as LanguageModel;
     }
@@ -116,6 +116,17 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
           `Supported: openai, anthropic.`,
       );
   }
+}
+
+/**
+ * AI SDK's Anthropic provider appends `/messages` to baseURL; unlike ACP's
+ * adapter, it expects the version prefix to already be present. MiniMax's
+ * compatible endpoint is commonly configured as `/anthropic`, so normalize it
+ * to `/anthropic/v1` before constructing the model.
+ */
+function normalizeAnthropicBaseUrl(value: string): string {
+  const normalized = value.trim().replace(/\/+$/, '');
+  return /\/v1$/i.test(normalized) ? normalized : `${normalized}/v1`;
 }
 
 function preferAnthropicCompat(): boolean {
