@@ -98,6 +98,20 @@ export const DEFAULT_PENDING_FEEDBACK_RETRY_POLICY: DeliveryRetryPolicy = {
 };
 
 /**
+ * 技能晋升（Skill Promotion Job）的默认重试预算。
+ *
+ * 晋升不是「等某个东西出现」，也不是「网络抖了一下」，所以两面都不像：它的失败几乎只有
+ * 存储故障（可立刻重投）与坏数据（不可重试，当场进死信）。次数取 5、退避 30s 起、封顶
+ * 15 分钟 —— 累加约 1 小时。给到这个宽度是因为一次晋升要写两处（Skill 与经验的回写），
+ * 中间崩溃留下的半成品必须靠重试收敛；而超过一小时还没收敛的，说明不是抖动，该让人看。
+ */
+export const DEFAULT_PROMOTION_RETRY_POLICY: DeliveryRetryPolicy = {
+  max_attempts: 5,
+  base_delay_ms: 30_000,
+  max_delay_ms: 15 * 60_000,
+};
+
+/**
  * 解析某条通道实际使用的重试策略。
  *
  * 通道之间必须能各自定价：消费一条交付项的失败（存储抖动）值得立刻重投，等待 Experience
@@ -122,7 +136,7 @@ export interface DeliveryLifecycleRecord {
   attempt_count: number;
   claimed_at?: string | undefined;
   claim_owner?: string | undefined;
-  /** 本次 claim 的 fencing token；见 schemas.ts 的 deliveryLifecycleFields */
+  /** 本次 claim 的 fencing token；见 schemas.ts 的 lifecycleRecordFields */
   claim_token?: string | undefined;
   lease_expires_at?: string | undefined;
   next_retry_at?: string | undefined;
