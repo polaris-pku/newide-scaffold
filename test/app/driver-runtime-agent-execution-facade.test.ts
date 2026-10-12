@@ -23,6 +23,7 @@ import {
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
+  buildDriverUsageFeedbackRecords,
   type AgentContextCleaner,
   type CallJournalEvent,
   type CallJournalPort,
@@ -423,7 +424,8 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         blockers: [],
         referenced_experiences: [
           {
-            experience_id: 'exp_elsewhere',
+            // 形状上是经验 id（uuid）但本 role 名下没有：这类引用照记，缺的是 outbox 而不是它
+            experience_id: '8d0e6a4c-3f21-4b7a-9c58-1e2f3a4b5c6d',
             applied: true,
             effectiveness: 'fully_effective',
             note: 'saved a round of rework',
@@ -444,6 +446,77 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       expect(result.diagnostics.driver_feedback_recorded).toBe(0);
       expect(String(result.diagnostics.driver_feedback_error)).toContain('not configured');
       expect(result.diagnostics.driver_feedback_ids).toBeUndefined();
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Driver 分不清「发给它的经验 id」与「上下文占位条目的编号」，会把后者当引用报回来。
+   * 那类条目命名不了任何一条经验，等多久都不会出现——不进 outbox，但必须计数：
+   * 悄悄少掉一条引用和「本次没有反馈」在诊断里长得一模一样。
+   */
+  it('引用若不是经验 id（上下文占位编号），不进 outbox 但要计数', async () => {
+    const placeholder = 'context-experience-1';
+    const real = '4c7b9d21-8e35-4f6a-b0c2-7a3d5e8f9b10';
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-feedback-placeholder-'));
+    const taskId = 'task_feedback_placeholder';
+    await fs.writeFile(
+      path.join(workspace, `${taskId}_report.txt`),
+      JSON.stringify({
+        summary: 'Used the experience context it was given.',
+        artifacts: [],
+        decisions: [],
+        blockers: [],
+        referenced_experiences: [
+          { experience_id: placeholder, applied: true, effectiveness: 'fully_effective', note: 'misread' },
+          { experience_id: real, applied: true, effectiveness: 'partially_effective', note: 'real' },
+        ],
+        assumptions: [],
+      }),
+      'utf8',
+    );
+
+    try {
+      const sentReferences: string[][] = [];
+      const memoryMaintenance: BMemoryMaintenancePort = {
+        async scheduleBuffer(input) {
+          return {
+            maintenance_ref: 'b_maintenance_placeholder',
+            kind: 'experience_extraction',
+            status: 'scheduled',
+            ...input,
+            experiences: [],
+            skills: [],
+            warnings: [],
+            created_at: '2026-07-21T00:00:00.000Z',
+            completed_at: '2026-07-21T00:00:01.000Z',
+            schema_version: SCHEMA_VERSION,
+          };
+        },
+        async recordDriverUsageFeedback(input) {
+          sentReferences.push(input.references.map((reference) => reference.experience_id));
+          return buildDriverUsageFeedbackRecords({
+            role_id: input.role_id,
+            task_id: input.task_id,
+            references: input.references,
+          });
+        },
+      };
+      const { facade } = createFacade(
+        new CapturingDriver('succeeded'),
+        new InMemoryBufferRepository(),
+        invokeDriverLlm(),
+        new InMemoryRepository(),
+        memoryMaintenance,
+      );
+      const result = await facade.runAgent(request(taskId, 'role_primary', workspace));
+
+      expect(result.status).toBe('completed');
+      // 占位编号压根没进 outbox，真引用照进
+      expect(sentReferences).toEqual([[real]]);
+      expect(result.diagnostics.driver_feedback_recorded).toBe(1);
+      expect(result.diagnostics.driver_feedback_ignored).toBe(1);
     } finally {
       await fs.rm(workspace, { recursive: true, force: true });
     }
@@ -978,6 +1051,10 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         description: eligibleExperience.description,
         content: eligibleExperience.content,
       });
+      // 只有正文的占位条目（LLM 通过 invoke_driver 的 context 传进来的）编号刻意避开经验
+      // id 的形状：它们没有落库身份，长得像经验 id 只会让 Driver 拿它们当引用报回来
+      expect(prompt.skills[1]!.id).toBe('context-skill-2');
+      expect(prompt.experiences[1]!.id).toBe('context-experience-2');
 
       expect(result.diagnostics).toMatchObject({ retrieval: { experiences: 1, skills: 1 } });
       const persisted = JSON.parse(

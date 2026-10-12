@@ -228,6 +228,9 @@ export {
   type MarketSearchQuery,
 } from './services/skill-market';
 export type {
+  ExperienceFeedbackApplication,
+  ExperienceFeedbackOutcome,
+  ExperienceFeedbackResult,
   ExperienceSaveResult,
   MarketSearchOptions,
   MarketImportResult,
@@ -236,6 +239,8 @@ export type {
 } from './ports/memory-repository';
 /** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
 export { MARKET_POOL_ROLE_ID } from './schemas';
+/** 某个字符串能不能命名一条经验（引用准入判据，见 schemas.canNameExperience） */
+export { canNameExperience } from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  8.7 三重门控退休检测（week3 RFC §8.2 触发机制）
@@ -400,6 +405,7 @@ export type {
   MemoryDeliveryRepository,
   ContextDeliveryFilter,
   DriverFeedbackFilter,
+  PendingFeedbackFilter,
   DeliverySubmitResult,
   DeliveryChannel,
   DeliveryClaimRequest,
@@ -408,12 +414,17 @@ export type {
   ClaimedDelivery,
   ClaimedContextDelivery,
   ClaimedDriverFeedback,
+  ClaimedPendingFeedback,
 } from './ports/memory-delivery';
 export {
   DEFAULT_DELIVERY_LEASE_MS,
   DEFAULT_DELIVERY_LOCK_TTL_MS,
   DEFAULT_DELIVERY_RETRY_POLICY,
+  DEFAULT_FEEDBACK_CONSUME_RETRY_POLICY,
+  DEFAULT_PENDING_FEEDBACK_RETRY_POLICY,
   newClaimToken,
+  resolveChannelRetryPolicy,
+  type DeliveryChannelKind,
   type DeliveryRetryPolicy,
 } from './services/delivery-lifecycle';
 
@@ -446,6 +457,7 @@ export type {
   MaintenanceRun,
   MaintenanceRunCounts,
   MaintenanceRunStatus,
+  PendingFeedbackRecord,
 } from './schemas';
 export {
   EMPTY_MAINTENANCE_RUN_COUNTS,
@@ -492,6 +504,46 @@ export {
   type LeaseHeartbeatOptions,
   type LeaseTimers,
 } from './services/lease-heartbeat';
+export {
+  applyFeedbackToExperience,
+  isFeedbackApplied,
+  nextConfidenceAfterFeedback,
+  recomputeAvgConfidence,
+} from './services/usage-feedback';
+export {
+  buildPendingFeedbackRecord,
+  feedbackApplicationOf,
+  isSupportedFeedbackVersion,
+  pendingFeedbackId,
+} from './services/pending-feedback';
+
+// ════════════════════════════════════════════════════════
+//  2d. Memory Maintenance：反馈消费与归并（Phase 2）
+//      outbox 里的 Driver 反馈 → 写进 Experience；经验还没出现就寄存进待归并队列，
+//      由独立的归并 run 等它出现。它不调 scheduleBuffer、不晋升 Skill、不演化 Persona，
+//      也不参与在线任务流程——在线流程只负责把反馈写进 outbox。
+// ════════════════════════════════════════════════════════
+
+export {
+  DefaultDriverFeedbackProcessor,
+  type DriverFeedbackApplicationOutcome,
+  type DriverFeedbackProcessContext,
+  type DriverFeedbackProcessOutcome,
+  type DriverFeedbackProcessStatus,
+  type DriverFeedbackProcessor,
+  type DriverFeedbackProcessorOptions,
+} from './runtime/driver-feedback-processor';
+export {
+  DriverFeedbackWorker,
+  DEFAULT_DRIVER_FEEDBACK_BATCH_SIZE,
+  DEFAULT_DRIVER_FEEDBACK_MAX_DURATION_MS,
+  type DriverFeedbackJob,
+  type DriverFeedbackRestoreResult,
+  type DriverFeedbackRunOptions,
+  type DriverFeedbackRunResult,
+  type DriverFeedbackStopReason,
+  type DriverFeedbackWorkerOptions,
+} from './runtime/driver-feedback-worker';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';

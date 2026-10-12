@@ -34,6 +34,18 @@
 import { randomUUID } from 'node:crypto';
 import type { DeliveryStatus } from '../schemas';
 
+/**
+ * 交付通道的判别式。
+ *
+ * 三条通道共用一套状态机与 claim/lease/retry 规则：两个 outbox（上下文交付、Driver 反馈）
+ * 是上游交给维护系统的输入，`pending_feedback` 是反馈消费者自己的待归并队列（反馈先到、
+ * Experience 还没出现时寄存于此）。它们的不同只在**记录形状**与**重试预算**上，转移规则
+ * 完全相同；把通道判别式定义在这里而不是 ports 里，是因为重试预算按通道解析（见
+ * resolveChannelRetryPolicy）属于状态机的一部分。ports/memory-delivery 把它再导出为
+ * `DeliveryChannel`。
+ */
+export type DeliveryChannelKind = 'context' | 'feedback' | 'pending_feedback';
+
 /** 重试策略：指数退避 + 次数上限 */
 export interface DeliveryRetryPolicy {
   /** 允许的最大投递次数（含首次）；达到后进 dead_letter */
@@ -56,6 +68,50 @@ export const DEFAULT_DELIVERY_RETRY_POLICY: DeliveryRetryPolicy = {
 
 /** 默认 lease 时长：下游一次处理窗口 60s，未续租即可被判定为崩溃 */
 export const DEFAULT_DELIVERY_LEASE_MS = 60_000;
+
+/**
+ * 消费 Driver 反馈的默认重试预算。
+ *
+ * 比基策略宽得多（5 秒起、封顶 5 分钟、最多 8 次，约 10 分钟），因为这条通道上的失败
+ * 几乎只有一类：存储/数据库暂时不可用。而它的代价不对称——消费一条反馈最多写两处
+ * （把反馈应用进 Experience，或把它寄存进待归并队列），一次抖动用光 3 次机会就意味着
+ * 「这份反馈没被消化」，那是整套机制最不能出的错。基策略（3 次 / 约 4 秒）留给上下文
+ * 交付通道，那里失败可以等下一次调度。
+ */
+export const DEFAULT_FEEDBACK_CONSUME_RETRY_POLICY: DeliveryRetryPolicy = {
+  max_attempts: 8,
+  base_delay_ms: 5_000,
+  max_delay_ms: 5 * 60_000,
+};
+
+/**
+ * 待归并反馈的默认重试预算：等的是「某条 Experience 什么时候出现」，不是「网络什么时候通」。
+ *
+ * 指数退避 30s 起、封顶 15 分钟、最多 20 次投递 —— 累加起来约 3.8 小时，这就是**保留期限**：
+ * Experience 一直不出现时，反馈不会无限重试，也不会被悄悄丢掉，而是在用满次数后带着最后一次
+ * 原因进死信，等人处理。数值放在这里（可被适配器构造参数覆盖），不散落在 worker 里。
+ */
+export const DEFAULT_PENDING_FEEDBACK_RETRY_POLICY: DeliveryRetryPolicy = {
+  max_attempts: 20,
+  base_delay_ms: 30_000,
+  max_delay_ms: 15 * 60_000,
+};
+
+/**
+ * 解析某条通道实际使用的重试策略。
+ *
+ * 通道之间必须能各自定价：消费一条交付项的失败（存储抖动）值得立刻重投，等待 Experience
+ * 出现的每一次尝试则要拉开间隔——共用一个计数器与同一组退避，任何一次抖动都会吃掉归并的
+ * 预算，观测上分不清积压属于谁。覆盖是按字段合并的，没写的字段沿用基策略。
+ */
+export function resolveChannelRetryPolicy(
+  base: DeliveryRetryPolicy,
+  overrides: Partial<Record<DeliveryChannelKind, Partial<DeliveryRetryPolicy>>> | undefined,
+  channel: DeliveryChannelKind,
+): DeliveryRetryPolicy {
+  const override = overrides?.[channel];
+  return override ? { ...base, ...override } : base;
+}
 
 /** 文件锁的默认存活上限：超过它可被另一进程判定为陈旧锁并接管 */
 export const DEFAULT_DELIVERY_LOCK_TTL_MS = 30_000;

@@ -1,7 +1,7 @@
 /**
  * InMemoryMemoryDeliveryRepository — MemoryDeliveryRepository 内存适配器
  *
- * 所有 Agent 共享一个实例，交付项与反馈按 role_id 隔离存储于内存 Map。
+ * 所有 Agent 共享一个实例，交付项、反馈与待归并反馈按 role_id 隔离存储于内存 Map。
  * 与 FileMemoryDeliveryRepository 保持同一套幂等语义与同一套 claim/lease/重试
  * 语义（转移规则来自 services/delivery-lifecycle.ts），使测试替身不会掩盖
  * 生产行为差异。
@@ -12,7 +12,10 @@
 import {
   DEFAULT_DELIVERY_LEASE_MS,
   DEFAULT_DELIVERY_RETRY_POLICY,
+  DEFAULT_FEEDBACK_CONSUME_RETRY_POLICY,
+  DEFAULT_PENDING_FEEDBACK_RETRY_POLICY,
   newClaimToken,
+  resolveChannelRetryPolicy,
   type DeliveryRetryPolicy,
 } from '../services/delivery-lifecycle';
 import {
@@ -28,7 +31,11 @@ import {
   type DeliveryRecordStore,
 } from '../services/delivery-claim';
 import { nowTimestamp } from '../../core';
-import type { ContextDeliveryItem, DriverFeedbackRecord } from '../schemas';
+import {
+  type ContextDeliveryItem,
+  type DriverFeedbackRecord,
+  type PendingFeedbackRecord,
+} from '../schemas';
 import type {
   ClaimedDelivery,
   ContextDeliveryFilter,
@@ -39,15 +46,21 @@ import type {
   DeliverySubmitResult,
   DriverFeedbackFilter,
   MemoryDeliveryRepository,
+  PendingFeedbackFilter,
 } from '../ports/memory-delivery';
 
 interface DeliveryStore {
   contexts: Map<string, ContextDeliveryItem>;
   feedback: Map<string, DriverFeedbackRecord>;
+  pendingFeedback: Map<string, PendingFeedbackRecord>;
 }
 
 export interface InMemoryMemoryDeliveryRepositoryOptions {
   retryPolicy?: Partial<DeliveryRetryPolicy>;
+  /** 消费 Driver 反馈（feedback 通道）的重试预算覆盖 */
+  feedbackRetryPolicy?: Partial<DeliveryRetryPolicy>;
+  /** 等待 Experience 出现（pending_feedback 通道）的重试预算覆盖 */
+  pendingFeedbackRetryPolicy?: Partial<DeliveryRetryPolicy>;
   lease_ms?: number;
 }
 
@@ -64,7 +77,23 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
       ...options.retryPolicy,
       lease_ms: options.lease_ms ?? DEFAULT_DELIVERY_LEASE_MS,
       claim_isolation: 'process_mutex',
+      channel_retry_policies: {
+        feedback: { ...DEFAULT_FEEDBACK_CONSUME_RETRY_POLICY, ...options.feedbackRetryPolicy },
+        pending_feedback: {
+          ...DEFAULT_PENDING_FEEDBACK_RETRY_POLICY,
+          ...options.pendingFeedbackRetryPolicy,
+        },
+      },
     };
+  }
+
+  /** 该通道实际使用的重试预算（未覆盖的通道沿用基策略） */
+  private policyFor(channel: DeliveryChannel): DeliveryRetryPolicy {
+    return resolveChannelRetryPolicy(
+      this.policy,
+      this.policy.channel_retry_policies,
+      channel,
+    );
   }
 
   async ensureAgent(role_id: string): Promise<void> {
@@ -138,16 +167,51 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
     return records.sort((left, right) => left.feedback_key.localeCompare(right.feedback_key));
   }
 
+  async submitPendingFeedback(
+    record: PendingFeedbackRecord,
+  ): Promise<DeliverySubmitResult<PendingFeedbackRecord>> {
+    const store = this.getOrCreateStore(record.role_id);
+    const existing = store.pendingFeedback.get(record.feedback_id);
+    if (existing) {
+      return { item: { ...existing }, created: false };
+    }
+    store.pendingFeedback.set(record.feedback_id, { ...record });
+    return { item: { ...record }, created: true };
+  }
+
+  async getPendingFeedback(
+    role_id: string,
+    feedback_id: string,
+  ): Promise<PendingFeedbackRecord | undefined> {
+    const record = this.stores.get(role_id)?.pendingFeedback.get(feedback_id);
+    return record ? { ...record } : undefined;
+  }
+
+  async listPendingFeedback(filter: PendingFeedbackFilter = {}): Promise<PendingFeedbackRecord[]> {
+    const records: PendingFeedbackRecord[] = [];
+    for (const store of this.stores.values()) {
+      for (const record of store.pendingFeedback.values()) {
+        if (matchesPendingFeedbackFilter(record, filter)) records.push({ ...record });
+      }
+    }
+    return records.sort((left, right) => left.feedback_id.localeCompare(right.feedback_id));
+  }
+
   // ── claim / lease / 重试 ─────────────────────────────────────────
   //
-  // 每个方法都显式写两条通道的分支，而不是用泛型分派：分派需要断言返回值类型，
-  // 而断言正是「两条通道其实已经被当成一回事」的伪装。分支写开之后，类型检查
-  // 仍然能挡住把 feedback 记录当成 context 记录返回。
+  // 每个方法都显式写三条通道的分支，而不是用泛型分派：分派需要断言返回值类型，
+  // 而断言正是「三条通道其实已经被当成一回事」的伪装。分支写开之后，类型检查
+  // 仍然能挡住把 feedback 记录当成 context 记录返回——最后的兜底分支也被 TS
+  // 收窄成 context（另两条已被排除），多出一条通道时编译器会当场指出来。
 
   async claimDelivery(
     input: DeliveryClaimRequest & { role_id: string; id: string },
   ): Promise<ClaimedDelivery | undefined> {
     const claim = this.claimInput(input);
+    if (input.channel === 'pending_feedback') {
+      const item = await claimRecord(this.pendingFeedbackStore(), input.role_id, input.id, claim);
+      return item ? { channel: 'pending_feedback', item } : undefined;
+    }
     if (input.channel === 'feedback') {
       const item = await claimRecord(this.feedbackStore(), input.role_id, input.id, claim);
       return item ? { channel: 'feedback', item } : undefined;
@@ -159,6 +223,10 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
   async claimNextDelivery(input: DeliveryClaimRequest): Promise<ClaimedDelivery | undefined> {
     const claim = this.claimInput(input);
     const scope = input.role_id !== undefined ? { role_id: input.role_id } : {};
+    if (input.channel === 'pending_feedback') {
+      const item = await claimNextRecord(this.pendingFeedbackStore(), { ...claim, ...scope });
+      return item ? { channel: 'pending_feedback', item } : undefined;
+    }
     if (input.channel === 'feedback') {
       const item = await claimNextRecord(this.feedbackStore(), { ...claim, ...scope });
       return item ? { channel: 'feedback', item } : undefined;
@@ -181,6 +249,15 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
       lease_ms: input.lease_ms ?? this.policy.lease_ms,
       now: input.now ?? nowTimestamp(),
     };
+    if (input.channel === 'pending_feedback') {
+      const item = await renewRecordClaim(
+        this.pendingFeedbackStore(),
+        input.role_id,
+        input.id,
+        args,
+      );
+      return item ? { channel: 'pending_feedback', item } : undefined;
+    }
     if (input.channel === 'feedback') {
       const item = await renewRecordClaim(this.feedbackStore(), input.role_id, input.id, args);
       return item ? { channel: 'feedback', item } : undefined;
@@ -203,6 +280,15 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
       processor_version: input.processor_version,
       now: input.now ?? nowTimestamp(),
     };
+    if (input.channel === 'pending_feedback') {
+      const item = await completeRecord(
+        this.pendingFeedbackStore(),
+        input.role_id,
+        input.id,
+        args,
+      );
+      return item ? { channel: 'pending_feedback', item } : undefined;
+    }
     if (input.channel === 'feedback') {
       const item = await completeRecord(this.feedbackStore(), input.role_id, input.id, args);
       return item ? { channel: 'feedback', item } : undefined;
@@ -226,8 +312,12 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
       error: input.error,
       retryable: input.retryable,
       now: input.now ?? nowTimestamp(),
-      policy: this.policy,
+      policy: this.policyFor(input.channel),
     };
+    if (input.channel === 'pending_feedback') {
+      const item = await failRecord(this.pendingFeedbackStore(), input.role_id, input.id, args);
+      return item ? { channel: 'pending_feedback', item } : undefined;
+    }
     if (input.channel === 'feedback') {
       const item = await failRecord(this.feedbackStore(), input.role_id, input.id, args);
       return item ? { channel: 'feedback', item } : undefined;
@@ -240,6 +330,15 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
     input: DeliveryRecordLocator & { now?: string },
   ): Promise<ClaimedDelivery | undefined> {
     const args = { now: input.now ?? nowTimestamp() };
+    if (input.channel === 'pending_feedback') {
+      const item = await retryDeadLetterRecord(
+        this.pendingFeedbackStore(),
+        input.role_id,
+        input.id,
+        args,
+      );
+      return item ? { channel: 'pending_feedback', item } : undefined;
+    }
     if (input.channel === 'feedback') {
       const item = await retryDeadLetterRecord(this.feedbackStore(), input.role_id, input.id, args);
       return item ? { channel: 'feedback', item } : undefined;
@@ -254,15 +353,35 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
     now?: string;
   } = {}): Promise<ClaimedDelivery[]> {
     const now = options.now ?? nowTimestamp();
-    const inputs = { role_id: options.role_id, now, policy: this.policy };
+    const scope = options.role_id;
     const restored: ClaimedDelivery[] = [];
-    if (options.channel !== 'feedback') {
-      const candidates = await restoreExpiredRecords(this.contextStore(), inputs);
+    const wants = (channel: DeliveryChannel): boolean =>
+      options.channel === undefined || options.channel === channel;
+    if (wants('context')) {
+      const candidates = await restoreExpiredRecords(this.contextStore(), {
+        role_id: scope,
+        now,
+        policy: this.policyFor('context'),
+      });
       restored.push(...candidates.map((c) => ({ channel: 'context' as const, item: c.record })));
     }
-    if (options.channel !== 'context') {
-      const candidates = await restoreExpiredRecords(this.feedbackStore(), inputs);
+    if (wants('feedback')) {
+      const candidates = await restoreExpiredRecords(this.feedbackStore(), {
+        role_id: scope,
+        now,
+        policy: this.policyFor('feedback'),
+      });
       restored.push(...candidates.map((c) => ({ channel: 'feedback' as const, item: c.record })));
+    }
+    if (wants('pending_feedback')) {
+      const candidates = await restoreExpiredRecords(this.pendingFeedbackStore(), {
+        role_id: scope,
+        now,
+        policy: this.policyFor('pending_feedback'),
+      });
+      restored.push(
+        ...candidates.map((c) => ({ channel: 'pending_feedback' as const, item: c.record })),
+      );
     }
     return restored;
   }
@@ -273,15 +392,24 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
     now?: string;
   } = {}): Promise<ClaimedDelivery[]> {
     const now = options.now ?? nowTimestamp();
-    const inputs = { role_id: options.role_id, now };
+    const scope = options.role_id;
     const due: ClaimedDelivery[] = [];
-    if (options.channel !== 'feedback') {
-      const candidates = await listRetryableRecords(this.contextStore(), inputs);
+    const wants = (channel: DeliveryChannel): boolean =>
+      options.channel === undefined || options.channel === channel;
+    if (wants('context')) {
+      const candidates = await listRetryableRecords(this.contextStore(), { role_id: scope, now });
       due.push(...candidates.map((c) => ({ channel: 'context' as const, item: c.record })));
     }
-    if (options.channel !== 'context') {
-      const candidates = await listRetryableRecords(this.feedbackStore(), inputs);
+    if (wants('feedback')) {
+      const candidates = await listRetryableRecords(this.feedbackStore(), { role_id: scope, now });
       due.push(...candidates.map((c) => ({ channel: 'feedback' as const, item: c.record })));
+    }
+    if (wants('pending_feedback')) {
+      const candidates = await listRetryableRecords(this.pendingFeedbackStore(), {
+        role_id: scope,
+        now,
+      });
+      due.push(...candidates.map((c) => ({ channel: 'pending_feedback' as const, item: c.record })));
     }
     return due;
   }
@@ -300,7 +428,7 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
       claim_token: newClaimToken(),
       now: input.now ?? nowTimestamp(),
       lease_ms: input.lease_ms ?? this.policy.lease_ms,
-      policy: this.policy,
+      policy: this.policyFor(input.channel),
     };
   }
 
@@ -342,6 +470,25 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
     };
   }
 
+  private pendingFeedbackStore(): DeliveryRecordStore<PendingFeedbackRecord> {
+    return {
+      list: async (role_id) =>
+        this.entries<PendingFeedbackRecord>(
+          role_id,
+          (store) => store.pendingFeedback.values(),
+          (record) => record.feedback_id,
+        ),
+      read: async (role_id, id) => {
+        const record = this.stores.get(role_id)?.pendingFeedback.get(id);
+        return record ? { ...record } : undefined;
+      },
+      write: async (role_id, record) => {
+        this.getOrCreateStore(role_id).pendingFeedback.set(record.feedback_id, { ...record });
+      },
+      lock: (role_id, id, fn) => this.withKeyLock(`pending-feedback:${role_id}:${id}`, fn),
+    };
+  }
+
   private entries<T>(
     role_id: string | undefined,
     select: (store: DeliveryStore) => Iterable<T>,
@@ -380,7 +527,7 @@ export class InMemoryMemoryDeliveryRepository implements MemoryDeliveryRepositor
   private getOrCreateStore(role_id: string): DeliveryStore {
     let store = this.stores.get(role_id);
     if (!store) {
-      store = { contexts: new Map(), feedback: new Map() };
+      store = { contexts: new Map(), feedback: new Map(), pendingFeedback: new Map() };
       this.stores.set(role_id, store);
     }
     return store;
@@ -403,6 +550,18 @@ function matchesFeedbackFilter(
 ): boolean {
   if (filter.role_id !== undefined && record.role_id !== filter.role_id) return false;
   if (filter.task_id !== undefined && record.task_id !== filter.task_id) return false;
+  if (filter.experience_id !== undefined && record.experience_id !== filter.experience_id) {
+    return false;
+  }
+  if (filter.status !== undefined && record.status !== filter.status) return false;
+  return true;
+}
+
+function matchesPendingFeedbackFilter(
+  record: PendingFeedbackRecord,
+  filter: PendingFeedbackFilter,
+): boolean {
+  if (filter.role_id !== undefined && record.role_id !== filter.role_id) return false;
   if (filter.experience_id !== undefined && record.experience_id !== filter.experience_id) {
     return false;
   }

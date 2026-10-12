@@ -57,6 +57,8 @@ function at(offsetMs: number): string {
 const LEASE = 60_000;
 
 const ROLE = 'role_claim';
+/** 夹具用的经验 id：引用准入要求它是经验 id 的形状（uuid），可读编号会被直接丢掉 */
+const EXPERIENCE_A = '11111111-1111-4111-8111-111111111111';
 
 function deliveryFor(roleId: string, taskId: string, seq = 1) {
   return buildContextDeliveryItem({
@@ -416,7 +418,7 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('feedback outbox 走同一套状态机', async () => {
     const store = await create(await tempRoot());
     await store.ensureAgent(ROLE);
-    const record = feedbackFor(ROLE, 'task_1', 'exp_1');
+    const record = feedbackFor(ROLE, 'task_1', EXPERIENCE_A);
     await store.submitDriverFeedback(record);
 
     const claimed = await store.claimDelivery({

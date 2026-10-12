@@ -18,6 +18,7 @@ import {
   AgentManager,
   InvokeDriverTool,
   LlmRetirementEvaluator,
+  canNameExperience,
   createAgentMemoryScope,
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
@@ -181,6 +182,8 @@ interface InvocationContext {
 /** Driver 使用反馈的提交结果；`error` 只进诊断，不影响任务状态。 */
 interface DriverFeedbackOutcome {
   recorded: DriverFeedbackRecord[];
+  /** Driver 报了、但压根不是经验 id 的引用条数（见 toMemoryItems 与 recordDriverFeedback） */
+  ignored: number;
   error?: string;
 }
 
@@ -1341,27 +1344,35 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     bufferSeq: number,
     references: readonly DriverReferencedExperience[],
   ): Promise<DriverFeedbackOutcome> {
-    if (references.length === 0) return { recorded: [] };
+    if (references.length === 0) return { recorded: [], ignored: 0 };
+    // 只有能命名一条经验的引用才是反馈。Driver 分不清「发给它的经验 id」与「上下文占位条目的
+    // 编号」，误读会把它报成引用（见 toMemoryItems）——那类条目在这里就丢掉并计数：它不是
+    // 「还没出现的经验」，等多久都不会出现，存进 outbox 只会让下游白等一轮保留期。
+    const usable = references.filter((reference) => canNameExperience(reference.experience_id));
+    const ignored = references.length - usable.length;
     // 消融标签同样不改这条边界：Driver 自报了引用却因为「这一臂是 B0/B4」而把反馈丢掉，
     // 就是静默丢数据——反馈必须幂等且不能悄无声息地少。标签只影响检索。
     if (!this.options.memoryMaintenance) {
       return {
         recorded: [],
+        ignored,
         error: 'B memory maintenance is not configured; driver feedback was not recorded.',
       };
     }
+    if (usable.length === 0) return { recorded: [], ignored };
     try {
       const recorded = await this.options.memoryMaintenance.recordDriverUsageFeedback({
         task_id: input.task_id,
         run_id: input.run_id,
         role_id: runtimeRoleId,
         ...(bufferSeq > 0 ? { buffer_seq: bufferSeq } : {}),
-        references,
+        references: usable,
       });
-      return { recorded };
+      return { recorded, ignored };
     } catch (error) {
       return {
         recorded: [],
+        ignored,
         error: error instanceof Error ? error.message : String(error),
       };
     }
@@ -1544,9 +1555,17 @@ function mapStatus(
   )[driverStatus];
 }
 
+/**
+ * `invoke_driver` 的 context 只有正文（`string[]`），这些条目没有落库身份。
+ *
+ * 给它们编号时**刻意避开经验 id 的形状**：过去这里是 `experience_1` / `skill_1`，与真检索来的
+ * UUID 混在同一个数组里下发给 Driver。Driver 无从分辨哪个编号是可引用的经验，于是把占位编号
+ * 照抄进 `referenced_experiences`，反馈链路再拿它当外键去查一条不存在的经验——生产路径上
+ * 「经验还没出现」的绝大多数就是这样来的。`context-` 前缀一望可知是占位条目。
+ */
 function toMemoryItems(prefix: string, values: string[] | undefined) {
   return (values ?? []).map((content, index) => ({
-    id: `${prefix}_${String(index + 1)}`,
+    id: `context-${prefix}-${String(index + 1)}`,
     description: `B runtime ${prefix} context`,
     content,
   }));
@@ -1622,9 +1641,13 @@ function memoryContextDiagnostics(cycle: MemoryCycleResult): Record<string, unkn
  * 是两件事，混成同一个空值就分不出来了。
  */
 function driverFeedbackDiagnostics(outcome: DriverFeedbackOutcome): Record<string, unknown> {
-  if (outcome.error === undefined && outcome.recorded.length === 0) return {};
+  if (outcome.error === undefined && outcome.recorded.length === 0 && outcome.ignored === 0) {
+    return {};
+  }
   return {
     driver_feedback_recorded: outcome.recorded.length,
+    // 报了却不是经验 id 的引用条数：>0 说明 Driver 在拿占位编号当经验引用，是上游该修的迹象
+    ...(outcome.ignored > 0 ? { driver_feedback_ignored: outcome.ignored } : {}),
     ...(outcome.error === undefined
       ? { driver_feedback_ids: outcome.recorded.map((record) => record.feedback_id) }
       : { driver_feedback_error: outcome.error }),

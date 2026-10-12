@@ -1,28 +1,32 @@
 /**
  * MemoryDeliveryRepository 端口
  *
- * 任务流程向下游 Memory Maintenance 系统交付输入的两条通道：
+ * 任务流程向下游 Memory Maintenance 系统交付输入的两条通道，以及反馈消费者自己的等待队列：
  *
  *   1. 上下文交付项（context delivery）—— DriverReturn + AgentContextSnapshot 的稳定引用，
  *      供下游做 Experience 提取。
- *   2. Driver 使用反馈 outbox —— Agent 对既有经验的使用事实，供下游判断 Skill 晋升。
+ *   2. Driver 使用反馈 outbox —— Agent 对既有经验的使用事实，供下游消费并归并到 Experience。
+ *   3. 待归并反馈（pending_feedback）—— 反馈消费者在「Experience 还没出现」时寄存的副本，
+ *      等那条经验出现后再归并（Phase 2）。它是消费者内部的工作队列，不是上游的输入，
+ *      但**状态语义与前两条完全相同**，因此与它们共用一套转移规则与一个存储。
  *
- * 两条通道共用一套状态语义（DeliveryStatus）与同样的提交幂等规则：同一个
+ * 三条通道共用一套状态语义（DeliveryStatus）与同样的提交幂等规则：同一个
  * 稳定键重复提交只保留第一条记录，返回 `created: false`，不覆盖已有内容、
  * 也不重复累计。
  *
  * claim / lease / retry 的转移规则定义在 services/delivery-lifecycle.ts，本端口
- * 只声明「有这些动作」，两个适配器必须给出同一套行为。两类记录的形状差异只体现在
+ * 只声明「有这些动作」，各适配器必须给出同一套行为。各类记录的形状差异只体现在
  * id 字段名（delivery_id / feedback_id）上，因此状态机部分是**泛化的**：
- * `channel` 是唯一的判别式，返回值按它收窄。端口刻意不写 14 个近乎相同的方法——
- * 两条通道各写一套转移才是它们漂移的原因。
+ * `channel` 是唯一的判别式，返回值按它收窄。端口刻意不写几十个近乎相同的方法——
+ * 每条通道各写一套转移才是它们漂移的原因。
  */
 import type {
   ContextDeliveryItem,
   DeliveryStatus,
   DriverFeedbackRecord,
+  PendingFeedbackRecord,
 } from '../schemas';
-import type { DeliveryRetryPolicy } from '../services/delivery-lifecycle';
+import type { DeliveryChannelKind, DeliveryRetryPolicy } from '../services/delivery-lifecycle';
 
 /** 提交结果：`created` 为 false 表示命中了幂等键，返回的是已存在的那条 */
 export interface DeliverySubmitResult<T> {
@@ -45,8 +49,21 @@ export interface DriverFeedbackFilter {
   status?: DeliveryStatus | undefined;
 }
 
-/** 两条交付通道的判别式 */
-export type DeliveryChannel = 'context' | 'feedback';
+/** 待归并反馈的查询过滤（全部可选，缺省即全量） */
+export interface PendingFeedbackFilter {
+  role_id?: string | undefined;
+  /** 按「在等哪条经验」收窄——排查「这条经验的反馈为什么还没归并」用得上 */
+  experience_id?: string | undefined;
+  status?: DeliveryStatus | undefined;
+}
+
+/**
+ * 三条交付通道的判别式。
+ *
+ * 定义在 services/delivery-lifecycle.ts（重试预算按通道解析，属于状态机的一部分），
+ * 这里只是它在端口层的名字。
+ */
+export type DeliveryChannel = DeliveryChannelKind;
 
 /** claim 请求：谁持有、持有多久、以什么时刻为准 */
 export interface DeliveryClaimRequest {
@@ -65,7 +82,10 @@ export interface DeliveryClaimRequest {
 export interface DeliveryRecordLocator {
   channel: DeliveryChannel;
   role_id: string;
-  /** `channel='context'` 时为 delivery_id，`channel='feedback'` 时为 feedback_id */
+  /**
+   * `channel='context'` 时为 delivery_id；反馈与待归并反馈都是 feedback_id
+   * （同一条反馈在两条通道里用同一个 id，因此两边的记录可以直接对起来）。
+   */
   id: string;
 }
 
@@ -77,13 +97,21 @@ export interface ClaimedDriverFeedback {
   channel: 'feedback';
   item: DriverFeedbackRecord;
 }
+/** claim 到的待归并反馈：反馈副本 + 它自己的归并进度 */
+export interface ClaimedPendingFeedback {
+  channel: 'pending_feedback';
+  item: PendingFeedbackRecord;
+}
 /**
  * 一次 claim/ack 的结果。
  *
  * 判别式 `channel` 让调用方在收窄之后直接拿到具体类型，不必在 port 层做断言；
- * 这也是两条通道能共用一套方法而不牺牲类型安全的原因。
+ * 这也是三条通道能共用一套方法而不牺牲类型安全的原因。
  */
-export type ClaimedDelivery = ClaimedContextDelivery | ClaimedDriverFeedback;
+export type ClaimedDelivery =
+  | ClaimedContextDelivery
+  | ClaimedDriverFeedback
+  | ClaimedPendingFeedback;
 
 /** 该实现的 claim/重试参数；capabilities 如实转述它，而不是报一份默认值 */
 export interface DeliveryRepositoryPolicy extends DeliveryRetryPolicy {
@@ -95,6 +123,20 @@ export interface DeliveryRepositoryPolicy extends DeliveryRetryPolicy {
    * - `exclusive_lock_file`：跨进程用独占锁文件串行化同一记录的 claim
    */
   claim_isolation: 'process_mutex' | 'exclusive_lock_file';
+  /**
+   * 各通道对重试预算的覆盖（按字段合并，未写的字段沿用基策略）。
+   *
+   * 典型用途是待归并反馈：它的每一次失败等的都是「Experience 什么时候出现」，退避应当
+   * 拉长、次数应当多给（缺省见 DEFAULT_PENDING_FEEDBACK_RETRY_POLICY），而交付消费的
+   * 失败多是存储抖动，退避要短。
+   *
+   * 字段缺席的意思是「所有通道都用上面那份基策略」（端口层的缺省）。本仓的三个适配器
+   * 都会自己带上反馈与待归并两条通道的覆盖，上下文通道因此仍走基策略——Phase 1 的行为
+   * 一个字没变。
+   */
+  channel_retry_policies?:
+    | Partial<Record<DeliveryChannel, Partial<DeliveryRetryPolicy>>>
+    | undefined;
 }
 
 export interface MemoryDeliveryRepository {
@@ -149,9 +191,29 @@ export interface MemoryDeliveryRepository {
   /** 列出 Driver 反馈（跨 role 缺省全量，按 role_id/task_id/experience_id/status 过滤） */
   listDriverFeedback(filter?: DriverFeedbackFilter): Promise<DriverFeedbackRecord[]>;
 
+  /**
+   * 寄存一条待归并反馈（幂等）。
+   *
+   * 幂等键是 `record.feedback_id`：同一条反馈重复寄存只留第一条。命中已有记录时**不覆盖**
+   * ——那条可能已经被归并任务推进到 processing/processed，上游重放不得把它拽回 pending
+   * （与两条 outbox 的提交同一条规则）。
+   */
+  submitPendingFeedback(
+    record: PendingFeedbackRecord,
+  ): Promise<DeliverySubmitResult<PendingFeedbackRecord>>;
+
+  /** 读取一条待归并反馈（按 role + feedback_id） */
+  getPendingFeedback(
+    role_id: string,
+    feedback_id: string,
+  ): Promise<PendingFeedbackRecord | undefined>;
+
+  /** 列出待归并反馈（跨 role 缺省全量，按 role_id/experience_id/status 过滤） */
+  listPendingFeedback(filter?: PendingFeedbackFilter): Promise<PendingFeedbackRecord[]>;
+
   // ── claim / lease / 重试（工作包 C） ──────────────────────────────
   //
-  // 下面这组方法对两条通道给出**同一套**转移语义。返回 undefined 统一表示
+  // 下面这组方法对三条通道给出**同一套**转移语义。返回 undefined 统一表示
   // 「这次什么都没做」：记录不存在、状态不允许（已被别人 claim、已 processed、
   // 还没到退避时刻）、持有者不匹配、或没抢到锁。调用方不需要区分这些——它们
   // 对调用方的下一步动作是同一种：稍后再试或放弃。

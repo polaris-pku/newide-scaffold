@@ -29,6 +29,16 @@ import { DELIVERY_ADAPTERS } from './maintenance-adapters';
 
 const tempDirs: string[] = [];
 
+/**
+ * 夹具用的经验 id。
+ *
+ * 引用准入要求 experience_id 是经验 id 的形状（uuid）——`exp_1` 这类可读编号会被
+ * `buildDriverUsageFeedbackRecords` 直接丢掉（它命名不了任何一条经验），构造不出记录。
+ */
+const EXPERIENCE_A = '11111111-1111-4111-8111-111111111111';
+const EXPERIENCE_B = '22222222-2222-4222-8222-222222222222';
+const EXPERIENCE_RACE = '33333333-3333-4333-8333-333333333333';
+
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -100,15 +110,15 @@ describe.each(DELIVERY_ADAPTERS)('$name', ({ create, reopen }) => {
     const store = await create(root);
     await store.ensureAgent('role_a');
 
-    const record = feedbackFor('role_a', 'task_1', 'exp_1');
+    const record = feedbackFor('role_a', 'task_1', EXPERIENCE_A);
     expect((await store.submitDriverFeedback(record)).created).toBe(true);
     const again = await store.submitDriverFeedback(record);
     expect(again.created).toBe(false);
     expect(again.item.effectiveness).toBe(record.effectiveness);
 
-    await store.submitDriverFeedback(feedbackFor('role_a', 'task_1', 'exp_2'));
+    await store.submitDriverFeedback(feedbackFor('role_a', 'task_1', EXPERIENCE_B));
     expect(await store.listDriverFeedback({ role_id: 'role_a' })).toHaveLength(2);
-    expect(await store.listDriverFeedback({ experience_id: 'exp_2' })).toHaveLength(1);
+    expect(await store.listDriverFeedback({ experience_id: EXPERIENCE_B })).toHaveLength(1);
   });
 
   it('deleteAgent 清干净该 role 的交付存储', async () => {
@@ -116,7 +126,7 @@ describe.each(DELIVERY_ADAPTERS)('$name', ({ create, reopen }) => {
     const store = await create(root);
     await store.ensureAgent('role_a');
     await store.submitContextDelivery(deliveryFor('role_a', 'task_1'));
-    await store.submitDriverFeedback(feedbackFor('role_a', 'task_1', 'exp_1'));
+    await store.submitDriverFeedback(feedbackFor('role_a', 'task_1', EXPERIENCE_A));
 
     await store.deleteAgent('role_a');
 
@@ -235,7 +245,7 @@ describe('FileMemoryDeliveryRepository（首次提交竞态）', () => {
     const second = new FileMemoryDeliveryRepository({ agentStateRoot: root });
     await first.ensureAgent('role_race');
 
-    const record = feedbackFor('role_race', 'task_race', 'exp_race');
+    const record = feedbackFor('role_race', 'task_race', EXPERIENCE_RACE);
     const contender = {
       ...record,
       observed_at: '2020-01-01T00:00:00.000Z',
@@ -281,5 +291,37 @@ describe('FileMemoryDeliveryRepository（首次提交竞态）', () => {
     }
     const entries = await readdir(join(root, 'role_swarm', 'delivery', 'context'));
     expect(entries).toEqual([`${items[0]!.delivery_id}.json`]);
+  });
+});
+// ════════════════════════════════════════════════════════
+//  引用准入（纯函数，与后端无关）
+// ════════════════════════════════════════════════════════
+
+describe('buildDriverUsageFeedbackRecords 的引用准入', () => {
+  it('命名不了经验的引用不进反馈表，能命名的照记', () => {
+    const records = buildDriverUsageFeedbackRecords({
+      role_id: 'role_a',
+      task_id: 'task_1',
+      references: [
+        // 上下文占位条目的编号：driver 常把它当经验 id 报回来
+        {
+          experience_id: 'context-experience-1',
+          applied: true,
+          effectiveness: 'fully_effective',
+          note: 'placeholder, not an experience',
+        },
+        { experience_id: '', applied: true, effectiveness: 'ineffective', note: 'empty id' },
+        { experience_id: EXPERIENCE_A, applied: true, effectiveness: 'fully_effective', note: 'ok' },
+        // 形状对但库里查不到：照记，由下游按 experience_id 归并时决定去留
+        {
+          experience_id: EXPERIENCE_B,
+          applied: true,
+          effectiveness: 'partially_effective',
+          note: 'not extracted yet',
+        },
+      ],
+    });
+
+    expect(records.map((record) => record.experience_id)).toEqual([EXPERIENCE_A, EXPERIENCE_B]);
   });
 });

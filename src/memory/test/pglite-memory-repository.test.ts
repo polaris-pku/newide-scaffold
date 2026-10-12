@@ -239,6 +239,29 @@ describe('PgMemoryRepository on embedded PGlite', () => {
   });
 
   /**
+   * 非 uuid 的 id 不可能在库里存在，却足够让 uuid 列报错（22P02）。适配器必须给出端口承诺的
+   * `experience_missing`——与内存腿同一个答案，而不是抛存储层自己的错：抛出去会被反馈消费者
+   * 当成瞬时故障反复重投，同一个输入在两条腿上于是得到两种待遇。
+   */
+  it('applyExperienceFeedback：id 不是 uuid 时回 experience_missing，而不是抛 SQL 错', async () => {
+    const role_id = `role_pglite_feedback_shape_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'Feedback Shape Agent' });
+
+    const result = await repository.applyExperienceFeedback(role_id, {
+      feedback_id: randomUUID(),
+      experience_id: 'context-experience-1',
+      applied: true,
+      effectiveness: 'fully_effective',
+      note: 'driver misread a context placeholder as an experience id',
+      observed_at: nowTimestamp(),
+      feedback_source: 'driver_usage',
+    });
+
+    expect(result.outcome).toBe('experience_missing');
+    expect(await repository.listExperiences(role_id)).toEqual([]);
+  });
+
+  /**
    * 晋升幂等只有真的走一遍 SQL 才算验过：唯一键是 (role_id, promoted_from)，靠部分唯一索引
    * + ON CONFLICT DO NOTHING 保证，而不是「先查再插」（后者在并发下会各自插进去）。
    */
