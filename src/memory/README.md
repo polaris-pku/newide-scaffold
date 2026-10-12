@@ -168,6 +168,8 @@ if (selected) {
 
 技能晋升候选必须同时满足：`type === 'positive'`、`confidence > 0.95`、尚未设置 `promoted_to`。是否真正生成 Skill 仍由注入的晋升实现决定。
 
+这里的 `SkillPromotionProcessor` 与维护通道里的 **Skill 晋升 Job**（见「Skill 晋升 Job」一节）不是同一套：Processor 是同步的、由调用方在 Buffer 流程里直接调；job 是带 claim/lease、批上限与 run 审计的批量外壳。新接入的调度器应当用 job。
+
 **触发策略与降级**：`checkAndExtract` / `checkAndPromote` 在**执行前**用策略端口评估是否触发——`BufferTriggerPolicy`（`BatchBufferTriggerPolicy`：pending ≥3 / 最老 ≥6h / 含 ineffective；`AlwaysExtractPolicy`：无条件）+ `PromotionTriggerPolicy`（`DefaultPromotionTriggerPolicy`：eligible ≥5 / 高信 >0.98 / 距上次 ≥24h）。两个 Processor 均无内置调度器，**触发方是外部调用者**（后台 Worker / 定时器 / 前端主动）。LLM 版提取/晋升/归纳（`LlmExperienceExtractor` / `LlmSkillPromotion` / `LlmPersonaInduction`）内部在 LLM 失败或空结果时**降级到规则版**（`RuleBasedExperienceExtractor` / `ruleBasedSkillPromotion` / `ruleBasedPersonaInduction`），规则版仅作兜底，主线全走 LLM。
 
 ### Persona 演化
@@ -256,6 +258,200 @@ const manager = await createAgentRuntime({
 ```
 
 `DeepSeekToolCallingClient` 从构造参数或 `DEEPSEEK_API_KEY` 读取密钥，默认模型为 `deepseek-chat`，默认地址为 `https://api.deepseek.com`。它本身不读取 `.env` 文件；需要由应用启动层加载环境变量。
+
+## Skill 晋升 Job（Memory Maintenance Phase 3）
+
+`DefaultSkillPromotionJob` 是独立的晋升 job：批量扫描 Experience 候选、逐条问策略、按结论落库
+（写 Skill / 只记结论 / 记拒绝），失败按退避重投或进死信。它与上面「Buffer 后处理」里的
+`SkillPromotionProcessor` 是**两条不同的路径**——Processor 是同步的、由调用方在 Buffer 流程里
+直接调的旧式组合；job 是带 claim/lease、批上限与 run 审计的批量外壳，供调度器独立触发。两条
+都没有内置定时器。
+
+### 配置策略
+
+策略实现 `PromotionStrategy`（`version` / `config` / `evaluate`），默认实现 `DefaultPromotionStrategy`：
+
+| 配置项 | 含义 | 缺省 |
+| --- | --- | --- |
+| `version` | 策略版本，**判据的一部分**（见「为什么不会重复晋升」） | `promotion-threshold.v1` |
+| `min_confidence` | 置信度门槛，判据是**严格大于** | `0.95` |
+| `min_referenced_count` | 被引用次数门槛 | `0`（不设门槛） |
+| `min_age_ms` | 时间窗口 | `0`（不设窗口） |
+| `min_user_rating` | 来源用户评分门槛（`resolved` / `partially_resolved` / `unresolved` / `not_rated`） | `null`（不设门槛） |
+| `approval` | `manual_review`：判定合格只记 `pending_review`；`auto_approve`：判定合格即写 Skill | `manual_review` |
+
+三个「有代价的开关」（引用次数 / 时间窗口 / 用户评分）缺省都是关的——打开会让晋升更晚发生，
+必须是显式的。`min_confidence` 与 `services/skill-promotion.ts` 的 `PROMOTION_CONFIDENCE_THRESHOLD`
+同值同判据（严格大于），两条路径对同一条经验不会给出相反结论。
+
+阈值只在策略对象上；批量与运行上限在 job 侧：
+
+| 参数 | 位置 | 缺省 |
+| --- | --- | --- |
+| 批量上限 | `jobOptions.batch_size`，`run({ batchSize })` 覆盖 | `DEFAULT_SKILL_PROMOTION_BATCH_SIZE`（20） |
+| 墙钟上限 | `jobOptions.max_duration_ms`，`run({ maxDurationMs })` 覆盖 | `DEFAULT_SKILL_PROMOTION_MAX_DURATION_MS`（60s） |
+| 租约时长 | `jobOptions.lease_ms` | `DEFAULT_DELIVERY_LEASE_MS`（60s） |
+| 重试预算 | `DEFAULT_PROMOTION_RETRY_POLICY`：5 次投递，30s 起指数退避，上限 15min | job 没有覆盖项；要改用 repository 的 `claimNextPromotionCandidate` / `failPromotion` 请求上的 `policy` |
+
+**策略版本是一道断言，不是开关**：`run({ strategy_version })` 与注入策略的 `version` 不一致时
+job 拒绝启动（抛错），且在开 run **之前**拒绝——审计里记下的版本必须就是真正判定用的那一个。
+
+### 手动跑一次
+
+```ts
+import { DefaultSkillPromotionJob, DefaultPromotionStrategy } from './memory';
+
+const job = new DefaultSkillPromotionJob({
+  repository,               // MemoryRepository
+  runStore,                 // MaintenanceRunStore
+  strategy: new DefaultPromotionStrategy({ approval: 'auto_approve' }),
+  worker_id: 'cron-skill-promotion',
+  role_id: 'role_frontend', // 省略则跨 role
+  batch_size: 20,
+});
+
+const controller = new AbortController();
+process.on('SIGTERM', () => controller.abort());
+
+const result = await job.run({
+  batchSize: 50,          // 覆盖 job 配置
+  approval: 'auto_approve',
+  dryRun: false,
+  restoreExpired: true,   // 缺省 true：跑之前先把过期租约放回队列
+  signal: controller.signal,
+});
+
+result.stop_reason; // no_work | batch_size | max_duration | aborted | worker_error
+result.counts;      // claimed / completed / retried / dead_letter / skipped / failure
+result.outcomes;    // 逐条：status、decision、failure、skill_id、warnings
+```
+
+- **优雅停止**（`signal`）只影响「要不要再 claim 下一条」：在途的那条照常跑完。停止判据固定按
+  「停止信号 → 到量 → 超时」的顺序判断。
+- **`restoreExpired: false`** 只是少做一次「跑之前先捞一遍」的扫描，不是让过期持有卡住：
+  claim 自己会回收过期租约。
+- **`dryRun: true`** 照常筛候选、照常问策略，但**不 claim、不写任何状态**，连启动恢复都不做；
+  结论只作为投影留在 `outcomes` 里（每条带 `Dry run:` 开头的 warning），run 的六个计数**一律为 0**
+  ——一次什么都没写的运行不该在吞吐指标里留下数字。演练同样做判定契约校验，一份自相矛盾的
+  判定记成 `failed`，不会伪装成 promoted / pending_review / rejected 里的任何一个。
+
+### 查一次晋升运行
+
+run 记在注入的 `MaintenanceRunStore` 上，`job_type` 是 `skill_promotion`：
+
+```ts
+const runs = await runStore.list({ job_type: 'skill_promotion', worker_id: 'cron-skill-promotion' });
+const run = await runStore.get(result.run.run_id);
+```
+
+`MaintenanceRun` 的字段：`run_id` / `job_type` / `status`（`running` / `completed` / `failed`）/
+`worker_id` / `started_at` / `finished_at`（终止态才有）/ 六个计数 / `last_error`。
+
+- **`status: 'completed'` 不代表这一批全都晋升了**：一次「3 条晋升、1 条死信」的运行是正常的运行，
+  它说的是「外壳自己没出故障」。逐条的成败看计数。
+- **`failed` 只有一种成因**：外壳自己读不动存储（例如 claim 抛错）。候选自己的失败不会把 run
+  标成 failed。
+- `last_error` 是给人看的一句话：优先写最后一条带失败的候选（`role_id/experience_id: code: message`），
+  没有候选失败时才写外壳自己的故障。
+- 逐条的诊断面在 `result.outcomes` 里、不落 run：`decision`（策略判了什么）、`failure`（规范化
+  失败码与可重试性）、`skill_id`、`warnings`。run 只留计数与一句结论。
+- 策略版本**不在 run 记录上**（`MaintenanceRun` 没有这个字段），它在 `result.strategy_version` 与
+  每条 Experience 的 `promotion.strategy_version` 上。
+
+### `pending_review` 怎么办
+
+`approval: 'manual_review'` 下判定合格的候选落成 `pending_review`：**不写任何 Skill**，只把结论
+记在经验的晋升标记上。它不会永远等下去——后续一次 `auto_approve` 的运行会把同一条候选**重新
+评估**并晋升：
+
+```ts
+await job.run({ approval: 'manual_review' }); // → pending_review，不写 Skill
+await job.run({ approval: 'manual_review' }); // 同一模式再跑：不重复 claim 已判过的
+await job.run({ approval: 'auto_approve' });  // → 重新评估，这一次写出 Skill
+```
+
+四种状态怎么区分（`promotionStateLabel(experience)` 把存储上的两列派生出一个词）：
+
+| 标签 | 存储上的形状 | 含义 | 谁来推进 |
+| --- | --- | --- | --- |
+| `pending_review` | `status='processed'` + `outcome='pending_review'` | 判定合格，等人工放行 | 下一次 `auto_approve` 运行 |
+| `retryable` | `status='pending'` + `attempt_count > 0` | 上次失败，等退避到期 | 自动（退避窗口过后） |
+| `processing` | `status='processing'` | 正被某个 worker 持有 | 持有者；租约过期后由恢复/claim 回收 |
+| `dead_letter` | `status='dead_letter'` | 用满次数或不可重试 | **只由人工** `retryDeadLetterPromotion` |
+
+### 失败与死信
+
+失败一律带规范化分类（`code` + `message` + `retryable`），落盘在经验的 `promotion.last_error` 上，
+同时出现在 `outcome.failure` 与 run 的 `last_error` 里。
+
+| 情形 | 分类 | 去向 |
+| --- | --- | --- |
+| 连接 / 超时类 errno | `downstream_unavailable` | 退避重投 |
+| 其余未知 | `unknown` | 退避重投（有上限） |
+| Agent 不在了 | `delivery_missing` | 死信 |
+| 载荷解析不了 / 策略判定违反契约 | `payload_unreadable` | 死信 |
+| 权限、路径类 errno / 技能引用不成立 | `storage_error` | 死信 |
+| Skill 写了、经验没回写 | `storage_error`（显式可重试） | 退避重投，复用同一条 Skill |
+| 用满 `max_attempts`（可重试也一样） | —— | 死信 |
+
+**死信只由人工放回**，自动路径不会再碰它：
+
+```ts
+const revived = await repository.retryDeadLetterPromotion({ role_id, experience_id, now });
+```
+
+排查看三处：经验标记上的 `last_error`（最近一次的原因）、`attempt_count`（投递了几次）、
+`strategy_version`（上一次结论按哪一版判据落的）。判定契约错误还在错误对象上带稳定标识
+（`contract_code` / `violation` / `expected` / `actual`），聚合「策略到底错在哪」时读它们，
+不要读 message 文本。
+
+### 为什么不会重复晋升
+
+三条独立的防线，缺一条都会攒出重复技能：
+
+1. **幂等键 `(role_id, promoted_from)`**：一条经验最多对应一条技能，由存储的唯一约束保证
+   （Pg 是部分唯一索引，内存实现走同一份判据）。写入走 `saveSkillIfAbsent()`：命中已有条目就
+   原样返回它并报 `created: false`，不新建、不覆盖、不重复计数。
+2. **两段写的顺序**：先写 Skill、再回写经验。第二步失败时整条重投，重投会在第一步命中同一条
+   Skill——「同一 Experience 不产生第二条 Skill」的依据在这里，而不是靠调用方记住上一轮写过什么。
+   经验的 `promoted_to` 与晋升结论由 `completePromotion()` **一次**条件写落定，因此不存在
+   「Skill 已存在、经验还没绑上」这个可被读到的中间态。
+3. **claim token fencing**：每次 claim 发一个新 token，`completePromotion()` / `failPromotion()`
+   都要求原样带回。token 不匹配、租约过期或状态已变，写回**什么都不做**（返回 `undefined`）——
+   落盘的责任归当前持有者，旧持有者盖不掉新持有者的结论。
+
+多 worker 并发跑同一批时，同一条候选只会被一个 worker claim 到（claim 是条件写），因此技能数
+不变，也不会出现两条经验绑到同一个 Skill。
+
+### 后端支持边界
+
+| 后端 | Skill Promotion | 说明 |
+| --- | --- | --- |
+| `InMemoryRepository` | 支持 | **测试用途**。它不假装持久化——进程重启等于清空 |
+| `PgMemoryRepository`（PGlite 或外部 PostgreSQL） | 支持，**生产用这个** | 晋升状态嵌在 Experience 载荷里；幂等键是 `memory_skills.promoted_from` 上的部分唯一索引 |
+| File 适配器 | **不支持完整 Skill Promotion** | 缺 `FileMemoryRepository`，见下 |
+
+**File 后端当前不支持 Skill Promotion，缺的是 `FileMemoryRepository`。** 三个 File 适配器实现的是
+另外三个端口——`FileBufferRepository`（Buffer）、`FileMemoryDeliveryRepository`（交付 / 反馈 outbox）、
+`FileMaintenanceRunStore`（run 审计）。晋升要的读写面（`claimNextPromotionCandidate` /
+`completePromotion` / `saveSkillIfAbsent` / `listSkills` …）长在 `MemoryRepository` 上，而
+`MemoryRepository` 只有 InMemory 与 Pg 两个实现。生产装配正是这样混用的：Buffer 走
+`FileBufferRepository`，经验与技能那半边接 `PgMemoryRepository`。
+
+因此 **`FileMaintenanceRunStore` 只负责 run 审计，不能当晋升存储用**。把 File 适配器接进
+`DefaultSkillPromotionJob` 在类型层就不通过（相对端口缺 35 个成员），运行时也会如实收成
+`worker_error` / `run.status='failed'`，不会退化成看起来健康的空跑。这条边界由
+`test/file-maintenance-boundary.test.ts` 钉住。
+
+### 架构边界
+
+- **没有改在线 Driver API**，也没有新增前端接口：晋升不经过 RPC 面，调用方是进程内的维护 runner。
+- **Context consumer 不触发晋升，Feedback consumer 也不触发**：四条维护通道各自独立，靠调度器
+  分别触发；`scheduleBuffer()` 只登记交付项。
+- **晋升仍由独立 job 触发**：`DefaultSkillPromotionJob.run()` 是唯一入口，它不调用上面两条通道，
+  也不被它们调用。
+- **Persona Evolution 不在本阶段**：`index.ts` 里没有任何晋升 job 的 Persona 入口；把 job 接进
+  调度器（谁在什么时候跑它）属于后续阶段。
 
 ## 测试
 
@@ -368,3 +564,9 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 ### 11. PG Repository 测试未纳入 CI
 
 `pg-memory-repository.test.ts` 整个测试套件在缺少 `MEMORY_PG_TEST_URL` 环境变量时**完全跳过**（使用 `describe.skip`）。由于 CI 环境通常不提供 PostgreSQL 实例，这些测试从未在 CI 中运行，`PgMemoryRepository` 的回归无法被自动化捕获。
+
+### 12. Skill Promotion 不支持 File 后端
+
+维护通道的 Skill 晋升需要一个实现了 `MemoryRepository` 的存储，而现有实现只有 `InMemoryRepository`（测试用）与 `PgMemoryRepository`（生产用）——**没有 `FileMemoryRepository`**。`FileBufferRepository` / `FileMemoryDeliveryRepository` / `FileMaintenanceRunStore` 分别是 Buffer、交付 outbox 与 run 审计存储，任何一个都不能当晋升存储用：把 File 适配器接进 `DefaultSkillPromotionJob` 在类型层就不通过（相对端口缺 35 个成员），运行时也会如实收成 `worker_error` / `run.status='failed'`。这条边界由 `test/file-maintenance-boundary.test.ts` 钉住，详见「Skill 晋升 Job」一节的「后端支持边界」。若要让纯 File 部署也能晋升，需要单独批准一个 FileMemoryRepository 的实现计划——本阶段刻意没有临时实现它。
+
+顺带一条同源的边界：晋升契约目前只在 **PGlite** 上执行。外部 PostgreSQL 那条腿（`pg-memory-repository.test.ts`）不含晋升用例，且缺 `MEMORY_PG_TEST_URL` 时整份跳过（见问题 #11）。
