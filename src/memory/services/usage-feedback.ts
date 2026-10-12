@@ -181,8 +181,12 @@ export async function recomputeAvgConfidence(
  * 抽出来是因为「均值怎么算」正是并发回写最容易漂移的地方：进程内实现要在**同一段
  * 同步临界区**里算出它，数据库实现要在**同一个事务**里算出它——两边都得先拿到
  * 一份经验集合，再把这同一份算术用上。算法只写一处，两条腿就不会各算各的。
+ *
+ * 参数收成结构类型（只要有 `confidence`）：Phase 4 的输入快照里每一条经验也是这个形状，
+ * 让它复用同一份算术，而不是在那边再写一遍 `sum / length`。多一处算术就多一个会漂的位数，
+ * 而「均值保留几位」这种约定恰恰是最容易两边不一致的地方。
  */
-export function averageConfidence(experiences: readonly ExperienceRecord[]): number {
+export function averageConfidence(experiences: readonly { confidence: number }[]): number {
   if (experiences.length === 0) return 0;
   const sum = experiences.reduce((total, experience) => total + experience.confidence, 0);
   return round3(sum / experiences.length);

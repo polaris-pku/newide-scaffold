@@ -565,8 +565,8 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 
 `pg-memory-repository.test.ts` 整个测试套件在缺少 `MEMORY_PG_TEST_URL` 环境变量时**完全跳过**（使用 `describe.skip`）。由于 CI 环境通常不提供 PostgreSQL 实例，这些测试从未在 CI 中运行，`PgMemoryRepository` 的回归无法被自动化捕获。
 
-### 12. Skill Promotion 不支持 File 后端
+### 12. Skill Promotion 与 Persona Evolution 都不支持 File 后端
 
-维护通道的 Skill 晋升需要一个实现了 `MemoryRepository` 的存储，而现有实现只有 `InMemoryRepository`（测试用）与 `PgMemoryRepository`（生产用）——**没有 `FileMemoryRepository`**。`FileBufferRepository` / `FileMemoryDeliveryRepository` / `FileMaintenanceRunStore` 分别是 Buffer、交付 outbox 与 run 审计存储，任何一个都不能当晋升存储用：把 File 适配器接进 `DefaultSkillPromotionJob` 在类型层就不通过（相对端口缺 35 个成员），运行时也会如实收成 `worker_error` / `run.status='failed'`。这条边界由 `test/file-maintenance-boundary.test.ts` 钉住，详见「Skill 晋升 Job」一节的「后端支持边界」。若要让纯 File 部署也能晋升，需要单独批准一个 FileMemoryRepository 的实现计划——本阶段刻意没有临时实现它。
+维护通道里需要 `MemoryRepository` 的两条通道——Skill Promotion（Phase 3）与 Persona Evolution（Phase 4）——都只能跑在实现了该端口的存储上，而现有实现只有 `InMemoryRepository`（测试用）与 `PgMemoryRepository`（生产用），**没有 `FileMemoryRepository`**。`FileBufferRepository` / `FileMemoryDeliveryRepository` / `FileMaintenanceRunStore` 分别是 Buffer、交付 outbox 与 run 审计存储，任何一个都不能当晋升或演化存储用：把 File 适配器接进 `DefaultSkillPromotionJob` 在类型层就不通过（相对端口缺 35 个成员），运行时也会如实收成 `worker_error` / `run.status='failed'`。这条边界由 `test/file-maintenance-boundary.test.ts` 钉住，详见「Skill 晋升 Job」一节的「后端支持边界」。若要让纯 File 部署也能晋升或演化，需要单独批准一个 FileMemoryRepository 的实现计划——本阶段刻意没有临时实现它。
 
-顺带一条同源的边界：晋升契约目前只在 **PGlite** 上执行。外部 PostgreSQL 那条腿（`pg-memory-repository.test.ts`）不含晋升用例，且缺 `MEMORY_PG_TEST_URL` 时整份跳过（见问题 #11）。
+顺带一条同源的边界：晋升与演化契约目前都只在 **PGlite** 上执行。外部 PostgreSQL 那条腿（`pg-memory-repository.test.ts`）不含这两条通道的用例，且缺 `MEMORY_PG_TEST_URL` 时整份跳过（见问题 #11）。

@@ -136,6 +136,17 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
     );
   `);
 
+  // Persona 演化标记（Phase 4-B）：可空，缺席即「这条演化流还没被人碰过」。
+  //
+  // 与 `persona` / `handle` 分列而不是塞进其中任何一个，理由是它属于**维护状态**：
+  // `handle` 是前端与 Coordinator 读的那份载荷（不该多出 claim token、重试次数与失败原因），
+  // 而 `persona` 是一次演化的产物（把「上一次怎么演化来的」记进产物会让两者互相耦合，
+  // 前端 PATCH Persona 时还得决定这一组字段怎么办）。
+  //
+  // `ADD COLUMN IF NOT EXISTS` 而不是改 CREATE TABLE：已有库里这张表早就建好了，
+  // 只改 CREATE 语句对它们等于没改。与 `promoted_from` 同一套迁移方式（幂等、可重复执行）。
+  await pool.query(`ALTER TABLE memory_agents ADD COLUMN IF NOT EXISTS persona_evolution JSONB;`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS memory_skills (
       id UUID PRIMARY KEY,

@@ -14,11 +14,12 @@
  *    `memory-delivery-store.test.ts`、`maintenance-run-store.test.ts`）。那些用例不在这里重复；
  *    这里只把与晋升直接相邻的两条（run 记录如实落盘、损坏记录不装成一条 run）在**晋升这个
  *    用法**下再钉一遍。
- * 2. **File 不能承载的是经验与技能那半边。** Skill Promotion 的每一步——扫候选、claim 一条、
- *    结论落地、Skill 幂等写入——都长在 `MemoryRepository` 端口上，而**没有任何 File 适配器
- *    实现那个端口**。所以今天不存在「File 后端的 Skill Promotion」，缺的是一个
- *    `FileMemoryRepository`，不是缺一条接线。把 FileBufferRepository 或 FileMaintenanceRunStore
- *    当成完整晋升存储是错的：前者是 Buffer 存储，后者是 run 审计存储。
+ * 2. **File 不能承载的是经验与技能那半边。** Skill Promotion 的每一步（扫候选、claim 一条、
+ *    结论落地、Skill 幂等写入）与 Persona Evolution 的每一步（按角色 claim、条件写新版本、
+ *    失败落盘）都长在 `MemoryRepository` 端口上，而**没有任何 File 适配器实现那个端口**。
+ *    所以今天不存在「File 后端的晋升或演化」，缺的是一个 `FileMemoryRepository`，不是缺一条
+ *    接线。把 FileBufferRepository 或 FileMaintenanceRunStore 当成完整存储是错的：前者是
+ *    Buffer 存储，后者是 run 审计存储。
  * 3. **边界必须"响"**。装配错了不能退化成一类看起来健康的空跑——一次把 File 适配器接进
  *    `DefaultSkillPromotionJob` 的运行会如实收成 `worker_error` / `run.status='failed'`，
  *    而不是 `no_work`。这与「缺的那一半没有静默替身」是同一件事。
@@ -33,6 +34,7 @@ import { FileBufferRepository } from '../adapters/file-buffer-repository';
 import { FileMaintenanceRunStore } from '../adapters/file-maintenance-run-store';
 import { FileMemoryDeliveryRepository } from '../adapters/file-memory-delivery';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
+import { PgMemoryRepository } from '../adapters/pg-memory-repository';
 import { DefaultPromotionStrategy } from '../adapters/default-promotion-strategy';
 import { DefaultSkillPromotionJob } from '../runtime/skill-promotion-job';
 import { buildContextDeliveryItem } from '../services/context-delivery';
@@ -75,7 +77,30 @@ const PROMOTION_REPOSITORY_METHODS = [
   'listSkills',
 ] as const satisfies ReadonlyArray<keyof MemoryRepository>;
 
-describe('File 后端与 Skill Promotion 的边界', () => {
+/**
+ * Persona 演化用到的 `MemoryRepository` 能力（Phase 4-B）。
+ *
+ * 与上面那份清单同一个用途：晋升与演化都长在这个端口上，而**File 一个实现都没有**。
+ * 两份分开列是因为它们各自对应一条通道——将来若只给其中一条补了存储，这里能指出是哪一条。
+ */
+const PERSONA_EVOLUTION_REPOSITORY_METHODS = [
+  // 候选与 claim（状态挂在 Agent 记录上）
+  'getPersonaEvolutionMarker',
+  'claimNextPersonaEvolutionCandidate',
+  'getPersona',
+  'listAgentIds',
+  // 结论落地与失败落盘
+  'completePersonaEvolution',
+  'failPersonaEvolution',
+  'restoreExpiredPersonaEvolutionClaims',
+  'retryDeadLetterPersonaEvolution',
+  // 写入的产物与写回的输入
+  'savePersona',
+  'listSkills',
+  'listExperiences',
+] as const satisfies ReadonlyArray<keyof MemoryRepository>;
+
+describe('File 后端与维护通道的边界', () => {
   it('能承载的那一半：skill_promotion 的 run 记录如实落盘，换个实例读得回来，且不留临时文件', async () => {
     const root = await tempRoot();
     const store = new FileMaintenanceRunStore({ root });
@@ -138,28 +163,75 @@ describe('File 后端与 Skill Promotion 的边界', () => {
     expect(await store.get('run_misshapen')).toBeUndefined();
   });
 
-  it('三个 File 适配器都不提供晋升所需的 MemoryRepository 能力', async () => {
+  it('三个 File 适配器都不提供晋升与演化所需的 MemoryRepository 能力', async () => {
     const root = await tempRoot();
     const fileAdapters = {
       FileBufferRepository: new FileBufferRepository({ agentStateRoot: root }),
       FileMemoryDeliveryRepository: new FileMemoryDeliveryRepository({ agentStateRoot: root }),
       FileMaintenanceRunStore: new FileMaintenanceRunStore({ root }),
     };
+    const lists = {
+      SkillPromotion: PROMOTION_REPOSITORY_METHODS,
+      PersonaEvolution: PERSONA_EVOLUTION_REPOSITORY_METHODS,
+    };
 
-    // 清单不是空的：真正的实现必须有这些能力，否则下面的断言测的是「一个不存在的清单」
+    // 清单不是空的：真正的实现必须有这些能力，否则下面的断言测的是「一个不存在的清单」。
+    // 两条通道各核一遍，而且核到**生产用的 Pg 实现**的原型上——只核内存实现的话，
+    // 「清单写对了、但生产后端其实没有」这种情况看不出来。
     const realRepository = new InMemoryRepository();
-    for (const method of PROMOTION_REPOSITORY_METHODS) {
-      expect(typeof realRepository[method], `InMemoryRepository.${method}`).toBe('function');
+    for (const [channel, methods] of Object.entries(lists)) {
+      for (const method of methods) {
+        expect(typeof realRepository[method], `InMemoryRepository.${channel}.${method}`).toBe(
+          'function',
+        );
+        expect(
+          typeof (PgMemoryRepository.prototype as unknown as Record<string, unknown>)[method],
+          `PgMemoryRepository.${channel}.${method}`,
+        ).toBe('function');
+      }
     }
 
     for (const [name, adapter] of Object.entries(fileAdapters)) {
-      for (const method of PROMOTION_REPOSITORY_METHODS) {
-        expect(
-          (adapter as unknown as Record<string, unknown>)[method],
-          `${name}.${method}`,
-        ).toBeUndefined();
+      for (const [channel, methods] of Object.entries(lists)) {
+        for (const method of methods) {
+          expect(
+            (adapter as unknown as Record<string, unknown>)[method],
+            `${name}.${channel}.${method}`,
+          ).toBeUndefined();
+        }
       }
     }
+  });
+
+  it('能承载的那一半（续）：persona_evolution 的 run 记录同样如实落盘并读得回来', async () => {
+    const root = await tempRoot();
+    const store = new FileMaintenanceRunStore({ root });
+
+    const run = await store.start({
+      job_type: 'persona_evolution',
+      worker_id: 'worker-file',
+      run_id: 'run_persona_boundary',
+      now: START,
+    });
+    const finished = await store.finish(run.run_id, {
+      claimed_count: 2,
+      completed_count: 1,
+      skipped_count: 1,
+      now: START,
+    });
+    expect(finished).toMatchObject({
+      job_type: 'persona_evolution',
+      status: 'completed',
+      claimed_count: 2,
+      completed_count: 1,
+      skipped_count: 1,
+      failure_count: 0,
+    });
+
+    // 同样是「一条 run 一个文件 + 换实例读得回来」：审计那半边不因通道不同而不同
+    expect(await readdir(root)).toEqual(['run_persona_boundary.json']);
+    const revived = new FileMaintenanceRunStore({ root });
+    expect(await revived.get(run.run_id)).toEqual(finished);
   });
 
   it('把 File 适配器接进晋升 job：类型层就不成立，运行起来也如实收成失败的 run', async () => {

@@ -31,7 +31,12 @@ import {
   knownDeliveryFailure,
   type DeliveryFailureClassification,
 } from './delivery-error-classification';
-import type { MaintenanceFailureCode, PersonaDef } from '../schemas';
+import type {
+  MaintenanceFailureCode,
+  PersonaDef,
+  PersonaEvolutionMarker,
+  PersonaEvolutionOutcome,
+} from '../schemas';
 import {
   PERSONA_EVOLUTION_APPROVAL_MODES,
   PERSONA_EVOLUTION_BLOCKER_RULES,
@@ -124,6 +129,47 @@ export function summarizePersonaEvolutionChange(input: {
     + `${String(input.eligible_experience_count)} experiences `
     + `(snapshot ${input.input_snapshot_hash.slice(0, 12)}).`
   );
+}
+
+/**
+ * 把一条结论摊进演化标记，交给 `completeDeliveryRecord` 去做状态转移（两个适配器共用）。
+ *
+ * 放在服务层而不是各适配器各写一份：这些字段是**审计**，两条腿写出来的东西必须逐字相同
+ * ——「同一个结论在内存后端记了 change_summary、在 Pg 后端没记」这种差异不会被任何一条
+ * 单腿测试发现，只会让人在生产上读不到本以为有的字段。
+ *
+ * `persona_version` 只在 `evolved` 时记：其余两种结论没有写出版本，留着一个版本号会让
+ * 「这一版是谁写的」出现第二个说法（权威是 Persona 自己的 `version`）。显式写成 undefined
+ * 而不是省略键，是为了让「结论换了、旧版本号跟着清掉」在代码里看得见。
+ */
+export function personaEvolutionSettlement(
+  marker: PersonaEvolutionMarker,
+  request: {
+    outcome: PersonaEvolutionOutcome;
+    parent_version: number;
+    strategy_version: string;
+    input_snapshot_hash: string;
+    source_run_id: string;
+    reasons: string[];
+    change_summary?: string | undefined;
+    reviewed_by?: string | undefined;
+    now: string;
+  },
+): PersonaEvolutionMarker {
+  const evolved = request.outcome === 'evolved';
+  return {
+    ...marker,
+    outcome: request.outcome,
+    parent_version: request.parent_version,
+    persona_version: evolved ? request.parent_version + 1 : undefined,
+    strategy_version: request.strategy_version,
+    input_snapshot_hash: request.input_snapshot_hash,
+    source_run_id: request.source_run_id,
+    evaluated_at: request.now,
+    reasons: [...request.reasons],
+    ...(request.change_summary !== undefined ? { change_summary: request.change_summary } : {}),
+    ...(request.reviewed_by !== undefined ? { reviewed_by: request.reviewed_by } : {}),
+  };
 }
 
 // ═══════════════════════════════════════════
