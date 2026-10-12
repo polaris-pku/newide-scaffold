@@ -739,3 +739,104 @@ export const DriverFeedbackRecordSchema = z.object({
   ...deliveryLifecycleFields,
 });
 export type DriverFeedbackRecord = z.infer<typeof DriverFeedbackRecordSchema>;
+
+// ═══════════════════════════════════════════
+//  Maintenance Run（维护任务运行记录）
+// ═══════════════════════════════════════════
+
+/**
+ * 维护 job 的种类。取值就是「谁在跑」：四条消费者通道（上下文交付、反馈消费、
+ * 反馈归并）与两个演化 job（技能晋升、Persona 演化）各有自己的 run。
+ *
+ * 反馈归并（`feedback_reconcile`）单列，而不是并进 `driver_feedback`：它由独立的
+ * 周期任务驱动、失败上限与保留期限另算，观测上要能和「消费新反馈」分开看积压。
+ */
+export const MaintenanceJobTypeSchema = z.enum([
+  'context_delivery',
+  'driver_feedback',
+  'feedback_reconcile',
+  'skill_promotion',
+  'persona_evolution',
+]);
+export type MaintenanceJobType = z.infer<typeof MaintenanceJobTypeSchema>;
+
+/**
+ * 维护 run 的生命周期。`running` 是唯一的非终止态：一个 run 要么正常收尾
+ * （`completed`），要么带着失败原因收尾（`failed`）。run 只描述「这一次运行」，
+ * 不承载业务事务语义——它失败不代表交付项失败，反之亦然。
+ */
+export const MaintenanceRunStatusSchema = z.enum(['running', 'completed', 'failed']);
+export type MaintenanceRunStatus = z.infer<typeof MaintenanceRunStatusSchema>;
+
+/**
+ * 规范化失败码。日志与指标只带 message 而不带关联 id/code 时，同一种故障在
+ * 不同 run 里长得不一样，积压与复发就无从聚合。枚举刻意小：新增码意味着
+ * 「这一族失败值得单独观测」，不该随手加。
+ */
+export const MaintenanceFailureCodeSchema = z.enum([
+  /** 交付记录在存储里找不到（被并发删掉，或引用了不存在的 id） */
+  'delivery_missing',
+  /** 交付项引用的 payload 读不出来：坏输入，重试无意义 */
+  'payload_unreadable',
+  /** 下游系统/连接不可用：可重试 */
+  'downstream_unavailable',
+  /** 模型调用失败（超时、限流、返回不可解析）：可重试 */
+  'model_error',
+  /** 存储读写失败：可重试 */
+  'storage_error',
+  /** 策略判定为不可晋升/不可演化：不是故障，是结论 */
+  'policy_rejected',
+  /** 没能归入以上任何一类的失败 */
+  'unknown',
+]);
+export type MaintenanceFailureCode = z.infer<typeof MaintenanceFailureCodeSchema>;
+
+/** 规范化失败描述：code 用于聚合，message 用于人读 */
+export const MaintenanceFailureSchema = z.object({
+  code: MaintenanceFailureCodeSchema,
+  message: z.string(),
+});
+export type MaintenanceFailure = z.infer<typeof MaintenanceFailureSchema>;
+
+/**
+ * 一次维护 run 的计数。六个计数各自对应一种终局，`claimed_count` 是入口口径、
+ * 其余五个是出口口径——同一次 run 里，出口只可能落在其中一个上。
+ */
+export const MaintenanceRunCountsSchema = z.object({
+  /** 本次 claim 到的交付项/候选数 */
+  claimed_count: z.number().int().min(0).default(0),
+  /** 处理成功并已推进到终态的数量 */
+  completed_count: z.number().int().min(0).default(0),
+  /** 失败但退避后会再来的数量 */
+  retried_count: z.number().int().min(0).default(0),
+  /** 用尽次数或明确不可重试、进了死信的数量 */
+  dead_letter_count: z.number().int().min(0).default(0),
+  /** 本次无事可做而跳过的数量（记录不在预期状态、已被别人处理走等） */
+  skipped_count: z.number().int().min(0).default(0),
+  /** 本 run 自身的失败条数（异常而非交付失败） */
+  failure_count: z.number().int().min(0).default(0),
+});
+export type MaintenanceRunCounts = z.infer<typeof MaintenanceRunCountsSchema>;
+
+/**
+ * 维护 run — 观测与审计实体，**不是业务事务边界**。
+ *
+ * 它回答的是「这一次调度发生了什么、多久、带走了什么失败码」，不参与
+ * 交付状态机：run 结束不改变任何交付项的状态，交付项的状态也不回写 run。
+ * 因此两个 store 上的并发（同一交付项被两个 run 各处理一次）不构成冲突——
+ * 收敛交付项靠的是交付存储自己的原子 claim。
+ */
+export const MaintenanceRunSchema = z.object({
+  run_id: z.string(),
+  job_type: MaintenanceJobTypeSchema,
+  status: MaintenanceRunStatusSchema,
+  /** 执行这次的 worker / 消费者标识（与交付项 claim_owner 同源） */
+  worker_id: z.string(),
+  started_at: z.iso.datetime(),
+  /** 终止态才有；`running` 时缺席 */
+  finished_at: z.iso.datetime().optional(),
+  ...MaintenanceRunCountsSchema.shape,
+  /** 终局失败原因（`failed` 时保留；`completed` 也可带，表示部分失败） */
+  last_error: z.string().optional(),
+});
+export type MaintenanceRun = z.infer<typeof MaintenanceRunSchema>;
