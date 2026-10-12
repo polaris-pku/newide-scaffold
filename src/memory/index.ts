@@ -621,9 +621,15 @@ export type {
 } from './ports/memory-repository';
 export {
   AGENT_MISSING_PREFIX,
+  PROMOTION_DECISION_CONTRACT_CODE,
+  PromotionDecisionContractError,
+  assertPromotionDecisionConsistent,
   buildPromotedSkill,
   classifyPromotionFailure,
+  describeContractFailure,
   executePromotionCandidate,
+  isPromotionDecisionContractError,
+  type PromotionDecisionViolation,
   type PromotionExecutionOptions,
   type PromotionExecutionResult,
   type PromotionExecutionStatus,

@@ -25,6 +25,15 @@
  * 下面那张分类表把它判为不可重试——**不会**把 `promoted_to` 写成指向别人的指针，也不会
  * 拿这条永远不会成立的引用去占满重试名额。
  *
+ * **策略返回值是一道契约**（`assertPromotionDecisionConsistent`）：判定合格与否不只是策略
+ * 自己的事，因为判定里有三个字段会被**原样写到别处**——`strategy_version` 进 Experience 的
+ * 晋升标记、`experience_id` 决定这条结论挂给谁、`approval` 决定这次是否允许写 Skill。一个
+ * 声明自己是 v1 却返回 v2 的策略会让经验记着 v2 而 run 记着 v1（同一条经验被两个版本各评
+ * 一次，审计分裂且反复重评），一条返回别人 id 的判定会把结论写到另一条经验上。这些都不是
+ * 「重投能修好」的抖动，而是配置/实现的错，因此在**写任何东西之前**就拒掉，按不可重试落盘
+ * 进死信，并在消息里带上期望值与实际值。校验刻意放在执行内核而不是 job 的入口：内核也可以
+ * 被别的调用方（脚本、后续的调度器）直接使用，契约不该由某一个外壳代为执行。
+ *
  * 失败一律走 `failPromotion`（带 claim token 的 fencing 写），由共享状态机决定是退避重投
  * 还是死信。分类表（`classifyPromotionFailure`）：
  *
@@ -33,6 +42,7 @@
  * | Agent 不在了 | delivery_missing | 死信——重投不会让 Agent 回来 |
  * | 载荷解析不了（ZodError） | payload_unreadable | 死信——重投读到的是同一份坏数据 |
  * | 技能引用不成立（不存在 / 跨 Agent / 来源不符） | storage_error | 死信——重投不会让这条引用成立 |
+ * | 策略返回的判定违反契约（版本/经验 id/审核模式/结论组合对不上） | payload_unreadable | 死信——同一次判定重投多少次都是同一份错结论 |
  * | 连接/超时类 errno | downstream_unavailable | 退避重投 |
  * | 权限/路径类 errno | storage_error | 死信 |
  * | Skill 写了、经验没回写 | storage_error（显式可重试）| 退避重投，重试复用同一条 Skill |
@@ -139,12 +149,29 @@ export async function executePromotionCandidate(
   const now = options.now ?? deps.now?.() ?? nowTimestamp();
   const { role_id, experience, claim_token, attempt_count } = candidate;
 
-  let decision: PromotionDecision;
+  let decision: PromotionDecision | undefined;
   try {
-    decision = await deps.strategy.evaluate({ role_id, experience, now, approval: options.approval });
+    // 先接住判定、再校验：校验要拒的正是这份判定，audit 里必须留着它到底返回了什么——只留
+    // 一句「对不上」而不留对不上的那个值，排查时还得去复现一次才看得到
+    decision = await deps.strategy.evaluate({
+      role_id,
+      experience,
+      now,
+      approval: options.approval,
+    });
+    // 契约校验必须在写任何东西之前：判定里的版本、经验 id 与审核模式都会被原样落到别处，
+    // 对不上就意味着这次执行会写出一条与 run 审计对不上的记录
+    assertPromotionDecisionConsistent(decision, {
+      experience_id: experience.id,
+      approval: options.approval,
+      strategy_version: deps.strategy.version,
+    });
   } catch (error) {
-    // 策略自己抛错（配置非法、注入的实现有 bug）：按通用分类落盘，不让它掀掉整批
-    return recordFailure(deps, candidate, classifyPromotionFailure(error), now, {});
+    // 策略自己抛错（配置非法、注入的实现有 bug）、或返回了一份对不上的判定：按通用分类落盘，
+    // 不让它掀掉整批
+    return recordFailure(deps, candidate, classifyPromotionFailure(error), now, {
+      ...(decision !== undefined ? { decision } : {}),
+    });
   }
 
   if (decision.verdict !== 'eligible') {
@@ -178,7 +205,10 @@ export async function executePromotionCandidate(
       claim_token,
       ...(deps.owner !== undefined ? { owner: deps.owner } : {}),
       outcome: 'promoted',
-      strategy_version: decision.strategy_version,
+      // 版本取注入策略的那一个：上面已经校验过判定自带的是同一个，这里用哪一个都不改变
+      // 结果，但取这一个让「run 记的版本 = 经验记的版本 = 真正判定用的版本」在写入口就是
+      // 同一个来源，而不是靠三处各自传递得恰好一致
+      strategy_version: deps.strategy.version,
       reasons: decision.reasons,
       skill_id: saved.skill.id,
       now,
@@ -218,6 +248,177 @@ export async function executePromotionCandidate(
     now,
     { decision, warnings, skill_reused: !saved.created },
   );
+}
+
+/**
+ * 错误对象上的稳定标识：跨进程、跨实例比对时不必依赖 `instanceof`（错误可能穿过多层包装）。
+ * 聚合「这一族失败」时读它，不要读 message。
+ */
+export const PROMOTION_DECISION_CONTRACT_CODE = 'promotion_decision_contract';
+
+/**
+ * 策略返回的判定违反契约。
+ *
+ * 与 `PromotionSkillIntegrityError` 同一种形状：错误对象上带着**稳定的机器可读标识**
+ * （`contract_code`）与逐条的现状值，聚合「这一族失败」时读标识，排查时读字段，两者都不必
+ * 依赖会变的消息文本。`expected` / `actual` 是排查这道题的唯一线索——「版本对不上」与
+ * 「版本对不上、该是 v1 实际是 v2」在事后是两条完全不同的线索。
+ */
+export class PromotionDecisionContractError extends Error {
+  readonly contract_code = PROMOTION_DECISION_CONTRACT_CODE;
+  /** 违反的是哪一条契约（按检查顺序，一次只报第一条） */
+  readonly violation: PromotionDecisionViolation;
+  readonly expected: string;
+  readonly actual: string;
+  readonly experience_id: string;
+
+  constructor(
+    message: string,
+    details: {
+      violation: PromotionDecisionViolation;
+      expected: string;
+      actual: string;
+      experience_id: string;
+    },
+  ) {
+    super(message);
+    this.name = 'PromotionDecisionContractError';
+    this.violation = details.violation;
+    this.expected = details.expected;
+    this.actual = details.actual;
+    this.experience_id = details.experience_id;
+  }
+}
+
+/** 这条错误是不是「策略判定违反契约」（按类与稳定 code 双重判定） */
+export function isPromotionDecisionContractError(
+  error: unknown,
+): error is PromotionDecisionContractError {
+  if (error instanceof PromotionDecisionContractError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  return (error as { contract_code?: unknown }).contract_code === PROMOTION_DECISION_CONTRACT_CODE;
+}
+
+/**
+ * 校验一条判定与本次执行是否自洽，不自洽就抛 `PromotionDecisionContractError`。
+ *
+ * 四条检查各自挡一类具体的事故，顺序也是「最先被写出去的那个字段」的顺序：
+ *
+ * 1. **版本** —— 判定说自己是 v2、注入的策略是 v1 时，经验会记着 v2、run 会记着 v1；
+ *    后果不止是审计对不上，还让这条经验被两个版本各判一次（版本是重评判据）。
+ * 2. **经验 id** —— 判定挂到别的经验上，晋升就会把结论与 `promoted_to` 写到一条没被
+ *    判过的经验上（技能那侧还有唯一键兜底，经验这侧没有）。
+ * 3. **审核模式** —— 判定说自己是 auto_approve、本次运行是 manual_review 时，人工审核的
+ *    约定会被悄悄放过（或反过来：合格的经验被记成待审核）。
+ * 4. **结论组合** —— `rejected` 必须给出挡住的规则与理由（否则「为什么被拒」不可审计），
+ *    `eligible` / `pending_review` 不得带挡住的规则（合格就不该有规则挡着）。
+ *
+ * 这是调用方与策略之间的契约，不是数据校验：策略是注入进来的，一份不自洽的判定只可能来自
+ * 配置错误或实现缺陷，重投多少次都是同一份，因此调用方一律判成不可重试。
+ */
+export function assertPromotionDecisionConsistent(
+  decision: PromotionDecision,
+  expected: {
+    /** 被判定的那条经验（候选自己带过来，权威） */
+    experience_id: string;
+    /** 本次运行的审核模式（运行选项，权威） */
+    approval: PromotionApprovalMode;
+    /** 注入策略的版本，也是 run 审计里记下的那一个 */
+    strategy_version: string;
+  },
+): void {
+  const { experience_id, approval, strategy_version } = expected;
+
+  if (decision.strategy_version !== strategy_version) {
+    throw contractError('strategy_version', {
+      expected: strategy_version,
+      actual: decision.strategy_version,
+      experience_id,
+      detail:
+        'the version recorded on the experience and on the run would split, and a version change '
+        + 'is what makes this candidate eligible for re-evaluation',
+    });
+  }
+
+  if (decision.experience_id !== experience_id) {
+    throw contractError('experience_id', {
+      expected: experience_id,
+      actual: decision.experience_id,
+      experience_id,
+      detail: 'the conclusion would be written to an experience the strategy never evaluated',
+    });
+  }
+
+  if (decision.approval !== approval) {
+    throw contractError('approval', {
+      expected: approval,
+      actual: decision.approval,
+      experience_id,
+      detail:
+        approval === 'manual_review'
+          ? 'it claims a verdict the run did not authorise, so a candidate under human review '
+            + 'would be settled as if it had been approved'
+          : 'it claims a verdict the run did not authorise, so a candidate allowed to be promoted '
+            + 'would be settled as if a human still had to look at it',
+    });
+  }
+
+  if (decision.verdict === 'rejected') {
+    if (decision.blocking_rules.length === 0) {
+      throw contractError('verdict_combination', {
+        expected: 'a rejected verdict with at least one blocking rule',
+        actual: 'a rejected verdict with no blocking rules',
+        experience_id,
+        detail: 'nothing would record why the candidate was turned down',
+      });
+    }
+    if (decision.reasons.length === 0) {
+      throw contractError('verdict_combination', {
+        expected: 'a rejected verdict with at least one reason',
+        actual: 'a rejected verdict with no reasons',
+        experience_id,
+        detail: 'the blocking rules would be recorded without an explanation',
+      });
+    }
+  } else if (decision.blocking_rules.length > 0) {
+    throw contractError('verdict_combination', {
+      expected: `blocking_rules to be empty for a "${decision.verdict}" verdict`,
+      actual: `blocking_rules ${JSON.stringify(decision.blocking_rules)}`,
+      experience_id,
+      detail: 'a candidate that qualifies cannot also be blocked by a rule',
+    });
+  }
+}
+
+/** 违反契约的四种形状（与检查顺序一致） */
+export type PromotionDecisionViolation =
+  | 'strategy_version'
+  | 'experience_id'
+  | 'approval'
+  | 'verdict_combination';
+
+function contractError(
+  violation: PromotionDecisionViolation,
+  details: { expected: string; actual: string; experience_id: string; detail: string },
+): PromotionDecisionContractError {
+  return new PromotionDecisionContractError(
+    `Promotion strategy returned an inconsistent decision for experience `
+      + `${details.experience_id} (${violation}): expected "${details.expected}", got `
+      + `"${details.actual}"; ${details.detail}. The decision contract is a configuration error, `
+      + 'not a transient failure, so this candidate is not retried.',
+    { violation, ...details },
+  );
+}
+
+/**
+ * 判定违反契约时，演练路径与执行内核共用的一句话。
+ *
+ * 抽出来是因为演练路径（job 的 previewOne）会**自己抛自己的**契约错误而不是走执行内核，
+ * 两处的诊断文案若各写一遍，早晚会对同一种不一致给出两种说法；而这条错误恰恰是要拿去做
+ * 跨 run 聚合的。期望值与实际值都在里面——那正是排查这道题需要的两个数。
+ */
+export function describeContractFailure(error: PromotionDecisionContractError): string {
+  return `The strategy returned a decision that violates the promotion contract (${error.violation}): expected "${error.expected}", got "${error.actual}".`;
 }
 
 /**
@@ -363,16 +564,23 @@ export function buildPromotedSkill(
 /**
  * 把执行期的异常映射成「可重试吗」与规范化失败码。
  *
- * 在通用分类之上只加一类判断：**归属的 Agent 不在了**。这不是「异常的形状」能回答的问题
- * （两个后端抛的都是普通 Error），所以判据取两个后端各自的固定信号：
+ * 在通用分类之上加三类判断，都是「异常的形状回答不了、只有本通道知道」的：
  *
- * - InMemory 的 `requireStore` 抛 `Agent not found: <id>`（`AGENT_MISSING_PREFIX`）；
- * - PG/PGlite 上这条状态其实不可达（`memory_experiences` 对 `memory_agents` 是
- *   `ON DELETE CASCADE`，Agent 没了经验也没了，根本扫不出候选），但若 INSERT 恰好撞上
- *   归属行消失，Postgres 报的是外键冲突 `23503`——一并按同一结论处理，免得它落进
- *   `unknown`（可重试）白重投五次。
+ * 1. **归属的 Agent 不在了**。两个后端抛的都是普通 Error，判据取它们各自的固定信号：
  *
- * 这两个信号由 promotion-executor 的契约测试钉住：适配器改了措辞或换了 SQLSTATE，那条
+ *    - InMemory 的 `requireStore` 抛 `Agent not found: <id>`（`AGENT_MISSING_PREFIX`）；
+ *    - PG/PGlite 上这条状态其实不可达（`memory_experiences` 对 `memory_agents` 是
+ *      `ON DELETE CASCADE`，Agent 没了经验也没了，根本扫不出候选），但若 INSERT 恰好撞上
+ *      归属行消失，Postgres 报的是外键冲突 `23503`——一并按同一结论处理，免得它落进
+ *      `unknown`（可重试）白重投五次。
+ *
+ * 2. **技能引用不成立**（`PromotionSkillIntegrityError`）：同一条不成立的引用，重投多少次
+ *    都不成立。
+ * 3. **策略判定违反契约**（`PromotionDecisionContractError`）：同一次判定重投多少次都还是
+ *    那一份，修它的是改配置或改实现。这一类按 `payload_unreadable` 落死信——它是「这条投递
+ *    的内容我读不懂」的另一种形状，与坏数据同一条理由，而不是 `unknown` 白占重试名额。
+ *
+ * 这些信号由 promotion-executor 的契约测试钉住：适配器改了措辞或换了 SQLSTATE，那条
  * 测试先红，而不是让分类悄悄退化。
  */
 export function classifyPromotionFailure(error: unknown): DeliveryFailureClassification {
@@ -384,6 +592,16 @@ export function classifyPromotionFailure(error: unknown): DeliveryFailureClassif
     return knownDeliveryFailure(
       'storage_error',
       `${message} (the reference itself is invalid, so retrying cannot fix it; this candidate needs human review)`,
+      false,
+    );
+  }
+  // 策略判定违反契约（版本 / 经验 id / 审核模式 / 结论组合）：同一次判定重投多少次都还是
+  // 那一份，修它的是改配置或改策略实现，不是再跑一遍。按 `payload_unreadable`（坏输入，
+  // 重试无意义）落死信，而不是掉进 `unknown`（可重试）白占五次名额。
+  if (isPromotionDecisionContractError(error)) {
+    return knownDeliveryFailure(
+      'payload_unreadable',
+      `${message} (the strategy decision itself is inconsistent, so retrying cannot fix it; this is a configuration error that needs a human)`,
       false,
     );
   }

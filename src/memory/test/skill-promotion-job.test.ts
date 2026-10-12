@@ -54,14 +54,22 @@ function runStoreRoot(): string {
 }
 import { ensurePgMemorySchema } from '../adapters/pg-memory-schema';
 import { DefaultSkillPromotionJob } from '../runtime/skill-promotion-job';
+import { promotionStateLabel } from '../services/promotion-candidates';
 import {
   DEFAULT_DELIVERY_LEASE_MS,
   DEFAULT_PROMOTION_RETRY_POLICY,
   addMilliseconds,
 } from '../services/delivery-lifecycle';
+import {
+  PROMOTION_DECISION_CONTRACT_CODE,
+  assertPromotionDecisionConsistent,
+  executePromotionCandidate,
+  isPromotionDecisionContractError,
+} from '../services/promotion-executor';
 import type { MaintenanceRunStore } from '../ports/maintenance-run-store';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type {
+  PromotionDecision,
   PromotionEvaluationInput,
   PromotionStrategy,
 } from '../ports/promotion-strategy';
@@ -197,6 +205,71 @@ const NO_FAILURES = {
   skipped_count: 0,
   failure_count: 0,
 };
+
+/**
+ * 让策略**照常判定**，但把判定里的某一个字段改掉之后再交回来。
+ *
+ * 契约校验要测的是「策略不老实」这一种故障，而真实的 `DefaultPromotionStrategy` 永远不会
+ * 返回一份自相矛盾的判定——所以只能在它外面改字段。刻意用 `base.evaluate` 的**真结论**做底：
+ * 这样「返回的判定与本次执行对不上」是唯一被注入的差异，失败一定能归因到契约校验，而不是
+ * 归因到某个假策略自己编的结论。
+ */
+function tamperingStrategy(
+  base: DefaultPromotionStrategy,
+  tamper: (decision: PromotionDecision, input: PromotionEvaluationInput, call: number) => PromotionDecision,
+): PromotionStrategy {
+  let calls = 0;
+  return {
+    version: base.version,
+    config: base.config,
+    evaluate: async (input) => {
+      calls += 1;
+      return tamper(await base.evaluate(input), input, calls);
+    },
+  };
+}
+
+/**
+ * 自称另一个版本的策略：**整体**换个版本（`version`、`config.version` 与判定自报的那一个
+ * 一起换）。
+ *
+ * 用它构造的是「运行与真跑的策略版本不是同一个」——run 会照着这个版本记审计。
+ */
+function selfDeclaredVersionStrategy(
+  base: DefaultPromotionStrategy,
+  version: string,
+): PromotionStrategy {
+  const config = { ...base.config, version };
+  return {
+    version,
+    config,
+    evaluate: async (input) => {
+      const decision = await base.evaluate(input);
+      return { ...decision, strategy_version: version };
+    },
+  };
+}
+
+/**
+ * 无论运行要求什么审核模式，都自称是 `fixed` 的那一个的策略。
+ *
+ * 这是「策略实现忽略运行选项」这一种配置错：运行让它在自动批准下判定，它却回一份写着
+ * manual_review 的结论（反过来也一样）。判定本身自洽，不自洽的是它与本次运行的关系。
+ */
+function claimingApprovalStrategy(
+  base: DefaultPromotionStrategy,
+  fixed: 'auto_approve' | 'manual_review',
+): PromotionStrategy {
+  const config = { ...base.config, approval: fixed };
+  return {
+    version: config.version,
+    config,
+    evaluate: async (input) => {
+      const decision = await base.evaluate(input);
+      return { ...decision, approval: fixed };
+    },
+  };
+}
 
 interface JobStoreCase {
   name: string;
@@ -653,6 +726,355 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       const result = await job().run({ strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION });
       expect(result.strategy_version).toBe(DEFAULT_PROMOTION_STRATEGY_VERSION);
       expect(result.counts.completed_count).toBe(1);
+    });
+
+    it('非法策略返回的判定：不写 Skill、不回写经验、判成不可重试并进死信，错误里带着两个版本', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const experience = experiences[0]!;
+      const claimed = await repository.claimNextPromotionCandidate({
+        role_id,
+        owner: 'worker-1',
+        now: clock.now(),
+        lease_ms: DEFAULT_DELIVERY_LEASE_MS,
+        strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+        approval: 'auto_approve',
+      });
+      expect(claimed?.experience.id).toBe(experience.id);
+      // claim 之后、判定之前的这一份快照，就是「本次执行一个字节都不该改」的基准
+      const before = await storedExperience(experience.id);
+
+      const lying = tamperingStrategy(autoApprove, (decision) => ({
+        ...decision,
+        strategy_version: 'promotion-threshold.v9',
+      }));
+
+      const result = await executePromotionCandidate(
+        { repository, strategy: lying, now: clock.now },
+        claimed!,
+        { approval: 'auto_approve', now: clock.now() },
+      );
+
+      expect(result.status).toBe('dead_letter');
+      expect(result.failure).toMatchObject({ code: 'payload_unreadable', retryable: false });
+      // 错误信息必须能回答「该是哪个版本、实际是哪个版本」
+      const reported = result.failure!.message;
+      expect(reported).toContain(DEFAULT_PROMOTION_STRATEGY_VERSION);
+      expect(reported).toContain('promotion-threshold.v9');
+      // 审计同样看得到那条错结论自报的版本（执行器把它留在结果里，人不必去猜）
+      expect(result.decision?.strategy_version).toBe('promotion-threshold.v9');
+
+      const stored = await storedExperience(experience.id);
+      expect(stored?.promotion?.status).toBe('dead_letter');
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(stored?.promotion?.strategy_version).toBeUndefined();
+      expect(stored?.promoted_to).toBeUndefined();
+      expect(stored?.promotion?.next_retry_at).toBeUndefined();
+      expect(stored?.promotion?.last_error).toContain('promotion-threshold.v9');
+      expect(stored?.promotion?.attempt_count).toBe(before?.promotion?.attempt_count);
+      // 没有晋升写入：没有 Skill、经验除晋升标记外与基准一致
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      expect(await repository.listExperiences(role_id)).toEqual([stored]);
+    });
+
+    it('策略返回的判定版本与 run 不符：run 记录的仍是注入策略的版本', async () => {
+      await seedExperiences(repository, role_id, 1);
+      const lying = tamperingStrategy(autoApprove, (decision) => ({
+        ...decision,
+        strategy_version: 'promotion-threshold.v9',
+      }));
+
+      const result = await job({ strategy: lying }).run({ batchSize: 5 });
+
+      // 运行的版本来自注入的策略，与判定自报的那一个无关
+      expect(result.strategy_version).toBe(DEFAULT_PROMOTION_STRATEGY_VERSION);
+      expect(result.outcomes[0]?.status).toBe('dead_letter');
+      expect(result.outcomes[0]?.decision?.strategy_version).toBe('promotion-threshold.v9');
+      expect(result.counts).toMatchObject({ claimed_count: 1, dead_letter_count: 1 });
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+    });
+
+    it('策略返回别的经验 id：不写任何东西，错误里带着两个经验 id', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const experience = experiences[0]!;
+      const other_id = randomUUID();
+      const lying = tamperingStrategy(autoApprove, (decision) => ({
+        ...decision,
+        experience_id: other_id,
+      }));
+
+      const result = await job({ strategy: lying }).run({ batchSize: 5 });
+
+      expect(result.outcomes[0]?.status).toBe('dead_letter');
+      expect(result.outcomes[0]?.experience_id).toBe(experience.id);
+      expect(result.outcomes[0]?.decision?.experience_id).toBe(other_id);
+      const reported = result.outcomes[0]?.failure?.message ?? '';
+      expect(reported).toContain(experience.id);
+      expect(reported).toContain(other_id);
+
+      const stored = await storedExperience(experience.id);
+      expect(stored?.promotion?.status).toBe('dead_letter');
+      expect(stored?.promoted_to).toBeUndefined();
+      expect(stored?.promotion?.outcome).toBeUndefined();
+
+      // 配置错不该被重试掩盖：它在死信里，自动路径不会再拿它去问一次策略
+      const auto = await job({ strategy: lying }).run({ batchSize: 5 });
+      expect(auto.counts.claimed_count).toBe(0);
+      expect(auto.outcomes).toHaveLength(0);
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+    });
+
+    it('人工审核的 run 碰上自称已批准的判定：不写 Skill，也不留下任何结论', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const claimed = await repository.claimNextPromotionCandidate({
+        role_id,
+        owner: 'worker-1',
+        now: clock.now(),
+        lease_ms: DEFAULT_DELIVERY_LEASE_MS,
+        strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+        approval: 'manual_review',
+      });
+      expect(claimed).toBeDefined();
+      // 声明自动批准的注入策略：它会给出 eligible，而这次运行明明是人工审核
+      const eager = claimingApprovalStrategy(autoApprove, 'auto_approve');
+
+      const result = await executePromotionCandidate(
+        { repository, strategy: eager, now: clock.now },
+        claimed!,
+        { approval: 'manual_review', now: clock.now() },
+      );
+
+      expect(result.status).toBe('dead_letter');
+      expect(result.failure?.retryable).toBe(false);
+      // 错误信息要指出对不上的是审核模式，以及该是哪一个、实际是哪一个
+      expect(result.failure?.message).toContain('approval');
+      expect(result.failure?.message).toContain('manual_review');
+      expect(result.decision?.approval).toBe('auto_approve');
+      // 人工审核模式下不得写出 Skill，也不得把这条经验判成任何一种结论
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await storedExperience(experiences[0]!.id);
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(stored?.promoted_to).toBeUndefined();
+      expect(stored?.promotion?.status).toBe('dead_letter');
+    });
+
+    it('自动批准模式的 run 碰上自称只做人工审核的判定：不把合格候选冻结成 pending_review', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const claimed = await repository.claimNextPromotionCandidate({
+        role_id,
+        owner: 'worker-1',
+        now: clock.now(),
+        lease_ms: DEFAULT_DELIVERY_LEASE_MS,
+        strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+        approval: 'auto_approve',
+      });
+      expect(claimed).toBeDefined();
+      const timid = claimingApprovalStrategy(autoApprove, 'manual_review');
+
+      const result = await executePromotionCandidate(
+        { repository, strategy: timid, now: clock.now },
+        claimed!,
+        { approval: 'auto_approve', now: clock.now() },
+      );
+
+      expect(result.status).toBe('dead_letter');
+      expect(result.failure?.message).toContain('approval');
+      expect(result.failure?.message).toContain('auto_approve');
+      expect(result.decision?.approval).toBe('manual_review');
+      // 合格候选不该被记成待审核——那是另一个结论，人也不能靠它把它放行
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await storedExperience(experiences[0]!.id);
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(stored?.promoted_to).toBeUndefined();
+      expect(stored?.promotion?.status).toBe('dead_letter');
+    });
+
+    it('注入的策略自称 v9、它返回的判定却标着 v1：拒掉，且 run 记的是注入的 v9', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      // 这个替身整体按 v9 配置（run 会照它记审计），但判定却被标成 v1——经验与会因此记成
+      // 两个版本，而版本正是「要不要重评」的判据
+      const injected = selfDeclaredVersionStrategy(autoApprove, 'promotion-threshold.v9');
+      const mislabeled = tamperingStrategy(injected, (decision) => ({
+        ...decision,
+        strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+      }));
+
+      const result = await job({ strategy: mislabeled }).run({ batchSize: 5 });
+
+      expect(result.outcomes[0]?.status).toBe('dead_letter');
+      expect(result.outcomes[0]?.failure).toMatchObject({
+        code: 'payload_unreadable',
+        retryable: false,
+      });
+      // 报错说清「该是哪一个、实际是哪一个」
+      const reported = result.outcomes[0]?.failure?.message ?? '';
+      expect(reported).toContain('promotion-threshold.v9');
+      expect(reported).toContain(DEFAULT_PROMOTION_STRATEGY_VERSION);
+      expect(result.outcomes[0]?.decision?.strategy_version).toBe(
+        DEFAULT_PROMOTION_STRATEGY_VERSION,
+      );
+      // run 上记的版本来自注入的策略（v9），不是判定自报的那一个
+      expect(result.strategy_version).toBe('promotion-threshold.v9');
+
+      const stored = await storedExperience(experiences[0]!.id);
+      expect(stored?.promotion?.status).toBe('dead_letter');
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(stored?.promotion?.strategy_version).toBeUndefined();
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+    });
+
+    it('dry run 撞上不自洽的判定：记成 failed，但不写 Skill、不改经验、run 计数仍为零写入', async () => {
+      await seedExperiences(repository, role_id, 1);
+      // 判据取**读回来**的那一份（Pg 侧写入时会按 description 重算向量），这样「经验没变」
+      // 比的是两次读口之间有没有差别，而不是「种子数据有没有被规范化」
+      const before = await repository.listExperiences(role_id);
+      const lying = tamperingStrategy(autoApprove, (decision) => ({
+        ...decision,
+        strategy_version: 'promotion-threshold.v9',
+      }));
+
+      const result = await job({ strategy: lying }).run({ dryRun: true, batchSize: 5 });
+
+      expect(result.dry_run).toBe(true);
+      expect(result.counts).toMatchObject({ claimed_count: 0, ...NO_FAILURES, completed_count: 0 });
+      // 不自洽的判定不得伪装成任何一种结论
+      expect(result.outcomes[0]?.status).toBe('failed');
+      expect(result.outcomes[0]?.failure).toMatchObject({
+        code: 'payload_unreadable',
+        retryable: false,
+      });
+      expect(result.outcomes[0]?.failure?.message).toContain('promotion-threshold.v9');
+      expect(result.outcomes[0]?.decision?.strategy_version).toBe('promotion-threshold.v9');
+      expect(
+        result.outcomes[0]?.warnings.some((text) => text.startsWith('Dry run')),
+      ).toBe(true);
+
+      // 演练什么都没写：没有 Skill，经验与跑之前一模一样
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      expect(await repository.listExperiences(role_id)).toEqual(before);
+    });
+
+    it('dry run 下三类不自洽都记成 failed，且一个字节都不落盘', async () => {
+      await seedExperiences(repository, role_id, 1);
+      const before = await repository.listExperiences(role_id);
+      const other_id = randomUUID();
+      const cases: Array<{ name: string; strategy: PromotionStrategy; needle: string }> = [
+        {
+          name: '版本',
+          strategy: tamperingStrategy(autoApprove, (decision) => ({
+            ...decision,
+            strategy_version: 'promotion-threshold.v9',
+          })),
+          needle: 'promotion-threshold.v9',
+        },
+        {
+          name: '经验 id',
+          strategy: tamperingStrategy(autoApprove, (decision) => ({
+            ...decision,
+            experience_id: other_id,
+          })),
+          needle: other_id,
+        },
+        {
+          name: '审核模式',
+          strategy: tamperingStrategy(autoApprove, (decision) => ({
+            ...decision,
+            approval: 'manual_review',
+          })),
+          needle: 'manual_review',
+        },
+      ];
+
+      for (const testCase of cases) {
+        const result = await job({ strategy: testCase.strategy }).run({ dryRun: true, batchSize: 5 });
+
+        expect(result.outcomes[0]?.status, testCase.name).toBe('failed');
+        expect(result.outcomes[0]?.failure?.message, testCase.name).toContain(testCase.needle);
+        expect(result.counts, testCase.name).toMatchObject({
+          claimed_count: 0,
+          ...NO_FAILURES,
+          completed_count: 0,
+        });
+        expect(await repository.listSkills(role_id), testCase.name).toHaveLength(0);
+        expect(await repository.listExperiences(role_id), testCase.name).toEqual(before);
+      }
+    });
+
+    it('合法策略的判定一切照旧：演练的投影与真跑的结果都不变', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const unqualified = makeExperience(role_id, {
+        confidence: 0.5,
+        created_at: addMilliseconds(START, 60_000),
+      });
+      await repository.saveExperience(role_id, unqualified);
+
+      const projection = await job().run({ dryRun: true, batchSize: 5 });
+      expect(projection.outcomes.map((item) => item.failure)).toEqual([undefined, undefined]);
+      expect(projection.outcomes.map((item) => item.status)).toEqual(['promoted', 'rejected']);
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+
+      const real = await job().run({ batchSize: 5 });
+      expect(real.outcomes.map((item) => item.status)).toEqual(['promoted', 'rejected']);
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+      const promoted = await storedExperience(experiences[0]!.id);
+      expect(promoted?.promotion?.strategy_version).toBe(DEFAULT_PROMOTION_STRATEGY_VERSION);
+      expect(promoted?.promotion?.outcome).toBe('promoted');
+    });
+
+    it('不可重试的契约错不会被重试掩盖：跨过退避窗口之后依然是死信', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const lying = tamperingStrategy(autoApprove, (decision) => ({
+        ...decision,
+        strategy_version: 'promotion-threshold.v9',
+      }));
+
+      const first = await job({ strategy: lying }).run({ batchSize: 5 });
+      expect(first.outcomes[0]?.status).toBe('dead_letter');
+
+      // 跨过重试预算的整个区间：死信不是「等一会儿再来」，重投不会改变一份错判定的内容
+      clock.advance(DEFAULT_PROMOTION_RETRY_POLICY.max_delay_ms);
+      const second = await job({ strategy: lying }).run({ batchSize: 5 });
+
+      expect(second.counts.claimed_count).toBe(0);
+      expect(second.outcomes).toHaveLength(0);
+      const stored = await storedExperience(experiences[0]!.id);
+      expect(promotionStateLabel(stored!)).toBe('dead_letter');
+      expect(stored?.promotion?.attempt_count).toBe(1);
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+    });
+
+    it('契约错在错误对象上带稳定标识，聚合与排查都不必读消息文本', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const experience = experiences[0]!;
+
+      // 对外能拿到的只有规范化失败（分类不保留原始错误对象），所以错误对象本身的形状由这一条
+      // 直接钉住：按稳定 code 判别的调用方（跨进程、跨包装层）不必去匹配消息文本。
+      let thrown: unknown;
+      try {
+        assertPromotionDecisionConsistent(
+          {
+            verdict: 'eligible',
+            strategy_version: 'promotion-threshold.v9',
+            approval: 'auto_approve',
+            reasons: ['Candidate qualifies.'],
+            blocking_rules: [],
+            experience_id: experience.id,
+          },
+          {
+            experience_id: experience.id,
+            approval: 'auto_approve',
+            strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+          },
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(isPromotionDecisionContractError(thrown)).toBe(true);
+      expect((thrown as { contract_code?: string }).contract_code).toBe(
+        PROMOTION_DECISION_CONTRACT_CODE,
+      );
+      expect((thrown as { violation?: string }).violation).toBe('strategy_version');
+      expect((thrown as { expected?: string }).expected).toBe(DEFAULT_PROMOTION_STRATEGY_VERSION);
+      expect((thrown as { actual?: string }).actual).toBe('promotion-threshold.v9');
     });
 
     it('非法的批量上限被拒绝启动', async () => {

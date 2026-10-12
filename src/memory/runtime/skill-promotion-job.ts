@@ -16,10 +16,15 @@
  *   dry-run 连启动恢复都不做（恢复本身就是一次写）。它的结论只出现在 `outcomes` 与返回值
  *   里，run 的六个计数**一律为 0**——一次什么都没写的运行不该在吞吐/积压指标里留下数字，
  *   否则把各 run 的 `completed_count` 加起来的人会数到并没有发生的晋升。投影状态由每条
- *   outcome 的 `warnings` 标明是演练。
+ *   outcome 的 `warnings` 标明是演练。演练同样做判定契约校验（见 `previewOne`）：一份自相
+ *   矛盾的判定记成 `failed`，不会伪装成 promoted / pending_review / rejected。
  * - **策略版本是一道断言**：运行选项里声明的版本与注入策略的实际版本不一致就拒绝启动，且
  *   在**开 run 之前**拒绝——审计里记下的版本必须就是真正生效的那一个，而一条只写了「配置
  *   是 v2、实际按 v1 判」的 run 会比没有这条 run 更容易让人读错判决。
+ * - **策略返回的判定也是一道断言**，但**不在这里**判：执行内核
+ *   （services/promotion-executor.ts 的 `assertPromotionDecisionConsistent`）在写任何东西
+ *   之前核对判定的版本、经验 id、审核模式与结论组合。放在内核是因为内核也会被别的调用方
+ *   直接用；本外壳只在自己的演练路径上复用同一份校验。
  *
  * 几条不能松的约束（与 Phase 1/2 相同，理由也相同）：
  *
@@ -60,7 +65,13 @@ import type {
 import { classifyDeliveryFailure } from '../services/delivery-error-classification';
 import { DEFAULT_DELIVERY_LEASE_MS } from '../services/delivery-lifecycle';
 import { EMPTY_MAINTENANCE_RUN_COUNTS } from '../services/maintenance-run-lifecycle';
-import { executePromotionCandidate } from '../services/promotion-executor';
+import {
+  assertPromotionDecisionConsistent,
+  classifyPromotionFailure,
+  describeContractFailure,
+  executePromotionCandidate,
+  isPromotionDecisionContractError,
+} from '../services/promotion-executor';
 import type { ExperienceRecord } from '../schemas';
 
 /** 一次运行缺省的 claim 上限；显式传 batchSize 可覆盖 */
@@ -357,6 +368,11 @@ export class DefaultSkillPromotionJob implements SkillPromotionJob {
    * `eligible` 映射成 `promoted`（真跑会写出 Skill），`pending_review` / `rejected` 原样保留
    * ——它们的名字在契约里就是同一件事。策略自己抛错时记成这一条的失败（包含分类），演练因此
    * 也能回答「换个配置跑一次会不会有候选先炸掉」。
+   *
+   * 演练路径**自己**做一遍判定契约校验，而不是复用执行内核：这一步什么都不写，但结论会被
+   * 人当成真跑的预演来读，而「策略会把一份自相矛盾的判定交回来」正是演练最该提前暴露的
+   * 一类配置错。校验不过就记成 `failed`（带规范化 failure），**不**退化成 `promoted` /
+   * `pending_review` / `rejected` 里的任何一个——那会把一次配置错伪装成一个正常结论。
    */
   private async previewOne(
     experience: ExperienceRecord,
@@ -384,6 +400,28 @@ export class DefaultSkillPromotionJob implements SkillPromotionJob {
         status: 'failed',
         failure: classifyDeliveryFailure(error),
         warnings: [DRY_RUN_WARNING, 'The strategy threw while previewing this candidate.'],
+      };
+    }
+
+    const expected = {
+      experience_id: experience.id,
+      approval: context.approval,
+      strategy_version: context.strategy_version,
+    };
+    try {
+      assertPromotionDecisionConsistent(decision, expected);
+    } catch (error) {
+      return {
+        ...base,
+        status: 'failed',
+        decision,
+        failure: classifyPromotionFailure(error),
+        warnings: [
+          DRY_RUN_WARNING,
+          isPromotionDecisionContractError(error)
+            ? describeContractFailure(error)
+            : 'The strategy returned an inconsistent decision while previewing this candidate.',
+        ],
       };
     }
 
