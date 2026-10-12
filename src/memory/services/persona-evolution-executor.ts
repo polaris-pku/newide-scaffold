@@ -54,10 +54,7 @@
  * 判定自报的父版本就是这次 claim 读到的那一版——「读到之后被谁改过」只有写的那一刻才知道。
  */
 import { nowTimestamp } from '../../core';
-import {
-  classifyDeliveryFailure,
-  type DeliveryFailureClassification,
-} from './delivery-error-classification';
+import { classifyDeliveryFailure } from './delivery-error-classification';
 import type { DeliveryRetryPolicy } from './delivery-lifecycle';
 import {
   isPersonaEvolutionDecisionContractError,
@@ -66,6 +63,7 @@ import {
   personaEvolutionFailure,
   summarizePersonaEvolutionChange,
   assertPersonaEvolutionDecisionConsistent,
+  type PersonaEvolutionFailureClassification,
 } from './persona-evolution-decision';
 import type { ClaimedPersonaEvolutionCandidate, MemoryRepository } from '../ports/memory-repository';
 import type {
@@ -133,8 +131,14 @@ export interface PersonaEvolutionExecutionResult {
   decision?: PersonaEvolutionDecision;
   /** 演化写下的 Persona 版本；`evolved` 时才有 */
   persona_version?: number;
-  /** 失败时的规范化分类；成功与跳过时为缺席 */
-  failure?: DeliveryFailureClassification;
+  /**
+   * 失败时的规范化分类；成功与跳过时为缺席。
+   *
+   * 除了给状态机读的 `code` 与 `retryable`，它还带着**落在六种情形里的哪一种**（`kind`）——
+   * run 的审计要按情形计数（「这一批里有几次是父版本冲突」），而从 `code` 上分不出来：
+   * 父版本冲突与存储抖动共享同一个 `storage_error`。
+   */
+  failure?: PersonaEvolutionFailureClassification;
   /** 不构成失败但需要人看见的事实 */
   warnings: string[];
 }
@@ -374,7 +378,7 @@ async function recordFailure(
   deps: PersonaEvolutionExecutorDeps,
   candidate: ClaimedPersonaEvolutionCandidate,
   options: PersonaEvolutionExecutionOptions,
-  failure: DeliveryFailureClassification,
+  failure: PersonaEvolutionFailureClassification,
   now: string,
   extra: { decision?: PersonaEvolutionDecision },
 ): Promise<PersonaEvolutionExecutionResult> {
@@ -443,7 +447,7 @@ const PG_FOREIGN_KEY_VIOLATION = '23503';
 export function classifyPersonaEvolutionFailure(
   error: unknown,
   layer: PersonaEvolutionFailureLayer,
-): DeliveryFailureClassification {
+): PersonaEvolutionFailureClassification {
   const message = error instanceof Error ? error.message : String(error);
 
   if (isPersonaEvolutionDecisionContractError(error)) {

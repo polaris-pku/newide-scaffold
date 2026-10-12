@@ -1068,6 +1068,106 @@ export const MaintenanceRunCountsSchema = z.object({
 export type MaintenanceRunCounts = z.infer<typeof MaintenanceRunCountsSchema>;
 
 /**
+ * 一条候选的 run 审计摘要（Phase 4 补全）。
+ *
+ * 每个「本次处理过的候选」一条：它是谁（`candidate_id`）、依据哪份输入（快照 hash 与规模）、
+ * 从哪一版出发（父版本）、走到哪里（结论；真的写出新版本时还有 `result_version`），以及这条
+ * 候选这次被父版本条件写挡下过几次。
+ *
+ * 与六个计数**并列而不是替代**：计数回答「这一批几条成功几条失败」，这里回答「分别是哪几条、
+ * 凭哪份输入判的」。两者都必须落在 run 上而不是只落在候选自己身上——候选的状态会被下一次
+ * 运行继续往前推（Persona 演化会覆盖演化标记、晋升会重写晋升标记），那一刻「上一次用的是哪
+ * 份输入」就没了；只有 run 上的这份摘要能让 `run_id` 事后自证。
+ *
+ * 字段全部可选，且**缺失就是缺失**：旧 run 没有这些字段，读出来也不该被填一个假值（填
+ * `parent_conflict_count: 0` 会被读成「那次没有冲突」，而我们并不知道）。写下的那一侧必须
+ * 如实给出「观察到的 0」，因此这个 0 是写入方的结论，不是读取方的默认值。
+ */
+export const MaintenanceRunCandidateAuditSchema = z.object({
+  /** 候选标识：Persona 演化是 `role_id`（候选就是一个角色一条演化流） */
+  candidate_id: z.string(),
+  /** 这次判定依据的输入快照 hash（逐候选的那一个，幂等键的一半） */
+  input_snapshot_hash: z.string().optional(),
+  /** 这次判定依据的父版本（写回前置条件的前件） */
+  parent_version: z.number().int().positive().optional(),
+  /** 这次真正写出的版本；只有写出版本的那条结论才有 */
+  result_version: z.number().int().positive().optional(),
+  /** 判定依据的输入规模，按各通道自己的口径记键（演化是 `skills` / `experiences`） */
+  input_counts: z.record(z.string(), z.number().int().min(0)).optional(),
+  /** 这条候选本次的结论，用各通道自己的状态词（`evolved` / `pending_review` / …） */
+  outcome: z.string().optional(),
+  /** 这条候选本次被父版本条件写挡下的次数 */
+  parent_conflict_count: z.number().int().min(0).optional(),
+});
+export type MaintenanceRunCandidateAudit = z.infer<typeof MaintenanceRunCandidateAuditSchema>;
+
+/** run 审计里的输入快照摘要：批量运行下逐候选 hash 有多个，因此给的是整体 digest + 规模 */
+export const MaintenanceRunInputSnapshotAuditSchema = z.object({
+  /**
+   * 覆盖本次全部候选的稳定 digest（逐候选 hash 排序后聚合）。
+   *
+   * 它是「这一次运行的输入」的**一个**可比对的标识：单候选时能直接对上那一条的 hash，多候选
+   * 时给出集合级的同一性。一个候选都没有时缺席——缺席说的是「没处理任何输入」，与「处理了
+   * 若干条、它们的摘要恰好是空」不是一件事。
+   */
+  digest: z.string().optional(),
+  /** 本次处理的候选数 */
+  candidate_count: z.number().int().min(0).optional(),
+  /** 各通道自己的输入规模合计（演化是 `skills` / `experiences` 的条数之和） */
+  counts: z.record(z.string(), z.number().int().min(0)).optional(),
+});
+export type MaintenanceRunInputSnapshotAudit = z.infer<
+  typeof MaintenanceRunInputSnapshotAuditSchema
+>;
+
+/** 本次处理到的候选所依据的父版本范围（候选一个都没有时缺席） */
+export const MaintenanceRunParentVersionRangeSchema = z.object({
+  min: z.number().int().positive(),
+  max: z.number().int().positive(),
+});
+export type MaintenanceRunParentVersionRange = z.infer<
+  typeof MaintenanceRunParentVersionRangeSchema
+>;
+
+/**
+ * 维护 run 的**结构化**审计载荷（Phase 4 补全）。
+ *
+ * 六个计数与 `last_error` 回答「跑了多大一批、成不成」，但回答不了「按什么判据、依据哪份
+ * 输入」——那几件事此前只落在**候选自己**的标记上（Persona 演化标记的 `strategy_version` /
+ * `input_snapshot_hash` / `parent_version`）。标记是会被下一次运行覆盖的活状态，于是演化一
+ * 遍之后，`run_id` 就再也说不清当时用的是哪一版策略、哪一份输入。这份载荷把那些事实按 run
+ * 落定一次，此后只读不改。
+ *
+ * 形状是**对象而不是字符串**，且每一条事实各占一格：审计要能被聚合（「这一版策略下有多少
+ * 次父版本冲突」），拼成一句人读的话就只能靠正则再解析回来。批量运行的形状也是刻意的——
+ * 多候选时逐候选摘要进 `candidates`，整体只给 digest 与范围，不假装一次运行只有一个候选。
+ *
+ * **可扩展靠加字段**（都是可选字段，旧记录读进来就是缺席），不靠一个无类型的口袋：新增一种
+ * 事实就在这份 schema 上加一格，读它的人不必知道写它的人当时在想什么。因此这里没有
+ * `details: unknown` 之类的口子。
+ *
+ * 向后兼容：工作包 A/B/C 与 Phase 1–3 落盘的 run 都没有这个键，读作「那次运行没记审计」；
+ * 不迁移、不补默认值，也不把这些缺失当成空集。
+ */
+export const MaintenanceRunAuditSchema = z.object({
+  /** 本次运行真正生效的策略版本（可版本化判定的通道才有：技能晋升 / Persona 演化） */
+  strategy_version: z.string().optional(),
+  /** 本次运行的审核模式（同上两条通道才有；它决定「合格」落成写出版本还是等人工） */
+  approval: z.string().optional(),
+  /** 本次是否只演练不落地（演练的审计描述的是「考虑过什么」，不是「写过什么」） */
+  dry_run: z.boolean().optional(),
+  /** 本次处理的输入快照摘要 */
+  input_snapshot: MaintenanceRunInputSnapshotAuditSchema.optional(),
+  /** 本次处理到的候选所依据的父版本范围 */
+  parent_version_range: MaintenanceRunParentVersionRangeSchema.optional(),
+  /** 本次运行里被父版本条件写挡下的次数合计（逐候选的计数之和） */
+  parent_conflict_count: z.number().int().min(0).optional(),
+  /** 逐候选摘要，按处理顺序 */
+  candidates: z.array(MaintenanceRunCandidateAuditSchema).optional(),
+});
+export type MaintenanceRunAudit = z.infer<typeof MaintenanceRunAuditSchema>;
+
+/**
  * 维护 run — 观测与审计实体，**不是业务事务边界**。
  *
  * 它回答的是「这一次调度发生了什么、多久、带走了什么失败码」，不参与
@@ -1085,6 +1185,13 @@ export const MaintenanceRunSchema = z.object({
   /** 终止态才有；`running` 时缺席 */
   finished_at: z.iso.datetime().optional(),
   ...MaintenanceRunCountsSchema.shape,
+  /**
+   * 结构化审计事实（见 `MaintenanceRunAuditSchema`）。
+   *
+   * 可选：Phase 4 之前落盘的 run、以及不需要审计的通道（两条消费者只记计数）都没有它，
+   * 缺席读作「这次运行没记审计」，而不是「审计是空对象」。
+   */
+  audit: MaintenanceRunAuditSchema.optional(),
   /** 终局失败原因（`failed` 时保留；`completed` 也可带，表示部分失败） */
   last_error: z.string().optional(),
 });

@@ -24,7 +24,7 @@
  * 调度器分别触发（计划 §12）。
  */
 import type { MaintenanceFailure, MaintenanceRun, MaintenanceRunCounts } from '../schemas';
-import type { DeliveryFailureClassification } from '../services/delivery-error-classification';
+import type { PersonaEvolutionFailureClassification } from '../services/persona-evolution-decision';
 import type { PersonaEvolutionSkipReason } from '../services/persona-evolution-candidates';
 import type { MemoryRepository } from './memory-repository';
 import type { MaintenanceRunStore } from './maintenance-run-store';
@@ -86,8 +86,13 @@ export interface PersonaEvolutionCandidateOutcome {
    * 会被 claim」只能由计划本身回答，而这个字段就是那个答案。
    */
   skip_reason?: PersonaEvolutionSkipReason;
-  /** 失败时的规范化分类；跳过与成功时为 undefined */
-  failure?: DeliveryFailureClassification;
+  /**
+   * 失败时的规范化分类；跳过与成功时为 undefined。
+   *
+   * 它同时带着「落在六种情形里的哪一种」（`kind`）——run 的审计按情形计数（父版本冲突几次），
+   * 而从 `code` 上分不出来：冲突与存储抖动共享同一个 `storage_error`。
+   */
+  failure?: PersonaEvolutionFailureClassification;
   /** 不构成失败但需要人看见的事实（复用了一次已有快照等） */
   warnings: string[];
 }

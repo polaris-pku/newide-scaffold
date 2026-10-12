@@ -17,6 +17,11 @@
  *   把各 run 的 `completed_count` 加起来的人会数到并没有发生的演化。
  * - **策略版本是一道断言**：运行选项里声明的版本与注入策略的实际版本不一致就拒绝启动，且
  *   在**开 run 之前**拒绝——审计里记下的版本必须就是真正生效的那一个。
+ * - **审计落在 run 上，不只落在候选上**：本次生效的策略版本、输入快照的集合级 digest 与逐候选
+ *   hash、父版本范围、父版本冲突次数，都随开跑与收尾写进 `MaintenanceRun.audit`。候选自己的
+ *   演化标记会被下一次演化覆盖（那是活状态），run 记录不会——`run_id` 因此能在事后自证「当时
+ *   按哪一版判据、依据哪份输入」。开跑时就先落一次策略版本，是为了让「跑到一半死掉、永远不收尾」
+ *   的那条 run 也说得清这件事。
  *
  * 几条不能松的约束（与 Phase 1/2/3 相同，理由也相同）：
  *
@@ -42,12 +47,18 @@
  */
 import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
-import type { MaintenanceFailure, MaintenanceRunCounts } from '../schemas';
+import type {
+  MaintenanceFailure,
+  MaintenanceRunAudit,
+  MaintenanceRunCandidateAudit,
+  MaintenanceRunCounts,
+} from '../schemas';
 import type { ClaimedPersonaEvolutionCandidate } from '../ports/memory-repository';
 import {
   PERSONA_EVOLUTION_APPROVAL_MODES,
   type PersonaEvolutionApprovalMode,
   type PersonaEvolutionDecision,
+  type PersonaEvolutionInputSnapshot,
 } from '../ports/persona-evolution-strategy';
 import type {
   PersonaEvolutionCandidateOutcome,
@@ -63,6 +74,7 @@ import { DEFAULT_DELIVERY_LEASE_MS } from '../services/delivery-lifecycle';
 import { EMPTY_MAINTENANCE_RUN_COUNTS } from '../services/maintenance-run-lifecycle';
 import {
   buildPersonaEvolutionSnapshot,
+  personaEvolutionBatchSnapshotDigest,
   personaEvolutionInputSnapshotHash,
   personaEvolutionLastRun,
   planPersonaEvolutionCandidate,
@@ -101,6 +113,15 @@ interface BatchContext {
   signal?: AbortSignal | undefined;
   counts: MaintenanceRunCounts;
   outcomes: PersonaEvolutionCandidateOutcome[];
+  /**
+   * 逐候选审计摘要，随处理边跑边攒，收尾时摊成 run 上的 `audit`。
+   *
+   * 与 `outcomes` 分开两列而不是从它现算：`outcomes` 是**本次调用的返回值**（调用方要逐条
+   * 读判定与 warnings），而审计是**要落进 run 记录**的那一份，字段更窄（不放判定正文）且
+   * 要能回答「哪一版策略、哪份输入、从哪一版出发」。两者面向不同的读者，混在一起迟早会为了
+   * 迁就一边而改另一边。
+   */
+  audit_candidates: MaintenanceRunCandidateAudit[];
   /**
    * 已用掉的批量名额。
    *
@@ -168,10 +189,19 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
       job_type: 'persona_evolution',
       worker_id: this.worker_id,
       now: startedAt,
+      // 「这次按什么判」在开跑前就是既成事实，先落一次：worker 跑到一半死掉时这条 run 永远
+      // 不会收尾，收尾那份审计也就一句都不会出现，而「它本来是用哪一版策略跑的」正是事后第一
+      // 个要问的问题。收尾时给的审计按字段合并到这一份上，不会被顶掉
+      audit: {
+        strategy_version: strategyVersion,
+        approval,
+        dry_run: dryRun,
+      },
     });
 
     const counts: MaintenanceRunCounts = { ...EMPTY_MAINTENANCE_RUN_COUNTS };
     const outcomes: PersonaEvolutionCandidateOutcome[] = [];
+    const auditCandidates: MaintenanceRunCandidateAudit[] = [];
     let stopReason: PersonaEvolutionStopReason = 'no_work';
     let workerFailure: MaintenanceFailure | undefined;
     let restoredCount = 0;
@@ -183,6 +213,7 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
       started_ms: startedMs,
       counts,
       outcomes,
+      audit_candidates: auditCandidates,
       budget_used: 0,
       approval,
       strategy_version: strategyVersion,
@@ -210,15 +241,20 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
     }
 
     const lastError = lastErrorOf(outcomes, workerFailure);
+    // 审计与计数一起交出去：`failed` 那条腿也带着它。一次「外壳读不动存储」的运行同样需要
+    // 说得清自己是按哪一版策略、依据哪份输入跑到一半的——那恰恰是最需要审计的一类运行
+    const audit = buildRunAudit(context, dryRun);
     const finished =
       workerFailure === undefined
         ? await this.options.runStore.finish(run.run_id, {
             ...counts,
+            audit,
             ...(lastError !== undefined ? { last_error: lastError } : {}),
             now: this.now(),
           })
         : await this.options.runStore.fail(run.run_id, workerFailure, {
             ...counts,
+            audit,
             now: this.now(),
           });
     if (!finished) {
@@ -288,6 +324,9 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
       context.counts.claimed_count += 1;
       const outcome = await this.executeOne(candidate, context);
       context.outcomes.push(outcome);
+      context.audit_candidates.push(
+        candidateAuditEntry(outcome.role_id, outcome, snapshotInputCounts(candidate.snapshot)),
+      );
       countOutcome(context.counts, outcome);
     }
   }
@@ -314,13 +353,18 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
       const guard = this.checkBatchGuards(context);
       if (guard) return guard;
 
-      let preview: { outcome: PersonaEvolutionCandidateOutcome; previewed: boolean };
+      let preview: {
+        outcome: PersonaEvolutionCandidateOutcome;
+        previewed: boolean;
+        input_counts: Record<string, number> | undefined;
+      };
       try {
         preview = await this.previewRole(role_id, context);
       } catch (error) {
         // 单条隔离：读不出一个角色的输入（正好被删掉、载荷损坏）不该让整次演练崩掉
         preview = {
           previewed: true,
+          input_counts: undefined,
           outcome: {
             status: 'failed',
             role_id,
@@ -332,6 +376,9 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
         };
       }
       context.outcomes.push(preview.outcome);
+      context.audit_candidates.push(
+        candidateAuditEntry(role_id, preview.outcome, preview.input_counts),
+      );
       if (preview.previewed) context.budget_used += 1;
     }
     return 'no_work';
@@ -418,7 +465,11 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
   private async previewRole(
     role_id: string,
     context: BatchContext,
-  ): Promise<{ outcome: PersonaEvolutionCandidateOutcome; previewed: boolean }> {
+  ): Promise<{
+    outcome: PersonaEvolutionCandidateOutcome;
+    previewed: boolean;
+    input_counts: Record<string, number>;
+  }> {
     const repository = this.options.repository;
     const marker = await repository.getPersonaEvolutionMarker(role_id);
     const persona = await repository.getPersona(role_id);
@@ -427,6 +478,9 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
       repository.listExperiences(role_id),
     ]);
     const snapshot = buildPersonaEvolutionSnapshot({ role_id, skills, experiences });
+    // 输入规模随每条结果一起交回：run 审计要记「这次看的候选各有多大」，而快照只在这条
+    // 路径上有——出了这个函数就只剩 hash，读不出条数
+    const input_counts = snapshotInputCounts(snapshot);
     const input_snapshot_hash = personaEvolutionInputSnapshotHash(snapshot);
     // 演练不 claim，标记本来就没被动过，因此这里读到的就是「计划执行之前的那份」
     const last_evolution = personaEvolutionLastRun(marker);
@@ -448,6 +502,7 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
     if (plan.kind === 'skip') {
       return {
         previewed: false,
+        input_counts,
         outcome: {
           ...base,
           status: 'skipped',
@@ -474,6 +529,7 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
     } catch (error) {
       return {
         previewed: true,
+        input_counts,
         outcome: {
           ...base,
           status: 'failed',
@@ -498,6 +554,7 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
       const audited = auditPersonaEvolutionDecision(returned);
       return {
         previewed: true,
+        input_counts,
         outcome: {
           ...base,
           status: 'failed',
@@ -516,6 +573,7 @@ export class DefaultPersonaEvolutionJob implements PersonaEvolutionJob {
     const decision: PersonaEvolutionDecision = returned;
     return {
       previewed: true,
+      input_counts,
       outcome: {
         ...base,
         status: decision.verdict === 'eligible' ? 'evolved' : decision.verdict,
@@ -556,6 +614,94 @@ function countOutcome(
       counts.failure_count += 1;
       return;
   }
+}
+
+/**
+ * 一条候选在本 run 审计里的摘要。
+ *
+ * `input_counts` 由调用点给：真跑取自 claim 到的那份快照，演练取自自己算的那份；读不出输入的
+ * 那条角色（外层 catch）没有它——**缺席就是缺席**，不补一个 0，因为 0 条技能与「没读到」是
+ * 两件不同的事。
+ *
+ * `parent_conflict_count` 从失败情形上算（`kind === 'storage_conflict'`），不从失败码上算：
+ * 冲突与存储抖动共享 `storage_error`，按码计数会把「有人抢先改了 Persona」混进「磁盘抖了一下」，
+ * 而这两件事的处置完全不同（前者重投必然自愈，后者可能一直坏着）。0 是**算出来的 0**：这次
+ * 处理确实没有遇到冲突。
+ */
+function candidateAuditEntry(
+  candidate_id: string,
+  outcome: PersonaEvolutionCandidateOutcome,
+  input_counts: Record<string, number> | undefined,
+): MaintenanceRunCandidateAudit {
+  return {
+    candidate_id,
+    ...(outcome.input_snapshot_hash !== undefined
+      ? { input_snapshot_hash: outcome.input_snapshot_hash }
+      : {}),
+    ...(outcome.parent_version !== undefined ? { parent_version: outcome.parent_version } : {}),
+    ...(outcome.persona_version !== undefined ? { result_version: outcome.persona_version } : {}),
+    ...(input_counts !== undefined ? { input_counts } : {}),
+    outcome: outcome.status,
+    parent_conflict_count: outcome.failure?.kind === 'storage_conflict' ? 1 : 0,
+  };
+}
+
+/** 快照的规模计数；键名是这条通道自己的口径（`skills` / `experiences`） */
+function snapshotInputCounts(snapshot: PersonaEvolutionInputSnapshot): Record<string, number> {
+  return {
+    skills: snapshot.skills.length,
+    experiences: snapshot.experiences.length,
+  };
+}
+
+/**
+ * 把这一批的事实摊成 run 上的结构化审计（收尾时调一次）。
+ *
+ * 逐候选的账进 `candidates`，整体的输入标识由 `personaEvolutionBatchSnapshotDigest` 现算——
+ * 批量运行下「这一次依据的是哪份输入」只能是一个集合级的 digest，单候选的 hash 在这里不够用
+ * （一个候选都没有时它干脆缺席，由 `candidate_count: 0` 如实表达）。
+ *
+ * 规模计数由逐候选合计出来，而不是另记一份：审计里不该出现两个可以对不上的数字。
+ */
+function buildRunAudit(context: BatchContext, dryRun: boolean): MaintenanceRunAudit {
+  const candidates = context.audit_candidates;
+  const digest = personaEvolutionBatchSnapshotDigest(
+    candidates.flatMap((item) =>
+      item.input_snapshot_hash === undefined ? [] : [item.input_snapshot_hash],
+    ),
+  );
+  const counts: Record<string, number> = {};
+  for (const item of candidates) {
+    for (const [key, value] of Object.entries(item.input_counts ?? {})) {
+      counts[key] = (counts[key] ?? 0) + value;
+    }
+  }
+  const parentVersions = candidates.flatMap((item) =>
+    item.parent_version === undefined ? [] : [item.parent_version],
+  );
+  return {
+    strategy_version: context.strategy_version,
+    approval: context.approval,
+    dry_run: dryRun,
+    input_snapshot: {
+      ...(digest !== undefined ? { digest } : {}),
+      candidate_count: candidates.length,
+      ...(Object.keys(counts).length > 0 ? { counts } : {}),
+    },
+    ...(parentVersions.length > 0
+      ? {
+          parent_version_range: {
+            min: Math.min(...parentVersions),
+            max: Math.max(...parentVersions),
+          },
+        }
+      : {}),
+    parent_conflict_count: candidates.reduce(
+      (total, item) => total + (item.parent_conflict_count ?? 0),
+      0,
+    ),
+    ...(candidates.length > 0 ? { candidates: [...candidates] } : {}),
+  };
 }
 
 /**

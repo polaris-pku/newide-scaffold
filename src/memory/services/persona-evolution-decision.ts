@@ -205,6 +205,22 @@ interface PersonaEvolutionFailureShape {
 }
 
 /**
+ * 一次演化失败的分类，外加它落在六种情形里的哪一种。
+ *
+ * `code` 是给状态机读的（它只认 `MaintenanceFailureCode` 那七个码），而**运行审计要按情形
+ * 计数**——`storage_conflict`（父版本已经不是当前版本）与 `storage_failure`（存储抖了一下）
+ * 共享同一个码，是两条完全不同的线索，而 run 上那个「父版本冲突几次」的数字只能由情形算出来。
+ * 从消息文本里反推是不可接受的：那句话是给人读的，改一次措辞就悄悄改掉了口径。
+ *
+ * `kind` 可选，因为**不是每一次分类都知道**自己是六种里的哪一种：走到通用分类器（
+ * `classifyDeliveryFailure`）兜底的那一支上，我们只拿得到一个失败码，硬安一个情形就是编。
+ */
+export interface PersonaEvolutionFailureClassification extends DeliveryFailureClassification {
+  /** 这次失败落在六种情形里的哪一种；只知道失败码时为缺席 */
+  kind?: PersonaEvolutionFailureKind;
+}
+
+/**
  * 六种情形 → （规范化失败码, 是否可重试）。
  *
  * 写成 `Record<PersonaEvolutionFailureKind, …>`：新增或改名一种情形时这里**先编译不过**，
@@ -226,13 +242,13 @@ const PERSONA_EVOLUTION_FAILURE_TABLE: Record<
 export const PERSONA_EVOLUTION_FAILURE_KINDS: readonly PersonaEvolutionFailureKind[] =
   Object.keys(PERSONA_EVOLUTION_FAILURE_TABLE) as PersonaEvolutionFailureKind[];
 
-/** 把一种失败情形规范化成可落盘的分类（`message` 带上原始原因） */
+/** 把一种失败情形规范化成可落盘的分类（`message` 带上原始原因，`kind` 带上情形本身） */
 export function personaEvolutionFailure(
   kind: PersonaEvolutionFailureKind,
   message: string,
-): DeliveryFailureClassification {
+): PersonaEvolutionFailureClassification {
   const shape = PERSONA_EVOLUTION_FAILURE_TABLE[kind];
-  return knownDeliveryFailure(shape.code, message, shape.retryable);
+  return { ...knownDeliveryFailure(shape.code, message, shape.retryable), kind };
 }
 
 /** 这六种情形里哪些是可以重投的（run 收尾与人工复核时读它） */

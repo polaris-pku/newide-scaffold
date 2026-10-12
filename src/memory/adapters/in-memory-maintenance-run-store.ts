@@ -32,8 +32,8 @@ export class InMemoryMaintenanceRunStore implements MaintenanceRunStore {
     if (this.runs.has(run.run_id)) {
       throw new Error(`Maintenance run already exists: ${run.run_id}`);
     }
-    this.runs.set(run.run_id, run);
-    return { ...run };
+    this.runs.set(run.run_id, cloneRun(run));
+    return cloneRun(run);
   }
 
   finish(
@@ -53,11 +53,11 @@ export class InMemoryMaintenanceRunStore implements MaintenanceRunStore {
 
   async get(run_id: string): Promise<MaintenanceRun | undefined> {
     const run = this.runs.get(run_id);
-    return run ? { ...run } : undefined;
+    return run ? cloneRun(run) : undefined;
   }
 
   async list(query: MaintenanceRunQuery = {}): Promise<MaintenanceRun[]> {
-    return selectMaintenanceRuns([...this.runs.values()], query).map((run) => ({ ...run }));
+    return selectMaintenanceRuns([...this.runs.values()], query).map(cloneRun);
   }
 
   /** 在 run 自己的临界区里重新读一遍再判断，重复收尾不会各自基于陈旧快照写回 */
@@ -73,7 +73,7 @@ export class InMemoryMaintenanceRunStore implements MaintenanceRunStore {
       const next = apply(current, now ?? nowTimestamp());
       if (!next) return undefined;
       this.runs.set(run_id, next);
-      return { ...next };
+      return cloneRun(next);
     });
     const settled = run.then(
       () => undefined,
@@ -85,4 +85,15 @@ export class InMemoryMaintenanceRunStore implements MaintenanceRunStore {
     });
     return run;
   }
+}
+
+/**
+ * 交给调用方的副本。
+ *
+ * 计数与 run 的顶层字段是标量，浅拷就够；`audit` 是**嵌套对象**——浅拷会把同一份嵌套结构
+ * 交出去，调用方改一个字段就等于改了「库」里的记录。文件与数据库两条腿因为过了序列化没有
+ * 这种耦合，而三条腿语义一致才谈得上契约，所以这里连嵌套也复制一份。
+ */
+function cloneRun(run: MaintenanceRun): MaintenanceRun {
+  return run.audit === undefined ? { ...run } : { ...run, audit: structuredClone(run.audit) };
 }

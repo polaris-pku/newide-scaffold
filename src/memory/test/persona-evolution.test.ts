@@ -13,7 +13,7 @@
  *   是**这条链路是纯的**：喂进同一份记录跑完整条判定链，输入对象一个字节没被改过，重复跑
  *   得到完全相同的结果。纯函数不写存储，这是它可以被机械验证的那一半。
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_PERSONA_EVOLUTION_STRATEGY_CONFIG,
@@ -25,6 +25,7 @@ import {
   initialPersonaEvolutionMarker,
   isApprovedSkill,
   isEligibleExperience,
+  personaEvolutionBatchSnapshotDigest,
   personaEvolutionIdempotencyKey,
   personaEvolutionInputSnapshotHash,
   personaEvolutionStateLabel,
@@ -425,6 +426,44 @@ describe('输入快照的 hash：只由内容决定', () => {
     expect(personaEvolutionInputSnapshotHash(withNoise)).toBe(
       personaEvolutionInputSnapshotHash(clean),
     );
+  });
+});
+
+// ═══════════════════════════════════════════
+//  2b. 批量 run 的输入快照 digest
+// ═══════════════════════════════════════════
+
+/**
+ * 单候选那条链路的输入标识就是它自己的 hash；一次运行处理的却是一**组**候选，因此 run 审计要
+ * 一个集合级的摘要。三条约定各自钉一条：与顺序无关、与条数有关、空集合没有摘要。
+ */
+describe('批量输入快照 digest：一个候选集合的稳定标识', () => {
+  const hashOf = (seed: string): string => createHash('sha256').update(seed).digest('hex');
+
+  it('是 sha256 的十六进制，同一个集合必然同一个 digest', () => {
+    const digest = personaEvolutionBatchSnapshotDigest([hashOf('a'), hashOf('b')]);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(personaEvolutionBatchSnapshotDigest([hashOf('a'), hashOf('b')])).toBe(digest);
+  });
+
+  it('顺序不影响 digest：处理顺序是调度的偶然，不是输入的一部分', () => {
+    expect(personaEvolutionBatchSnapshotDigest([hashOf('b'), hashOf('a'), hashOf('c')])).toBe(
+      personaEvolutionBatchSnapshotDigest([hashOf('a'), hashOf('b'), hashOf('c')]),
+    );
+  });
+
+  it('集合变了 digest 就变：多一个候选、少一个候选、换一个候选都算', () => {
+    const base = personaEvolutionBatchSnapshotDigest([hashOf('a'), hashOf('b')]);
+    expect(personaEvolutionBatchSnapshotDigest([hashOf('a')])).not.toBe(base);
+    expect(personaEvolutionBatchSnapshotDigest([hashOf('a'), hashOf('c')])).not.toBe(base);
+    // 同一个候选出现两次是另一份输入，digest 也不该相同
+    expect(personaEvolutionBatchSnapshotDigest([hashOf('a'), hashOf('a')])).not.toBe(
+      personaEvolutionBatchSnapshotDigest([hashOf('a')]),
+    );
+  });
+
+  it('空集合没有 digest：缺席说的是「没处理任何输入」，不是一个空摘要', () => {
+    expect(personaEvolutionBatchSnapshotDigest([])).toBeUndefined();
   });
 });
 
@@ -1228,6 +1267,8 @@ describe('失败分类：码与可重试性只定一次', () => {
         code: testCase.code,
         retryable: testCase.retryable,
         message: `${testCase.kind} happened`,
+        // 情形本身随分类一起交出去：run 审计按情形计数（冲突几次），而从 `code` 上分不出来
+        kind: testCase.kind,
       });
       expect(isRetryablePersonaEvolutionFailure(testCase.kind), testCase.kind).toBe(
         testCase.retryable,
@@ -1244,6 +1285,11 @@ describe('失败分类：码与可重试性只定一次', () => {
     const storage = personaEvolutionFailure('storage_failure', 'disk error');
     expect(conflict.code).toBe(storage.code);
     expect(conflict.message).not.toBe(storage.message);
+    // 码相同、情形不同：run 审计里那个「父版本冲突几次」的计数只能由情形算出来，
+    // 读 code 会把「有人抢先改了 Persona」与「磁盘抖了一下」算成一件事
+    expect(conflict.kind).toBe('storage_conflict');
+    expect(storage.kind).toBe('storage_failure');
+    expect(conflict.retryable).toBe(true);
   });
 });
 

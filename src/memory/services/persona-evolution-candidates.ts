@@ -300,6 +300,33 @@ export function personaEvolutionInputSnapshotHash(
 }
 
 /**
+ * 批量 run 的输入快照 digest —— 把本次处理过的**逐候选 hash** 聚合成一个稳定摘要。
+ *
+ * 单候选那条链路的输入标识就是它自己的快照 hash（记在演化标记上）；而一次运行处理的是一个
+ * **候选集合**，「这次运行依据的是哪份输入」因此需要一个集合级的标识。缺了它，run 审计只剩
+ * 逐候选的行，想回答「两次运行的输入是不是同一批」得先把两组 hash 各自排序再逐条比。
+ *
+ * 三条约定，与单候选的 hash 同源：
+ *
+ * 1. **只由内容决定，与顺序无关**：喂进来的 hash 先排序再拼串，因此同一个候选集合无论以什么
+ *    顺序被处理，digest 都一样（处理顺序是调度的偶然，不是输入的一部分）。
+ * 2. **条数进摘要**：`['a','bc']` 与 `['ab','c']` 这类拼接歧义由分隔符挡住，条数则是给
+ *    「同一批内容、只是重复出现」一个显式的区分位——同一个候选出现两次与只出现一次的 digest
+ *    不同，那两件事本来也不是同一份输入。
+ * 3. **空集合没有 digest**：一个候选都没处理时返回 `undefined`，让它与「处理了候选、摘要恰好
+ *    是某个值」在读口上分得开。审计里那条「候选数为 0」说的才是这件事。
+ */
+export function personaEvolutionBatchSnapshotDigest(
+  hashes: readonly string[],
+): string | undefined {
+  const sorted = [...hashes].sort();
+  if (sorted.length === 0) return undefined;
+  return createHash('sha256')
+    .update(['persona-evolution-batch.v1', String(sorted.length), ...sorted].join('\u001e'), 'utf8')
+    .digest('hex');
+}
+
+/**
  * 幂等键：`(role_id, input_snapshot_hash, strategy_version)`。
  *
  * 它就是「同一条演化流已经按这份输入、这版判据处理过」这句话的身份。计划 §11 建议的键里

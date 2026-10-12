@@ -10,7 +10,8 @@
  *      +----fail-------> failed
  *
  * 收尾只从 `running` 出发：已经收尾的 run 再收尾返回 undefined，而不是把先到的
- * 结论覆盖掉。计数按字段合并，调用方只报它知道的那些。
+ * 结论覆盖掉。计数与审计都按字段合并，调用方只报它知道的那些——「没报」不等于「归零」，
+ * 也不等于「清空」（见 `mergeMaintenanceRunAudit`）。
  *
  * 所有函数都接收显式的 `now`，不自己读时钟——测试因此不依赖真实时间。
  */
@@ -18,6 +19,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   MaintenanceFailure,
   MaintenanceRun,
+  MaintenanceRunAudit,
   MaintenanceRunCounts,
   MaintenanceRunStatus,
 } from '../schemas';
@@ -50,6 +52,7 @@ export function createMaintenanceRun(
   if (!input.worker_id) {
     throw new Error('Maintenance run requires a non-empty worker_id.');
   }
+  const audit = mergeMaintenanceRunAudit(undefined, input.audit);
   return {
     run_id: input.run_id ?? createMaintenanceRunId(input.job_type),
     job_type: input.job_type,
@@ -57,6 +60,7 @@ export function createMaintenanceRun(
     worker_id: input.worker_id,
     started_at: now,
     ...EMPTY_MAINTENANCE_RUN_COUNTS,
+    ...(audit !== undefined ? { audit } : {}),
   };
 }
 
@@ -88,6 +92,34 @@ export function isMaintenanceRunTerminal(status: MaintenanceRunStatus): boolean 
   return status !== 'running';
 }
 
+/**
+ * 按字段合并审计：收尾时只补齐它知道的那些，缺席的字段保留 run 上已有的值。
+ *
+ * 与 `mergeMaintenanceRunCounts` 同一条规矩、同一个理由：**「没报」不等于「归零」**。开跑时
+ * 记下的策略版本不该因为收尾只带逐候选摘要就被抹掉——恰恰相反，那一条正是 worker 中途死掉
+ * 之后唯一还留在 run 上的事实。
+ *
+ * 覆盖是**顶层字段**级的，不递归合并内部对象：一份新的 `input_snapshot` 整块取代旧的（而不是
+ * 两个 digest 逐键拼起来）。深层合并看着贴心，实际会让「这次报了什么」变得难以预料——读的人
+ * 得先想一遍两边各有什么才敢读结果。要报的部分自己写全。
+ *
+ * 显式写成 `undefined` 的字段与缺席等价（都不覆盖）：`exactOptionalPropertyTypes` 下「清空
+ * 一个字段」不是本函数的语义，三个适配器都照这一份规则走。
+ *
+ * 返回的是**深拷贝**：调用方（job 把自己边跑边攒的上下文交出来）之后还持有同一份嵌套数组与
+ * 对象，不复制的话「写完再改自己那份」就等于改了记录。文件与数据库两条腿因为过了序列化天然
+ * 没有这个耦合，内存那条腿靠这一份复制对齐——三条腿语义一致才谈得上契约。
+ */
+export function mergeMaintenanceRunAudit(
+  base: MaintenanceRunAudit | undefined,
+  patch: MaintenanceRunAudit | undefined,
+): MaintenanceRunAudit | undefined {
+  const merged: Record<string, unknown> = { ...base, ...patch };
+  const present = Object.entries(merged).filter(([, value]) => value !== undefined);
+  if (present.length === 0) return undefined;
+  return structuredClone(Object.fromEntries(present)) as MaintenanceRunAudit;
+}
+
 function settle(
   run: MaintenanceRun,
   status: 'completed' | 'failed',
@@ -97,6 +129,7 @@ function settle(
 ): MaintenanceRun | undefined {
   if (isMaintenanceRunTerminal(run.status)) return undefined;
   const counts = mergeMaintenanceRunCounts(run, result);
+  const audit = mergeMaintenanceRunAudit(run.audit, result.audit);
   // 终态字段放在展开之后：即便计数合并哪天多带了别的键，也覆盖不了这次收尾的结论
   const finished: MaintenanceRun = {
     run_id: run.run_id,
@@ -104,6 +137,7 @@ function settle(
     worker_id: run.worker_id,
     started_at: run.started_at,
     ...counts,
+    ...(audit !== undefined ? { audit } : {}),
     status,
     finished_at: now,
   };

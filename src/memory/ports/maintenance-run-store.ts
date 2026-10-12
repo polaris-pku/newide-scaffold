@@ -11,7 +11,9 @@
  *   是错误（同一次运行被开了两遍），不静默覆盖。
  * - `finish` / `fail` 只能从 `running` 出发。**终态只写一次**：对已经收尾的 run
  *   再收尾返回 undefined，而不是把先到的结论覆盖掉。
- * - 计数按字段合并：调用方只报它知道的那些，其余保持不变量（缺省 0）。
+ * - 计数与结构化审计都按字段合并：调用方只报它知道的那些，其余保持原值（新 run 的计数缺省
+ *   0，审计缺席则保持缺席）。开跑时写的审计（策略版本一类）能被收尾时报的那一份补齐，而不是
+ *   被它顶掉。
  * - 记录不存在时 `get` 返回 undefined、`finish`/`fail` 返回 undefined——与交付端口
  *   「返回 undefined 表示这次什么都没做」是同一种约定。
  *
@@ -22,6 +24,7 @@ import type {
   MaintenanceFailure,
   MaintenanceJobType,
   MaintenanceRun,
+  MaintenanceRunAudit,
   MaintenanceRunCounts,
   MaintenanceRunStatus,
 } from '../schemas';
@@ -33,6 +36,15 @@ export interface StartMaintenanceRunInput {
   worker_id: string;
   /** 显式指定 run_id（测试注入用）；缺省由实现生成 */
   run_id?: string;
+  /**
+   * 开跑时就已经知道、且与「这次按什么判」有关的审计事实（策略版本、审核模式、是否演练）。
+   *
+   * 单列一个**开跑时**的口子，为的是「worker 跑到一半死了」这种情形：那条 run 永远不会收尾，
+   * 于是收尾时写下的审计一句都不会出现，而「它本来是按哪一版策略跑的」恰恰是排查时第一个要
+   * 问的问题。收尾时给的审计按字段合并到这一份上（见 `mergeMaintenanceRunAudit`），缺席的
+   * 字段保留这里写下的值。
+   */
+  audit?: MaintenanceRunAudit;
   /** 参考时刻（测试注入）；缺省取当前时间 */
   now?: string;
 }
@@ -47,6 +59,14 @@ export interface StartMaintenanceRunInput {
 export interface FinishMaintenanceRunInput extends Partial<MaintenanceRunCounts> {
   /** 本次运行的最后一条错误（部分失败也允许带上） */
   last_error?: string;
+  /**
+   * 收尾时写下的审计事实（逐候选摘要、输入快照 digest、父版本冲突次数…）。
+   *
+   * 与计数同样的合并规矩：**缺席的字段保持 run 上已有的值**，因此开跑时写下的策略版本不会
+   * 被「这次只报了候选摘要」抹掉。整体是一个结构化对象而不是拼接好的字符串——审计要能被
+   * 聚合，而不是只能被人读（见 schemas 的 `MaintenanceRunAuditSchema`）。
+   */
+  audit?: MaintenanceRunAudit;
   /** 参考时刻（测试注入）；缺省取当前时间 */
   now?: string;
 }

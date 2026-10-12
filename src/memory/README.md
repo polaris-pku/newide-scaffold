@@ -349,7 +349,8 @@ const run = await runStore.get(result.run.run_id);
 ```
 
 `MaintenanceRun` 的字段：`run_id` / `job_type` / `status`（`running` / `completed` / `failed`）/
-`worker_id` / `started_at` / `finished_at`（终止态才有）/ 六个计数 / `last_error`。
+`worker_id` / `started_at` / `finished_at`（终止态才有）/ 六个计数 / `audit`（可选，见下一节）/
+`last_error`。
 
 - **`status: 'completed'` 不代表这一批全都晋升了**：一次「3 条晋升、1 条死信」的运行是正常的运行，
   它说的是「外壳自己没出故障」。逐条的成败看计数。
@@ -359,8 +360,10 @@ const run = await runStore.get(result.run.run_id);
   没有候选失败时才写外壳自己的故障。
 - 逐条的诊断面在 `result.outcomes` 里、不落 run：`decision`（策略判了什么）、`failure`（规范化
   失败码与可重试性）、`skill_id`、`warnings`。run 只留计数与一句结论。
-- 策略版本**不在 run 记录上**（`MaintenanceRun` 没有这个字段），它在 `result.strategy_version` 与
-  每条 Experience 的 `promotion.strategy_version` 上。
+- 策略版本**不在晋升的 run 记录上**：它在 `result.strategy_version` 与每条 Experience 的
+  `promotion.strategy_version` 上。`MaintenanceRun` 上有一格通用的 `audit` 承载这类事实，但
+  **晋升这条通道目前不写它**（写它的是 Persona 演化，见下一节），因此读晋升的 run 时 `audit`
+  是缺席。
 
 ### `pending_review` 怎么办
 
@@ -572,11 +575,28 @@ const run = await runStore.get(result.run.run_id);
 ```
 
 字段与晋升同形（`run_id` / `status` / `worker_id` / `started_at` / `finished_at` / 六个计数 /
-`last_error`）。**`status: 'completed'` 不代表这一批都演化了**——它说的是「外壳自己没出故障」；
-逐条看计数与 `outcomes`。`failed` 只有一种成因：外壳自己读不动存储。`last_error` 是给人看的一句
-话：优先写最后一条带失败的角色（`role_id: code: message`）。
+`last_error`），**外加一格结构化审计 `audit`**。`status: 'completed'` 不代表这一批都演化了——它
+说的是「外壳自己没出故障」；逐条看计数与 `outcomes`。`failed` 只有一种成因：外壳自己读不动存储。
+`last_error` 是给人看的一句话：优先写最后一条带失败的角色（`role_id: code: message`）。
 
-演化自己那份审计在**角色的演化标记**上（`personaEvolutionStateLabel` 把存储上的两列派生出一个词）：
+`audit` 是给定这次运行的事实，形状是对象而不是拼好的一句话（要能被聚合，而不是只能被人读）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `strategy_version` / `approval` / `dry_run` | 这次真正生效的判据、审核模式，以及是否只是演练 |
+| `input_snapshot.digest` | 覆盖本次全部候选的稳定 digest（逐候选 hash 排序后聚合；没处理候选时缺席） |
+| `input_snapshot.candidate_count` / `counts` | 处理了几个候选（演练时是「考虑过几个」）、各通道自己的输入规模合计（`skills` / `experiences`） |
+| `parent_version_range` | 本次处理到的候选所依据的父版本范围（最小 / 最大） |
+| `parent_conflict_count` | 本次运行里被父版本条件写挡下的次数合计 |
+| `candidates[]` | 逐候选摘要：`candidate_id`（就是 role）、`input_snapshot_hash`、`parent_version`、`result_version`、`input_counts`、`outcome`、`parent_conflict_count` |
+
+为什么要在 run 上再记一份：演化标记（上面那张状态表）是**活状态**，下一次演化会把它覆盖掉，
+于是「上一次用的是哪一版判据、哪份输入」就没了；run 记录只写不改，`run_id` 因此能事后自证。
+策略版本在**开跑时就先落一次**（不是等收尾），因此一条跑到一半被杀的 run 也说得清这件事。
+审计的字段全部可选，旧 run 读作缺席——**缺席就是缺席**，不会被填成 0 或空对象。
+
+反过来，演化自己那份**当前**状态在角色的演化标记上（`personaEvolutionStateLabel` 把存储上的两列
+派生出一个词）：
 
 | 标签 | 存储上的形状 | 含义 | 谁来推进 |
 | --- | --- | --- | --- |
@@ -588,7 +608,8 @@ const run = await runStore.get(result.run.run_id);
 
 除状态外，标记上还留着这一版是怎么来的：`parent_version` → `persona_version`、`strategy_version`、
 `input_snapshot_hash`、`source_run_id`、`evaluated_at`、`reasons`、`change_summary`、`reviewed_by`。
-**策略版本与来源不在 run 记录上**（`MaintenanceRun` 没有这些字段），查它们看标记。
+标记是**当前**那一版的说法，会被下一次演化覆盖；**那一次运行**用的是哪一版判据与哪份输入，看 run
+记录上的 `audit`（同一批事实在开跑时就先落了一次，见上一节）。
 
 ### `pending_review` 怎么办
 
