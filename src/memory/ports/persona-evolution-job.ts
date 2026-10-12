@@ -25,6 +25,7 @@
  */
 import type { MaintenanceFailure, MaintenanceRun, MaintenanceRunCounts } from '../schemas';
 import type { DeliveryFailureClassification } from '../services/delivery-error-classification';
+import type { PersonaEvolutionSkipReason } from '../services/persona-evolution-candidates';
 import type { MemoryRepository } from './memory-repository';
 import type { MaintenanceRunStore } from './maintenance-run-store';
 import type {
@@ -77,6 +78,14 @@ export interface PersonaEvolutionCandidateOutcome {
   parent_version?: number;
   /** 演化写下的 Persona 版本；`evolved` 时才有 */
   persona_version?: number;
+  /**
+   * `skipped` 的原因（Phase 4-C 新增）：机器可读的那一列，用来聚合「这些角色都卡在哪」。
+   *
+   * 只有演练路径会产出它——真跑是先 claim 再处理，claim 不到即「这次没活」，不落结果行
+   * （见 runtime/persona-evolution-job.ts 的文件头）。演练不 claim，因此「这条角色本来会不
+   * 会被 claim」只能由计划本身回答，而这个字段就是那个答案。
+   */
+  skip_reason?: PersonaEvolutionSkipReason;
   /** 失败时的规范化分类；跳过与成功时为 undefined */
   failure?: DeliveryFailureClassification;
   /** 不构成失败但需要人看见的事实（复用了一次已有快照等） */

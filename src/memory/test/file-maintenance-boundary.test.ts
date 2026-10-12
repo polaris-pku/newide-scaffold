@@ -21,8 +21,10 @@
  *    接线。把 FileBufferRepository 或 FileMaintenanceRunStore 当成完整存储是错的：前者是
  *    Buffer 存储，后者是 run 审计存储。
  * 3. **边界必须"响"**。装配错了不能退化成一类看起来健康的空跑——一次把 File 适配器接进
- *    `DefaultSkillPromotionJob` 的运行会如实收成 `worker_error` / `run.status='failed'`，
- *    而不是 `no_work`。这与「缺的那一半没有静默替身」是同一件事。
+ *    `DefaultSkillPromotionJob` 或 `DefaultPersonaEvolutionJob` 的运行会如实收成
+ *    `worker_error` / `run.status='failed'`，而不是 `no_work`。这与「缺的那一半没有静默
+ *    替身」是同一件事，两条通道各钉一遍：缺口是同一个，但用法两样，将来只给其中一条补上
+ *    存储时，这里能指出是哪一条。
  *
  * 本文件**不**实现 FileMemoryRepository，也不改任何适配器：那是需要单独批准的接口层工作。
  */
@@ -36,6 +38,8 @@ import { FileMemoryDeliveryRepository } from '../adapters/file-memory-delivery';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { PgMemoryRepository } from '../adapters/pg-memory-repository';
 import { DefaultPromotionStrategy } from '../adapters/default-promotion-strategy';
+import { DefaultPersonaEvolutionStrategy } from '../adapters/default-persona-evolution-strategy';
+import { DefaultPersonaEvolutionJob } from '../runtime/persona-evolution-job';
 import { DefaultSkillPromotionJob } from '../runtime/skill-promotion-job';
 import { buildContextDeliveryItem } from '../services/context-delivery';
 import type { MemoryRepository } from '../ports/memory-repository';
@@ -234,6 +238,36 @@ describe('File 后端与维护通道的边界', () => {
     expect(await revived.get(run.run_id)).toEqual(finished);
   });
 
+  it('把 File 适配器接进演化 job：类型层不成立，运行起来也如实收成失败的 run', async () => {
+    const root = await tempRoot();
+    const bufferRepository = new FileBufferRepository({ agentStateRoot: root });
+    const runStore = new FileMaintenanceRunStore({ root });
+
+    const job = new DefaultPersonaEvolutionJob({
+      // @ts-expect-error FileBufferRepository 不是 MemoryRepository——演化要的读写面它同样一条都没有
+      repository: bufferRepository,
+      runStore,
+      strategy: new DefaultPersonaEvolutionStrategy({ approval: 'auto_approve' }),
+      worker_id: 'worker-file',
+      now: () => START,
+    });
+
+    // 与晋升同一条边界：缺的那一半没有静默替身。**不能**收成 `no_work`——一次看起来健康的
+    // 空跑会让人以为「File 后端也能演化，只是眼下没有候选」。启动恢复先碰到缺失的读口
+    // （`restoreExpiredPersonaEvolutionClaims`），外壳如实把 run 标成 failed
+    const result = await job.run({ batchSize: 5 });
+
+    expect(result.stop_reason).toBe('worker_error');
+    expect(result.counts.claimed_count).toBe(0);
+    expect(result.outcomes).toHaveLength(0);
+    expect(result.run.status).toBe('failed');
+    expect(result.worker_failure).toBeDefined();
+    const workerFailure = result.worker_failure!;
+    // 失败本身也是可审计的：run 记录落在同一份 File 存储上，原因写在 last_error 里
+    expect(result.run.last_error).toContain(workerFailure.code);
+    expect(await runStore.get(result.run.run_id)).toMatchObject({ status: 'failed' });
+  });
+
   it('把 File 适配器接进晋升 job：类型层就不成立，运行起来也如实收成失败的 run', async () => {
     const root = await tempRoot();
     const bufferRepository = new FileBufferRepository({ agentStateRoot: root });
@@ -263,8 +297,7 @@ describe('File 后端与维护通道的边界', () => {
     expect(await runStore.get(result.run.run_id)).toMatchObject({ status: 'failed' });
   });
 
-  it('边界不在"File 不能做维护"：交付通道在 File 上照常走完一次 claim 与收尾', async () => {
-    const root = await tempRoot();
+  it('边界不在"File 不能做维护"：交付通道在 File 上照常走完一次 claim 与收尾', async () => {    const root = await tempRoot();
     const delivery = new FileMemoryDeliveryRepository({ agentStateRoot: root });
     await delivery.ensureAgent('role_file_boundary');
     const item = buildContextDeliveryItem({

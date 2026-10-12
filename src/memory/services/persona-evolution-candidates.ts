@@ -20,6 +20,8 @@
  *    它是写回的前置条件——把它塞进键会让「演化出一版新 Persona」本身改变键，于是每一次
  *    重跑都必然产出一个新版本，正好是幂等要防的那件事（详见 `planPersonaEvolutionCandidate`
  *    的注释）。
+ * 4. **上一次结论的读法**（`personaEvolutionLastRun`）：判定能看到的「历史」只有标记上的那
+ *    一条结论，且必须在重评**重置标记之前**读出来（Phase 4-C 的 claim 与演练路径都调它）。
  */
 import { createHash } from 'node:crypto';
 import {
@@ -35,6 +37,7 @@ import type {
   PersonaEvolutionSkillSnapshot,
   PersonaEvolutionExperienceSnapshot,
   PersonaEvolutionApprovalMode,
+  PersonaEvolutionLastRun,
 } from '../ports/persona-evolution-strategy';
 import type {
   ExperienceRecord,
@@ -496,6 +499,38 @@ export function reevaluatePersonaEvolutionMarker(
     change_summary: undefined,
     reviewed_by: undefined,
     updated_at: now,
+  };
+}
+
+/**
+ * 把标记上的**上一次结论**读成判定能看的那份历史（`PersonaEvolutionLastRun`）。
+ *
+ * 判定的输入里有一格是「上一次演化留下了什么」，它回答的是「这份输入是不是已经按这套判据
+ * 演化过了」——缺了它，默认策略的 `no_new_input` 就永远判不出来，于是「策略版本变了、输入
+ * 没变」会一路走到正文比较，靠 `persona_unchanged` 兜住。两条路都不会多写一个版本，但审计
+ * 里记下的挡板规则从「输入没变」变成「正文没变」，读起来是两件不同的事。
+ *
+ * 两个使用场景，读的都是**计划执行之前**的那份标记：
+ *
+ * - 适配器 claim 时把它挂到候选上（`ClaimedPersonaEvolutionCandidate.last_evolution`）——
+ *   重评路径会先把标记重置（`reevaluatePersonaEvolutionMarker` 清掉结论字段），claim 之后
+ *   的标记上已经没有这份历史了，所以必须在重置**之前**读出来；
+ * - 演练路径直接拿读到的标记算（那条路径不 claim，标记本来就没被动过）。
+ *
+ * 判据只有一条：**出过结论才有历史**。processing / 退回队列 / 死信都不带结论，它们答的是
+ * 「这条流走到哪了」，不是「上一次判的是什么」；把 `last_error` 之类的失败痕迹当成历史喂给
+ * 判定，等于让一次失败的投递看起来像一次判定。
+ */
+export function personaEvolutionLastRun(
+  marker: PersonaEvolutionMarker | undefined,
+): PersonaEvolutionLastRun | undefined {
+  if (marker?.outcome === undefined) return undefined;
+  return {
+    outcome: marker.outcome,
+    input_snapshot_hash: marker.input_snapshot_hash,
+    strategy_version: marker.strategy_version,
+    persona_version: marker.persona_version,
+    evaluated_at: marker.evaluated_at,
   };
 }
 
