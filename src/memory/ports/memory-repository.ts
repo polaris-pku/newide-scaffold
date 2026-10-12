@@ -15,11 +15,17 @@ import type {
   ExperienceRecord,
   MarketStatus,
   PersonaDef,
+  PersonaEvolutionMarker,
+  PersonaEvolutionOutcome,
   PromotionOutcome,
   RetiredReason,
   SkillRecord,
 } from '../schemas';
 import type { DeliveryRetryPolicy } from '../services/delivery-lifecycle';
+import type {
+  PersonaEvolutionApprovalMode,
+  PersonaEvolutionInputSnapshot,
+} from './persona-evolution-strategy';
 import type { PromotionApprovalMode } from './promotion-strategy';
 
 /** 向量检索参数（索引层 top-K 召回） */
@@ -241,6 +247,126 @@ export interface PromotionRestoreOptions {
   now: string;
   /** 重试预算；缺省用 DEFAULT_PROMOTION_RETRY_POLICY */
   policy?: DeliveryRetryPolicy;
+}
+
+// ── Persona 演化的状态面（Phase 4-B） ────────────────────────────────
+//
+// 与晋升（经验上的一个标记）同一套骨架，只有一处结构差异：**候选是「角色」而不是「行」**。
+// 一个角色同时只有一条演化流，因此状态按 role 持有，claim/lease/fencing 也按 role 生效；
+// 而「这条候选此刻该不该动」需要先看清这个角色的输入（已批准技能 + 已落定的经验）——
+// 那份输入必须与标记在**同一个临界区**里读出来，否则「同一份输入」这句话就没有依据。
+//
+// 因此 claim 的入参刻意**不带**输入快照或 hash：适配器自己在临界区里读 Persona、技能、
+// 经验，算出快照与 hash，再据此做计划。把 hash 交给调用方算，等于让「判据」与「被判的
+// 那份输入」之间开出一个窗口——窗口里落进来的新经验会让人按旧快照判、按新快照记。
+
+/**
+ * 一条已 claim 的演化候选。
+ *
+ * 它同时是「这次判定的全部依据」：判定必须基于 `snapshot`，`parent_version` 取自
+ * `persona.version`，写回时把 `claim_token` 与 `parent_version` 原样带回。
+ */
+export interface ClaimedPersonaEvolutionCandidate {
+  role_id: string;
+  /** claim 之后的标记（`processing`，带租约与 token） */
+  marker: PersonaEvolutionMarker;
+  /** 本次 claim 的 fencing token；落结论与落失败都要原样带回 */
+  claim_token: string;
+  /** claim 时的投递次数（已经 +1） */
+  attempt_count: number;
+  /** claim 那一刻读到的 Persona —— 父版本的权威读口，也是这次判定的 `parent_version` */
+  persona: PersonaDef;
+  /** claim 那一刻算出来的输入快照 —— 判定唯一能读到的输入 */
+  snapshot: PersonaEvolutionInputSnapshot;
+  /** 快照的 hash；幂等键的一半 */
+  input_snapshot_hash: string;
+}
+
+/** 一次 claim 的入参（输入快照由适配器在临界区里自己算，见上面的说明） */
+export interface PersonaEvolutionClaimRequest {
+  owner: string;
+  now: string;
+  lease_ms: number;
+  /** 当前生效的策略版本：决定判过的候选要不要重评 */
+  strategy_version: string;
+  /** 本次运行的审核模式：决定 `pending_review` 要不要被自动批准接起来 */
+  approval: PersonaEvolutionApprovalMode;
+  /** 只处理该 role；缺省按 `listAgentIds()` 的顺序逐条尝试 */
+  role_id?: string;
+  /** 重试预算；缺省用 DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/** 落一条结论的入参 */
+export interface PersonaEvolutionCompletionRequest {
+  role_id: string;
+  claim_token: string;
+  /** 交叉核对的持有者标识；真正的 fencing 是 claim_token */
+  owner?: string;
+  /** 判定所依据的父版本：**条件写的前置条件** */
+  parent_version: number;
+  /** 本次的结论 */
+  outcome: PersonaEvolutionOutcome;
+  /** 判定用的策略版本；写进标记，也是「要不要重评」的判据 */
+  strategy_version: string;
+  /** 判定所依据的输入快照；写进标记，也是幂等键的一半 */
+  input_snapshot_hash: string;
+  /** 产生这次结论的 maintenance run */
+  source_run_id: string;
+  /** 判定理由（人读） */
+  reasons: string[];
+  /** 变更摘要（人读）；`evolved` 时应当给 */
+  change_summary?: string;
+  /** 自动批准时的批准者标识 */
+  reviewed_by?: string;
+  /**
+   * `outcome === 'evolved'` 时必填：这一版的**完整** Persona。
+   *
+   * 实现要校验 `persona.version === parent_version + 1` 且 `persona.role_id === role_id`：
+   * 版本号只能由父版本推出，让调用方自报一个跳版本的值就等于允许它写出一个不属于它的版本。
+   */
+  persona?: PersonaDef;
+  now: string;
+}
+
+/**
+ * 落一条结论的结果。
+ *
+ * 三种终局必须分得开，因为它们的处置完全不同：`applied` 是落地了，`claim_lost` 是「这次没
+ * 轮到我们」（落盘责任归当前持有者），而 `parent_conflict` 是**判据过期**——别的 worker 或
+ * 前端 PATCH 在读到与写回之间改了 Persona，此时绝不能覆盖（那是「不得破坏旧版本」的落点），
+ * 但也**不是**永久失败：重投会重新读、重算快照、重判一次。
+ */
+export type PersonaEvolutionCompletionResult =
+  | { kind: 'applied'; marker: PersonaEvolutionMarker; persona?: PersonaDef | undefined }
+  | { kind: 'claim_lost' }
+  | { kind: 'parent_conflict'; expected_parent_version: number; current_version: number };
+
+/** 落一次失败的入参（退避回队列或进死信） */
+export interface PersonaEvolutionFailureRequest {
+  role_id: string;
+  claim_token: string;
+  owner?: string;
+  error: string;
+  retryable: boolean;
+  now: string;
+  /** 重试预算；缺省用 DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/** 启动恢复的入参 */
+export interface PersonaEvolutionRestoreOptions {
+  /** 只恢复该 role；缺省跨全部 Agent */
+  role_id?: string;
+  now: string;
+  /** 重试预算；缺省用 DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/** 恢复出来的一条候选：标记本身不带 role，因此成对返回 */
+export interface RestoredPersonaEvolutionClaim {
+  role_id: string;
+  marker: PersonaEvolutionMarker;
 }
 
 export interface MemoryRepository {
@@ -500,6 +626,82 @@ export interface MemoryRepository {
     experience_id: string;
     now: string;
   }): Promise<ExperienceRecord | undefined>;
+
+  // ── Persona 演化的状态面（Phase 4-B） ────────────────────────────
+
+  /**
+   * 读一个角色的演化标记。
+   *
+   * 从未演化过返回 `undefined` —— 那不是错误，是「这条演化流还没被人碰过」（Phase 4 之前
+   * 落库的 Agent、以及刚建的 Agent）。**必须是持久层的事实**，不能靠进程内缓存兜：它是
+   * 「要不要 claim」的第一手判据。
+   */
+  getPersonaEvolutionMarker(role_id: string): Promise<PersonaEvolutionMarker | undefined>;
+
+  /**
+   * claim 下一个该演化的角色：读出它的输入、算出快照、按计划把标记推进到 `processing`。
+   *
+   * 「读输入 → 算快照 → 判计划 → 写标记」必须在**同一个临界区**里完成：计划的判据之一是
+   * 「这份输入与上一次演化过的是不是同一份」，而输入是由同一个角色名下的技能与经验算出来的
+   * ——中间插进来一条新经验，就会出现「按旧快照判、按新快照记」。因此入参不带快照，适配器
+   * 自己在临界区里算（这也让两个适配器不可能对「输入是什么」有各自的解释）。
+   *
+   * 拿不到（没有候选、别人抢先、抢不到锁）返回 undefined —— 与交付侧「返回 undefined 表示
+   * 这次什么都没做」是同一种约定，不是错误。
+   */
+  claimNextPersonaEvolutionCandidate(
+    request: PersonaEvolutionClaimRequest,
+  ): Promise<ClaimedPersonaEvolutionCandidate | undefined>;
+
+  /**
+   * 落一条结论（`processing` → `processed`），并在 `evolved` 时**条件写入**新 Persona 版本。
+   *
+   * 两道条件缺一不可，且必须在同一次原子写里成立：
+   *
+   * 1. **凭据**（`claim_token` / 可选 `owner` / 租约未过期、标记仍是 `processing`）：不成立
+   *    返回 `{ kind: 'claim_lost' }` 且**什么都不写**——那是「这次没轮到我们」，结论归当前
+   *    持有者，硬写只会把别人的结论盖掉。
+   * 2. **父版本**（写回那一刻读到的 `persona.version` 必须等于 `request.parent_version`）：
+   *    不成立返回 `{ kind: 'parent_conflict' }` 且**不覆盖**——Persona 是单实体单版本号的，
+   *    版本号就是乐观锁。冲突说明这份判定已经过期（别的 worker 先写了一步，或前端 PATCH
+   *    改过），重投会重新读、重算、重判。
+   *
+   * 落地的形态：Persona 行换成 `request.persona`（版本 = 父版本 + 1），标记写成
+   * `processed` + 结论 + `parent_version` / `persona_version` / `strategy_version` /
+   * `input_snapshot_hash` / `source_run_id` / `reasons` / `change_summary` / `reviewed_by`，
+   * 并清掉凭据（token 与租约是**活着的**凭据，终态不再有人持有）。
+   *
+   * **重复执行不产生重复版本**靠的是「凭据 + 父版本」这两道条件：第二次调用时标记已经不是
+   * `processing`（或 token 已换），因此 `claim_lost`，一个字节都不会写。
+   */
+  completePersonaEvolution(
+    request: PersonaEvolutionCompletionRequest,
+  ): Promise<PersonaEvolutionCompletionResult>;
+
+  /** 落一次失败（退避回队列或进死信）；凭据不成立返回 undefined */
+  failPersonaEvolution(
+    request: PersonaEvolutionFailureRequest,
+  ): Promise<PersonaEvolutionMarker | undefined>;
+
+  /**
+   * 启动恢复：把租约过期仍停在 `processing` 的演化标记放回队列。
+   *
+   * 每一条都在自己的临界区里重新判一次过期，因此不会把「列举之后已经被别人完成了」的候选
+   * 重投一次。
+   */
+  restoreExpiredPersonaEvolutionClaims(
+    options: PersonaEvolutionRestoreOptions,
+  ): Promise<RestoredPersonaEvolutionClaim[]>;
+
+  /**
+   * 人工重试：`dead_letter` → `pending`，并清零投递次数（「再试一次」就是再给满额机会）。
+   *
+   * 只有死信可重试，其余状态返回 undefined。这是**运维入口**，自动路径不会调它。
+   */
+  retryDeadLetterPersonaEvolution(request: {
+    role_id: string;
+    now: string;
+  }): Promise<PersonaEvolutionMarker | undefined>;
 
   /**
    * 直写技能向量（memory.reindex 全量重建索引用）。

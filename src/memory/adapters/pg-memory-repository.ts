@@ -17,6 +17,7 @@ import {
   ExperienceRecordSchema,
   MARKET_POOL_ROLE_ID,
   PersonaDefSchema,
+  PersonaEvolutionMarkerSchema,
   SkillRecordSchema,
   canNameExperience,
   type AgentArchiveRecord,
@@ -26,12 +27,14 @@ import {
   type CreateAgentSpec,
   type ExperienceRecord,
   type PersonaDef,
+  type PersonaEvolutionMarker,
   type RetiredReason,
   type SkillRecord,
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type { PromotionApprovalMode } from '../ports/promotion-strategy';
 import type {
+  ClaimedPersonaEvolutionCandidate,
   ClaimedPromotionCandidate,
   ExperienceFeedbackApplication,
   ExperienceFeedbackResult,
@@ -40,15 +43,22 @@ import type {
   MarketSearchOptions,
   MemoryRepository,
   MemoryVectorSearchOptions,
+  PersonaEvolutionClaimRequest,
+  PersonaEvolutionCompletionRequest,
+  PersonaEvolutionCompletionResult,
+  PersonaEvolutionFailureRequest,
+  PersonaEvolutionRestoreOptions,
   PromotionCandidateQuery,
   PromotionClaimRequest,
   PromotionCompletionRequest,
   PromotionFailureRequest,
   PromotionRestoreOptions,
+  RestoredPersonaEvolutionClaim,
   SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
 import {
+  DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY,
   DEFAULT_PROMOTION_RETRY_POLICY,
   claimDeliveryRecord,
   completeDeliveryRecord,
@@ -59,6 +69,15 @@ import {
   resetDeliveryForRetry,
   type DeliveryRetryPolicy,
 } from '../services/delivery-lifecycle';
+import {
+  buildPersonaEvolutionSnapshot,
+  personaEvolutionInputSnapshotHash,
+  planPersonaEvolutionCandidate,
+} from '../services/persona-evolution-candidates';
+import {
+  personaEvolutionSettlement,
+  resolvePersonaEvolutionWrite,
+} from '../services/persona-evolution-decision';
 import {
   comparePromotionCandidates,
   planPromotionCandidate,
@@ -1231,6 +1250,390 @@ export class PgMemoryRepository implements MemoryRepository {
       const reset = resetDeliveryForRetry(marker, { now: request.now });
       return reset ? { ...current, promotion: reset } : undefined;
     });
+  }
+
+  // ── Persona 演化的状态面（Phase 4-B） ──────────────────────────────
+  //
+  // 与晋升同一套骨架（role 临界区里「读 → 算出下一版 → 条件写」），但状态与 Persona 落在
+  // **同一行**（`memory_agents`），因此「凭据仍然成立」与「父版本仍然是当前版本」两道条件
+  // 可以在同一条 UPDATE 的谓词里一起成立——不可能出现一个成立一个不成立。这正是把标记放在
+  // Agent 记录上带来的红利。
+
+  async getPersonaEvolutionMarker(
+    role_id: string,
+  ): Promise<PersonaEvolutionMarker | undefined> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ persona_evolution: unknown | null }>(
+      `SELECT persona_evolution FROM memory_agents WHERE role_id = $1`,
+      [role_id],
+    );
+    const row = result.rows[0];
+    if (!row || row.persona_evolution === null || row.persona_evolution === undefined) {
+      return undefined;
+    }
+    return PersonaEvolutionMarkerSchema.parse(row.persona_evolution);
+  }
+
+  async claimNextPersonaEvolutionCandidate(
+    request: PersonaEvolutionClaimRequest,
+  ): Promise<ClaimedPersonaEvolutionCandidate | undefined> {
+    await this.ensureSchema();
+    // 隐藏的市场池 Agent 已经被 listAgentIds 排除在外——它只是技能的归属容器，不演化
+    const roles = request.role_id !== undefined ? [request.role_id] : await this.listAgentIds();
+    for (const role_id of roles) {
+      const claimed = await this.withRoleLock(role_id, () =>
+        this.claimPersonaEvolutionLocked(role_id, request),
+      );
+      if (claimed) return claimed;
+    }
+    return undefined;
+  }
+
+  async completePersonaEvolution(
+    request: PersonaEvolutionCompletionRequest,
+  ): Promise<PersonaEvolutionCompletionResult> {
+    await this.ensureSchema();
+    const evolved = request.outcome === 'evolved';
+    if (evolved) {
+      const persona = request.persona;
+      if (!persona) {
+        throw new Error('completePersonaEvolution requires a persona when the outcome is "evolved".');
+      }
+      // 版本号只能由父版本推出：让调用方自报一个跳版本的值，等于允许它写出一个不属于它的版本
+      if (persona.role_id !== request.role_id) {
+        throw new Error(
+          `completePersonaEvolution received a persona for ${persona.role_id}, not ${request.role_id}.`,
+        );
+      }
+      if (persona.version !== request.parent_version + 1) {
+        throw new Error(
+          `completePersonaEvolution requires persona version ${String(request.parent_version + 1)} `
+            + `(parent ${String(request.parent_version)} + 1); got ${String(persona.version)}.`,
+        );
+      }
+    }
+
+    return this.withRoleLock(request.role_id, async () => {
+      const current = await this.readPersonaEvolutionRow(request.role_id);
+      const marker = current?.marker;
+      if (!current || !marker) return { kind: 'claim_lost' };
+
+      // 凭据先判：不成立就什么都不写，落盘责任归当前持有者
+      const settled = completeDeliveryRecord(
+        personaEvolutionSettlement(marker, request),
+        {
+          ...(request.owner !== undefined ? { owner: request.owner } : {}),
+          claim_token: request.claim_token,
+          now: request.now,
+        },
+      );
+      if (!settled) return { kind: 'claim_lost' };
+
+      const applied = await this.writePersonaEvolutionSettlement(
+        request.role_id,
+        marker,
+        settled,
+        evolved
+          ? { expected_parent_version: request.parent_version, persona: request.persona! }
+          : undefined,
+      );
+      if (applied.kind === 'applied') {
+        return {
+          kind: 'applied',
+          marker: settled,
+          ...(evolved ? { persona: { ...request.persona! } } : {}),
+        };
+      }
+      if (applied.kind === 'parent_conflict') {
+        return {
+          kind: 'parent_conflict',
+          expected_parent_version: request.parent_version,
+          current_version: applied.current_version,
+        };
+      }
+      return { kind: 'claim_lost' };
+    });
+  }
+
+  async failPersonaEvolution(
+    request: PersonaEvolutionFailureRequest,
+  ): Promise<PersonaEvolutionMarker | undefined> {
+    await this.ensureSchema();
+    return this.withRoleLock(request.role_id, async () => {
+      const current = await this.readPersonaEvolutionRow(request.role_id);
+      const marker = current?.marker;
+      if (!marker) return undefined;
+
+      const failed = failDeliveryRecord(marker, {
+        ...(request.owner !== undefined ? { owner: request.owner } : {}),
+        claim_token: request.claim_token,
+        error: request.error,
+        retryable: request.retryable,
+        now: request.now,
+        policy: request.policy ?? DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY,
+      });
+      if (!failed) return undefined;
+
+      const written = await this.writePersonaEvolutionMarkerIfUnchanged(
+        request.role_id,
+        marker,
+        failed,
+      );
+      return written ? failed : undefined;
+    });
+  }
+
+  async restoreExpiredPersonaEvolutionClaims(
+    options: PersonaEvolutionRestoreOptions,
+  ): Promise<RestoredPersonaEvolutionClaim[]> {
+    await this.ensureSchema();
+    const policy = options.policy ?? DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY;
+    const roles = options.role_id !== undefined ? [options.role_id] : await this.listAgentIds();
+    const restored: RestoredPersonaEvolutionClaim[] = [];
+
+    for (const role_id of roles) {
+      // 每一条都在自己的临界区里重新判一次过期：列举之后已经被别人完成的候选不会被重投
+      const entry = await this.withRoleLock(role_id, async () => {
+        const current = await this.readPersonaEvolutionRow(role_id);
+        const marker = current?.marker;
+        if (!marker || !isDeliveryClaimExpired(marker, options.now)) return undefined;
+        const updated = expireDeliveryClaimRecord(marker, { now: options.now, policy });
+        const written = await this.writePersonaEvolutionMarkerIfUnchanged(role_id, marker, updated);
+        return written ? { role_id, marker: updated } : undefined;
+      });
+      if (entry) restored.push(entry);
+    }
+    return restored;
+  }
+
+  async retryDeadLetterPersonaEvolution(request: {
+    role_id: string;
+    now: string;
+  }): Promise<PersonaEvolutionMarker | undefined> {
+    await this.ensureSchema();
+    return this.withRoleLock(request.role_id, async () => {
+      const current = await this.readPersonaEvolutionRow(request.role_id);
+      const marker = current?.marker;
+      if (!marker) return undefined;
+
+      const reset = resetDeliveryForRetry(marker, { now: request.now });
+      if (!reset) return undefined;
+
+      const written = await this.writePersonaEvolutionMarkerIfUnchanged(
+        request.role_id,
+        marker,
+        reset,
+      );
+      return written ? reset : undefined;
+    });
+  }
+
+  /** 读一个角色的演化状态（Persona 与标记）。Agent 不存在时返回 undefined */
+  private async readPersonaEvolutionRow(role_id: string): Promise<
+    | {
+        persona: PersonaDef;
+        marker?: PersonaEvolutionMarker | undefined;
+      }
+    | undefined
+  > {
+    const result = await this.pool.query<{ persona: unknown; persona_evolution: unknown | null }>(
+      `SELECT persona, persona_evolution FROM memory_agents WHERE role_id = $1`,
+      [role_id],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      persona: PersonaDefSchema.parse(row.persona),
+      ...(row.persona_evolution === null || row.persona_evolution === undefined
+        ? {}
+        : { marker: PersonaEvolutionMarkerSchema.parse(row.persona_evolution) }),
+    };
+  }
+
+  /**
+   * 一个角色的一次 claim。**整段在 role 临界区里**：读 Persona、技能、经验，算快照与 hash，
+   * 判计划，条件写标记——因此「据以判定的那份输入」与「据此写下的租约」来自同一次读。
+   *
+   * 已知的窗口（与晋升的执行内核同类，且同样自愈）：快照是从 `memory_skills` /
+   * `memory_experiences` 两张表读出来的，跨进程的并发写入不在 role 临界区的保护范围内。
+   * 若在读与写之间落下一条新经验，标记记下的 hash 就比库里的现状旧一版。后果是下一次运行
+   * 会算出另一个 hash 并重新评估——判定与它记下的 hash 始终一致（两者都来自这一次读），
+   * 因此不会出现「按旧快照判、按新快照记」这种自相矛盾的记录。
+   */
+  private async claimPersonaEvolutionLocked(
+    role_id: string,
+    request: PersonaEvolutionClaimRequest,
+  ): Promise<ClaimedPersonaEvolutionCandidate | undefined> {
+    const current = await this.readPersonaEvolutionRow(role_id);
+    if (!current) return undefined;
+
+    const [skills, experiences] = await Promise.all([
+      this.listSkills(role_id),
+      this.listExperiences(role_id),
+    ]);
+    const snapshot = buildPersonaEvolutionSnapshot({ role_id, skills, experiences });
+    const input_snapshot_hash = personaEvolutionInputSnapshotHash(snapshot);
+    const policy = request.policy ?? DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY;
+
+    const plan = planPersonaEvolutionCandidate(current.marker, {
+      now: request.now,
+      strategy_version: request.strategy_version,
+      approval: request.approval,
+      input_snapshot_hash,
+      policy,
+    });
+    if (plan.kind === 'skip') return undefined;
+
+    const marker =
+      plan.kind === 'expire_then_claim'
+        ? expireDeliveryClaimRecord(current.marker!, { now: request.now, policy })
+        : plan.marker;
+
+    const claimed = claimDeliveryRecord(marker, {
+      owner: request.owner,
+      now: request.now,
+      lease_ms: request.lease_ms,
+      claim_token: newClaimToken(),
+      policy,
+    });
+    if (!claimed) {
+      // 回收之后可能直接进了死信（次数用满），claim 自然拿不到它——把回收结果写回去，
+      // 否则这条标记的租约永远停在过期状态，每次扫描都白跑一遍
+      if (plan.kind === 'expire_then_claim') {
+        await this.writePersonaEvolutionMarkerIfUnchanged(role_id, current.marker!, marker);
+      }
+      return undefined;
+    }
+
+    const written = await this.writePersonaEvolutionMarkerIfUnchanged(
+      role_id,
+      current.marker,
+      claimed,
+    );
+    if (!written) return undefined;
+
+    return {
+      role_id,
+      marker: claimed,
+      claim_token: claimed.claim_token!,
+      attempt_count: claimed.attempt_count,
+      persona: current.persona,
+      snapshot,
+      input_snapshot_hash,
+    };
+  }
+
+  /**
+   * 只写标记的条件写（claim / fail / 回收 / 人工重试都走它）。
+   *
+   * 谓词带的是**读到的这一版标记**（四个字段，全为 NULL 时要求这一行压根没有标记），因此
+   * 跨进程的并发抢写只有一个能成功——这正是「两个 worker 并发 claim 同一角色只有一个拿到」
+   * 在数据库上的落点。`current` 为 undefined 表示「读的时候还没有标记」。
+   */
+  private async writePersonaEvolutionMarkerIfUnchanged(
+    role_id: string,
+    current: PersonaEvolutionMarker | undefined,
+    next: PersonaEvolutionMarker,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE memory_agents
+       SET persona_evolution = $2::jsonb
+       WHERE role_id = $1
+         AND persona_evolution->>'status' IS NOT DISTINCT FROM $3
+         AND persona_evolution->>'attempt_count' IS NOT DISTINCT FROM $4
+         AND persona_evolution->>'claim_token' IS NOT DISTINCT FROM $5
+         AND persona_evolution->>'updated_at' IS NOT DISTINCT FROM $6`,
+      [
+        role_id,
+        JSON.stringify(next),
+        current?.status ?? null,
+        current === undefined ? null : String(current.attempt_count),
+        current?.claim_token ?? null,
+        current?.updated_at ?? null,
+      ],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  /**
+   * 落一条结论的条件写。凭据与父版本两道条件在**同一条 UPDATE** 里成立。
+   *
+   * `handle` 用 `jsonb_set` 就地合并 `persona` 一个键，而不是整份覆盖：handle 里还嵌着
+   * 技能计数、经验计数与指标快照，那些字段会被别的操作（晋升、反馈归并、任务收尾）独立推进。
+   * 拿着 claim 那一刻读到的副本整份写回，等于把中间发生的每一次推进都回滚掉——这类丢更新
+   * 在测试里几乎撞不上，在生产上表现为「技能数莫名其妙少了几个」。
+   *
+   * 谓词不成立时无法从 rowCount 区分是哪一道条件挡住的，因此重读一次那一行：父版本对不上
+   * 就是**判定过期**（`parent_conflict`，可重投），否则是**凭据失效**（`claim_lost`）。
+   * 这个区分不是细节：前者要重新读、重新判，后者说明这次压根没轮到我们。
+   */
+  private async writePersonaEvolutionSettlement(
+    role_id: string,
+    current: PersonaEvolutionMarker,
+    next: PersonaEvolutionMarker,
+    evolved: { expected_parent_version: number; persona: PersonaDef } | undefined,
+  ): Promise<
+    { kind: 'applied' } | { kind: 'claim_lost' } | { kind: 'parent_conflict'; current_version: number }
+  > {
+    const guard = [
+      role_id,
+      current.status,
+      String(current.attempt_count),
+      current.claim_token ?? null,
+      current.updated_at,
+    ];
+    const result =
+      evolved === undefined
+        ? await this.pool.query(
+            `UPDATE memory_agents
+             SET persona_evolution = $2::jsonb
+             WHERE role_id = $1
+               AND persona_evolution->>'status' IS NOT DISTINCT FROM $3
+               AND persona_evolution->>'attempt_count' IS NOT DISTINCT FROM $4
+               AND persona_evolution->>'claim_token' IS NOT DISTINCT FROM $5
+               AND persona_evolution->>'updated_at' IS NOT DISTINCT FROM $6`,
+            [guard[0], JSON.stringify(next), guard[1], guard[2], guard[3], guard[4]],
+          )
+        : await this.pool.query(
+            `UPDATE memory_agents
+             SET persona = $2::jsonb,
+                 handle = jsonb_set(handle, '{persona}', $2::jsonb),
+                 persona_evolution = $3::jsonb
+             WHERE role_id = $1
+               AND (persona->>'version')::int = $4
+               AND persona_evolution->>'status' IS NOT DISTINCT FROM $5
+               AND persona_evolution->>'attempt_count' IS NOT DISTINCT FROM $6
+               AND persona_evolution->>'claim_token' IS NOT DISTINCT FROM $7
+               AND persona_evolution->>'updated_at' IS NOT DISTINCT FROM $8`,
+            [
+              guard[0],
+              JSON.stringify(evolved.persona),
+              JSON.stringify(next),
+              String(evolved.expected_parent_version),
+              guard[1],
+              guard[2],
+              guard[3],
+              guard[4],
+            ],
+          );
+
+    if ((result.rowCount ?? 0) > 0) return { kind: 'applied' };
+    if (evolved === undefined) return { kind: 'claim_lost' };
+
+    // 两道条件里到底是哪一道挡住的：重读一次当前版本，父版本对不上就是判定过期。
+    // 判据取自 4-A 的 `resolvePersonaEvolutionWrite`——与内存实现、与 4-A 的单测共用同一份
+    // 定义，因此「什么时候算冲突」不可能在两个后端之间漂移。
+    const reread = await this.readPersonaEvolutionRow(role_id);
+    if (reread) {
+      const resolution = resolvePersonaEvolutionWrite({
+        parent_version: evolved.expected_parent_version,
+        current_version: reread.persona.version,
+      });
+      if (resolution.kind === 'conflict') {
+        return { kind: 'parent_conflict', current_version: resolution.current_version };
+      }
+    }
+    return { kind: 'claim_lost' };
   }
 
   /**

@@ -750,6 +750,17 @@ export type {
   PersonaEvolutionMarker,
   PersonaEvolutionOutcome,
 } from './schemas';
+export type {
+  ClaimedPersonaEvolutionCandidate,
+  PersonaEvolutionClaimRequest,
+  PersonaEvolutionCompletionRequest,
+  PersonaEvolutionCompletionResult,
+  PersonaEvolutionFailureRequest,
+  PersonaEvolutionRestoreOptions,
+  RestoredPersonaEvolutionClaim,
+} from './ports/memory-repository';
+export { personaEvolutionFeedbackSummary } from './services/persona-evolution-candidates';
+export { personaEvolutionSettlement } from './services/persona-evolution-decision';
 
 // ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型

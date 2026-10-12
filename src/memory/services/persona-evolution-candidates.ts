@@ -28,7 +28,9 @@ import {
   isDeliveryDue,
   type DeliveryRetryPolicy,
 } from './delivery-lifecycle';
+import { averageConfidence } from './usage-feedback';
 import type {
+  PersonaEvolutionFeedbackSummary,
   PersonaEvolutionInputSnapshot,
   PersonaEvolutionSkillSnapshot,
   PersonaEvolutionExperienceSnapshot,
@@ -139,13 +141,64 @@ export function buildPersonaEvolutionSnapshot(input: {
   experiences: ExperienceRecord[];
   feedback?: PersonaEvolutionFeedbackSummaryInput | undefined;
 }): PersonaEvolutionInputSnapshot {
-  const skills = selectApprovedSkills(input.skills).map(toSkillSnapshot);
-  const experiences = selectEligibleExperiences(input.experiences).map(toExperienceSnapshot);
+  const approvedSkills = selectApprovedSkills(input.skills);
+  const eligibleExperiences = selectEligibleExperiences(input.experiences);
+  // 缺省由**参与演化的那些经验**自己推导反馈聚合：反馈的证据（`confidence_history` 里带
+  // `feedback_id` 的条目）本来就落在经验上，因此这份聚合是快照内容的一个纯函数，判定能看到的
+  // 就是它能依据的全部。传进来的那一份优先（测试与脚本要构造确定的输入时用得上）。
+  //
+  // 注意喂进去的是**裁剪之前**的经验记录：快照条目刻意不带 `confidence_history`（那是整条
+  // 历史，不是判定的输入），而反馈痕迹只在那份历史里。
+  const feedback = input.feedback ?? personaEvolutionFeedbackSummary(eligibleExperiences);
   return {
     role_id: input.role_id,
-    skills: skills.sort(compareSnapshotEntries),
-    experiences: experiences.sort(compareSnapshotEntries),
-    ...(input.feedback !== undefined ? { feedback: { ...input.feedback } } : {}),
+    skills: approvedSkills.map(toSkillSnapshot).sort(compareSnapshotEntries),
+    experiences: eligibleExperiences.map(toExperienceSnapshot).sort(compareSnapshotEntries),
+    ...(feedback !== undefined ? { feedback: { ...feedback } } : {}),
+  };
+}
+
+/**
+ * 从**参与演化的经验**上推导反馈聚合；没有任何反馈痕迹时返回 undefined。
+ *
+ * 证据来自 `confidence_history`：反馈回写路径会给每一条变更记一个 `feedback_id`（见
+ * schemas.ts 的 ConfidenceHistoryEntrySchema），而没有 `feedback_id` 的条目是种子数据、
+ * 手工调整或反馈回写之前的旧记录，都不算「一条反馈被归并过」。
+ *
+ * 三处刻意的选择：
+ *
+ * 1. **没有痕迹就是缺席，不是 0**。缺席与「归并过 0 条」是两件不同的事，前者意味着「这个
+ *    角色还没有任何反馈证据」，策略要么不设反馈门槛、要么显式拒绝（`feedback_unavailable`）
+ *    ——两者都不该是「用一个 0 分把它判掉」。
+ * 2. **按 `feedback_id` 去重**：同一条反馈可能被应用到多条经验上，而这里答的是「有多少条
+ *    反馈已经被归并进来」，重复计数会让同一个证据的影响随经验条数放大。
+ * 3. **平均置信度按同一批经验现算**，而不是读 `AgentMetrics.avg_confidence`：后者是全量经验的
+ *    聚合，与快照里这一批不是同一个总体。用后者会让「策略依据的反馈质量」被一批它看不到的
+ *    经验左右——同一个 hash 下判定却随不可见数据变化，幂等键就失去了意义。
+ */
+export function personaEvolutionFeedbackSummary(
+  experiences: readonly {
+    confidence: number;
+    confidence_history: readonly { feedback_id?: string | undefined; updated_at: string }[];
+  }[],
+): PersonaEvolutionFeedbackSummary | undefined {
+  const latestByFeedback = new Map<string, string>();
+  for (const experience of experiences) {
+    for (const entry of experience.confidence_history) {
+      if (entry.feedback_id === undefined) continue;
+      const current = latestByFeedback.get(entry.feedback_id);
+      if (current === undefined || entry.updated_at > current) {
+        latestByFeedback.set(entry.feedback_id, entry.updated_at);
+      }
+    }
+  }
+  if (latestByFeedback.size === 0) return undefined;
+
+  const lastFeedbackAt = [...latestByFeedback.values()].sort().at(-1);
+  return {
+    applied_feedback_count: latestByFeedback.size,
+    average_confidence: averageConfidence(experiences),
+    ...(lastFeedbackAt !== undefined ? { last_feedback_at: lastFeedbackAt } : {}),
   };
 }
 
