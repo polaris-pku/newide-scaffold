@@ -787,6 +787,40 @@ export {
 } from './runtime/persona-evolution-job';
 
 // ════════════════════════════════════════════════════════
+//  20c. Memory Maintenance：Persona 版本历史与回滚（Phase 4 修复 B）
+//      「每一版 Persona 的正文」本身：演化与回滚各追加一行，`savePersona` 覆盖写时登记
+//      当前版本那一行，迁移为老 Agent 补一行 `baseline`。
+//
+//      读端口（`listPersonaVersions` / `getPersonaVersion` / `getCurrentPersonaVersion`）
+//      与回滚端口（`rollbackPersona`）都在 `MemoryRepository` 上——**必须**在那里：写下一版
+//      Persona 与登记这一版的历史是同一笔写，分成两个 store 就等于承认存在「Persona 已经是
+//      v5、历史里没有 v5」的窗口，而那个窗口正是回滚与审计唯一依赖的东西。
+//
+//      回滚是**再写一版**而不是擦掉一版：正文抄自目标版本，版本号是当前版本 +1，旧历史一行
+//      不动；条件写落在当前版本上，并发回滚只有一个赢家，输的那个拿到明确的 version_conflict。
+// ════════════════════════════════════════════════════════
+
+export type { PersonaVersionRecord, PersonaVersionSource } from './schemas';
+export type {
+  PersonaRollbackRequest,
+  PersonaRollbackResult,
+  PersonaVersionQuery,
+} from './ports/memory-repository';
+export {
+  applyPersonaVersionLimit,
+  buildRolledBackPersona,
+  evolvedPersonaVersionRecord,
+  manualPersonaVersionRecord,
+  personaRollbackRecord,
+  personaVersionRecord,
+  resolvePersonaRollback,
+  seedPersonaVersionRecord,
+  summarizePersonaRollback,
+  type PersonaRollbackResolution,
+  type PersonaVersionRecordInput,
+} from './services/persona-version-history';
+
+// ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型
 // ════════════════════════════════════════════════════════
 

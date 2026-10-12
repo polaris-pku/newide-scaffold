@@ -104,6 +104,22 @@ const PERSONA_EVOLUTION_REPOSITORY_METHODS = [
   'listExperiences',
 ] as const satisfies ReadonlyArray<keyof MemoryRepository>;
 
+/**
+ * Persona 版本历史与回滚用到的 `MemoryRepository` 能力（Phase 4 修复 B）。
+ *
+ * 与前两份同一个用途，单独列出是因为它对应的是**产物面**而不是那两条通道：历史与回滚同样只
+ * 长在 `MemoryRepository` 上（必须如此——写下一版 Persona 与登记这一版的历史是同一笔写），
+ * 因此 File 后端一样承载不了。
+ */
+const PERSONA_VERSION_REPOSITORY_METHODS = [
+  'listPersonaVersions',
+  'getPersonaVersion',
+  'getCurrentPersonaVersion',
+  'rollbackPersona',
+  'getPersona',
+  'savePersona',
+] as const satisfies ReadonlyArray<keyof MemoryRepository>;
+
 describe('File 后端与维护通道的边界', () => {
   it('能承载的那一半：skill_promotion 的 run 记录如实落盘，换个实例读得回来，且不留临时文件', async () => {
     const root = await tempRoot();
@@ -177,6 +193,7 @@ describe('File 后端与维护通道的边界', () => {
     const lists = {
       SkillPromotion: PROMOTION_REPOSITORY_METHODS,
       PersonaEvolution: PERSONA_EVOLUTION_REPOSITORY_METHODS,
+      PersonaVersionHistory: PERSONA_VERSION_REPOSITORY_METHODS,
     };
 
     // 清单不是空的：真正的实现必须有这些能力，否则下面的断言测的是「一个不存在的清单」。

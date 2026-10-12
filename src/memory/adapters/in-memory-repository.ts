@@ -17,6 +17,7 @@ import {
   type ExperienceRecord,
   type PersonaDef,
   type PersonaEvolutionMarker,
+  type PersonaVersionRecord,
   type RetiredReason,
   type SkillRecord,
 } from '../schemas';
@@ -37,6 +38,9 @@ import type {
   PersonaEvolutionCompletionResult,
   PersonaEvolutionFailureRequest,
   PersonaEvolutionRestoreOptions,
+  PersonaRollbackRequest,
+  PersonaRollbackResult,
+  PersonaVersionQuery,
   PromotionCandidateQuery,
   PromotionClaimRequest,
   PromotionCompletionRequest,
@@ -74,6 +78,15 @@ import {
   type PromotionCandidateInput,
 } from '../services/promotion-candidates';
 import {
+  applyPersonaVersionLimit,
+  buildRolledBackPersona,
+  evolvedPersonaVersionRecord,
+  manualPersonaVersionRecord,
+  personaRollbackRecord,
+  resolvePersonaRollback,
+  seedPersonaVersionRecord,
+} from '../services/persona-version-history';
+import {
   assertPromotedSkillReference,
   type PromotedSkillFacts,
 } from '../services/promotion-integrity';
@@ -105,6 +118,17 @@ interface AgentStore {
    * `persona`（那是一次演化的产物，把「上一次怎么来的」记进产物会让两者互相耦合）。
    */
   personaEvolution?: PersonaEvolutionMarker;
+  /**
+   * 每一版 Persona 的正文与来历，按版本号索引（Phase 4 修复 B）。
+   *
+   * 用 `Map` 而不是数组：版本号是主键（Pg 那边就是 `PRIMARY KEY (role_id, persona_version)`），
+   * 「同一版本号只有一行」因此是数据结构本身的性质，不需要靠写入方自觉。读的时候按版本号
+   * 排序后返回，所以顺序不依赖插入顺序——版本号被写入方覆盖成更小的值时也不会串位。
+   *
+   * 建 Agent 时就有第 1 版（种子那一行），因此「当前版本在历史里没有行」在这个后端不可能
+   * 发生；Pg 那边只有 Phase B 之前落库的老 Agent 会缺，靠迁移补一行 `baseline`。
+   */
+  personaVersions: Map<number, PersonaVersionRecord>;
 }
 
 interface ScoredRecord<T> {
@@ -144,6 +168,10 @@ export class InMemoryRepository implements MemoryRepository {
       metrics,
       skills: [],
       experiences: [],
+      // 第 1 版当场进历史：历史里永远有「当前版本」那一行，是回滚可用的前提
+      personaVersions: new Map<number, PersonaVersionRecord>([
+        [persona.version, seedPersonaVersionRecord(persona)],
+      ]),
     });
   }
 
@@ -422,9 +450,21 @@ export class InMemoryRepository implements MemoryRepository {
 
   async savePersona(role_id: string, persona: PersonaDef): Promise<void> {
     const store = this.requireStore(role_id);
+    const previous_version = store.persona.version;
     store.persona = persona;
     // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
     store.handle = { ...store.handle, persona };
+    // 版本历史跟着这次覆盖写一起更新（Phase 4 修复 B）。这条路径是无条件覆盖（既有语义，
+    // 调用方是前端 PATCH 与按需重生成），因此这里**只登记**、不设条件：它保证的不变量是
+    // 「当前 Persona 的版本号那一行，内容就是当前 Persona」，而不是「版本号只会变大」。
+    store.personaVersions.set(
+      persona.version,
+      manualPersonaVersionRecord({
+        persona,
+        previous_version,
+        now: nowTimestamp(),
+      }),
+    );
   }
 
   /**
@@ -740,6 +780,23 @@ export class InMemoryRepository implements MemoryRepository {
       store.persona = persona;
       // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
       store.handle = { ...store.handle, persona };
+      // 历史与正文在**同一笔写**里落下（这里与下面两行之间没有 await，因此是一段临界区）：
+      // 「Persona 已经是 v5、历史里没有 v5」这个窗口一次都不该出现，它是回滚与审计唯一的依赖
+      store.personaVersions.set(
+        persona.version,
+        evolvedPersonaVersionRecord({
+          persona,
+          parent_version: request.parent_version,
+          source_run_id: request.source_run_id,
+          strategy_version: request.strategy_version,
+          input_snapshot_hash: request.input_snapshot_hash,
+          ...(request.change_summary !== undefined
+            ? { change_summary: request.change_summary }
+            : {}),
+          ...(request.reviewed_by !== undefined ? { reviewed_by: request.reviewed_by } : {}),
+          now: request.now,
+        }),
+      );
     }
 
     store.personaEvolution = settled;
@@ -800,6 +857,88 @@ export class InMemoryRepository implements MemoryRepository {
 
     store.personaEvolution = reset;
     return { ...reset };
+  }
+
+  // ── Persona 版本历史与回滚（Phase 4 修复 B） ──────────────────────
+  //
+  // 读的两个方法都对**不存在的角色**抛错（与 `getPersona` 一致）：「这个角色的历史」与
+  // 「没有这个角色」是两件事，把后者读成空数组会让调用方的笔误看起来像「它没有历史」。
+  // Pg 那条腿用 LEFT JOIN 换到同一个结论（见那边的方法），因此两条腿在这条边界上一致。
+
+  async listPersonaVersions(
+    role_id: string,
+    query: PersonaVersionQuery = {},
+  ): Promise<PersonaVersionRecord[]> {
+    const store = this.requireStore(role_id);
+    const records = [...store.personaVersions.values()]
+      .sort((left, right) => left.persona_version - right.persona_version)
+      .map((record) => structuredClone(record));
+    return applyPersonaVersionLimit(records, query.limit);
+  }
+
+  async getPersonaVersion(
+    role_id: string,
+    version: number,
+  ): Promise<PersonaVersionRecord | undefined> {
+    const record = this.requireStore(role_id).personaVersions.get(version);
+    return record === undefined ? undefined : structuredClone(record);
+  }
+
+  async getCurrentPersonaVersion(
+    role_id: string,
+  ): Promise<PersonaVersionRecord | undefined> {
+    const store = this.requireStore(role_id);
+    const record = store.personaVersions.get(store.persona.version);
+    return record === undefined ? undefined : structuredClone(record);
+  }
+
+  async rollbackPersona(request: PersonaRollbackRequest): Promise<PersonaRollbackResult> {
+    const store = this.requireStore(request.role_id);
+
+    // 目标版本先判：请求本身就不可满足时先说这件事，不去比较版本条件（那会给出一个更绕的
+    // 解释，而调用方真正要修的是「你指的是哪一版」）
+    const target = store.personaVersions.get(request.target_version);
+    if (!target) return { kind: 'target_missing', target_version: request.target_version };
+
+    const resolution = resolvePersonaRollback({
+      expected_current_version: request.expected_current_version,
+      current_version: store.persona.version,
+      target_version: request.target_version,
+    });
+    if (resolution.kind === 'conflict') {
+      return {
+        kind: 'version_conflict',
+        expected_version: resolution.expected_version,
+        current_version: resolution.current_version,
+      };
+    }
+
+    // 以下是**一段没有 await 的临界区**：条件判过之后，正文、聚合根快照与历史行一起落定，
+    // 中间不存在「Persona 换好了、历史还没写」或「两个回滚都以为自己赢了」的窗口
+    const persona = buildRolledBackPersona({
+      role_id: request.role_id,
+      target: target.persona,
+      next_version: resolution.next_version,
+      now: request.now,
+    });
+    const record = personaRollbackRecord({
+      role_id: request.role_id,
+      persona,
+      parent_version: resolution.parent_version,
+      target_version: request.target_version,
+      ...(request.reason !== undefined ? { reason: request.reason } : {}),
+      ...(request.reviewed_by !== undefined ? { reviewed_by: request.reviewed_by } : {}),
+      now: request.now,
+    });
+
+    store.persona = persona;
+    // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
+    store.handle = { ...store.handle, persona };
+    // 演化标记刻意不动：它的去重键是 (role_id, input_snapshot_hash, strategy_version)，输入
+    // 没变时把它作废会让下一次演化把刚回滚掉的版本原样写回来（见 ports 的说明）
+    store.personaVersions.set(persona.version, record);
+
+    return { kind: 'applied', persona: { ...persona }, record: structuredClone(record) };
   }
 
   /**

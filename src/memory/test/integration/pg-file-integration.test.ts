@@ -129,6 +129,7 @@ describePgFile('PgMemoryRepository + FileBufferRepository 组合集成', () => {
     await rm(agentStateRoot, { recursive: true, force: true });
     // 清理 PG 表
     if (pool) {
+      await pool.query('DROP TABLE IF EXISTS memory_persona_versions');
       await pool.query('DROP TABLE IF EXISTS memory_experiences');
       await pool.query('DROP TABLE IF EXISTS memory_skills');
       await pool.query('DROP TABLE IF EXISTS memory_agents');

@@ -757,6 +757,7 @@ describe('persona evolution state contract — PgMemoryRepository on embedded PG
 
   afterAll(async () => {
     if (pool) {
+      await pool.query('DROP TABLE IF EXISTS memory_persona_versions');
       await pool.query('DROP TABLE IF EXISTS memory_experiences');
       await pool.query('DROP TABLE IF EXISTS memory_skills');
       await pool.query('DROP TABLE IF EXISTS memory_agents');

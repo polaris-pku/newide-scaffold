@@ -17,6 +17,7 @@ import type {
   PersonaDef,
   PersonaEvolutionMarker,
   PersonaEvolutionOutcome,
+  PersonaVersionRecord,
   PromotionOutcome,
   RetiredReason,
   SkillRecord,
@@ -383,6 +384,48 @@ export interface RestoredPersonaEvolutionClaim {
   marker: PersonaEvolutionMarker;
 }
 
+// ── Persona 版本历史与回滚（Phase 4 修复 B） ─────────────────────────
+
+/** 版本历史的读入参 */
+export interface PersonaVersionQuery {
+  /** 只要最近的 N 条（返回仍按版本号升序）；缺省全部 */
+  limit?: number;
+}
+
+/** 一次回滚的入参 */
+export interface PersonaRollbackRequest {
+  role_id: string;
+  /** 正文抄自哪一版 */
+  target_version: number;
+  /**
+   * 调用方读到的当前版本 —— **必填**，条件写的前置条件。
+   *
+   * 不给它留「不给就无论如何都写」的余地：那会把回滚退化成一次无条件覆盖，两个并发回滚
+   * 会各自以为自己成功了。想要「不管当前是第几版」的调用方，先读一次再传进来——把那一步
+   * 显式留在他手里，比在这里替他猜要诚实。
+   */
+  expected_current_version: number;
+  /** 人读原因，摊进 `change_summary` */
+  reason?: string;
+  /** 操作者标识（`reviewed_by`） */
+  reviewed_by?: string;
+  now: string;
+}
+
+/**
+ * 一次回滚的结果。三种终局必须分得开，因为处置完全不同：
+ *
+ * - `applied`：落地了，返回新的正文与那一行历史。
+ * - `version_conflict`：**你以为的当前版本已经不是当前版本**（并发回滚、期间有人演化或
+ *   改过 Persona）。一个字节都没写；重投要重新读、重新决定以哪一版为准。
+ * - `target_missing`：这一版不在历史里——请求本身就不可满足（老 Agent 在 Phase B 之前
+ *   的版本没有正文可考，历史起点是 `baseline` 那一行）。
+ */
+export type PersonaRollbackResult =
+  | { kind: 'applied'; persona: PersonaDef; record: PersonaVersionRecord }
+  | { kind: 'version_conflict'; expected_version: number; current_version: number }
+  | { kind: 'target_missing'; target_version: number };
+
 export interface MemoryRepository {
   /** 确保 Agent 存在（不存在则用种子数据初始化） */
   ensureAgent(role_id: string): Promise<void>;
@@ -716,6 +759,64 @@ export interface MemoryRepository {
     role_id: string;
     now: string;
   }): Promise<PersonaEvolutionMarker | undefined>;
+
+  // ── Persona 版本历史与回滚（Phase 4 修复 B） ─────────────────────
+  //
+  // 上面那组方法管的是**演化这条流水线**（候选、持有、结论）；这一组管的是它的**产物**：
+  // 每一版 Persona 的正文本身。修复前只有「当前 Persona + 最新标记」两处，因此下一次演化
+  // 覆盖标记之后，旧版本的正文就再也找不回来了——`PersonaDef` 是单实体单版本号的，
+  // `savePersona` 又是覆盖写。历史是回滚的**前提**：没有旧正文可抄，回滚只是一句空话。
+  //
+  // 为什么历史长在这个端口上，而不是另起一个 HistoryStore：**原子性**。写下一版 Persona
+  // 与登记这一版的历史必须是同一笔写——分成两个 store 就等于承认中间存在「Persona 已经是
+  // v5、历史里没有 v5」的窗口，而那个窗口恰好是回滚与审计唯一依赖的东西。Pg 那边这一笔写
+  // 因此是**一条语句**（UPDATE ... RETURNING 配一个数据修改 CTE 的 INSERT），不是两笔。
+
+  /**
+   * 一个角色的版本历史，按版本号升序（旧 → 新）。
+   *
+   * 只读，且**不改写任何东西**：老 Agent 的历史起点是迁移时登记的 `baseline` 那一行，
+   * Phase B 之前的版本不会在这里凭空出现（没有正文可考，编不出来）。
+   */
+  listPersonaVersions(
+    role_id: string,
+    query?: PersonaVersionQuery,
+  ): Promise<PersonaVersionRecord[]>;
+
+  /** 某一版的完整记录；这一版不存在（或属于别的角色）返回 undefined */
+  getPersonaVersion(role_id: string, version: number): Promise<PersonaVersionRecord | undefined>;
+
+  /**
+   * 当前版本的记录 —— 「现在这一版是什么、怎么来的」一次问完。
+   *
+   * 当前版本号取自 `getPersona()`（唯一权威），因此它与 `getPersonaVersion(role_id, 那个号)`
+   * 是同一件事；单独有一个方法是为了让调用方不必先读 Persona 再读历史，并且让「当前版本在
+   * 历史里没有行」这件事**只可能**是迁移之前留下的老数据（Phase B 之后每一笔写都同时落两处）。
+   */
+  getCurrentPersonaVersion(role_id: string): Promise<PersonaVersionRecord | undefined>;
+
+  /**
+   * 把角色回滚到某一版的正文 —— **再写一版**，不是擦掉一版。
+   *
+   * 语义（每一条都有它挡的东西）：
+   *
+   * 1. **条件写**：只有当写下去那一刻读到的当前版本仍等于 `expected_current_version` 时才落。
+   *    不成立返回 `version_conflict`，一个字节都不写——并发回滚只有一个赢家，输的那个必须
+   *    知道，否则它会用自己那份「读到的东西」覆盖赢家刚写下的结果。
+   * 2. **新版本号**：落下的是 `当前版本 + 1`，正文抄自 `target_version`。**不复用旧版本号**：
+   *    `PersonaDef.version` 是演化写回的前置条件（乐观锁），把版本号改回去等于让一个拿着旧
+   *    判定的 worker 重新变得「正确」，于是它会把刚回滚掉的那一版写回来。
+   * 3. **旧历史一行不动**：回滚追加一行，`parent_version` 记取代了哪一版、
+   *    `rollback_from_version` 记正文抄自哪一版、`change_summary` 带上原因、`created_at` 是
+   *    这一版的时刻。
+   * 4. **不碰演化标记**：标记的去重键是 `(role_id, input_snapshot_hash, strategy_version)`，
+   *    输入没变时把它作废会让下一次演化把刚回滚掉的版本原样写回来。回滚只是把当前版本往前
+   *    推了一版，那份判定仍然「已经在这份输入上做过」。
+   *
+   * 目标版本不存在返回 `target_missing`（在版本条件之前判：请求本身就不可满足时先说这件事）。
+   * 回滚到当前版本是允许的退化情形——新的版本号、同样的正文，如实落下。
+   */
+  rollbackPersona(request: PersonaRollbackRequest): Promise<PersonaRollbackResult>;
 
   /**
    * 直写技能向量（memory.reindex 全量重建索引用）。

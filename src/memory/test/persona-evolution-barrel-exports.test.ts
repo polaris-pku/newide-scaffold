@@ -45,6 +45,7 @@ import {
   PERSONA_EVOLUTION_VERDICTS,
   PersonaEvolutionDecisionContractError,
   buildPersonaEvolutionSnapshot,
+  buildRolledBackPersona,
   classifyPersonaEvolutionFailure,
   executePersonaEvolutionCandidate,
   mergeMaintenanceRunAudit,
@@ -54,6 +55,8 @@ import {
   personaEvolutionLastRun,
   personaEvolutionStateLabel,
   planPersonaEvolutionCandidate,
+  resolvePersonaRollback,
+  summarizePersonaRollback,
   type ClaimedPersonaEvolutionCandidate,
   type ExperienceRecord,
   type MaintenanceRunStore,
@@ -82,6 +85,11 @@ import {
   type PersonaEvolutionStateLabel,
   type PersonaEvolutionStrategy,
   type PersonaEvolutionViolation,
+  type PersonaRollbackRequest,
+  type PersonaRollbackResult,
+  type PersonaVersionQuery,
+  type PersonaVersionRecord,
+  type PersonaVersionSource,
   type SkillRecord,
 } from '../index';
 
@@ -158,6 +166,11 @@ type BarrelPersonaEvolutionSurface = {
   contractError: PersonaEvolutionDecisionContractError;
   repository: MemoryRepository;
   runStore: MaintenanceRunStore;
+  personaVersion: PersonaVersionRecord;
+  personaVersionSource: PersonaVersionSource;
+  personaVersionQuery: PersonaVersionQuery;
+  rollbackRequest: PersonaRollbackRequest;
+  rollbackResult: PersonaRollbackResult;
   skill: SkillRecord;
   experience: ExperienceRecord;
   persona: PersonaDef;
@@ -180,6 +193,10 @@ describe('Persona 演化的 barrel 导出面', () => {
     // （外部 runner 要对账「两次运行的输入是不是同一批」），二是审计怎么按字段合并
     expect(typeof personaEvolutionBatchSnapshotDigest).toBe('function');
     expect(typeof mergeMaintenanceRunAudit).toBe('function');
+    // 版本历史与回滚这一面（Phase 4 修复 B）：外部运维入口要用到条件判据与两个构造
+    expect(typeof resolvePersonaRollback).toBe('function');
+    expect(typeof buildRolledBackPersona).toBe('function');
+    expect(typeof summarizePersonaRollback).toBe('function');
     expect(typeof InMemoryRepository).toBe('function');
     expect(typeof InMemoryMaintenanceRunStore).toBe('function');
     // 常量也是装配的一部分：外部 runner 要能照默认值表达「我没改批量上限 / 我没换判据」
@@ -332,6 +349,66 @@ describe('Persona 演化的 barrel 导出面', () => {
     expect(skipped.outcomes[0]?.status).toBe('skipped');
     expect(skipped.outcomes[0]?.skip_reason).toBe('already_evolved_for_snapshot');
   });
+
+  it('只用 barrel 就能读回版本历史并回滚一次（运维入口不必走深路径）', async () => {
+    const role_id = `role_barrel_persona_history_${randomUUID()}`;
+    const repository: MemoryRepository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id, name: 'Barrel Persona History Agent' });
+    await repository.saveSkillIfAbsent(role_id, makeSkill(role_id));
+    await repository.saveExperience(role_id, makeExperience(role_id));
+
+    const job: PersonaEvolutionJob = new DefaultPersonaEvolutionJob({
+      repository,
+      runStore: new InMemoryMaintenanceRunStore(),
+      strategy: new DefaultPersonaEvolutionStrategy({ approval: 'auto_approve' }),
+      worker_id: 'worker-barrel',
+      role_id,
+      now: () => START,
+    });
+    expect((await job.run({ batchSize: 5 })).outcomes[0]?.status).toBe('evolved');
+
+    // 历史：种子 + 演化各一行，正文都从 barrel 的类型接住
+    const history: PersonaVersionRecord[] = await repository.listPersonaVersions(role_id);
+    expect(history.map((record) => record.source)).toEqual(['seed', 'evolution']);
+    const target: PersonaDef = history[0]!.persona;
+
+    // 条件判据可以单独用：外部运维入口自己算「现在还该不该滚」（先读一次再传进来）
+    expect(
+      resolvePersonaRollback({
+        expected_current_version: 2,
+        current_version: 2,
+        target_version: 1,
+      }).kind,
+    ).toBe('apply');
+
+    const request: PersonaRollbackRequest = {
+      role_id,
+      target_version: 1,
+      expected_current_version: 2,
+      reason: 'barrel smoke',
+      now: START,
+    };
+    const rolled: PersonaRollbackResult = await repository.rollbackPersona(request);
+    expect(rolled.kind).toBe('applied');
+
+    const query: PersonaVersionQuery = { limit: 2 };
+    const recent = await repository.listPersonaVersions(role_id, query);
+    expect(recent.map((record) => record.persona_version)).toEqual([2, 3]);
+
+    const current: PersonaVersionRecord | undefined =
+      await repository.getCurrentPersonaVersion(role_id);
+    const source: PersonaVersionSource | undefined = current?.source;
+    expect(source).toBe('rollback');
+    expect(current?.persona.summary).toBe(target.summary);
+    expect(current?.change_summary).toBe(
+      summarizePersonaRollback({
+        parent_version: 2,
+        next_version: 3,
+        target_version: 1,
+        reason: 'barrel smoke',
+      }),
+    );
+  });
 });
 
 // ════════════════════════════════════════════════════════
@@ -345,6 +422,7 @@ const CHANNEL_SOURCES = [
   '../services/persona-evolution-candidates.ts',
   '../services/persona-evolution-decision.ts',
   '../services/persona-evolution-executor.ts',
+  '../services/persona-version-history.ts',
   '../adapters/default-persona-evolution-strategy.ts',
   '../runtime/persona-evolution-job.ts',
 ] as const;
