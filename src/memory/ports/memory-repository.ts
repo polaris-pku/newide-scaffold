@@ -10,6 +10,8 @@ import type {
   AgentMetrics,
   AgentStatus,
   CreateAgentSpec,
+  DriverFeedbackSource,
+  Effectiveness,
   ExperienceRecord,
   MarketStatus,
   PersonaDef,
@@ -78,6 +80,38 @@ export interface ExperienceSaveResult {
   experience: ExperienceRecord;
   /** true = 本次新建（计数已加）；false = 幂等命中（同 id 已有条目，什么都没改） */
   created: boolean;
+}
+
+/**
+ * 一条 Driver 使用反馈对某条经验的应用请求。
+ *
+ * `feedback_id` 是幂等键：同一条反馈重复应用只生效一次。其余字段是回写所需的全部事实，
+ * 由反馈记录原样带过来（不在这里重新解读效果档位）。
+ */
+export interface ExperienceFeedbackApplication {
+  /** 幂等键：反馈的唯一标识（outbox 与待归并队列共用同一个 id） */
+  feedback_id: string;
+  /** 被引用的经验；不存在时什么也不写，由调用方决定是等待还是放弃 */
+  experience_id: string;
+  /** 本次任务是否实际应用了该经验 */
+  applied: boolean;
+  /** 该经验在本次任务中的效果 */
+  effectiveness: Effectiveness;
+  /** 备注原文 */
+  note: string;
+  /** 观察到该使用事实的时刻 */
+  observed_at: string;
+  /** 反馈来源（写进置信度历史的 reason，用于区分 Driver 自报与用户评分） */
+  feedback_source: DriverFeedbackSource;
+}
+
+/** 一次反馈应用的去向：写了 / 早就写过 / 目标经验还不存在 */
+export type ExperienceFeedbackOutcome = 'applied' | 'already_applied' | 'experience_missing';
+
+export interface ExperienceFeedbackResult {
+  outcome: ExperienceFeedbackOutcome;
+  /** 应用之后仓库里的那条经验；`experience_missing` 时缺席 */
+  experience?: ExperienceRecord;
 }
 
 export interface MemoryRepository {
@@ -234,6 +268,29 @@ export interface MemoryRepository {
   updateSkill(role_id: string, skill: SkillRecord): Promise<void>;
   /** 更新已有经验（如晋升后写入 promoted_to） */
   updateExperience(role_id: string, experience: ExperienceRecord): Promise<void>;
+
+  /**
+   * 把一条 Driver 使用反馈**原子且幂等**地应用到一条经验上。
+   *
+   * 这是反馈消费与归并的唯一写入路径。它必须由存储层保证两件事，调用方无法用
+   * `listExperiences` + `updateExperience` 自行拼出来：
+   *
+   * 1. **幂等**：同一 `feedback_id` 重复应用只生效一次。判据写在经验自己的置信度历史里
+   *    （`ConfidenceHistoryEntry.feedback_id`），因此崩溃后重跑、lease 过期被别的 worker
+   *    接手重跑，都只会得到 `already_applied`，不会第二次调整置信度、也不会第二次累加引用数。
+   * 2. **原子**：判重与写入之间没有窗口。两个 worker 同时应用同一条反馈时，只有一个写进去；
+   *    同时应用**两条不同**反馈到同一条经验时，也不该有一方用旧快照覆盖另一方（实现用
+   *    CAS / 临界区，而不是「读出来、改一份内存副本、整份覆盖回去」）。
+   *
+   * 经验不存在时**不建经验、不报错**：反馈先到是正常情况，返回 `experience_missing` 由
+   * 调用方决定是寄存待归并还是放弃。经验存在时按效果档位调整置信度、累加引用计数，并把
+   * 本条反馈写进置信度历史（溯源）。`avg_confidence` 由实现顺带按当前经验集重算，
+   * 与既有回写路径保持一致。
+   */
+  applyExperienceFeedback(
+    role_id: string,
+    input: ExperienceFeedbackApplication,
+  ): Promise<ExperienceFeedbackResult>;
 
   /**
    * 直写技能向量（memory.reindex 全量重建索引用）。

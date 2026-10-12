@@ -30,6 +30,8 @@ import {
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type {
+  ExperienceFeedbackApplication,
+  ExperienceFeedbackResult,
   ExperienceSaveResult,
   MarketImportResult,
   MarketSearchOptions,
@@ -38,6 +40,7 @@ import type {
   SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
+import { applyFeedbackToExperience, isFeedbackApplied, recomputeAvgConfidence } from '../services/usage-feedback';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 import {
   createSeedHandle,
@@ -143,6 +146,15 @@ const SKILL_AGGREGATE_BUMP_SQL = `
       )
   WHERE role_id = $1
 `;
+
+/**
+ * 反馈应用的条件写最多重读几版。
+ *
+ * 每次没写进去都意味着「读之后有人改了同一条经验」——可能是另一条反馈，也可能是晋升
+ * 写入。允许几次重读是为了吸收正常的并发抖动；一直抢不到就说明这条经验正被密集回写，
+ * 此时把这条反馈还给交付层的退避重试（抛错 → 可重试失败）比在这里空转更合适。
+ */
+const EXPERIENCE_FEEDBACK_MAX_CAS_ATTEMPTS = 5;
 
 /**
  * 读取表内 description_embedding 列的 vector(N) 维度；列不存在返回 undefined。
@@ -840,6 +852,96 @@ export class PgMemoryRepository implements MemoryRepository {
     if (result.rowCount === 0) {
       throw new Error(`Experience not found: ${experience.id}`);
     }
+  }
+
+  /**
+   * 反馈的原子幂等应用（数据库实现）。
+   *
+   * 与交付存储的 claim 同一手法：**读 → 在内存里算出下一条 → 条件 UPDATE**，条件里带上
+   * 读到的那一版（`updated_at` / `confidence` / `referenced_count`）与「这条反馈还没应用过」
+   * 的判据。写不进去就说明读之后有人改过这条经验，重读一遍再来；重读时可能发现这条反馈
+   * 已经被对端应用（同一条反馈的并发重投），那时如实报 `already_applied`。
+   *
+   * 幂等判据交给数据库的 jsonb 包含运算（`confidence_history @> [{feedback_id}]`），而不是
+   * 「先查再插」——后者在两次往返之间正是两个 worker 会同时通过的地方。任何一次成功写入
+   * 都会把 `updated_at` 推到新的时刻，因此乐观锁令牌随之变化，不会出现两次写共用一版的情况。
+   *
+   * 重试不是无上限的：连读好几版都被抢先，说明这条经验正被打字机式地并发回写，与其在这里
+   * 转圈，不如把这条反馈还给交付层的退避重试（抛错即由调用方按可重试失败处理）。
+   */
+  async applyExperienceFeedback(
+    role_id: string,
+    input: ExperienceFeedbackApplication,
+  ): Promise<ExperienceFeedbackResult> {
+    await this.ensureSchema();
+    await this.requireAgentRow(role_id);
+
+    for (let attempt = 0; attempt < EXPERIENCE_FEEDBACK_MAX_CAS_ATTEMPTS; attempt += 1) {
+      const current = await this.readExperienceForRole(role_id, input.experience_id);
+      if (!current) return { outcome: 'experience_missing' };
+      if (isFeedbackApplied(current, input.feedback_id)) {
+        return { outcome: 'already_applied', experience: current };
+      }
+
+      const next = applyFeedbackToExperience(current, input, nowTimestamp());
+      const updated = await this.writeExperienceIfUnchanged(role_id, current, next, input.feedback_id);
+      if (updated) {
+        await recomputeAvgConfidence(this, role_id);
+        return { outcome: 'applied', experience: updated };
+      }
+    }
+
+    throw new Error(
+      `Experience ${input.experience_id} kept changing while feedback ${input.feedback_id} was being applied; the delivery will be retried.`,
+    );
+  }
+
+  /** 按 role + 主键读一条经验（反馈应用读的是当次快照，不参与后续写入） */
+  private async readExperienceForRole(
+    role_id: string,
+    experience_id: string,
+  ): Promise<ExperienceRecord | undefined> {
+    const result = await this.pool.query<{ payload: unknown }>(
+      `SELECT payload FROM memory_experiences WHERE role_id = $1 AND id = $2`,
+      [role_id, experience_id],
+    );
+    const row = result.rows[0];
+    return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
+  }
+
+  /**
+   * 条件写回经验的载荷（描述没变，因此**不动** description_embedding 列）。
+   *
+   * 条件里的四个值合起来是这一版的乐观锁令牌：任一被改过就写不进去，返回 undefined。
+   * 返回写回之后的载荷（数据库侧真正落地的那一份），调用方据此报「已应用」。
+   */
+  private async writeExperienceIfUnchanged(
+    role_id: string,
+    current: ExperienceRecord,
+    next: ExperienceRecord,
+    feedback_id: string,
+  ): Promise<ExperienceRecord | undefined> {
+    const result = await this.pool.query<{ payload: unknown }>(
+      `UPDATE memory_experiences
+       SET payload = $3::jsonb
+       WHERE role_id = $1 AND id = $2
+         AND payload->>'updated_at' = $4
+         AND payload->>'confidence' = $5
+         AND payload->>'referenced_count' = $6
+         AND NOT (payload -> 'confidence_history' @> $7::jsonb)
+       RETURNING payload`,
+      [
+        role_id,
+        current.id,
+        JSON.stringify(next),
+        current.updated_at,
+        String(current.confidence),
+        String(current.referenced_count),
+        JSON.stringify([{ feedback_id }]),
+      ],
+    );
+    const row = result.rows[0];
+    return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
   }
 
   async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {

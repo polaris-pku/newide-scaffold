@@ -246,6 +246,15 @@ export const ConfidenceHistoryEntrySchema = z.object({
   updated_at: z.iso.datetime(),
   /** 变更原因说明 */
   reason: z.string(),
+  /**
+   * 造成这次变更的 Driver 反馈 id（反馈回写路径才有）。
+   *
+   * 它同时是**反馈应用的幂等键落点**：条目一旦写下，就说明这条反馈已经作用过这条经验，
+   * 重复投递（崩溃后重跑、lease 过期被接手）再来一次时据此跳过。可选是刻意的——历史
+   * 记录与 `applyUsageFeedback` 写的旧条目都没有这个字段，它们按「无从判断」读入即可，
+   * 不需要迁移。
+   */
+  feedback_id: z.string().optional(),
 });
 
 /**
@@ -715,16 +724,15 @@ export const DriverFeedbackSourceSchema = z.enum(['driver_usage', 'user_rating']
 export type DriverFeedbackSource = z.infer<typeof DriverFeedbackSourceSchema>;
 
 /**
- * Driver 使用反馈记录 — Agent 对某条既有经验的使用事实。
+ * 一条 Driver 反馈的**内容**字段（交付状态机之外的那部分）。
  *
- * 刻意独立于 Experience 是否存在：Driver 可能引用跨 agent 或已被处置的经验，
- * 反馈先落到 outbox，等下游系统上线/补全后再按 `feedback_id` 归并。
- *
- * `feedback_id` 由 `role_id + task_id + experience_id + feedback_source +
- * event_version` 派生：同一份 DriverReturn 重复提交只会得到同一条反馈，
- * 既不会重复累计使用效果，也不会覆盖已知的更高质量反馈。
+ * 单独抽出来是给待归并副本用的：那份副本要回答的是「这条反馈说了什么」，不该带上任何
+ * 一条交付记录的进度。照抄整条 outbox 记录会把 status/attempt_count/claim_token/租约
+ * 一起带进去——同一个 payload 里于是有两个互相矛盾的状态，而副本里那个还是**冻结**的
+ * （写完就不动了），最容易被误读成实时进度。按这份 schema 取内容，副本从构造上就不带
+ * 这些字段（zod 对象默认丢弃未知键）。
  */
-export const DriverFeedbackRecordSchema = z.object({
+const driverFeedbackContentFields = {
   /** 文件名安全 id（由 feedback_key 哈希而来） */
   feedback_id: z.string(),
   /** 稳定幂等键：`{role_id}:{task_id}:{experience_id}:{source}:{event_version}` */
@@ -749,9 +757,59 @@ export const DriverFeedbackRecordSchema = z.object({
   feedback_source: DriverFeedbackSourceSchema,
   /** 契约事件版本（见 DRIVER_FEEDBACK_EVENT_VERSION） */
   event_version: z.string(),
+};
+
+/** 反馈的内容（不含交付状态机字段）；待归并副本、应用与校验都只依赖这一份 */
+export const DriverFeedbackContentSchema = z.object(driverFeedbackContentFields);
+export type DriverFeedbackContent = z.infer<typeof DriverFeedbackContentSchema>;
+
+/**
+ * Driver 使用反馈记录 — Agent 对某条既有经验的使用事实。
+ *
+ * 刻意独立于 Experience 是否存在：Driver 可能引用跨 agent 或已被处置的经验，
+ * 反馈先落到 outbox，等下游系统上线/补全后再按 `feedback_id` 归并。
+ *
+ * `feedback_id` 由 `role_id + task_id + experience_id + feedback_source +
+ * event_version` 派生：同一份 DriverReturn 重复提交只会得到同一条反馈，
+ * 既不会重复累计使用效果，也不会覆盖已知的更高质量反馈。
+ *
+ * 内容是内容、进度是进度：上面那份内容字段 + 交付状态机字段。前者可被单独复制
+ * （见 PendingFeedbackRecord.feedback），后者只属于这一条交付记录。
+ */
+export const DriverFeedbackRecordSchema = z.object({
+  ...driverFeedbackContentFields,
   ...deliveryLifecycleFields,
 });
 export type DriverFeedbackRecord = z.infer<typeof DriverFeedbackRecordSchema>;
+
+/**
+ * 待归并反馈 — 反馈先到、Experience 还没出现时，反馈消费者把它寄存在这里。
+ *
+ * 为什么要有这一条记录，而不是把 outbox 那条反馈留在 pending 上反复重投：outbox 记录的是
+ * 「上游交付了什么」，它的投递次数与退避预算属于**消费这条反馈**；而归并要等的是另一件事
+ * ——某条 Experience 什么时候出现，等待窗口长得多（小时计），失败上限与保留期限另算。
+ * 两者共用一个计数器，任何一次存储抖动都会吃掉归并的预算，观测上也分不清积压是谁的。
+ * 因此归并队列单列：幂等键仍是 `feedback_id`（同一条反馈只寄存一份），状态机与 claim/lease
+ * 语义则复用交付那套（见 services/delivery-lifecycle.ts），不另造一套。
+ *
+ * `feedback` 里存**原始反馈的内容副本**（`DriverFeedbackContent`，不含交付状态机字段），
+ * 不存引用：归并发生在 Experience 出现之后的某个时刻，那一刻不该再去翻 outbox——它可能已经
+ * 被人工重试清零、被清库、或者干脆换了后端。「保留原始 payload 和关联键」在这里是自足的意思。
+ *
+ * `created_at` 即入队时刻，也就是 pending age 的起点（保留期限从它算起）。
+ */
+export const PendingFeedbackRecordSchema = z.object({
+  /** 幂等键 = 原反馈的 `feedback_id`：同一条反馈只寄存一条 */
+  feedback_id: z.string(),
+  /** 上报该反馈的 Agent；归并时按它定位 Experience 的归属 */
+  role_id: z.string(),
+  /** 关联键：等它出现的那条经验（与 feedback.experience_id 同源） */
+  experience_id: z.string(),
+  /** 原始反馈的内容（效果档位、备注、观察时刻、来源与契约版本都在里面，归并时自足） */
+  feedback: DriverFeedbackContentSchema,
+  ...deliveryLifecycleFields,
+});
+export type PendingFeedbackRecord = z.infer<typeof PendingFeedbackRecordSchema>;
 
 // ═══════════════════════════════════════════
 //  Maintenance Run（维护任务运行记录）

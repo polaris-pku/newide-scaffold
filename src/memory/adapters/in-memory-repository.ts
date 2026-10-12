@@ -21,6 +21,8 @@ import {
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type {
+  ExperienceFeedbackApplication,
+  ExperienceFeedbackResult,
   ExperienceSaveResult,
   MarketImportResult,
   MarketSearchOptions,
@@ -29,6 +31,7 @@ import type {
   SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
+import { applyFeedbackToExperience, isFeedbackApplied, recomputeAvgConfidence } from '../services/usage-feedback';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 import { cosineSimilarity } from '../utils/vector';
 import {
@@ -386,6 +389,33 @@ export class InMemoryRepository implements MemoryRepository {
       throw new Error(`Experience not found: ${experience.id}`);
     }
     store.experiences[index] = await this.withDescriptionEmbedding(experience);
+  }
+
+  /**
+   * 反馈的原子幂等应用（内存实现）。
+   *
+   * 「查有没有 / 判重 / 写回」三步之间**一个 await 都没有**，因此在 JS 单线程下就是一段
+   * 临界区：并发的两个应用不可能都基于同一份旧快照写回，同一条反馈也不可能应用两次
+   * （与 saveExperienceIfAbsent 用的是同一手法）。刻意不经过 withDescriptionEmbedding：
+   * 描述没变、向量就不该重算，写回的是仓库里那条记录的副本。
+   *
+   * 注：内存实现没有持久层，重启即清空——它是测试替身，不是生产存储（见 ports 里的说明）。
+   */
+  async applyExperienceFeedback(
+    role_id: string,
+    input: ExperienceFeedbackApplication,
+  ): Promise<ExperienceFeedbackResult> {
+    const store = this.requireStore(role_id);
+    const index = store.experiences.findIndex((item) => item.id === input.experience_id);
+    const current = store.experiences[index];
+    if (!current) return { outcome: 'experience_missing' };
+    if (isFeedbackApplied(current, input.feedback_id)) {
+      return { outcome: 'already_applied', experience: { ...current } };
+    }
+    const next = applyFeedbackToExperience(current, input, nowTimestamp());
+    store.experiences[index] = next;
+    await recomputeAvgConfidence(this, role_id);
+    return { outcome: 'applied', experience: { ...next } };
   }
 
   async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {

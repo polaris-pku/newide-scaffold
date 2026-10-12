@@ -20,9 +20,18 @@
  * 与 feedback.ts（用户评分）同模式：纯函数式，repository 直接注入。
  * 引用了不存在/已删除的经验 id 时静默跳过（防御性：driver 可能引用跨 agent
  * 或已处置的记忆）。失败不抛错、不阻断任务主流程（由调用方决定是否降级）。
+ *
+ * 本文件另外承载**两条反馈通路共用的规则**：效果档位到置信度增量、上下限、以及
+ * 「应用后的经验记录长什么样」（nextConfidenceAfterFeedback / applyFeedbackToExperience /
+ * isFeedbackApplied）。异步的反馈消费者（runtime/driver-feedback-processor）与这里的
+ * 进程内回写是两条不同的路径——前者按 feedback_id 幂等、原子写入，后者是实验入口的
+ * 逐条回写——但它们对同一条反馈必须给出同一个业务结果，所以算的部分只写一次。
  */
 import { nowTimestamp } from '../../core';
-import type { MemoryRepository } from '../ports/memory-repository';
+import type {
+  ExperienceFeedbackApplication,
+  MemoryRepository,
+} from '../ports/memory-repository';
 import type { Effectiveness, ExperienceRecord } from '../schemas';
 
 /** 用后验证回写的单条引用（对齐 DriverReturn.referenced_experiences 条目） */
@@ -135,10 +144,7 @@ async function writeBack(
   reference: UsageReference,
   now: string,
 ): Promise<ExperienceRecord> {
-  const delta = CONFIDENCE_DELTA[reference.effectiveness];
-  const nextConfidence = round3(
-    clamp(experience.confidence + delta, CONFIDENCE_FLOOR, CONFIDENCE_CAP),
-  );
+  const nextConfidence = nextConfidenceAfterFeedback(experience.confidence, reference.effectiveness);
   const updated: ExperienceRecord = {
     ...experience,
     referenced_count: experience.referenced_count + 1,
@@ -158,7 +164,7 @@ async function writeBack(
 }
 
 /** 重算 avg_confidence = 全部经验置信度均值（写入 updateMetrics，保持聚合根一致） */
-async function recomputeAvgConfidence(
+export async function recomputeAvgConfidence(
   repository: MemoryRepository,
   role_id: string,
 ): Promise<void> {
@@ -180,4 +186,74 @@ function clamp(value: number, min: number, max: number): number {
 
 function round3(value: number): number {
   return Math.round(value * 1_000) / 1_000;
+}
+
+// ═══════════════════════════════════════════
+//  反馈写回的共享规则（反馈消费者与归并路径）
+// ═══════════════════════════════════════════
+
+/**
+ * 回写后的置信度：按效果档位调整并夹在上下限之间。
+ *
+ * 单独抽出来，是因为**档位到增量、上下限**这三件事必须只有一处定义：遗留的进程内
+ * 回写（applyUsageFeedback）与反馈消费者的原子应用（applyExperienceFeedback）算错了
+ * 任何一处，同一条反馈在两条路径上就会给出两个置信度。记录怎么拼、写在哪，才是两边
+ * 真正不同的部分。
+ */
+export function nextConfidenceAfterFeedback(
+  current: number,
+  effectiveness: Effectiveness,
+): number {
+  return round3(clamp(current + CONFIDENCE_DELTA[effectiveness], CONFIDENCE_FLOOR, CONFIDENCE_CAP));
+}
+
+/**
+ * 反馈应用之后的经验记录（纯函数）：引用计数 +1、置信度按档位调整、追加一条带反馈
+ * 溯源的置信度历史。
+ *
+ * `feedback_id` 写进历史条目，是**幂等判据的落点**（见 isFeedbackApplied）：它让
+ * 「这条反馈已经作用过这条经验」成为一条可查的事实，而不是靠调用方记得自己做过什么。
+ * 遗留的进程内回写（applyUsageFeedback）不走这里——它的条目没有 feedback_id，也就没有
+ * 幂等可言（那条路径的重放由调用方自己保证不重复）；两条路径共用的是**算术**，不是记法。
+ */
+export function applyFeedbackToExperience(
+  experience: ExperienceRecord,
+  input: ExperienceFeedbackApplication,
+  now: string,
+): ExperienceRecord {
+  const nextConfidence = nextConfidenceAfterFeedback(experience.confidence, input.effectiveness);
+  return {
+    ...experience,
+    referenced_count: experience.referenced_count + 1,
+    // 观察时刻可能早于上一次引用（反馈乱序到达），仍以「最近一次」为准
+    last_referenced_at: latestTimestamp(experience.last_referenced_at, input.observed_at),
+    confidence: nextConfidence,
+    confidence_history: [
+      ...experience.confidence_history,
+      {
+        value: nextConfidence,
+        updated_at: now,
+        reason:
+          input.feedback_source === 'user_rating'
+            ? `user_rating_validation:${input.effectiveness}`
+            : `usage_validation:${input.effectiveness}`,
+        feedback_id: input.feedback_id,
+      },
+    ],
+    updated_at: now,
+  };
+}
+
+/** 这条反馈是否已经作用过这条经验：置信度历史里有没有它 */
+export function isFeedbackApplied(experience: ExperienceRecord, feedback_id: string): boolean {
+  return experience.confidence_history.some((entry) => entry.feedback_id === feedback_id);
+}
+
+/** 两个可选时刻里较晚的那个（都没有则缺席） */
+function latestTimestamp(
+  current: string | undefined,
+  candidate: string,
+): string {
+  if (current === undefined) return candidate;
+  return Date.parse(candidate) > Date.parse(current) ? candidate : current;
 }

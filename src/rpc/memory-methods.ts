@@ -424,7 +424,15 @@ const driverFeedbackFilterParamsSchema = z
     status: DeliveryStatusSchema.optional(),
   })
   .strict();
-const deliveryChannelSchema = z.enum(['context', 'feedback']);
+/**
+ * 交付通道的线上取值。
+ *
+ * 这里的枚举与端口层的 DeliveryChannel 是同一组值：交付操作本身是泛化的（claim / renew /
+ * ack / retry / 列出到期项），三条通道共用同一套语义。第三项 `pending_feedback` 是反馈
+ * 消费者的待归并队列——不列出它就等于让「不带 channel 的列出/恢复」返回一个线上枚举里
+ * 不存在的值。本阶段只为它提供了这些既有操作，没有新增任何方法。
+ */
+const deliveryChannelSchema = z.enum(['context', 'feedback', 'pending_feedback']);
 const deliveryScopeParamsSchema = z
   .object({
     channel: deliveryChannelSchema.optional(),

@@ -66,6 +66,7 @@ import type {
   DeliveryStatus,
   DriverFeedbackRecord,
   ExperienceRecord,
+  PendingFeedbackRecord,
   PersonaDef,
   SkillRecord,
 } from '../memory/schemas';
@@ -208,7 +209,8 @@ export interface ContextDeliveryPayload {
  */
 export type AckDeliveryPayload =
   | { channel: 'context'; delivery: ContextDeliveryItem; archive?: BufferArchiveOutcome }
-  | { channel: 'feedback'; feedback: DriverFeedbackRecord };
+  | { channel: 'feedback'; feedback: DriverFeedbackRecord }
+  | { channel: 'pending_feedback'; pending_feedback: PendingFeedbackRecord };
 
 /** 一条归档缺口：交付已 processed，但源 Buffer 还留在 pending */
 export interface DeliveryArchiveBacklogEntry {
@@ -221,7 +223,8 @@ export interface DeliveryArchiveBacklogEntry {
 /** claim / ack 的返回：交付项本身，按通道放在各自的字段下 */
 export type DeliveryRecordPayload =
   | { channel: 'context'; delivery: ContextDeliveryItem }
-  | { channel: 'feedback'; feedback: DriverFeedbackRecord };
+  | { channel: 'feedback'; feedback: DriverFeedbackRecord }
+  | { channel: 'pending_feedback'; pending_feedback: PendingFeedbackRecord };
 
 /** 交付状态计数 */
 export interface DeliveryStatusCounts {
@@ -322,6 +325,10 @@ export class BMemoryBackendService {
         ownership: 'external',
         context_delivery: deliveryCapability('context delivery'),
         driver_feedback_outbox: deliveryCapability('driver feedback outbox'),
+        // 这里报的是**基策略**（上下文交付通道用的那套，Phase 1 起没变过）。反馈消费与
+        // 待归并通道各自有覆盖（见 services/delivery-lifecycle 的两份 DEFAULT_*_RETRY_POLICY，
+        // 分别约 10 分钟与 3.8 小时），本字段不逐通道展开——把每个通道的预算摆上运维面
+        // 属于后续阶段的维护入口。
         claim: delivery
           ? {
               status: 'available',
@@ -1067,6 +1074,10 @@ export class BMemoryBackendService {
       if (completed.channel === 'feedback') {
         return { channel: 'feedback', feedback: completed.item };
       }
+      // 待归并反馈同理：它的 payload 是反馈副本，不引用任何 Buffer
+      if (completed.channel === 'pending_feedback') {
+        return { channel: 'pending_feedback', pending_feedback: completed.item };
+      }
       return {
         channel: 'context',
         delivery: completed.item,
@@ -1341,6 +1352,9 @@ function isPendingSkill(value: unknown): value is { id: string; review_status: '
 
 /** 把 port 的判别式结果摊平成 JSON 友好的形状（前端不必再按 channel 取字段） */
 function toDeliveryPayload(claimed: ClaimedDelivery): DeliveryRecordPayload {
+  if (claimed.channel === 'pending_feedback') {
+    return { channel: 'pending_feedback', pending_feedback: claimed.item };
+  }
   return claimed.channel === 'feedback'
     ? { channel: 'feedback', feedback: claimed.item }
     : { channel: 'context', delivery: claimed.item };
