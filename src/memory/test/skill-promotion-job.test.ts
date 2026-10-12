@@ -12,6 +12,13 @@
  * 同一份外壳契约跑两个后端（InMemoryRepository 与 PGlite 上的 PgMemoryRepository），
  * run store 在那条腿上也换成真实实现（文件后端：队列与审计按设计不占数据库）。
  * 时间全部由注入的 clock 提供，因此退避、租约过期与墙钟上限都不依赖真实时钟。
+ *
+ * Phase 3-D 把这份契约补齐到「一条候选从入队到各种终局」的完整路径上：新增的五条覆盖
+ * **重评的判据是策略版本变了**、**可重试失败用满投递次数才进死信**、**重启后新实例接着
+ * 处理队列里的候选**、**被接手之后旧持有者的凭据再也写不进任何东西**、以及**同批里一条
+ * 可重试的失败不拖累另一条**（原先只覆盖了死信那一种形状）。五条都落在共享 suite 里，
+ * 因此 InMemory 与 PGlite 各自跑一遍；存储层的同一组语义（claim 并发、token fencing、
+ * 租约回收、汇总计数）另由 promotion-state.test.ts 的双后端契约钉住。
  */
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -620,6 +627,17 @@ describe('assertPromotionDecisionConsistent — 运行时判定契约', () => {
 interface JobStoreCase {
   name: string;
   create: () => Promise<{ repository: MemoryRepository; runStore: MaintenanceRunStore }>;
+  /**
+   * 重启：一整套新的维护组件指向**同一份存储**。
+   *
+   * 与 maintenance-adapters.ts 的 `DeliveryAdapterCase.reopen` 同一套约定——内存实现没有
+   * 持久层，只能原样返回上一个句柄。这正是它不该被当成生产存储的原因，矩阵里如实体现，
+   * 而不是假装重启过；真正的跨进程持久性由 Pg 那条腿与 promotion-state.test.ts 钉住。
+   */
+  reopen: (previous: {
+    repository: MemoryRepository;
+    runStore: MaintenanceRunStore;
+  }) => Promise<{ repository: MemoryRepository; runStore: MaintenanceRunStore }>;
 }
 
 // ════════════════════════════════════════════════════════
@@ -632,14 +650,16 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
     let runStore: MaintenanceRunStore;
     let clock: TestClock;
     let role_id: string;
+    /** 本后端的那一套维护组件（重启用例拿它换一整套新的句柄） */
+    let stores: { repository: MemoryRepository; runStore: MaintenanceRunStore };
 
     /** 自动批准是显式开关（缺省策略是人工审核），多数用例要的正是「判定合格就晋升」 */
     const autoApprove = new DefaultPromotionStrategy({ approval: 'auto_approve' });
 
     beforeAll(async () => {
-      const created = await storeCase.create();
-      repository = created.repository;
-      runStore = created.runStore;
+      stores = await storeCase.create();
+      repository = stores.repository;
+      runStore = stores.runStore;
     });
 
     beforeEach(async () => {
@@ -754,6 +774,42 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       expect(await repository.listSkills(role_id)).toHaveLength(3);
     });
 
+    it('重启：一整套新的维护组件接着处理上一个实例留在队列里的候选', async () => {
+      const experiences = await seedExperiences(repository, role_id, 3);
+
+      const before = await job({ worker_id: 'worker-before-restart', batch_size: 1 }).run();
+      expect(before.counts).toMatchObject({ claimed_count: 1, completed_count: 1 });
+      expect(before.outcomes[0]?.experience_id).toBe(experiences[0]?.id);
+
+      // 「重启」= 新的 job / worker / run store 句柄指向同一份存储：队列里剩什么、已经写出
+      // 什么，全都只能从存储读出来，实例上没有任何东西可以继承
+      const revived = await storeCase.reopen(stores);
+
+      const restarted = new DefaultSkillPromotionJob({
+        repository: revived.repository,
+        runStore: revived.runStore,
+        strategy: autoApprove,
+        worker_id: 'worker-after-restart',
+        role_id,
+        now: clock.now,
+      });
+      const after = await restarted.run({ batchSize: 5 });
+
+      expect(after.counts).toMatchObject({ claimed_count: 2, completed_count: 2 });
+      expect(after.outcomes.map((item) => item.experience_id)).toEqual([
+        experiences[1]?.id,
+        experiences[2]?.id,
+      ]);
+      expect(await revived.repository.listSkills(role_id)).toHaveLength(3);
+
+      // 两次运行各开一条 run，重启之后都还在，审计不混：新实例没有覆盖或续用上一条
+      expect(after.run.run_id).not.toBe(before.run.run_id);
+      const runs = await revived.runStore.list({ job_type: 'skill_promotion' });
+      expect(runs.map((item) => item.run_id)).toEqual(
+        expect.arrayContaining([before.run.run_id, after.run.run_id]),
+      );
+    });
+
     it('墙钟上限：超时即停，已经处理的那条照常落定', async () => {
       await seedExperiences(repository, role_id, 3);
       // 每条判定推进 5 秒的假时钟：跑完第一条就已经越过 1 秒的上限
@@ -812,6 +868,51 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       const upgraded = await job().run({ approval: 'auto_approve' });
       expect(upgraded.outcomes.map((item) => item.status)).toEqual(['promoted']);
       expect(upgraded.outcomes[0]?.experience_id).toBe(experiences[0]?.id);
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+    });
+
+    it('策略版本变了：同一份数据被按新版本的口径重新评估，并落在新结论上', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1, { confidence: 0.99 });
+      const experience = experiences[0]!;
+
+      // v1 的门槛定得比这条经验的置信度还高：同一份数据在 v1 下就是不合格
+      const strictV1 = new DefaultPromotionStrategy({
+        version: 'promotion-threshold.v1',
+        min_confidence: 0.999,
+        approval: 'auto_approve',
+      });
+      const first = await job({ strategy: strictV1 }).run({ batchSize: 5 });
+      expect(first.strategy_version).toBe('promotion-threshold.v1');
+      expect(first.outcomes.map((item) => item.status)).toEqual(['rejected']);
+      const rejected = await storedExperience(experience.id);
+      expect(rejected?.promotion?.outcome).toBe('rejected');
+      expect(rejected?.promotion?.strategy_version).toBe('promotion-threshold.v1');
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+
+      // 同一版本再跑：结论已定，不重评——重评的判据是「判据变了」，不是「又跑了一轮」，
+      // 否则每跑一次都会把同一份数据再问一遍，运维看到的次数就没有意义了
+      const sameVersion = await job({ strategy: strictV1 }).run({ batchSize: 5 });
+      expect(sameVersion.counts.claimed_count).toBe(0);
+      expect(sameVersion.outcomes).toHaveLength(0);
+
+      // 换成 v2（门槛降到 0.95）：版本变了就是判据变了，这条候选必须回到队列重判一次
+      const lenientV2 = new DefaultPromotionStrategy({
+        version: 'promotion-threshold.v2',
+        min_confidence: 0.95,
+        approval: 'auto_approve',
+      });
+      const second = await job({ strategy: lenientV2 }).run({ batchSize: 5 });
+
+      expect(second.strategy_version).toBe('promotion-threshold.v2');
+      expect(second.outcomes.map((item) => item.status)).toEqual(['promoted']);
+      expect(second.outcomes[0]?.decision?.strategy_version).toBe('promotion-threshold.v2');
+      // 重评是「像从没评过一样」的第一次投递：不继承上一版策略留下的次数
+      expect(second.outcomes[0]?.attempt_count).toBe(1);
+
+      const promoted = await storedExperience(experience.id);
+      expect(promoted?.promotion?.outcome).toBe('promoted');
+      expect(promoted?.promotion?.strategy_version).toBe('promotion-threshold.v2');
+      expect(promotionStateLabel(promoted!)).toBe('promoted');
       expect(await repository.listSkills(role_id)).toHaveLength(1);
     });
 
@@ -909,6 +1010,64 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       expect(await repository.listSkills(role_id)).toHaveLength(1);
     });
 
+    it('可重试失败一直重投，用满投递次数之后才进死信', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const experience = experiences[0]!;
+      const transient = Object.assign(new Error('connection reset by peer'), {
+        code: 'ECONNRESET',
+      });
+      // 每一轮都失败：这一条要验的不是「能不能恢复」，而是重投次数的**上限**——一条永远
+      // 失败的候选必须有个尽头，否则每次调度都在同一条毒记录上倒下
+      const alwaysFlaky = job({
+        strategy: hookedStrategy(autoApprove, () => {
+          throw transient;
+        }),
+      });
+      const maxAttempts = DEFAULT_PROMOTION_RETRY_POLICY.max_attempts;
+
+      const statuses: PromotionCandidateStatus[] = [];
+      const attemptCounts: number[] = [];
+      for (let round = 1; round <= maxAttempts; round += 1) {
+        const result = await alwaysFlaky.run({ batchSize: 5 });
+        expect(result.counts.claimed_count, `第 ${round} 轮`).toBe(1);
+        const outcome = result.outcomes[0]!;
+        statuses.push(outcome.status);
+        attemptCounts.push(outcome.attempt_count);
+
+        // 跨过这一次的退避窗口。退避是指数增长的，因此**读回落盘的那个时刻**再前进到它：
+        // 顺带钉住「下一次可投递的时刻是从持久层算出来的」，而不是实例上的一本账
+        const stored = await storedExperience(experience.id);
+        const nextRetryAt = stored?.promotion?.next_retry_at;
+        if (nextRetryAt !== undefined) {
+          clock.advance(Math.max(0, Date.parse(nextRetryAt) - Date.parse(clock.now())));
+        }
+      }
+
+      // 前 max_attempts - 1 次回到队列，最后一次用满名额进死信
+      expect(statuses).toEqual([
+        ...Array<string>(maxAttempts - 1).fill('retried'),
+        'dead_letter',
+      ]);
+      expect(attemptCounts).toEqual(
+        Array.from({ length: maxAttempts }, (_unused, index) => index + 1),
+      );
+
+      const dead = await storedExperience(experience.id);
+      expect(dead?.promotion?.status).toBe('dead_letter');
+      expect(dead?.promotion?.attempt_count).toBe(maxAttempts);
+      expect(dead?.promotion?.last_error).toContain('connection reset');
+      expect(promotionStateLabel(dead!)).toBe('dead_letter');
+      expect(dead?.promoted_to).toBeUndefined();
+
+      // 用满名额之后自动路径不再碰它，哪怕时间跨过整个退避区间
+      clock.advance(DEFAULT_PROMOTION_RETRY_POLICY.max_delay_ms);
+      const afterwards = await alwaysFlaky.run({ batchSize: 5 });
+      expect(afterwards.stop_reason).toBe('no_work');
+      expect(afterwards.counts.claimed_count).toBe(0);
+      expect(afterwards.outcomes).toHaveLength(0);
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+    });
+
     /** 模拟「上一个 worker claim 走之后崩了」：这条候选停在它的名下，租约由调用方跨过去 */
     async function strandClaim(
       experience_id: string,
@@ -979,6 +1138,49 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       expect(result.outcomes.map((item) => item.experience_id)).toEqual([experiences[0]?.id]);
       expect(result.outcomes[0]?.attempt_count).toBe(2);
       expect(result.counts).toMatchObject({ claimed_count: 1, completed_count: 1 });
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+    });
+
+    it('被接手之后旧持有者再也写不进任何东西：新 worker 的结论一个字节都没被盖掉', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const experience = experiences[0]!;
+
+      // 第一个 worker claim 之后「崩了」：候选停在它的名下，凭据还在它手里
+      const stranded = await repository.claimNextPromotionCandidate({
+        role_id,
+        owner: 'worker-crashed',
+        now: clock.now(),
+        lease_ms: DEFAULT_DELIVERY_LEASE_MS,
+        strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+        approval: 'auto_approve',
+      });
+      expect(stranded?.experience.id).toBe(experience.id);
+
+      // 租约过期，新 worker 接管这条候选并把它晋升掉（走 job 的启动恢复 + claim 正路）
+      clock.advance(DEFAULT_DELIVERY_LEASE_MS);
+      const takeover = await job({ worker_id: 'worker-takeover' }).run({ batchSize: 5 });
+      expect(takeover.outcomes.map((item) => item.status)).toEqual(['promoted']);
+      const skill = (await repository.listSkills(role_id))[0]!;
+
+      // 旧 worker 拿着 claim 那一刻的凭据回来落结论：一次都不能成功。凭据是四项一起看的
+      // （状态 / token / owner / 租约），每一项各自单独钉在 promotion-state.test.ts 的双后端
+      // 契约里；这里验的是接管**真的发生过之后**这四项合起来的效果——执行内核「什么都不写」，
+      // 因为落盘的责任归当前持有者，硬写只会把别人的结论盖掉
+      const stale = await executePromotionCandidate(
+        { repository, strategy: autoApprove, now: clock.now, owner: 'worker-crashed' },
+        stranded!,
+        { approval: 'auto_approve', now: clock.now() },
+      );
+      expect(stale.status).toBe('failed');
+      expect(stale.failure).toBeDefined();
+      expect(stale.failure?.retryable).toBe(true);
+
+      // 新 worker 写下的那一份完好无损：绑定还在、技能只此一条、经验没有被旧凭据改回处理中
+      const stored = await storedExperience(experience.id);
+      expect(stored?.promoted_to).toBe(skill.id);
+      expect(stored?.promotion?.status).toBe('processed');
+      expect(stored?.promotion?.outcome).toBe('promoted');
+      expect(promotionStateLabel(stored!)).toBe('promoted');
       expect(await repository.listSkills(role_id)).toHaveLength(1);
     });
 
@@ -1355,6 +1557,45 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       const skills = await repository.listSkills(role_id);
       expect(skills).toHaveLength(1);
       expect(promoted?.promoted_to).toBe(skills[0]?.id);
+    });
+
+    it('同一批里一条重投不拖累另一条：失败只落在它自己的计数上', async () => {
+      const experiences = await seedExperiences(repository, role_id, 2);
+      const first = experiences[0]!;
+      const second = experiences[1]!;
+      const transient = Object.assign(new Error('connection reset by peer'), {
+        code: 'ECONNRESET',
+      });
+      // 只对第一条抛错。候选按 `created_at` 升序被 claim，因此第一条就是下标 0 的那条——
+      // 这里要的是「一次抖动」，不是「这条候选坏了」
+      const flaky = hookedStrategy(autoApprove, (input) => {
+        if (input.experience.id === first.id) throw transient;
+      });
+
+      const result = await job({ strategy: flaky }).run({ batchSize: 5 });
+
+      expect(result.outcomes.map((item) => item.status)).toEqual(['retried', 'promoted']);
+      expect(result.counts).toMatchObject({
+        claimed_count: 2,
+        completed_count: 1,
+        retried_count: 1,
+        dead_letter_count: 0,
+        failure_count: 0,
+      });
+
+      // 抖动的那条按退避回队列，没被拖成死信；另一条照常落库
+      const retried = await storedExperience(first.id);
+      expect(retried?.promotion?.status).toBe('pending');
+      expect(retried?.promoted_to).toBeUndefined();
+      const promoted = await storedExperience(second.id);
+      expect(promoted?.promotion?.outcome).toBe('promoted');
+      const skills = await repository.listSkills(role_id);
+      expect(skills).toHaveLength(1);
+      expect(promoted?.promoted_to).toBe(skills[0]?.id);
+
+      // 一条候选的失败不是整批的失败：run 照常收尾，只是把「这一批为什么没干净」写上 run
+      expect(result.run.status).toBe('completed');
+      expect(result.run.last_error).toContain('downstream_unavailable');
     });
 
     it('直接调执行内核：配不上对的结论照样被拦住（契约不由外壳代为执行）', async () => {
@@ -2103,6 +2344,8 @@ runSkillPromotionJobSuite({
     repository: new InMemoryRepository(),
     runStore: new InMemoryMaintenanceRunStore(),
   }),
+  // 内存实现没有持久层：换句柄只能返回上一份存储（它不假装自己重启过）
+  reopen: async (previous) => previous,
 });
 
 describe('skill promotion job — PgMemoryRepository (PGlite) + FileMaintenanceRunStore', () => {
@@ -2125,6 +2368,15 @@ describe('skill promotion job — PgMemoryRepository (PGlite) + FileMaintenanceR
   runSkillPromotionJobSuite({
     name: 'PgMemoryRepository (PGlite)',
     create: async () => ({
+      repository: new PgMemoryRepository({
+        pool,
+        embedding: new HashEmbeddingProvider(),
+        autoMigrate: false,
+      }),
+      runStore: new FileMaintenanceRunStore({ root: runStoreRoot() }),
+    }),
+    // 重启：新的 repository 与 run store 实例指向同一个库，内存里什么都没继承下来
+    reopen: async () => ({
       repository: new PgMemoryRepository({
         pool,
         embedding: new HashEmbeddingProvider(),
