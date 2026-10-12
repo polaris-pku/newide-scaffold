@@ -183,7 +183,7 @@ if (selected) {
 | `DefaultPersonaTriggerPolicy`                          | 技能增长 ≥3 / ≥7 天定期（有新经验）/ ≥30 天强制刷新       |
 | `savePersona(persona)`（`AgentMemoryScope` / `MemoryRepository`） | Persona 写入 API，同步 `AgentHandle.persona`   |
 
-Persona 演化与 Agent 解耦：Agent 只读 `getPersona()`，演化由外部主动触发；演化后新 Persona 从下一次 `buildAgentSystemPrompt` 生效。版本处理为简单覆盖 version++（不保留历史）。漂移-余弦门控 / 技能收缩门控待 drift-embedding 能力，属 future work。
+Persona 演化与 Agent 解耦：Agent 只读 `getPersona()`，演化由外部主动触发；演化后新 Persona 从下一次 `buildAgentSystemPrompt` 生效。写入是「覆盖当前 Persona、版本号 +1」，但**每一版的正文与来历都会追加进版本历史**（Phase 4 修复 B，见下面的「版本历史与回滚」）；漂移-余弦门控 / 技能收缩门控待 drift-embedding 能力，属 future work。
 
 上表是**同步**那条路径（Processor + 归纳实现）。带 claim/lease、版本条件写、输入快照与 run 审计的
 **批量维护 job** 是另一条：见「Persona 演化 Job（Memory Maintenance Phase 4）」。两条路径的产物都是
@@ -219,7 +219,11 @@ Persona 演化与 Agent 解耦：Agent 只读 `getPersona()`，演化由外部�
   数据持久化到 `<appStateRoot>/b/pglite`（可用 `NEWIDE_B_PGLITE_DATA_DIR` 覆盖，`:memory:` 表示内存）。
 
 两者共享同一套 SQL 与 `ensurePgMemorySchema()` 建表逻辑。默认 `autoMigrate: true`，首次访问时自动建表；
-数据库用户需要具备相应权限。默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，
+数据库用户需要具备相应权限。建表与迁移都是**幂等**的（`CREATE TABLE IF NOT EXISTS` /
+`ADD COLUMN IF NOT EXISTS`），每次启动都跑一遍，其中还包括两条一次性的对账：`memory_skills.promoted_from`
+的「列 ↔ 载荷」对账（载荷是唯一权威），以及为 Phase B 之前落库的 Agent 在 `memory_persona_versions`
+里补一行 `baseline`——登记的只是它**当前**那一版，来历无从考证的那几格缺席（见「版本历史与回滚」）。
+默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，
 不是语义嵌入模型。生产环境应通过 `PgMemoryRepository` 构造参数注入合适的 `EmbeddingProvider`。
 
 ### 文件 Buffer
@@ -680,19 +684,106 @@ const revived = await repository.retryDeadLetterPersonaEvolution({ role_id, now 
 结果记 `storage_conflict` 退回队列，重投会重新读、重算快照、重判一次。反复冲突说明有东西在持续
 改同一个角色的 Persona，那时次数会用满并进死信，需要人看一眼。
 
+### 版本历史与回滚
+
+上面几节说的都是**当前**那一版（`PersonaDef` 单实体、单版本号）。每一版的**正文**另有一份持久化
+历史 —— 它才是回滚能成立的前提：没有旧正文可抄，「回滚」只是一句空话。历史长在 `MemoryRepository`
+上（不是另一个 store），因为写下一版 Persona 与登记这一版的历史必须是**同一笔写**。
+
+一行一版，主键是 `(role_id, persona_version)`。字段是「正文 + 来历」：
+
+| 字段 | 含义 |
+| --- | --- |
+| `persona_version` / `persona` | 第几版、这一版的**完整正文**（不是差异：回滚要能直接写回去） |
+| `source` | 这一版经哪条路径写下：`seed` / `baseline` / `evolution` / `rollback` / `manual` |
+| `parent_version` | 写它的时候当前是第几版（与演化标记的 `parent_version` 同义）；**不知道就缺席**，不编 |
+| `source_run_id` / `strategy_version` / `input_snapshot_hash` | 产生它的那次 run、判定用的判据版本与输入快照（演化才有） |
+| `rollback_from_version` | 正文抄自哪一版（只有 `source='rollback'` 有） |
+| `change_summary` / `reviewed_by` | 人读摘要、审批或操作者标识 |
+| `created_at` | 这一版落下来的时刻（`seed` / `baseline` 取正文自己的 `generated_at`） |
+
+五条写入路径各有各的来历，因此 `source` 分得细：`seed` 是建 Agent 时的第 1 版；`baseline` 是迁移
+时为**已存在**的 Agent 登记的当前版本（它的来历**无从考证**，父版本与 run 都缺席）；`evolution`
+是演化 job 落下的那一版；`rollback` 是回滚落下的一版；`manual` 是其余经 `savePersona` 的写入
+（前端 PATCH、按需重生成）——它们在存储层看起来是同一种，要区分得让调用方带一个原因进来，那是
+另一件事。
+
+**查历史**（三个读端口，都对不存在的角色抛 `Agent not found`，不把笔误读成「它没有历史」）：
+
+```ts
+const history = await repository.listPersonaVersions(role_id);          // 按版本号升序，旧 → 新
+const recent = await repository.listPersonaVersions(role_id, { limit: 5 }); // 最近 5 版（仍升序）
+const v3 = await repository.getPersonaVersion(role_id, 3);               // 某一版；没有则 undefined
+const current = await repository.getCurrentPersonaVersion(role_id);      // 当前那一版（含来历）
+```
+
+`getCurrentPersonaVersion()` 的版本号取自 `getPersona()`（唯一权威），因此它与
+`getPersonaVersion(role_id, 那个号)` 是同一件事；单独有一个方法是为了不必先读 Persona 再读历史。
+
+**回滚**是**再写一版**，不是擦掉一版：
+
+```ts
+const current = await repository.getPersona(role_id);
+const result = await repository.rollbackPersona({
+  role_id,
+  target_version: 3,                          // 正文抄这一版
+  expected_current_version: current.version,  // 你读到的是第几版（必填：条件写的前置条件）
+  reason: 'v7 把角色带偏了',
+  reviewed_by: 'operator-1',
+  now: new Date().toISOString(),
+});
+```
+
+| 结果 | 含义 |
+| --- | --- |
+| `applied` | 落下新的一版（`当前版本 + 1`，正文抄自目标版本），返回正文与那一行历史 |
+| `version_conflict` | 你以为的当前版本已经不是当前版本（并发回滚、期间有人演化或改过 Persona）：**一个字节都没写** |
+| `target_missing` | 这一版不在历史里（老 Agent 在 Phase B 之前的版本没有正文可考，历史起点是 `baseline` 那一行） |
+
+四条要留意的语义：
+
+- **不复用旧版本号**。回滚落下的是 `当前版本 + 1`。把版本号改回目标版本等于让乐观锁倒退：一个
+  拿着 v5 判定结果的 worker 会在「当前版本又变回 v3」之后重新认为自己是对的，把刚回滚掉的那一版
+  写回来。
+- **旧历史一行不动**，回滚也**不碰演化标记**。标记的去重键是
+  `(role_id, input_snapshot_hash, strategy_version)`，输入没变时把它作废会让下一次演化把刚回滚掉
+  的版本原样写回来——那正是回滚要挡的事。因此**回滚之后演化 job 对这个角色没有活**，直到输入或
+  策略版本变化（那时它是一条新判定，不是重放旧的）。
+- **条件写落在当前版本上**：`expected_current_version` 必填，是为了让并发回滚只有一个赢家，输的
+  那个拿到明确的 `version_conflict` 而不是悄悄再写一版。
+- **原子**：正文、`AgentHandle` 内嵌快照与历史行在同一笔写里落下（Pg 是一条语句——条件更新配一个
+  数据修改 CTE 的 INSERT），因此不存在「Persona 已经是 v5、历史里没有 v5」的窗口。这条不变量
+  由 `test/persona-version-history.test.ts` 钉住（两个后端各跑一遍同一份契约）。
+- **迁移是幂等的**：建表用 `CREATE TABLE IF NOT EXISTS`，补 `baseline` 用 `ON CONFLICT DO NOTHING`，
+  每次启动都跑一遍（见「PostgreSQL / 嵌入式 PGlite」）。它只是**补缺**：既有的历史一行都不改写。
+- **没有新增前端接口，也没有改在线路径**：三个读端口与 `rollbackPersona` 只长在 `MemoryRepository`
+  上，`savePersona` 的签名与语义没变（只是顺带登记一行历史），RPC 面与在线 Driver 一行未动。
+
+已知边界（都写在测试里，不是「暂时没测」）：
+
+- **同一版本号被二次写入**时那一行跟着最后一次写入走（版本号是主键，不攒第二行）。能造出这种情形
+  的只有「版本号先被回退、之后又涨回同一号」，那时旧内容早已不是当前内容。反过来，`savePersona`
+  是无条件覆盖（既有语义，本阶段不改），因此同号重写与版本号回退都推不出一个诚实的父版本，那种
+  情形下 `parent_version` 缺席。
+- **老 Agent 的历史只有起点**：`baseline` 那一行登记的是迁移那一刻的当前版本，之前那些被覆盖掉的
+  正文**补不回来**（没有任何地方存过它们）。
+- **只有 Pg 支持**：`InMemoryRepository` 为测试实现同一份语义（进程重启等于清空），File 适配器没有
+  这个能力（见下面的「后端支持边界」）。
+
 ### 后端支持边界
 
-| 后端 | Persona 演化 | 说明 |
-| --- | --- | --- |
-| `InMemoryRepository` | 支持 | **测试用途**。它不假装持久化——进程重启等于清空 |
-| `PgMemoryRepository`（PGlite 或外部 PostgreSQL） | 支持，**生产用这个** | 演化标记是 `memory_agents.persona_evolution`（可空 JSONB），条件写用一条带 `IS NOT DISTINCT FROM` 谓词的 UPDATE 兑现 |
-| File 适配器 | **不支持** | 缺 `FileMemoryRepository`，与 Skill Promotion 同一个缺口 |
+| 后端 | Persona 演化 | 版本历史与回滚 | 说明 |
+| --- | --- | --- | --- |
+| `InMemoryRepository` | 支持 | 支持 | **测试用途**。它不假装持久化——进程重启等于清空 |
+| `PgMemoryRepository`（PGlite 或外部 PostgreSQL） | 支持，**生产用这个** | 支持，**生产用这个** | 演化标记是 `memory_agents.persona_evolution`（可空 JSONB），条件写用一条带 `IS NOT DISTINCT FROM` 谓词的 UPDATE 兑现；历史是 `memory_persona_versions`（主键 `(role_id, persona_version)`），写入与正文同一条语句 |
+| File 适配器 | **不支持** | **不支持** | 缺 `FileMemoryRepository`，与 Skill Promotion 同一个缺口 |
 
-**File 后端不支持 Persona 演化**：演化要的读写面（`claimNextPersonaEvolutionCandidate` /
-`completePersonaEvolution` / `restoreExpiredPersonaEvolutionClaims` …）长在 `MemoryRepository` 上，
-而它只有 InMemory 与 Pg 两个实现。把 File 适配器接进 `DefaultPersonaEvolutionJob` 在类型层就不
-通过，运行时也会如实收成 `worker_error` / `run.status='failed'`，不会退化成看起来健康的空跑。
-边界由 `test/file-maintenance-boundary.test.ts` 钉住（两条通道各钉一遍）。
+**File 后端不支持 Persona 演化**（历史与回滚同样不支持）：演化要的读写面
+（`claimNextPersonaEvolutionCandidate` / `completePersonaEvolution` / `restoreExpiredPersonaEvolutionClaims`
+/ `rollbackPersona` …）长在 `MemoryRepository` 上，而它只有 InMemory 与 Pg 两个实现。把 File 适配器
+接进 `DefaultPersonaEvolutionJob` 在类型层就不通过，运行时也会如实收成 `worker_error` /
+`run.status='failed'`，不会退化成看起来健康的空跑。边界由 `test/file-maintenance-boundary.test.ts`
+钉住（三份能力清单各钉一遍：晋升、演化、版本历史与回滚）。
 
 **验证边界**：演化的双后端契约跑在 `InMemoryRepository` 与 **PGlite**（嵌入式 WASM PostgreSQL）
 上，因此 CI 里那条腿始终真的在跑；**外部 PostgreSQL 未验证**（`MEMORY_PG_TEST_URL` 未设置），与
@@ -825,6 +916,6 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 
 ### 12. Skill Promotion 与 Persona Evolution 都不支持 File 后端
 
-维护通道里需要 `MemoryRepository` 的两条通道——Skill Promotion（Phase 3）与 Persona Evolution（Phase 4）——都只能跑在实现了该端口的存储上，而现有实现只有 `InMemoryRepository`（测试用）与 `PgMemoryRepository`（生产用），**没有 `FileMemoryRepository`**。`FileBufferRepository` / `FileMemoryDeliveryRepository` / `FileMaintenanceRunStore` 分别是 Buffer、交付 outbox 与 run 审计存储，任何一个都不能当晋升或演化存储用：把 File 适配器接进 `DefaultSkillPromotionJob` 或 `DefaultPersonaEvolutionJob` 在类型层就不通过（前者相对端口缺 35 个成员），运行时也会如实收成 `worker_error` / `run.status='failed'`，不会退化成看起来健康的空跑。这条边界由 `test/file-maintenance-boundary.test.ts` 钉住（两条通道各一遍），详见「Skill 晋升 Job」与「Persona 演化 Job」两节的「后端支持边界」。若要让纯 File 部署也能晋升或演化，需要单独批准一个 FileMemoryRepository 的实现计划——本阶段刻意没有临时实现它。
+维护通道里需要 `MemoryRepository` 的两条通道——Skill Promotion（Phase 3）与 Persona Evolution（Phase 4），以及 Phase 4 修复 B 补的 **Persona 版本历史与回滚**——都只能跑在实现了该端口的存储上，而现有实现只有 `InMemoryRepository`（测试用）与 `PgMemoryRepository`（生产用），**没有 `FileMemoryRepository`**。`FileBufferRepository` / `FileMemoryDeliveryRepository` / `FileMaintenanceRunStore` 分别是 Buffer、交付 outbox 与 run 审计存储，任何一个都不能当晋升、演化或版本历史存储用：把 File 适配器接进 `DefaultSkillPromotionJob` 或 `DefaultPersonaEvolutionJob` 在类型层就不通过（前者相对端口缺 35 个成员），运行时也会如实收成 `worker_error` / `run.status='failed'`，不会退化成看起来健康的空跑。这条边界由 `test/file-maintenance-boundary.test.ts` 钉住（三份能力清单各一遍），详见「Skill 晋升 Job」与「Persona 演化 Job」两节的「后端支持边界」。若要让纯 File 部署也能晋升或演化，需要单独批准一个 FileMemoryRepository 的实现计划——本阶段刻意没有临时实现它。
 
 顺带一条同源的边界：晋升与演化契约目前都只在 **PGlite** 上执行。外部 PostgreSQL 那条腿（`pg-memory-repository.test.ts`）不含这两条通道的用例，且缺 `MEMORY_PG_TEST_URL` 时整份跳过（见问题 #11）。

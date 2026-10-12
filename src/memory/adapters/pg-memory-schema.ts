@@ -147,6 +147,61 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
   // 只改 CREATE 语句对它们等于没改。与 `promoted_from` 同一套迁移方式（幂等、可重复执行）。
   await pool.query(`ALTER TABLE memory_agents ADD COLUMN IF NOT EXISTS persona_evolution JSONB;`);
 
+  // Persona 版本历史（Phase 4 修复 B）：每一版 Persona 的正文与来历。
+  //
+  // 为什么是单独一张表、而不是 Agent 行上的又一列：历史是**多行**（每演化一次、每回滚一次
+  // 追加一行），而且它的两种读法（按角色列出全部版本、按版本号取一行）都要能吃上索引；塞进
+  // 一个 JSONB 列会让「取第 3 版」变成把整份历史读出来再筛。
+  //
+  // 主键 `(role_id, persona_version)` 就是「同一角色同一版本号只有一行」这条不变量。列
+  // `persona_version` 与载荷里的 `persona.version` 同源（都由 personaVersionRecord 从正文
+  // 派生），列存在的意义是让主键与排序用得上索引——Phase 3 的 `promoted_from` 曾经列与载荷
+  // 分裂过一次，这里从一开始就只留一个权威（正文）。
+  //
+  // `ON DELETE CASCADE`：Agent 被删时历史跟着走（与经验、技能同一个处置）。退休归档保留的是
+  // 最小字段，不承担「把每一版正文留在库里」的职责。
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS memory_persona_versions (
+      role_id TEXT NOT NULL REFERENCES memory_agents(role_id) ON DELETE CASCADE,
+      persona_version INT NOT NULL,
+      payload JSONB NOT NULL,
+      PRIMARY KEY (role_id, persona_version)
+    );
+  `);
+
+  // 老 Agent 的**当前**版本补一行 `baseline`。
+  //
+  // Phase B 之前落库的版本没有历史：旧正文早已被覆盖，**补不出来**。能如实登记的只有「迁移
+  // 这一刻的当前版本」这一件事，而它的来历（父版本、策略版本、run）不知道就是不知道——那几格
+  // 缺席，不编。补它的理由有两个：回滚要有目标，以及「当前版本在历史里有一行」这条不变量
+  // 从迁移那一刻起成立。
+  //
+  // 这一步同时是**修复步骤**：某个 Agent 的当前版本若因为「建 Agent 与写历史之间进程消失」
+  // 而缺行，下一次启动照样补上。`DO NOTHING` 而不是 `DO UPDATE`——这里登记的是既有事实，
+  // 不许改写历史（写入路径那边才用 `DO UPDATE`，见 PgMemoryRepository 的说明）。
+  //
+  // `created_at` 取正文自己的 `generated_at`：这一版什么时候生成的，正文自己带着答案，用迁移
+  // 时刻是另一个意思（那一行是我们什么时候**登记**的）。两个正则护栏让脏数据**跳过**而不是
+  // 把初始化搞崩：`version` 不是数字时 `::int` 会报错，`generated_at` 不是 ISO 串时读回来解析
+  // 不了——跳过之后那个 Agent 就是「历史里没有行」，如实缺席，而不是整个记忆后端起不来。
+  await pool.query(`
+    INSERT INTO memory_persona_versions (role_id, persona_version, payload)
+    SELECT
+      role_id,
+      (persona->>'version')::int,
+      jsonb_build_object(
+        'role_id', role_id,
+        'persona_version', (persona->>'version')::int,
+        'persona', persona,
+        'source', 'baseline',
+        'created_at', persona->>'generated_at'
+      )
+    FROM memory_agents
+    WHERE persona->>'version' ~ '^[0-9]+$'
+      AND persona->>'generated_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
+    ON CONFLICT (role_id, persona_version) DO NOTHING;
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS memory_skills (
       id UUID PRIMARY KEY,

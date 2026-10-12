@@ -643,6 +643,94 @@ export const PersonaEvolutionMarkerSchema = z.object({
 });
 export type PersonaEvolutionMarker = z.infer<typeof PersonaEvolutionMarkerSchema>;
 
+/**
+ * 一版 Persona 是怎么来的（Phase 4 修复 B）。
+ *
+ * 这五个值对应**五条写入路径**，而不是五种人。分得细是因为它们回答的是不同的问题：
+ * 前两个是「这一版不是谁写出来的，是被登记下来的」，后三个是「谁把它写成了这样」。
+ */
+export const PersonaVersionSourceSchema = z.enum([
+  /** Agent 建出来时的种子版本（`PersonaDef.version === 1`，正文来自 createSeedPersona） */
+  'seed',
+  /**
+   * 迁移时为**已存在**的 Agent 登记的当前版本。
+   *
+   * 它的正文就是迁移那一刻库里的 Persona，但**来源无从考证**：Phase B 之前落库的版本
+   * 没有父版本、没有策略版本、没有 run。登记它而不是假装有历史，是为了让「当前版本」在
+   * 历史里始终有一行（回滚有目标、当前版本可读），同时把「这一版的来历不明」如实说出来。
+   */
+  'baseline',
+  /** Persona 演化 job 写出的一版（`completePersonaEvolution` 的 `evolved` 出口） */
+  'evolution',
+  /** 回滚写出的一版：正文抄自 `rollback_from_version`，版本号是新的 */
+  'rollback',
+  /**
+   * 其余写入路径覆盖写下的版本：前端 PATCH（`mergePersonaPatch`）、按需重生成
+   * （`regeneratePersona` 的归纳器）——它们都经 `savePersona`，在存储层看起来是同一种。
+   */
+  'manual',
+]);
+export type PersonaVersionSource = z.infer<typeof PersonaVersionSourceSchema>;
+
+/**
+ * 一版 Persona 的**正文 + 来历** —— 版本历史的一行（Phase 4 修复 B）。
+ *
+ * 修复前只有「当前 Persona」与「最新演化标记」两处：下一次演化覆盖标记之后，旧版本的正文
+ * 就再也找不回来了——`PersonaDef` 是单实体单版本号的，`savePersona` 是覆盖写。于是
+ * 「回滚」只能是一句空话。本表把每一版的正文按版本号留下来，回滚才有**可抄的东西**。
+ *
+ * 字段分三组，读法如下：
+ *
+ * | 问题 | 读法 |
+ * | --- | --- |
+ * | 这是哪一版、正文是什么 | `persona_version` + `persona`（完整 PersonaDef） |
+ * | 它取代了哪一版 | `parent_version`（与演化标记的 `parent_version` 同义：写它的时候当前是第几版） |
+ * | 它是怎么来的 | `source`（五条写入路径之一） |
+ * | 它按哪一版判据、依据什么输入、哪一次 run | `strategy_version` / `input_snapshot_hash` / `source_run_id` |
+ * | 回滚从哪一版抄来 | `rollback_from_version`（只有 `source === 'rollback'` 有） |
+ * | 变了什么、谁批的 | `change_summary` / `reviewed_by` |
+ * | 什么时候落的 | `created_at` |
+ *
+ * **`persona_version` 与 `persona.version` 同源**：它不是第二个权威，而是在**唯一的构造点**
+ * （services/persona-version-history 的 `personaVersionRecord`）从正文派生出来的，数据库那一列
+ * 也由同一个值填入。这样「按列查出来的版本号」与「载荷里的版本号」不可能各说各话——Phase 3
+ * 的 `promoted_from` 就是列与载荷分裂过一次的地方，这里从一开始就只留一个权威（正文）。
+ *
+ * **内容字段是完整的 `PersonaDef`，不是差异**：回滚要的是能直接写回去的完整正文；
+ * 存差异就得先能重放整条链，而那要求链上没有断点——老版本恰恰是有断点的（见 `baseline`）。
+ *
+ * 缺席的字段一律读作**「这一版没有这件事」**，不补默认值：`parent_version` 缺席是「不知道
+ * 它取代了谁」（baseline 那一行就是这样），而不是「它取代了第 0 版」；`source_run_id` 缺席是
+ * 「这一版不是某次维护 run 写出来的」，而不是「run 是空字符串」。
+ */
+export const PersonaVersionRecordSchema = z.object({
+  /** 这一版属于哪个角色 */
+  role_id: z.string(),
+  /** 版本号；与 `persona.version` 同源（由构造点派生，见上面的说明） */
+  persona_version: z.number().int().positive(),
+  /** 这一版的完整正文 —— 回滚抄的就是它 */
+  persona: PersonaDefSchema,
+  /** 这一版是经哪条路径写下的 */
+  source: PersonaVersionSourceSchema,
+  /** 写它的时候当前是第几版；不知道时为缺席（不编） */
+  parent_version: z.number().int().positive().optional(),
+  /** 产生这一版的维护 run；只有演化写过 run 时为缺席 */
+  source_run_id: z.string().optional(),
+  /** 判定用的策略版本（演化） */
+  strategy_version: z.string().optional(),
+  /** 判定所依据的输入快照 hash（演化） */
+  input_snapshot_hash: z.string().optional(),
+  /** 回滚时正文抄自哪一版（只有 `source === 'rollback'` 有） */
+  rollback_from_version: z.number().int().positive().optional(),
+  /** 变更摘要（人读） */
+  change_summary: z.string().optional(),
+  /** 审批 / 操作者标识；自动批准是 `system:auto-approval`（与标记同词同义） */
+  reviewed_by: z.string().optional(),
+  /** 这一版落下来的时刻 */
+  created_at: z.iso.datetime(),
+});
+export type PersonaVersionRecord = z.infer<typeof PersonaVersionRecordSchema>;
+
 // ═══════════════════════════════════════════
 //  Metrics
 // ═══════════════════════════════════════════
