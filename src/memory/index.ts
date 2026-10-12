@@ -662,6 +662,96 @@ export type {
 } from './ports/skill-promotion-job';
 
 // ════════════════════════════════════════════════════════
+//  20b. Memory Maintenance：Persona 演化（Phase 4-A）
+//      独立的 Persona 演化通道的**契约**：策略端口、job 契约、版本模型与演化标记、
+//      选候选与输入快照的纯规则、判定契约与失败分类。执行内核与批量外壳（4-C）落下来
+//      之前，这里导出的是「可被判定的东西长什么样」，不是能跑的实现。
+//
+//      它只读已批准 / 已生效的技能与晋升状态已落定的经验，由外部调度器独立触发；在线
+//      Driver、Context consumer、Feedback consumer 与 Skill Promotion 都不调用它，它也
+//      不调用它们中的任何一个。
+// ════════════════════════════════════════════════════════
+
+export {
+  DEFAULT_PERSONA_EVOLUTION_STRATEGY_CONFIG,
+  DEFAULT_PERSONA_EVOLUTION_STRATEGY_VERSION,
+  DefaultPersonaEvolutionStrategy,
+} from './adapters/default-persona-evolution-strategy';
+export {
+  PERSONA_EVOLUTION_APPROVAL_MODES,
+  PERSONA_EVOLUTION_BLOCKER_RULES,
+  PERSONA_EVOLUTION_VERDICTS,
+} from './ports/persona-evolution-strategy';
+export type {
+  PersonaEvolutionApprovalMode,
+  PersonaEvolutionBlockerRule,
+  PersonaEvolutionDecision,
+  PersonaEvolutionEvaluationInput,
+  PersonaEvolutionExperienceSnapshot,
+  PersonaEvolutionFeedbackSummary,
+  PersonaEvolutionInputSnapshot,
+  PersonaEvolutionLastRun,
+  PersonaEvolutionPersonaDraft,
+  PersonaEvolutionSkillSnapshot,
+  PersonaEvolutionStrategy,
+  PersonaEvolutionStrategyConfig,
+  PersonaEvolutionVerdict,
+} from './ports/persona-evolution-strategy';
+export type {
+  PersonaEvolutionCandidateOutcome,
+  PersonaEvolutionCandidateStatus,
+  PersonaEvolutionJob,
+  PersonaEvolutionJobOptions,
+  PersonaEvolutionRestoreResult,
+  PersonaEvolutionRunOptions,
+  PersonaEvolutionRunResult,
+  PersonaEvolutionStopReason,
+} from './ports/persona-evolution-job';
+export {
+  DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY,
+} from './services/delivery-lifecycle';
+export {
+  buildPersonaEvolutionSnapshot,
+  compareRecordsById,
+  initialPersonaEvolutionMarker,
+  isApprovedSkill,
+  isEligibleExperience,
+  personaEvolutionIdempotencyKey,
+  personaEvolutionInputSnapshotHash,
+  personaEvolutionStateLabel,
+  planPersonaEvolutionCandidate,
+  reevaluatePersonaEvolutionMarker,
+  selectApprovedSkills,
+  selectEligibleExperiences,
+  type PersonaEvolutionCandidateInput,
+  type PersonaEvolutionCandidatePlan,
+  type PersonaEvolutionFeedbackSummaryInput,
+  type PersonaEvolutionSkipReason,
+  type PersonaEvolutionStateLabel,
+} from './services/persona-evolution-candidates';
+export {
+  PERSONA_EVOLUTION_DECISION_CONTRACT_CODE,
+  PERSONA_EVOLUTION_FAILURE_KINDS,
+  PersonaEvolutionDecisionContractError,
+  assertPersonaEvolutionDecisionConsistent,
+  auditPersonaEvolutionDecision,
+  buildEvolvedPersona,
+  describePersonaEvolutionContractFailure,
+  isPersonaEvolutionDecisionContractError,
+  isRetryablePersonaEvolutionFailure,
+  personaEvolutionFailure,
+  resolvePersonaEvolutionWrite,
+  summarizePersonaEvolutionChange,
+  type PersonaEvolutionFailureKind,
+  type PersonaEvolutionViolation,
+  type PersonaEvolutionWriteResolution,
+} from './services/persona-evolution-decision';
+export type {
+  PersonaEvolutionMarker,
+  PersonaEvolutionOutcome,
+} from './schemas';
+
+// ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型
 // ════════════════════════════════════════════════════════
 

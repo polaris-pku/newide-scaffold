@@ -560,6 +560,89 @@ export const PersonaDefSchema = z.object({
 });
 export type PersonaDef = z.infer<typeof PersonaDefSchema>;
 
+/**
+ * 一次演化的结论 —— 这条角色的演化流走到了哪一格（Phase 4）。
+ *
+ * 与晋升的 `PromotionOutcome` 是同一族语义，只换了落脚点：晋升的产物是「多了一条技能」，
+ * 演化的产物是「Persona 版本 +1」，所以第一格叫 `evolved` 而不是 `promoted`。
+ *
+ * `eligible`（策略说够格）**不在**这里——那是判定，`evolved` 是事实：自动批准时前者导致
+ * 后者，人工审核时前者导致 `pending_review`。把「够格」写进这个枚举，就再也分不出
+ * 「够格但没人放行」和「已经写进库」。
+ */
+export const PersonaEvolutionOutcomeSchema = z.enum([
+  /** 判定合格且当前是自动批准模式：新 Persona 版本已经写在库里 */
+  'evolved',
+  /** 判定合格但当前是人工审核模式：只留下这里，**不写 Persona**，等人工或后续自动批准的运行 */
+  'pending_review',
+  /** 判定不合格：留下理由与挡板规则，同一输入快照与策略版本下不再重复评估 */
+  'rejected',
+]);
+export type PersonaEvolutionOutcome = z.infer<typeof PersonaEvolutionOutcomeSchema>;
+
+/**
+ * 演化标记 —— Persona Evolution Job 处理**一个角色**时留下的一切（Phase 4）。
+ *
+ * **可缺席即「从未演化过」**：Phase 4 之前落库的 Agent、以及新建的 Agent 都没有这个字段，
+ * 读作「这条演化流还没被人碰过」，不需要迁移脚本（Pg 侧是一个可空的 JSONB 列，老行是 NULL）。
+ *
+ * 与晋升标记（`ExperiencePromotionSchema`）是**同一套骨架 + 不同的结论字段**：生命周期字段
+ * 共用 `lifecycleRecordFields`，转移规则共用 `services/delivery-lifecycle.ts`，因此这条通道
+ * 没有第二套状态机。三处刻意的差异，都是「候选是角色而不是行」的直接后果：
+ *
+ * 1. **候选的粒度是 role**：claim/lease 按角色持有（一个角色同时只有一条演化流），因此
+ *    逐条结果与幂等键都以 `role_id` 为主，而不像晋升那样每条经验各自持有。
+ * 2. **多了一组版本字段**：`parent_version`（判定与写回的前置条件）、`persona_version`
+ *    （这次写下的版本）、`input_snapshot_hash`（幂等键的一半）、`strategy_version`、
+ *    `source_run_id`、`change_summary`。计划 §11 要求 Persona 更新「记录 source run、
+ *    strategy version、input snapshot 与变更摘要」，落点就是这里。
+ * 3. **没有 `skill_id` 这种「产物指针」**：产物是 Persona 本身（同一行、版本号 +1），
+ *    不需要跨实体引用，因而也没有晋升那条「引用成立性」校验。
+ *
+ * 版本模型读法（计划 §11 的「Persona 版本」一节）：
+ *
+ * | 问题 | 读法 |
+ * | --- | --- |
+ * | 当前 Persona 是第几版 | `PersonaDef.version` |
+ * | 它是由哪一版演化来的 | 本标记的 `parent_version` → `persona_version` |
+ * | 它依据什么输入 | `input_snapshot_hash` |
+ * | 按哪一版判据 | `strategy_version` |
+ * | 是谁、哪一次运行产生的 | `source_run_id` + `reviewed_by` |
+ * | 变了什么 | `change_summary`（人读） |
+ * | 审核状态 | `outcome`（`pending_review` = 等人工；`evolved` + `reviewed_by` = 自动批准） |
+ *
+ * **落点**：标记挂在 **Agent 记录**上（InMemory 是 `AgentStore` 的一个字段，Pg 是
+ * `memory_agents` 的一个可空 JSONB 列，见 Phase 4-B），**不放进 `AgentHandle`、也不放进
+ * `PersonaDef`**。理由是它属于维护状态而不是对外视图：`AgentHandle` 是前端与 Coordinator
+ * 读的那份载荷，把 claim token、重试次数、失败原因塞进去等于给在线读口加了一组它不该看见
+ * 的字段；而 `PersonaDef` 是一次演化的**产物**，把「上一次演化是怎么来的」记在产物里会让
+ * 产物与状态互相耦合（前端 PATCH Persona 时还得决定这一组字段怎么办）。
+ */
+export const PersonaEvolutionMarkerSchema = z.object({
+  ...lifecycleRecordFields,
+  /** 最近一次演化的结论；缺席 = 还没得出结论（正在处理、或被判失败退回了队列） */
+  outcome: PersonaEvolutionOutcomeSchema.optional(),
+  /** 这次判定与写回所基于的父 Persona 版本：条件写的前置条件 */
+  parent_version: z.number().int().positive().optional(),
+  /** 这次演化写下的 Persona 版本；只在 `outcome === 'evolved'` 时有值，且等于它 +1 */
+  persona_version: z.number().int().positive().optional(),
+  /** 做出该结论的策略版本；版本变了，同一份输入可以被重新评估 */
+  strategy_version: z.string().optional(),
+  /** 判定所依据的输入快照 hash —— 与 `strategy_version` 一起构成「要不要重评」的判据 */
+  input_snapshot_hash: z.string().optional(),
+  /** 产生这次结论的 maintenance run */
+  source_run_id: z.string().optional(),
+  /** 结论产生的时刻 */
+  evaluated_at: z.iso.datetime().optional(),
+  /** 结论的人读理由（策略给了什么、被哪条规则挡住） */
+  reasons: z.array(z.string()).optional(),
+  /** 变更摘要（人读）：这次演化把 Persona 从哪一版推到哪一版、依据什么规模 */
+  change_summary: z.string().optional(),
+  /** 自动批准时的批准者标识；与技能晋升同一个值（`system:auto-approval`） */
+  reviewed_by: z.string().optional(),
+});
+export type PersonaEvolutionMarker = z.infer<typeof PersonaEvolutionMarkerSchema>;
+
 // ═══════════════════════════════════════════
 //  Metrics
 // ═══════════════════════════════════════════
