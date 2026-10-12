@@ -31,7 +31,7 @@ import type {
   SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
-import { applyFeedbackToExperience, isFeedbackApplied, recomputeAvgConfidence } from '../services/usage-feedback';
+import { applyFeedbackToExperience, averageConfidence, isFeedbackApplied } from '../services/usage-feedback';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 import { cosineSimilarity } from '../utils/vector';
 import {
@@ -394,10 +394,16 @@ export class InMemoryRepository implements MemoryRepository {
   /**
    * 反馈的原子幂等应用（内存实现）。
    *
-   * 「查有没有 / 判重 / 写回」三步之间**一个 await 都没有**，因此在 JS 单线程下就是一段
-   * 临界区：并发的两个应用不可能都基于同一份旧快照写回，同一条反馈也不可能应用两次
-   * （与 saveExperienceIfAbsent 用的是同一手法）。刻意不经过 withDescriptionEmbedding：
-   * 描述没变、向量就不该重算，写回的是仓库里那条记录的副本。
+   * 「查有没有 / 判重 / 写回经验 / 重算聚合」四步之间**一个 await 都没有**，因此在 JS
+   * 单线程下就是一段临界区：并发的两个应用不可能都基于同一份旧快照写回，同一条反馈也
+   * 不可能应用两次（与 saveExperienceIfAbsent 用的是同一手法）。刻意不经过
+   * withDescriptionEmbedding：描述没变、向量就不该重算，写回的是仓库里那条记录的副本。
+   *
+   * 聚合根的重算**必须**在这段临界区里：`recomputeAvgConfidence` 是「读全部经验 → 算均值
+   * → 写 updateMetrics」，中间隔着 await。两条反馈并发时，后进入临界区的那条会在算出均值
+   * 之后、写回之前被另一条插进来，于是它写回的是一个**已经过时**的均值——最终库里的
+   * `avg_confidence` 落在旧快照上，与经验集合的真实均值对不上。这里改成同步算出均值并当场
+   * 赋值：读到的集合与写回的均值必然来自同一刻，数据库实现把同样两件事收进同一个事务。
    *
    * 注：内存实现没有持久层，重启即清空——它是测试替身，不是生产存储（见 ports 里的说明）。
    */
@@ -414,7 +420,10 @@ export class InMemoryRepository implements MemoryRepository {
     }
     const next = applyFeedbackToExperience(current, input, nowTimestamp());
     store.experiences[index] = next;
-    await recomputeAvgConfidence(this, role_id);
+    // 同步（不 await）：下面的重算与上面的写回属于同一个临界区，见方法注释
+    const metrics = { ...store.metrics, avg_confidence: averageConfidence(store.experiences) };
+    store.metrics = metrics;
+    store.handle = { ...store.handle, metric: metrics };
     return { outcome: 'applied', experience: { ...next } };
   }
 

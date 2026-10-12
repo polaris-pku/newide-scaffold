@@ -169,15 +169,23 @@ export async function recomputeAvgConfidence(
   role_id: string,
 ): Promise<void> {
   const experiences = await repository.listExperiences(role_id);
-  const average =
-    experiences.length > 0
-      ? experiences.reduce((sum, experience) => sum + experience.confidence, 0) /
-        experiences.length
-      : 0;
   await repository.updateMetrics(role_id, (metrics) => ({
     ...metrics,
-    avg_confidence: round3(average),
+    avg_confidence: averageConfidence(experiences),
   }));
+}
+
+/**
+ * 一组经验的置信度均值（保留三位小数），空集为 0。
+ *
+ * 抽出来是因为「均值怎么算」正是并发回写最容易漂移的地方：进程内实现要在**同一段
+ * 同步临界区**里算出它，数据库实现要在**同一个事务**里算出它——两边都得先拿到
+ * 一份经验集合，再把这同一份算术用上。算法只写一处，两条腿就不会各算各的。
+ */
+export function averageConfidence(experiences: readonly ExperienceRecord[]): number {
+  if (experiences.length === 0) return 0;
+  const sum = experiences.reduce((total, experience) => total + experience.confidence, 0);
+  return round3(sum / experiences.length);
 }
 
 function clamp(value: number, min: number, max: number): number {
