@@ -92,3 +92,59 @@ export function feedbackApplicationOf(
 export function isSupportedFeedbackVersion(event_version: string): boolean {
   return event_version === DRIVER_FEEDBACK_EVENT_VERSION;
 }
+
+/**
+ * 待归并记录**自己声明的关联键**是否与它携带的反馈内容一致。
+ *
+ * 一条待归并记录回答两个问题：它挂在哪条交付队列上（顶层 `feedback_id` / `role_id` /
+ * `experience_id`），以及它携带的反馈说了什么（嵌套 `feedback` 里的同名字段）。两者是同一
+ * 事实的两处抄写，必须逐字一致——不一致就意味着这份记录被手工改过，或者来自另一套构造规则。
+ *
+ * 为什么必须在**归并之前**挡住：应用的定位与写入用的是嵌套那一份（`feedback.role_id` /
+ * `feedback.experience_id`），而 claim/lease/ack/fail、也就是死信落点，用的是顶层那一份
+ * （`{channel, role_id: record.role_id, id: record.feedback_id}`）。两者不一致时会出现两种
+ * 都不可接受的写入——**跨 Agent 写**（顶层指向 A、内容说 B，于是 B 的经验被 A 队列里的反馈
+ * 改写，而那条经验的置信度历史里记着一条它不知道来源的 id）、以及**fence 键错位**（死信落在
+ * 一条与内容无关的记录上，真正出问题的那条永远留在队列里空转）。
+ *
+ * 三者都判，缺一不可：
+ * - `role_id` 不一致 → 上面那条跨 Agent 写
+ * - `experience_id` 不一致 → 同 role 内也会写错经验（"the" experience 由内容说了算）
+ * - `feedback_id` 不一致 → 幂等键与溯源落点对不上（内容里那个才是要记进置信度历史的 id）
+ *
+ * 返回不一致的字段名（空数组表示自洽）；调用方据此落一条规范化的 `payload_unreadable`
+ * 错误并直接进死信——这是不可恢复的损坏数据，重投多少次都是同一个结论。
+ */
+export function pendingFeedbackBindingMismatches(
+  record: PendingFeedbackRecord,
+): PendingFeedbackIdentityField[] {
+  const mismatches: PendingFeedbackIdentityField[] = [];
+  if (record.feedback_id !== record.feedback.feedback_id) mismatches.push('feedback_id');
+  if (record.role_id !== record.feedback.role_id) mismatches.push('role_id');
+  if (record.experience_id !== record.feedback.experience_id) mismatches.push('experience_id');
+  return mismatches;
+}
+
+/**
+ * 把上一条的不一致渲染成一句可落盘的诊断。
+ *
+ * 逐个字段列出「顶层说什么、内容说什么」：只报字段名的话，人工恢复时还得自己去把两侧读出来
+ * 对比一遍，而这条记录从此只会出现在死信里。
+ */
+export function describePendingFeedbackBindingMismatch(
+  record: PendingFeedbackRecord,
+  mismatches: readonly PendingFeedbackIdentityField[],
+): string {
+  const fields = mismatches
+    .map(
+      (field) =>
+        `${field}=${record[field]} (top-level) vs ${record.feedback[field]} (feedback payload)`,
+    )
+    .join('; ');
+  return `Pending feedback ${record.feedback_id} contradicts its own payload on ${mismatches.join(
+    ', ',
+  )}: ${fields}.`;
+}
+
+/** 待归并记录里既是顶层关联键、又在反馈内容里各有一份的字段 */
+type PendingFeedbackIdentityField = 'feedback_id' | 'role_id' | 'experience_id';

@@ -506,14 +506,17 @@ export {
 } from './services/lease-heartbeat';
 export {
   applyFeedbackToExperience,
+  averageConfidence,
   isFeedbackApplied,
   nextConfidenceAfterFeedback,
   recomputeAvgConfidence,
 } from './services/usage-feedback';
 export {
   buildPendingFeedbackRecord,
+  describePendingFeedbackBindingMismatch,
   feedbackApplicationOf,
   isSupportedFeedbackVersion,
+  pendingFeedbackBindingMismatches,
   pendingFeedbackId,
 } from './services/pending-feedback';
 

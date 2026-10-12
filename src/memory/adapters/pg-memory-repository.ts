@@ -9,7 +9,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
-import type { SqlPool } from '../ports/sql-pool';
+import type { SqlClient, SqlPool } from '../ports/sql-pool';
 import {
   AgentArchiveRecordSchema,
   AgentHandleSchema,
@@ -41,7 +41,11 @@ import type {
   SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
-import { applyFeedbackToExperience, isFeedbackApplied, recomputeAvgConfidence } from '../services/usage-feedback';
+import {
+  applyFeedbackToExperience,
+  averageConfidence,
+  isFeedbackApplied,
+} from '../services/usage-feedback';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 import {
   createSeedHandle,
@@ -156,6 +160,27 @@ const SKILL_AGGREGATE_BUMP_SQL = `
  * 此时把这条反馈还给交付层的退避重试（抛错 → 可重试失败）比在这里空转更合适。
  */
 const EXPERIENCE_FEEDBACK_MAX_CAS_ATTEMPTS = 5;
+
+/**
+ * 反馈应用之后的条件写回 Agent 聚合指标（avg_confidence）。
+ *
+ * 条件（`metrics->>'avg_confidence'` 仍是读到的那一版）是一条**有序性护栏**：一次成功的
+ * 反馈应用会把经验集合推到一个新状态，它算出的均值只有落在一个**还没有被别人推进过**的
+ * 聚合上才算数。两个消费者并发回写**不同**经验时，各自读到的都是旧集合，后写的那一方若
+ * 无条件整份覆盖，就会把先写那一方的均值抹掉——库里两条经验都更新了，`avg_confidence`
+ * 却停在只反映其中一条的旧值。写不进去（rowCount=0）由调用方重读经验集合再来一遍，
+ * 第二遍读到的是两份更新之后的集合，均值因此必然收敛到真实均值。
+ *
+ * handle 内嵌的 `metric` 快照与 `metrics` 列必须同时推进：`AgentBoardQuery` 读 handle、
+ * `getMetrics` 读列，只写一个会让同一个聚合根在两个读口上给出两个答案。
+ */
+const FEEDBACK_AVG_CONFIDENCE_SQL = `
+  UPDATE memory_agents
+  SET metrics = jsonb_set(metrics, '{avg_confidence}', to_jsonb($3::double precision), true),
+      handle = jsonb_set(handle, '{metric,avg_confidence}', to_jsonb($3::double precision), false)
+  WHERE role_id = $1
+    AND metrics->>'avg_confidence' = $2
+`;
 
 /**
  * 读取表内 description_embedding 列的 vector(N) 维度；列不存在返回 undefined。
@@ -867,6 +892,11 @@ export class PgMemoryRepository implements MemoryRepository {
    * 「先查再插」——后者在两次往返之间正是两个 worker 会同时通过的地方。任何一次成功写入
    * 都会把 `updated_at` 推到新的时刻，因此乐观锁令牌随之变化，不会出现两次写共用一版的情况。
    *
+   * 「推进经验」与「推进聚合根」这两件事必须在**同一个事务**里、并且整段重试循环按 role
+   * 串行（见 withRoleLock）：前者是条件写，后者只认「聚合还没被别人推进过」。少了事务，
+   * 应用过经验却漏掉均值的那一版永远补不回来；少了串行，进程内两条反馈会各自读到对方的
+   * 中间态。跨进程（外部 PostgreSQL）那一侧靠条件写本身成立，与 withRoleLock 的说明一致。
+   *
    * 重试不是无上限的：连读好几版都被抢先，说明这条经验正被打字机式地并发回写，与其在这里
    * 转圈，不如把这条反馈还给交付层的退避重试（抛错即由调用方按可重试失败处理）。
    */
@@ -877,76 +907,79 @@ export class PgMemoryRepository implements MemoryRepository {
     await this.ensureSchema();
     await this.requireAgentRow(role_id);
 
-    for (let attempt = 0; attempt < EXPERIENCE_FEEDBACK_MAX_CAS_ATTEMPTS; attempt += 1) {
-      const current = await this.readExperienceForRole(role_id, input.experience_id);
-      if (!current) return { outcome: 'experience_missing' };
+    return this.withRoleLock(role_id, async () => {
+      for (let attempt = 0; attempt < EXPERIENCE_FEEDBACK_MAX_CAS_ATTEMPTS; attempt += 1) {
+        const applied = await this.applyFeedbackOnce(role_id, input);
+        if (applied) return applied;
+      }
+
+      throw new Error(
+        `Experience ${input.experience_id} kept changing while feedback ${input.feedback_id} was being applied; the delivery will be retried.`,
+      );
+    });
+  }
+
+  /**
+   * 一次事务内的尝试：条件写经验 → 按事务内可见的经验集重算均值 → 条件写聚合指标。
+   *
+   * 返回 undefined 表示这一版被别人抢先（经验或聚合任一没写进去），调用方重读再来；
+   * 返回一个结果表示已经定局（写进去了，或者经验缺席 / 这条反馈早就应用过）。
+   */
+  private async applyFeedbackOnce(
+    role_id: string,
+    input: ExperienceFeedbackApplication,
+  ): Promise<ExperienceFeedbackResult | undefined> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const current = await readExperienceRow(client, role_id, input.experience_id);
+      if (!current) {
+        await client.query('COMMIT');
+        return { outcome: 'experience_missing' };
+      }
       if (isFeedbackApplied(current, input.feedback_id)) {
+        await client.query('COMMIT');
         return { outcome: 'already_applied', experience: current };
       }
 
       const next = applyFeedbackToExperience(current, input, nowTimestamp());
-      const updated = await this.writeExperienceIfUnchanged(role_id, current, next, input.feedback_id);
-      if (updated) {
-        await recomputeAvgConfidence(this, role_id);
-        return { outcome: 'applied', experience: updated };
-      }
-    }
-
-    throw new Error(
-      `Experience ${input.experience_id} kept changing while feedback ${input.feedback_id} was being applied; the delivery will be retried.`,
-    );
-  }
-
-  /** 按 role + 主键读一条经验（反馈应用读的是当次快照，不参与后续写入） */
-  private async readExperienceForRole(
-    role_id: string,
-    experience_id: string,
-  ): Promise<ExperienceRecord | undefined> {
-    // 形状不对的 id 不可能在库里存在，先判掉：直接拿去比 uuid 列会抛 22P02，端口承诺的
-    // experience_missing 因此永远走不到，异常还会被分类器当成瞬时故障反复重试。同一个输入
-    // 在 InMemory 腿返回 missing、在这里抛错，正是契约分歧——判据与内存腿一致：查不到就是没有。
-    if (!canNameExperience(experience_id)) return undefined;
-    const result = await this.pool.query<{ payload: unknown }>(
-      `SELECT payload FROM memory_experiences WHERE role_id = $1 AND id = $2`,
-      [role_id, experience_id],
-    );
-    const row = result.rows[0];
-    return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
-  }
-
-  /**
-   * 条件写回经验的载荷（描述没变，因此**不动** description_embedding 列）。
-   *
-   * 条件里的四个值合起来是这一版的乐观锁令牌：任一被改过就写不进去，返回 undefined。
-   * 返回写回之后的载荷（数据库侧真正落地的那一份），调用方据此报「已应用」。
-   */
-  private async writeExperienceIfUnchanged(
-    role_id: string,
-    current: ExperienceRecord,
-    next: ExperienceRecord,
-    feedback_id: string,
-  ): Promise<ExperienceRecord | undefined> {
-    const result = await this.pool.query<{ payload: unknown }>(
-      `UPDATE memory_experiences
-       SET payload = $3::jsonb
-       WHERE role_id = $1 AND id = $2
-         AND payload->>'updated_at' = $4
-         AND payload->>'confidence' = $5
-         AND payload->>'referenced_count' = $6
-         AND NOT (payload -> 'confidence_history' @> $7::jsonb)
-       RETURNING payload`,
-      [
+      const written = await writeExperienceIfUnchanged(
+        client,
         role_id,
-        current.id,
-        JSON.stringify(next),
-        current.updated_at,
-        String(current.confidence),
-        String(current.referenced_count),
-        JSON.stringify([{ feedback_id }]),
-      ],
-    );
-    const row = result.rows[0];
-    return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
+        current,
+        next,
+        input.feedback_id,
+      );
+      if (!written) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+
+      // 事务内重读**全部**经验算均值：只有落在这个时刻的集合上，聚合才与经验集合同源
+      // （另有一条反馈可能刚提交过另一条经验）。写回聚合同样带条件，见 SQL 常量。
+      const experiences = await listExperienceRows(client, role_id);
+      const metrics = await readAgentMetrics(client, role_id);
+      if (!metrics) throw new Error(`Agent not found: ${role_id}`);
+
+      const synced = await client.query(FEEDBACK_AVG_CONFIDENCE_SQL, [
+        role_id,
+        String(metrics.avg_confidence),
+        averageConfidence(experiences),
+      ]);
+      if (synced.rowCount === 0) {
+        // 聚合被另一次回写推进过：这一版均值已经过时，连同上面的经验写一起退回重来
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+
+      await client.query('COMMIT');
+      return { outcome: 'applied', experience: written };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {
@@ -1178,4 +1211,89 @@ function isUniqueViolation(error: unknown): boolean {
     'code' in error &&
     (error as { code: string }).code === '23505'
   );
+}
+
+// ═══════════════════════════════════════════
+//  反馈应用的事务内读写（都走同一个 client）
+// ═══════════════════════════════════════════
+
+/**
+ * 按 role + 主键读一条经验。
+ *
+ * 走调用方给的 client 而不是池：这几段读写必须落在同一个事务、同一条连接上，中间不能被
+ * 别的语句插进来（PGlite 只有一个连接，混用池与 client 就等于把事务拆散）。
+ */
+async function readExperienceRow(
+  client: SqlClient,
+  role_id: string,
+  experience_id: string,
+): Promise<ExperienceRecord | undefined> {
+  // 形状不对的 id 不可能在库里存在，先判掉：直接拿去比 uuid 列会抛 22P02，端口承诺的
+  // experience_missing 因此永远走不到，异常还会被分类器当成瞬时故障反复重试。同一个输入
+  // 在 InMemory 腿返回 missing、在这里抛错，正是契约分歧——判据与内存腿一致：查不到就是没有。
+  if (!canNameExperience(experience_id)) return undefined;
+  const result = await client.query<{ payload: unknown }>(
+    `SELECT payload FROM memory_experiences WHERE role_id = $1 AND id = $2`,
+    [role_id, experience_id],
+  );
+  const row = result.rows[0];
+  return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
+}
+
+/** 事务内读该 role 的全部经验（算聚合均值的那一份集合） */
+async function listExperienceRows(client: SqlClient, role_id: string): Promise<ExperienceRecord[]> {
+  const result = await client.query<{ payload: unknown }>(
+    `SELECT payload FROM memory_experiences WHERE role_id = $1 ORDER BY payload->>'created_at' ASC`,
+    [role_id],
+  );
+  return result.rows.map((row) => ExperienceRecordSchema.parse(row.payload));
+}
+
+/** 事务内读聚合指标（只取条件写需要的那一版 `avg_confidence`，其余字段不动） */
+async function readAgentMetrics(
+  client: SqlClient,
+  role_id: string,
+): Promise<AgentMetrics | undefined> {
+  const result = await client.query<{ metrics: unknown }>(
+    'SELECT metrics FROM memory_agents WHERE role_id = $1',
+    [role_id],
+  );
+  const row = result.rows[0];
+  return row ? AgentMetricsSchema.parse(row.metrics) : undefined;
+}
+
+/**
+ * 条件写回经验的载荷（描述没变，因此**不动** description_embedding 列）。
+ *
+ * 条件里的四个值合起来是这一版的乐观锁令牌：任一被改过就写不进去，返回 undefined。
+ * 返回写回之后的载荷（数据库侧真正落地的那一份），调用方据此报「已应用」。
+ */
+async function writeExperienceIfUnchanged(
+  client: SqlClient,
+  role_id: string,
+  current: ExperienceRecord,
+  next: ExperienceRecord,
+  feedback_id: string,
+): Promise<ExperienceRecord | undefined> {
+  const result = await client.query<{ payload: unknown }>(
+    `UPDATE memory_experiences
+     SET payload = $3::jsonb
+     WHERE role_id = $1 AND id = $2
+       AND payload->>'updated_at' = $4
+       AND payload->>'confidence' = $5
+       AND payload->>'referenced_count' = $6
+       AND NOT (payload -> 'confidence_history' @> $7::jsonb)
+     RETURNING payload`,
+    [
+      role_id,
+      current.id,
+      JSON.stringify(next),
+      current.updated_at,
+      String(current.confidence),
+      String(current.referenced_count),
+      JSON.stringify([{ feedback_id }]),
+    ],
+  );
+  const row = result.rows[0];
+  return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
 }

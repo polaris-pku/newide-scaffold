@@ -21,8 +21,9 @@
  *   两层合起来，重复投递、崩溃重跑、lease 过期被接手重跑，都只会得到同一条业务结果。
  *
  * 失败处理与 Phase 1 的上下文消费者同形：坏输入（契约版本不认识、feedback_id 与派生值
- * 不符、关联键为空）当场进死信，不值得重投；存储/连接类错误按可重试回退，次数用满由
- * 状态机置死信。租约丢失（心跳被拒）时不写任何终态——那条记录已经不是自己的了。
+ * 不符、关联键为空、待归并记录的顶层关联键与它携带的内容对不上）当场进死信，不值得重投；
+ * 存储/连接类错误按可重试回退，次数用满由状态机置死信。租约丢失（心跳被拒）时不写任何
+ * 终态——那条记录已经不是自己的了。
  */
 import {
   DRIVER_FEEDBACK_EVENT_VERSION,
@@ -47,8 +48,10 @@ import {
 } from '../services/lease-heartbeat';
 import {
   buildPendingFeedbackRecord,
+  describePendingFeedbackBindingMismatch,
   feedbackApplicationOf,
   isSupportedFeedbackVersion,
+  pendingFeedbackBindingMismatches,
 } from '../services/pending-feedback';
 
 /** 反馈消费者管的两条通道：输入 outbox 与自己的待归并队列 */
@@ -199,6 +202,25 @@ export class DefaultDriverFeedbackProcessor implements DriverFeedbackProcessor {
     const base = outcomeBase(pending, context);
     const token = pending.claim_token;
     if (!token) return this.missingClaimToken(base, warnings, pending.feedback_id);
+    // 先看这条记录对不对得上自己携带的内容，再看内容本身读不读得懂：关联键错位时，顶层那份
+    // 是 claim/lease 与死信落点用的键，嵌套那份才是应用写入用的键，两处必须逐字一致。
+    // 不一致即不可恢复的损坏——绝不能拿它去 applyExperienceFeedback（会把反馈写进另一条
+    // 经验、甚至另一个 Agent），当场进死信。
+    const mismatches = pendingFeedbackBindingMismatches(pending);
+    if (mismatches.length > 0) {
+      warnings.push(
+        'The parked record binds its feedback payload inconsistently, so nothing was applied; see the recorded error for both sides of the contradiction.',
+      );
+      return this.settleFailure(
+        'pending_feedback',
+        pending,
+        context,
+        token,
+        payloadFailure(describePendingFeedbackBindingMismatch(pending, mismatches)),
+        warnings,
+        base,
+      );
+    }
     // 契约校验对寄存记录同样适用：它可能来自更早的版本（当时能被寄存，不代表现在读得懂）
     const invalid = validateFeedback(pending.feedback);
     if (invalid) {
@@ -512,25 +534,24 @@ export class DefaultDriverFeedbackProcessor implements DriverFeedbackProcessor {
  * 不明的反馈记在某条经验名下，而那条经验不知道它是谁。
  *
  * 契约版本不认识同样属于坏输入：重投多少次都是同一个结论，直接死信。
+ *
+ * 待归并记录还多一层约束（顶层关联键 vs 内容），那一条在 reconcile 里单独判：它要的是
+ * **记录**的字段，而这里只拿到内容。
  */
 function validateFeedback(
   feedback: DriverFeedbackContent,
 ): DeliveryFailureClassification | undefined {
   if (!isSupportedFeedbackVersion(feedback.event_version)) {
-    return knownDeliveryFailure(
-      'payload_unreadable',
+    return payloadFailure(
       `Feedback ${feedback.feedback_id} declares event_version=${feedback.event_version}, which this consumer cannot read (expected ${DRIVER_FEEDBACK_EVENT_VERSION}).`,
-      false,
     );
   }
   if (!canNameExperience(feedback.experience_id)) {
-    // 这类引用不是「经验还没出现」，而是**永远不会有**的经验 id：它连形状都不对
-    // （典型是上下文占位条目的编号）。寄存起来等一条不存在的经验，只会白占一段保留期，
-    // 所以当场进死信——这也是停放（parked）与死信在这里的分界。
-    return knownDeliveryFailure(
-      'payload_unreadable',
+    // 这类引用不是「经验还没出现」，而是**永远不会有**的经验 id：它连形状都不对（典型是
+    // 上下文占位条目的编号）。寄存起来等一条不存在的经验，只会白占一段保留期，所以当场
+    // 进死信——这也是停放（parked）与死信在这里的分界。
+    return payloadFailure(
       `Feedback ${feedback.feedback_id} names "${feedback.experience_id}", which cannot be the id of an experience and will never appear; dead-lettering instead of parking.`,
-      false,
     );
   }
   const expectedKey = driverFeedbackKey({
@@ -541,21 +562,27 @@ function validateFeedback(
     event_version: feedback.event_version,
   });
   if (feedback.feedback_key !== expectedKey) {
-    return knownDeliveryFailure(
-      'payload_unreadable',
+    return payloadFailure(
       `Feedback ${feedback.feedback_id} declares key ${feedback.feedback_key} but its own fields derive ${expectedKey}.`,
-      false,
     );
   }
   const expectedId = driverFeedbackId(expectedKey);
   if (feedback.feedback_id !== expectedId) {
-    return knownDeliveryFailure(
-      'payload_unreadable',
+    return payloadFailure(
       `Feedback ${feedback.feedback_id} does not match the id derived from its own fields (${expectedId}).`,
-      false,
     );
   }
   return undefined;
+}
+
+/**
+ * 「这条投递的内容读不懂」的规范化失败：码固定 `payload_unreadable`，且**不可重试**。
+ *
+ * 内容坏了不是异常形状的问题，异常分类器看不出来（它只会给出 unknown + 可重试）。坏输入
+ * 必须在判定的一刻就定性，否则一条被改过的记录会在重试预算里滚动几小时才进死信。
+ */
+function payloadFailure(message: string): DeliveryFailureClassification {
+  return knownDeliveryFailure('payload_unreadable', message, false);
 }
 
 /** 结果里那部分与具体输入无关的字段（两类记录都有 feedback_id / role_id / experience_id） */

@@ -59,6 +59,7 @@ import type { LeaseTimers } from '../services/lease-heartbeat';
 import type { MemoryDeliveryRepository } from '../ports/memory-delivery';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { MaintenanceRunStore } from '../ports/maintenance-run-store';
+import type { SqlPool, SqlQueryResult } from '../ports/sql-pool';
 import { DRIVER_FEEDBACK_EVENT_VERSION, DriverFeedbackContentSchema } from '../schemas';
 import type {
   DriverFeedbackRecord,
@@ -829,7 +830,7 @@ describe.each(DELIVERY_CASES)('Driver Feedback Worker 归并 — $name', (adapte
     expect(await h.delivery.listPendingFeedback({ role_id: ROLE })).toHaveLength(0);
   });
 
-  it('寄存记录里的 feedback_id 与自己的因子对不上：归并时进死信', async () => {
+  it('寄存记录里的 feedback_id 与它携带的内容对不上：归并时进死信，且报出两侧的值', async () => {
     const root = await tempRoot();
     const h = await harness({ root, case: adapterCase });
     const feedback = feedbackFor(ROLE, randomUUID());
@@ -841,7 +842,11 @@ describe.each(DELIVERY_CASES)('Driver Feedback Worker 归并 — $name', (adapte
     const result = await h.worker.reconcilePending();
 
     expect(result.outcomes[0]?.status).toBe('dead_letter');
-    expect(result.outcomes[0]?.failure?.message).toContain('does not match the id derived');
+    expect(result.outcomes[0]?.failure?.code).toBe('payload_unreadable');
+    expect(result.outcomes[0]?.failure?.retryable).toBe(false);
+    // 诊断要把矛盾的两侧都写出来：这条记录从此只在死信里，人工恢复时不该再去库外对读一遍
+    expect(result.outcomes[0]?.failure?.message).toContain('contradicts its own payload');
+    expect(result.outcomes[0]?.failure?.message).toContain(`${feedback.feedback_id}_tampered`);
   });
 
   it('重启后仍能归并：新进程接着处理上一次寄存的记录', async () => {
@@ -876,7 +881,154 @@ describe.each(DELIVERY_CASES)('Driver Feedback Worker 归并 — $name', (adapte
 });
 
 // ════════════════════════════════════════════════════════
-//  4. lease：续租、过期与 fencing
+//  4. 待归并记录的关联键自洽（顶层字段 vs 它携带的内容）
+// ════════════════════════════════════════════════════════
+
+/**
+ * 一条待归并记录把同一组关联键抄了两处：顶层（`feedback_id` / `role_id` / `experience_id`，
+ * claim/lease/ack/fail 用的就是它们）与它携带的反馈内容（应用写入用的那一份）。两处不一致
+ * 说明这份记录被手工改过或来自另一套构造规则，**必须在归并之前挡住**——应用走内容、死信
+ * 落点走顶层，照它写下去要么把反馈写进另一个 Agent 的经验，要么让死信落在一条与内容无关
+ * 的记录上。
+ *
+ * 两条腿（文件 / 内存）都跑：这条判据落在处理器里，但「记录从存储里读回来时字段
+ * 还是不是我们写进去的那两个」属于各后端的义务。
+ */
+describe.each(DELIVERY_CASES)('待归并记录关联键不一致 — $name', (adapterCase) => {
+  /**
+   * 直接往待归并队列塞一条顶层与内容对不上的记录。
+   *
+   * 绕过 buildPendingFeedbackRecord（它构造出来的两份必然一致），模拟「被手工改过或来自
+   * 另一套构造规则」的历史数据——这正是这条判据要挡的输入。
+   */
+  async function parkInconsistent(
+    h: Harness,
+    record: PendingFeedbackRecord,
+  ): Promise<PendingFeedbackRecord> {
+    const parked = await h.delivery.submitPendingFeedback(record);
+    expect(parked.created).toBe(true);
+    return parked.item;
+  }
+
+  it('顶层 role_id 与内容不一致：不写任何经验，进死信', async () => {
+    const root = await tempRoot();
+    const h = await harness({ root, case: adapterCase });
+    const experienceId = randomUUID();
+    const declared = feedbackFor(ROLE, experienceId);
+    const ours = await h.seedExperience(ROLE, experienceId);
+    const theirs = await h.seedExperience(OTHER_ROLE, experienceId);
+    // 内容说 ROLE、顶层说 OTHER_ROLE：照顶层 claim/落死信，照内容写经验
+    await parkInconsistent(h, {
+      ...buildPending(declared),
+      role_id: OTHER_ROLE,
+      feedback_id: declared.feedback_id,
+    });
+
+    const result = await h.worker.reconcilePending();
+
+    expect(result.outcomes[0]?.status).toBe('dead_letter');
+    expect(result.outcomes[0]?.failure?.code).toBe('payload_unreadable');
+    expect(result.outcomes[0]?.failure?.retryable).toBe(false);
+    expect(result.outcomes[0]?.failure?.message).toContain('role_id');
+    // 内容指向的那条经验没被碰过：跨 Agent 的写入没有发生
+    expect(await storedExperience(h.repository, experienceId)).toMatchObject({
+      confidence: ours.confidence,
+      referenced_count: ours.referenced_count,
+    });
+    expect(await storedExperience(h.repository, experienceId, OTHER_ROLE)).toMatchObject({
+      confidence: theirs.confidence,
+      referenced_count: theirs.referenced_count,
+    });
+  });
+
+  it('顶层 experience_id 与内容不一致：不写任何经验，进死信', async () => {
+    const root = await tempRoot();
+    const h = await harness({ root, case: adapterCase });
+    const declared = feedbackFor(ROLE, randomUUID());
+    const actual = await h.seedExperience(ROLE, declared.experience_id);
+    await parkInconsistent(h, {
+      ...buildPending(declared),
+      experience_id: randomUUID(),
+      feedback_id: declared.feedback_id,
+    });
+
+    const result = await h.worker.reconcilePending();
+
+    expect(result.outcomes[0]?.status).toBe('dead_letter');
+    expect(result.outcomes[0]?.failure?.message).toContain('experience_id');
+    expect(await storedExperience(h.repository, actual.id)).toMatchObject({
+      confidence: actual.confidence,
+      referenced_count: actual.referenced_count,
+      confidence_history: actual.confidence_history,
+    });
+  });
+
+  it('顶层 feedback_id 与内容不一致：进死信，幂等键不受影响', async () => {
+    const root = await tempRoot();
+    const h = await harness({ root, case: adapterCase });
+    const declared = feedbackFor(ROLE, randomUUID());
+    const experience = await h.seedExperience(ROLE, declared.experience_id);
+    await parkInconsistent(h, {
+      ...buildPending(declared),
+      feedback_id: `${declared.feedback_id}_top_level`,
+    });
+
+    const result = await h.worker.reconcilePending();
+
+    expect(result.outcomes[0]?.status).toBe('dead_letter');
+    expect(result.outcomes[0]?.failure?.message).toContain('feedback_id');
+    expect(await storedExperience(h.repository, experience.id)).toMatchObject({
+      confidence: experience.confidence,
+      referenced_count: experience.referenced_count,
+    });
+  });
+
+  it('坏记录不落经验：经验集与 Agent 聚合一个数都不动', async () => {
+    const root = await tempRoot();
+    const h = await harness({ root, case: adapterCase });
+    const declared = feedbackFor(ROLE, randomUUID());
+    const seeded = await h.seedExperience(ROLE, declared.experience_id);
+    // 读回存过的那一份再比：seedExperience 返回的是写之前的记录（仓库落盘时会补向量）
+    const before = await storedExperience(h.repository, seeded.id);
+    const metricsBefore = await h.repository.getMetrics(ROLE);
+    await parkInconsistent(h, { ...buildPending(declared), role_id: OTHER_ROLE });
+
+    await h.worker.reconcilePending();
+
+    expect(await storedExperience(h.repository, seeded.id)).toEqual(before);
+    expect(await h.repository.getMetrics(ROLE)).toEqual(metricsBefore);
+  });
+
+  it('坏记录不会无限重试：一次归并即进死信，再跑也 claim 不到', async () => {
+    const root = await tempRoot();
+    const h = await harness({ root, case: adapterCase });
+    const declared = feedbackFor(ROLE, randomUUID());
+    const parked = await parkInconsistent(h, { ...buildPending(declared), role_id: OTHER_ROLE });
+
+    const result = await h.worker.reconcilePending();
+
+    // 一次就定局：不可重试的坏输入不该占用归并通道 20 次 / 3.8 小时的预算
+    expect(result.counts.dead_letter_count).toBe(1);
+    expect(result.counts.retried_count).toBe(0);
+    expect(result.outcomes[0]?.attempt_count).toBe(1);
+
+    // 再跑几轮也 claim 不到它，且不会把它拽回 pending
+    for (let round = 0; round < 3; round += 1) {
+      h.clock.advance(120_000);
+      const again = await h.worker.reconcilePending();
+      expect(again.counts.claimed_count).toBe(0);
+    }
+    const settled = await h.delivery.getPendingFeedback(parked.role_id, parked.feedback_id);
+    expect(settled?.status).toBe('dead_letter');
+    expect(settled?.attempt_count).toBe(1);
+    // 人工处理所需的现场仍在：两边冲突的值都留在这条记录里
+    expect(settled?.feedback.role_id).toBe(ROLE);
+    expect(settled?.role_id).toBe(OTHER_ROLE);
+  });
+});
+
+// ════════════════════════════════════════════════════════
+//  5. lease：续租、过期与 fencing
 // ════════════════════════════════════════════════════════
 
 describe('Driver Feedback Worker — lease 续租与 fencing', () => {
@@ -1000,12 +1152,21 @@ describe('Driver Feedback Worker — lease 续租与 fencing', () => {
 interface MemoryCase {
   name: string;
   create: () => Promise<MemoryRepository>;
+  /**
+   * 实现是否把记忆放在数据库里。
+   *
+   * 用得上的地方是「读快照 → 写回」的窗口：进程内实现没有一轮真实的存储往返，那条窗口短到
+   * 没法靠调度稳定命中；数据库实现则是多条语句、跨 await 的真实往返，窗口就在那儿。因此
+   * 只有它跑那条把窗口撑开的用例，其余用例两条腿共用。
+   */
+  databaseDrift: boolean;
 }
 
 const MEMORY_CASES: MemoryCase[] = [
   {
     name: 'InMemoryRepository',
     create: () => Promise.resolve(new InMemoryRepository()),
+    databaseDrift: false,
   },
   {
     name: 'PgMemoryRepository（PGlite）',
@@ -1015,10 +1176,260 @@ const MEMORY_CASES: MemoryCase[] = [
       pgMemoryTouched = true;
       return new PgMemoryRepository({ pool });
     },
+    databaseDrift: true,
   },
 ];
 
-describe.each(MEMORY_CASES)('applyExperienceFeedback 契约 — $name', ({ create }) => {
+/**
+ * 聚合根与经验集合同源：`avg_confidence` 必须等于当前经验集的真实均值。
+ *
+ * 这条不变量就是 P2 的全部要求——并发回写下它最容易破，破了之后库里看不出任何异常
+ * （每条经验都对、只有那个均值停在旧快照上），因此每个并发用例都拿它当最后一道断言。
+ */
+async function expectAggregateMatchesExperiences(repository: MemoryRepository): Promise<void> {
+  const experiences = await repository.listExperiences(ROLE);
+  const trueAverage =
+    experiences.length === 0
+      ? 0
+      : Math.round(
+          (experiences.reduce((sum, item) => sum + item.confidence, 0) / experiences.length) * 1_000,
+        ) / 1_000;
+  const metrics = await repository.getMetrics(ROLE);
+  expect(metrics.avg_confidence).toBe(trueAverage);
+  expect(metrics.experience_count).toBe(experiences.length);
+}
+
+/**
+ * 一个能**安排交错**的最小 SqlPool：把「另一个消费者恰好在这一刻推进了聚合」这件事变得确定。
+ *
+ * 为什么需要它：`avg_confidence` 漂移是一场并发写竞争——两条反馈读同一份经验集合，各自算出
+ * 一个均值，后写的那一方覆盖先写的。嵌入式 PGlite 是单连接数据库，所有语句在一条队列上按序
+ * 执行，两次往返之间的窗口按秒都撑不开，于是这场竞争在它上面稳定复现不了（外部 PostgreSQL
+ * 上每方各占一条连接，窗口就是真的）。这个替身提供两条能力：
+ *
+ * - **快照隔离**：事务内的读看得见已提交的状态与自己的写，看不见另一个事务未提交的写——
+ *   这正是多连接下「某条反馈读到的是别人提交之前的集合」的由来。
+ * - **按语句挂钩子**：可以在某条语句之后让外部世界推进聚合（`bumpAverageAfterFirstExperienceWrite`），
+ *   模拟并发消费者刚写完聚合并提交。
+ *
+ * 它只实现本条契约用到的语句；未识别的一律拒绝，免得用例在「其实什么都没测到」的情况下通过。
+ */
+interface StubExperience {
+  role_id: string;
+  payload: Record<string, unknown>;
+}
+
+interface StubPoolState {
+  agents: Map<string, { metrics: Record<string, unknown>; handle: unknown }>;
+  experiences: Map<string, StubExperience>;
+}
+
+interface StubSqlPool {
+  pool: SqlPool;
+  /** 每次事务提交计数：重试能否收敛，就看它长不长得对 */
+  commits(): number;
+  /** 每次事务回滚计数：条件写被拒的那一版会走这里 */
+  rollbacks(): number;
+  /** 在某条「UPDATE memory_experiences」之后，替另一个消费者把聚合推进一版 */
+  bumpAverageAfterFirstExperienceWrite(): void;
+}
+
+function createStubSqlPool(role_id: string, seed: { experience: ExperienceRecord }): StubSqlPool {
+  const global: StubPoolState = {
+    agents: new Map([
+      [
+        role_id,
+        {
+          metrics: {
+            role_id,
+            total_tasks: 0,
+            tasks_bid: 0,
+            tasks_won: 0,
+            tasks_completed: 0,
+            tasks_succeeded: 0,
+            tasks_partial: 0,
+            tasks_failed: 0,
+            skill_count: 0,
+            experience_count: 1,
+            imported_skill_count: 0,
+            promoted_skill_count: 0,
+            avg_confidence: 0.8,
+            token_cost_total: 0,
+            persona_version: 1,
+          },
+          handle: {},
+        },
+      ],
+    ]),
+    experiences: new Map([
+      [
+        seed.experience.id,
+        { role_id, payload: seed.experience as unknown as Record<string, unknown> },
+      ],
+    ]),
+  };
+
+  let staggerExperienceWrites = false;
+  let readMetricsFromCommitted = false;
+  let commits = 0;
+  let rollbacks = 0;
+
+  /** 另一条连接上的消费者：推进聚合，并立刻提交（本事务的快照不该看见它） */
+  const bumpAverageExternally = (): void => {
+    const agent = global.agents.get(role_id);
+    if (!agent) throw new Error('stub: agent row is missing');
+    agent.metrics = { ...agent.metrics, avg_confidence: 0.75 };
+    commits += 1; // 外部提交，不是本事务的提交
+  };
+
+  const snapshot = (): StubPoolState => ({
+    agents: new Map(
+      [...global.agents].map(([key, value]) => [
+        key,
+        // 深一层拷贝 metrics：否则「另一个消费者推进聚合」会顺着共享引用改到本事务自己的
+        // 视图里，快照隔离就不成立了（那样测的是替身的漏洞，不是仓储的行为）
+        { ...value, metrics: JSON.parse(JSON.stringify(value.metrics)) as Record<string, unknown> },
+      ]),
+    ),
+    experiences: new Map(
+      [...global.experiences].map(([key, value]) => [key, { ...value, payload: { ...value.payload } }]),
+    ),
+  });
+
+  const dispatch = <T>(
+    db: StubPoolState,
+    text: string,
+    params: unknown[] | undefined,
+  ): SqlQueryResult<T> => {
+    const rows = <R>(values: R[]): SqlQueryResult<T> => ({
+      rows: values as unknown as T[],
+      rowCount: values.length,
+    });
+
+    if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') {
+      if (text === 'COMMIT') commits += 1;
+      if (text === 'ROLLBACK') rollbacks += 1;
+      return { rows: [], rowCount: null };
+    }
+
+    if (text.includes('SELECT handle, persona, metrics FROM memory_agents')) {
+      const agent = db.agents.get(params?.[0] as string);
+      return rows(agent ? [{ handle: agent.handle, persona: {}, metrics: agent.metrics }] : []);
+    }
+
+    if (text.includes('SELECT metrics FROM memory_agents')) {
+      // 条件写读聚合时走的是一次**新的快照**（真实数据库里 READ COMMITTED 的语句级快照）：
+      // 另一个连接刚提交的聚合推进必须被看见，否则「聚合已经变了」这件事根本无从判断。
+      const source = readMetricsFromCommitted ? global : db;
+      const agent = source.agents.get(params?.[0] as string);
+      return rows(agent ? [{ metrics: agent.metrics }] : []);
+    }
+
+    if (text.includes('SELECT payload FROM memory_experiences')) {
+      const experience = text.includes('AND id = $2')
+        ? db.experiences.get(params?.[1] as string)
+        : [...db.experiences.values()].find((item) => item.role_id === params?.[0]);
+      return rows(experience ? [{ payload: experience.payload }] : []);
+    }
+
+    if (text.includes('ORDER BY payload')) {
+      return rows(
+        [...db.experiences.values()]
+          .filter((item) => item.role_id === params?.[0])
+          .map((item) => ({ payload: item.payload })),
+      );
+    }
+
+    if (text.includes('UPDATE memory_experiences')) {
+      const experience = db.experiences.get(params?.[1] as string);
+      if (!experience) return rows([]);
+      if (text.includes('NOT (payload ->')) {
+        const history = experience.payload.confidence_history as { feedback_id?: string }[];
+        const feedbackId = (params?.[6] as { feedback_id?: string }[])?.[0]?.feedback_id;
+        if (feedbackId !== undefined && history.some((entry) => entry.feedback_id === feedbackId)) {
+          return rows([]);
+        }
+      }
+      experience.payload = JSON.parse(params?.[2] as string) as Record<string, unknown>;
+      const written = { payload: experience.payload };
+      // 钩子：这一次写之后，另一个消费者推进了聚合并提交（本事务看不到）
+      if (staggerExperienceWrites) {
+        staggerExperienceWrites = false;
+        bumpAverageExternally();
+      }
+      return rows([written]);
+    }
+
+    if (text.includes('UPDATE memory_agents')) {
+      const agent = db.agents.get(params?.[0] as string);
+      if (!agent) return rows([]);
+      if (text.includes("metrics->>'avg_confidence'")) {
+        // 条件写：聚合被别的消费者推进过就一行也写不进去
+        if (String(agent.metrics.avg_confidence) !== String(params?.[1])) return rows([]);
+        agent.metrics = { ...agent.metrics, avg_confidence: params?.[2] as number };
+      } else {
+        agent.metrics = JSON.parse(params?.[1] as string) as Record<string, unknown>;
+      }
+      return rows([{ role_id: params?.[0] }]);
+    }
+
+    throw new Error(`stub SqlPool does not implement: ${text}`);
+  };
+
+  const query = async <T>(text: string, params?: unknown[]): Promise<SqlQueryResult<T>> =>
+    dispatch<T>(snapshot(), text, params);
+
+  const pool: SqlPool = {
+    query,
+    connect: async () => {
+      const transaction = snapshot();
+      return {
+        query: <T>(text: string, params?: unknown[]) => {
+          const result = dispatch<T>(transaction, text, params);
+          if (text === 'COMMIT') {
+            global.agents = transaction.agents;
+            global.experiences = transaction.experiences;
+          }
+          return Promise.resolve(result);
+        },
+        release: () => undefined,
+      };
+    },
+    end: () => Promise.resolve(),
+  };
+
+  return {
+    pool,
+    commits: () => commits,
+    rollbacks: () => rollbacks,
+    bumpAverageAfterFirstExperienceWrite: () => {
+      staggerExperienceWrites = true;
+      // 聚合的条件读走已提交状态；本事务的写仍然只在自己那份快照里，提交时才落地
+      readMetricsFromCommitted = true;
+    },
+  };
+}
+
+describe.each(MEMORY_CASES)(
+  'applyExperienceFeedback 契约 — $name',
+  ({ create, databaseDrift }) => {
+  /** 一条作用在某条经验上的反馈应用（id 由用例给，便于断言幂等与溯源） */
+  function applicationFor(
+    experienceId: string,
+    feedbackId: string,
+    effectiveness: 'fully_effective' | 'partially_effective' | 'ineffective',
+  ) {
+    return {
+      feedback_id: feedbackId,
+      experience_id: experienceId,
+      applied: true,
+      effectiveness,
+      note: feedbackId,
+      observed_at: '2026-10-10T01:00:00.000Z',
+      feedback_source: 'driver_usage' as const,
+    };
+  }
+
   it('经验存在：置信度按效果调整、引用计数 +1、历史带上反馈 id', async () => {
     const repository = await create();
     await repository.ensureAgent(ROLE);
@@ -1120,6 +1531,112 @@ describe.each(MEMORY_CASES)('applyExperienceFeedback 契约 — $name', ({ creat
     expect(updated.confidence_history.map((entry) => entry.feedback_id)).toEqual(
       expect.arrayContaining(['drvfb_conc_up', 'drvfb_conc_down']),
     );
+  });
+
+  it('并发回写后 avg_confidence 等于经验集合的真实均值（不是旧快照）', async () => {
+    const repository = await create();
+    await repository.ensureAgent(ROLE);
+    const experience = experienceFor(ROLE, randomUUID());
+    await repository.saveExperienceIfAbsent(ROLE, experience);
+
+    const [up, down] = await Promise.all([
+      repository.applyExperienceFeedback(
+        ROLE,
+        applicationFor(experience.id, 'drvfb_avg_up', 'fully_effective'),
+      ),
+      repository.applyExperienceFeedback(
+        ROLE,
+        applicationFor(experience.id, 'drvfb_avg_down', 'ineffective'),
+      ),
+    ]);
+
+    expect([up.outcome, down.outcome]).toEqual(['applied', 'applied']);
+    const stored = (await repository.listExperiences(ROLE))[0]!;
+    expect(stored.confidence).toBe(0.8);
+    expect((await repository.getMetrics(ROLE)).avg_confidence).toBe(stored.confidence);
+    await expectAggregateMatchesExperiences(repository);
+    // 聚合根内嵌的快照与列同源：同一个数在两个读口上给出两个答案就是漂移
+    expect((await repository.getAgent(ROLE)).metric.avg_confidence).toBe(
+      (await repository.getMetrics(ROLE)).avg_confidence,
+    );
+    expect((await repository.getMetrics(ROLE)).experience_count).toBe(1);
+  });
+
+  it.skipIf(!databaseDrift)(
+    '聚合被别人推进过时不吃旧快照：条件写被拒、重读后收敛，绝不用过期均值覆盖',
+    async () => {
+      const experience = experienceFor(ROLE, randomUUID());
+      const stub = createStubSqlPool(ROLE, { experience });
+      const repository = new PgMemoryRepository({ pool: stub.pool, autoMigrate: false });
+      // 与「另一条连接上的消费者刚写完聚合并提交」等价：本事务读到经验、写下自己那一版之后，
+      // 外部把 avg_confidence 推到了 0.75
+      stub.bumpAverageAfterFirstExperienceWrite();
+
+      const result = await repository.applyExperienceFeedback(
+        ROLE,
+        applicationFor(experience.id, 'drvfb_guard', 'fully_effective'),
+      );
+
+      expect(result.outcome).toBe('applied');
+      const metrics = await repository.getMetrics(ROLE);
+      // 被拒的那一版会整段重来：回滚掉自己的写，重读聚合（0.75），
+      // 再用**这一版经验集合**（0.9）重算——0.9 才是与集合同源的均值
+      expect(metrics.avg_confidence).toBe(0.9);
+      expect(stub.rollbacks()).toBe(1);
+      expect(stub.commits()).toBe(2); // 外部那次 + 本事务最终那次
+      const written = await repository.listExperiences(ROLE);
+      expect(written[0]?.confidence).toBe(0.9);
+      expect(written[0]?.referenced_count).toBe(2);
+    },
+  );
+
+  it('同一条反馈并发应用：只生效一次，聚合也只跟一次', async () => {
+    const repository = await create();
+    await repository.ensureAgent(ROLE);
+    const experience = experienceFor(ROLE, randomUUID());
+    await repository.saveExperienceIfAbsent(ROLE, experience);
+
+    const [first, second] = await Promise.all([
+      repository.applyExperienceFeedback(
+        ROLE,
+        applicationFor(experience.id, 'drvfb_race_one', 'fully_effective'),
+      ),
+      repository.applyExperienceFeedback(
+        ROLE,
+        applicationFor(experience.id, 'drvfb_race_one', 'fully_effective'),
+      ),
+    ]);
+
+    expect([first.outcome, second.outcome].sort()).toEqual(['already_applied', 'applied']);
+    const stored = (await repository.listExperiences(ROLE))[0]!;
+    expect(stored.confidence).toBe(0.9);
+    expect(stored.referenced_count).toBe(2);
+    expect((await repository.getMetrics(ROLE)).avg_confidence).toBe(0.9);
+  });
+
+  it('并发回写到不同经验：两条都落地，均值仍等于整个集合的真实均值', async () => {
+    const repository = await create();
+    await repository.ensureAgent(ROLE);
+    const raised = experienceFor(ROLE, randomUUID());
+    const low = experienceFor(ROLE, randomUUID(), { confidence: 0.9 });
+    await repository.saveExperienceIfAbsent(ROLE, raised);
+    await repository.saveExperienceIfAbsent(ROLE, low);
+
+    // 两条反馈各改一条经验：谁先写、谁后写都不该让均值停在只反映其中一条的旧值上
+    const [up, down] = await Promise.all([
+      repository.applyExperienceFeedback(ROLE, applicationFor(raised.id, 'drvfb_pair_up', 'fully_effective')),
+      repository.applyExperienceFeedback(ROLE, applicationFor(low.id, 'drvfb_pair_down', 'ineffective')),
+    ]);
+
+    expect([up.outcome, down.outcome]).toEqual(['applied', 'applied']);
+    const metrics = await repository.getMetrics(ROLE);
+    // 0.8→0.9 与 0.9→0.8：集合变成 0.9 / 0.8，均值 0.85
+    expect(metrics.avg_confidence).toBe(0.85);
+    await expectAggregateMatchesExperiences(repository);
+    expect(metrics.experience_count).toBe(2);
+    // 既有聚合字段没有被这次回写破坏
+    expect(metrics.skill_count).toBe(0);
+    expect((await repository.getAgent(ROLE)).experience_count).toBe(2);
   });
 });
 
