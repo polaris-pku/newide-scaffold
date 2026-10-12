@@ -1,24 +1,31 @@
 /**
  * MemoryDeliveryRepository 适配器测试（工作包 B）
  *
- * 文件与内存两个实现必须给出同一套语义——否则测试替身会掩盖生产行为差异：
+ * 三个实现（内存 / 文件 / PGlite+PostgreSQL）必须给出同一套语义——否则测试替身会
+ * 掩盖生产行为差异。矩阵定义在 test/maintenance-adapters.ts，这里跑的是提交与查询那一半：
  *
  *   1. 同键提交只留第一条（幂等），且不覆盖已有内容与状态
  *   2. 过滤与跨 role 列举
  *   3. deleteAgent 清干净
- *   4. 文件实现跨实例存活（重启后交付项还在），损坏记录不阻断列举
+ *   4. 持久化实现跨实例存活（重启后交付项还在），损坏记录不阻断列举
  */
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+/**
+ * PGlite 是 WASM 引擎：建库本身要一秒起步。整仓并行跑测试时，这份启动成本会挤进
+ * 单测默认的 5s 预算，于是整条腿偶发超时（失败者每次都不一样，正是超时的形状）。
+ * 这里给本文件放宽超时——测的是契约语义，不是「PGlite 在负载下多久起来」。
+ */
+vi.setConfig({ testTimeout: 30_000 });
 import { FileMemoryDeliveryRepository } from '../adapters/file-memory-delivery';
-import { InMemoryMemoryDeliveryRepository } from '../adapters/in-memory-memory-delivery';
 import {
   buildContextDeliveryItem,
   buildDriverUsageFeedbackRecords,
 } from '../services/context-delivery';
-import type { MemoryDeliveryRepository } from '../ports/memory-delivery';
+import { DELIVERY_ADAPTERS } from './maintenance-adapters';
 
 const tempDirs: string[] = [];
 
@@ -31,26 +38,6 @@ async function tempRoot(): Promise<string> {
   tempDirs.push(root);
   return root;
 }
-
-interface AdapterCase {
-  name: string;
-  create: (root: string) => MemoryDeliveryRepository;
-  /** 重启（新实例指向同一份存储）；内存实现没有这一层，用同一实例顶替 */
-  reopen: (root: string, previous: MemoryDeliveryRepository) => MemoryDeliveryRepository;
-}
-
-const ADAPTERS: AdapterCase[] = [
-  {
-    name: 'FileMemoryDeliveryRepository',
-    create: (root) => new FileMemoryDeliveryRepository({ agentStateRoot: root }),
-    reopen: (root) => new FileMemoryDeliveryRepository({ agentStateRoot: root }),
-  },
-  {
-    name: 'InMemoryMemoryDeliveryRepository',
-    create: () => new InMemoryMemoryDeliveryRepository(),
-    reopen: (_root, previous) => previous,
-  },
-];
 
 function deliveryFor(roleId: string, taskId: string, seq = 1) {
   return buildContextDeliveryItem({
@@ -73,10 +60,10 @@ function feedbackFor(roleId: string, taskId: string, experienceId: string) {
   return record!;
 }
 
-describe.each(ADAPTERS)('$name', ({ create, reopen }) => {
+describe.each(DELIVERY_ADAPTERS)('$name', ({ create, reopen }) => {
   it('同键提交只留第一条，且不覆盖已有内容', async () => {
     const root = await tempRoot();
-    const store = create(root);
+    const store = await create(root);
     await store.ensureAgent('role_a');
 
     const first = deliveryFor('role_a', 'task_1');
@@ -92,7 +79,7 @@ describe.each(ADAPTERS)('$name', ({ create, reopen }) => {
 
   it('按 role / task / status 过滤，并支持跨 role 列举', async () => {
     const root = await tempRoot();
-    const store = create(root);
+    const store = await create(root);
     await store.ensureAgent('role_a');
     await store.ensureAgent('role_b');
 
@@ -110,7 +97,7 @@ describe.each(ADAPTERS)('$name', ({ create, reopen }) => {
 
   it('反馈 outbox：同键幂等，可按 experience_id 过滤', async () => {
     const root = await tempRoot();
-    const store = create(root);
+    const store = await create(root);
     await store.ensureAgent('role_a');
 
     const record = feedbackFor('role_a', 'task_1', 'exp_1');
@@ -126,7 +113,7 @@ describe.each(ADAPTERS)('$name', ({ create, reopen }) => {
 
   it('deleteAgent 清干净该 role 的交付存储', async () => {
     const root = await tempRoot();
-    const store = create(root);
+    const store = await create(root);
     await store.ensureAgent('role_a');
     await store.submitContextDelivery(deliveryFor('role_a', 'task_1'));
     await store.submitDriverFeedback(feedbackFor('role_a', 'task_1', 'exp_1'));
@@ -139,12 +126,12 @@ describe.each(ADAPTERS)('$name', ({ create, reopen }) => {
 
   it('文件实现：交付项跨实例存活，且落盘路径可预期', async () => {
     const root = await tempRoot();
-    const store = create(root);
+    const store = await create(root);
     await store.ensureAgent('role_a');
     const item = deliveryFor('role_a', 'task_1');
     await store.submitContextDelivery(item);
 
-    const reopened = reopen(root, store);
+    const reopened = await reopen(root, store);
     const found = await reopened.getContextDelivery('role_a', item.delivery_id);
     expect(found).toMatchObject({
       delivery_key: item.delivery_key,
@@ -155,7 +142,7 @@ describe.each(ADAPTERS)('$name', ({ create, reopen }) => {
 
   it('文件实现：损坏记录不阻断列举', async () => {
     const root = await tempRoot();
-    const store = create(root);
+    const store = await create(root);
     if (!(store instanceof FileMemoryDeliveryRepository)) return;
     await store.ensureAgent('role_a');
     const item = deliveryFor('role_a', 'task_1');
@@ -170,7 +157,7 @@ describe.each(ADAPTERS)('$name', ({ create, reopen }) => {
 
   it('文件实现：交付项真的写在 role 目录树下（与 buffer 同层）', async () => {
     const root = await tempRoot();
-    const store = create(root);
+    const store = await create(root);
     if (!(store instanceof FileMemoryDeliveryRepository)) return;
     await store.ensureAgent('role_a');
     const item = deliveryFor('role_a', 'task_1');

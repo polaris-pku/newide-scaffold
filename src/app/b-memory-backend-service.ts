@@ -53,6 +53,7 @@ import {
   type DeliveryChannel,
   type DeliveryClaimRequest,
   type DeliveryRecordLocator,
+  type DeliveryRepositoryPolicy,
   contextDeliveryId,
   contextDeliveryKey,
 } from '../memory';
@@ -83,14 +84,19 @@ export interface BMemoryOperationCapability {
 /**
  * 交付 claim 的能力声明。
  *
- * `isolation` 是这里最要紧的一格：只有文件实现用独占锁文件串行化 claim，
- * 多进程消费才成立；内存实现只在同进程内不重复投递，把它当生产部署用会
- * 出现两个消费者同时处理同一条交付。调用方据此决定能不能开多个消费者。
+ * `isolation` 是这里最要紧的一格：它说的是「多进程消费成不成立、靠什么成立」。
+ * 文件实现用独占锁文件串行化同一个 claim；内存实现只在同进程内
+ * 不重复投递，把它当生产部署用会出现两个消费者同时处理同一条交付。
+ * 调用方据此决定能不能开多个消费者。
  */
 export interface BMemoryDeliveryClaimCapability {
   status: 'available' | 'unavailable';
   reason?: string;
-  isolation: 'process_mutex' | 'exclusive_lock_file' | 'unavailable';
+  /**
+   * 直接取端口的隔离级别枚举再补一个 `unavailable`：适配器新增一种隔离方式时，
+   * 这里跟着端口走，不必有人记得同步改两处。
+   */
+  isolation: DeliveryRepositoryPolicy['claim_isolation'] | 'unavailable';
   /** 未显式指定 lease_ms 时的租约时长 */
   lease_ms: number;
   /** 投递次数上限；达到后交付项进 dead_letter */

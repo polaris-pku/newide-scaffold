@@ -1,8 +1,8 @@
 /**
  * 交付 claim / lease / 重试测试（工作包 C）
  *
- * 两条通道（context / feedback）共用一套状态机，两个适配器（内存 / 文件）也必须给出
- * 同一套行为——否则测试替身会掩盖生产差异。所以整个套件按适配器参数化跑两遍。
+ * 两条通道（context / feedback）共用一套状态机，两个适配器（文件 / 内存）也必须给出同一套行为——否则测试替身会掩盖生产差异。所以整个
+ * 套件按适配器参数化跑两遍，矩阵定义在 test/maintenance-adapters.ts。
  *
  * 覆盖的状态转移：
  *
@@ -20,8 +20,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
+
 import { FileMemoryDeliveryRepository } from '../adapters/file-memory-delivery';
-import { InMemoryMemoryDeliveryRepository } from '../adapters/in-memory-memory-delivery';
 import {
   buildContextDeliveryItem,
   buildDriverUsageFeedbackRecords,
@@ -32,6 +32,9 @@ import type {
   ClaimedDriverFeedback,
   MemoryDeliveryRepository,
 } from '../ports/memory-delivery';
+import {
+  DELIVERY_ADAPTERS,
+} from './maintenance-adapters';
 
 const tempDirs: string[] = [];
 
@@ -51,22 +54,6 @@ function at(offsetMs: number): string {
   return new Date(Date.parse(T0) + offsetMs).toISOString();
 }
 const LEASE = 60_000;
-
-interface AdapterCase {
-  name: string;
-  create: (root: string) => MemoryDeliveryRepository;
-}
-
-const ADAPTERS: AdapterCase[] = [
-  {
-    name: 'FileMemoryDeliveryRepository',
-    create: (root) => new FileMemoryDeliveryRepository({ agentStateRoot: root }),
-  },
-  {
-    name: 'InMemoryMemoryDeliveryRepository',
-    create: () => new InMemoryMemoryDeliveryRepository(),
-  },
-];
 
 const ROLE = 'role_claim';
 
@@ -120,9 +107,9 @@ function claimOne(
   });
 }
 
-describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
+describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('两个消费者同时 claim 同一条：只有一个拿到', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
 
     const [first, second] = await Promise.all([
@@ -139,7 +126,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('claimNext 只投递一次，且跳过还没到退避时刻的记录', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
 
     const [first, second] = await Promise.all([
@@ -174,7 +161,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('lease 过期后回到可投递队列（崩溃恢复），期间不动还活着的 lease', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer_a', 0));
 
@@ -205,7 +192,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('连续可重试失败达到上限后进 dead_letter，保留原因与次数', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
 
     let nowMs = 0;
@@ -248,7 +235,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('不可重试的失败直接进 dead_letter，不消耗剩余次数', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer', 0));
 
@@ -268,7 +255,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('complete 是终止态：不再被投递，也不能再失败或重试', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer', 0));
 
@@ -305,7 +292,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('只有持有者能续租与完成，且过期后不再续租', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer_a', 0));
 
@@ -355,7 +342,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('人工 retry 把 dead_letter 放回 pending 并清零次数', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const id = await seed(store);
     asContext(await claimOne(store, id, 'consumer', 0));
     asContext(
@@ -381,7 +368,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('feedback outbox 走同一套状态机', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     await store.ensureAgent(ROLE);
     const record = feedbackFor(ROLE, 'task_1', 'exp_1');
     await store.submitDriverFeedback(record);
@@ -415,7 +402,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('下游已推进的状态不会被上游重放拽回去', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     const item = deliveryFor(ROLE, 'task_1');
     await store.ensureAgent(ROLE);
     await store.submitContextDelivery(item);
@@ -434,7 +421,7 @@ describe.each(ADAPTERS)('$name — 交付状态机', ({ create }) => {
   });
 
   it('listRetryableDeliveries 只给得到期的那部分', async () => {
-    const store = create(await tempRoot());
+    const store = await create(await tempRoot());
     await store.ensureAgent(ROLE);
     await store.submitContextDelivery(deliveryFor(ROLE, 'task_1', 1));
     await store.submitContextDelivery(deliveryFor(ROLE, 'task_2', 2));
