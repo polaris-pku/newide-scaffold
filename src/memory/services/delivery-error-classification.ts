@@ -87,6 +87,29 @@ export function isRetryableDeliveryFailure(error: unknown): boolean {
   return classifyDeliveryFailure(error).retryable;
 }
 
+/**
+ * 已知失败的分类：调用方已经知道这是什么错，只是要一份规范化的码与消息。
+ *
+ * 用到它的地方有两类，都不是「异常形状能告诉我们答案」的情况：
+ *
+ * - **坏输入不是异常**：Buffer 读不出来、契约版本不认识、交付项引用的上下文与它所在
+ *   Buffer 不同源——这些在消费方眼里是「这条投递的内容我读不懂」，重投多少次都一样。
+ *   它们有的表现为抛错（文件损坏），有的干脆是一个返回值（归档的 failed 判别式），
+ *   靠异常形状判不出来。
+ * - **阶段即结论**：落库/归档阶段的失败来源只有一个（存储），码固定为 storage_error；
+ *   可重试性仍应沿用结构判定，所以这里把码与可重试性分开传。
+ *
+ * 定性规则集中在这个模块，消费者不必（也不该）自己拼 `{ retryable, code, message }`：
+ * 一条通道上写死的判断，另一条通道看不见，正是两条通道对同一种失败给出两种待遇的原因。
+ */
+export function knownDeliveryFailure(
+  code: MaintenanceFailureCode,
+  message: string,
+  retryable: boolean,
+): DeliveryFailureClassification {
+  return { retryable, code, message };
+}
+
 function errnoOf(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
   const value = (error as { code?: unknown }).code;

@@ -186,6 +186,7 @@ export {
   persistExtractedExperiences,
   stableExperienceId,
   type PersistedExtraction,
+  type MemoryScopeFactory,
   promoteExperiences,
   extractBufferForAgent,
   promoteExperiencesForAgent,
@@ -424,6 +425,7 @@ export {
 export {
   classifyDeliveryFailure,
   isRetryableDeliveryFailure,
+  knownDeliveryFailure,
   type DeliveryFailureClassification,
 } from './services/delivery-error-classification';
 export { InMemoryMaintenanceRunStore } from './adapters/in-memory-maintenance-run-store';
@@ -457,6 +459,39 @@ export {
   mergeMaintenanceRunCounts,
   selectMaintenanceRuns,
 } from './services/maintenance-run-lifecycle';
+
+// ════════════════════════════════════════════════════════
+//  2c. Memory Maintenance：上下文消费（Phase 1）
+//      交付项 → Experience 的消费内核 + 批量运行外壳。它只吃 context 通道，
+//      不晋升 Skill、不演化 Persona —— 那两件事是后续独立的 job。
+// ════════════════════════════════════════════════════════
+
+export {
+  DefaultContextDeliveryProcessor,
+  type ContextDeliveryProcessOutcome,
+  type ContextDeliveryProcessContext,
+  type ContextDeliveryProcessStatus,
+  type ContextDeliveryProcessor,
+  type ContextDeliveryProcessorOptions,
+} from './runtime/context-delivery-processor';
+export {
+  ContextDeliveryWorker,
+  DEFAULT_CONTEXT_DELIVERY_BATCH_SIZE,
+  DEFAULT_CONTEXT_DELIVERY_MAX_DURATION_MS,
+  type ContextDeliveryRestoreResult,
+  type ContextDeliveryRunOptions,
+  type ContextDeliveryRunResult,
+  type ContextDeliveryStopReason,
+  type ContextDeliveryWorkerOptions,
+} from './runtime/context-delivery-worker';
+export {
+  SYSTEM_LEASE_TIMERS,
+  leaseRenewIntervalMs,
+  startLeaseHeartbeat,
+  type LeaseHeartbeat,
+  type LeaseHeartbeatOptions,
+  type LeaseTimers,
+} from './services/lease-heartbeat';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';
