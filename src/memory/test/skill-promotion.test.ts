@@ -18,6 +18,7 @@ import {
   classifyPromotionFailure,
   executePromotionCandidate,
 } from '../services/promotion-executor';
+import { PromotionSkillIntegrityError } from '../services/promotion-integrity';
 import { persistExtractedExperiences, stableExperienceId } from '../services/memory-cycle';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { InMemoryBufferRepository } from '../adapters/in-memory-buffer-repository';
@@ -984,6 +985,28 @@ class FailingSkillWriteRepository extends InMemoryRepository {
   }
 }
 
+/**
+ * 技能写入点把技能挂到**另一个 Agent** 名下（正常路径上不可能：id 与归属都由本执行器自己
+ * 给，见 buildPromotedSkill）。
+ *
+ * 造这个替身是为了走到「回写引用不成立」那条分支，而且走的是**真**的 `completePromotion`：
+ * 经验侧的 `promoted_to` 是一条跨表指针，写歪了没有任何东西会来修它，所以存储层必须把这条
+ * 回写整个拒掉，执行器也必须把它认成永久错误——而不是拿一条永远不会成立的引用去占满重试
+ * 名额，或者干脆把指针落上去。
+ */
+class ForeignSkillRepository extends InMemoryRepository {
+  constructor(private readonly owner_role_id: string) {
+    super();
+  }
+
+  override async saveSkillIfAbsent(_role_id: string, skill: SkillRecord): Promise<SkillSaveResult> {
+    return super.saveSkillIfAbsent(this.owner_role_id, {
+      ...skill,
+      agent_id: this.owner_role_id,
+    });
+  }
+}
+
 /** 播种一个 Agent 与一条高置信度正经验，并 claim 到手 */
 async function seedClaimedExperience(repository: InMemoryRepository, role_id: string) {
   await repository.initializeAgent({ role_id, name: 'Promotion Exec Agent' });
@@ -1041,6 +1064,20 @@ describe('classifyPromotionFailure', () => {
     const classified = classifyPromotionFailure(new Error('boom'));
     expect(classified.code).toBe('unknown');
     expect(classified.retryable).toBe(true);
+  });
+
+  it('晋升引用不成立 → 不可重试的 storage_error（重投不会让一条不成立的引用成立）', () => {
+    const classified = classifyPromotionFailure(
+      new PromotionSkillIntegrityError('Promotion integrity: skill x does not exist.', {
+        violation: 'missing',
+        role_id: 'role_x',
+        experience_id: 'exp_x',
+        skill_id: 'skill_x',
+      }),
+    );
+    expect(classified.code).toBe('storage_error');
+    expect(classified.retryable).toBe(false);
+    expect(classified.message).toContain('does not exist');
   });
 });
 
@@ -1170,5 +1207,37 @@ describe('executePromotionCandidate — 失败分类与落盘', () => {
     });
     expect(reclaimed?.experience.id).toBe(experience.id);
     expect(reclaimed?.attempt_count).toBe(2);
+  });
+
+  it('回写引用不成立（技能挂在别的 Agent 名下）：不写 promoted_to，直接死信', async () => {
+    const role_id = `role_exec_foreign_${randomUUID()}`;
+    const owner_role_id = `role_exec_owner_${randomUUID()}`;
+    const repository = new ForeignSkillRepository(owner_role_id);
+    await repository.initializeAgent({ role_id: owner_role_id, name: 'Other Agent' });
+    const { experience, claimed } = await seedClaimedExperience(repository, role_id);
+
+    const result = await executePromotionCandidate(
+      { repository, strategy: autoApproveStrategy, now: () => EXEC_NOW },
+      claimed,
+      { approval: 'auto_approve', now: EXEC_NOW },
+    );
+
+    // 永久错误：判成 storage_error + 不可重试，一次就进死信，不占重试名额
+    expect(result.status).toBe('dead_letter');
+    expect(result.failure?.code).toBe('storage_error');
+    expect(result.failure?.retryable).toBe(false);
+    expect(result.failure?.message).toMatch(/Promotion integrity/);
+
+    const stored = (await repository.listExperiences(role_id))[0]!;
+    expect(stored.id).toBe(experience.id);
+    // 引用不成立时经验上不能留下任何指向：既没有 promoted_to，也没有结论
+    expect(stored.promoted_to).toBeUndefined();
+    expect(stored.promotion?.outcome).toBeUndefined();
+    expect(stored.promotion?.skill_id).toBeUndefined();
+    expect(stored.promotion?.status).toBe('dead_letter');
+    expect(stored.promotion?.last_error).toMatch(/Promotion integrity/);
+    // 被判失败的是**这条引用**，不是那次技能写入：技能确实落了库（挂在别人名下），审计里
+    // 看得到它，人不该在「技能没写成功」这条错路上找
+    expect(await repository.listSkills(owner_role_id)).toHaveLength(1);
   });
 });

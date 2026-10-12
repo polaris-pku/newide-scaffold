@@ -18,6 +18,13 @@
  * 记住上一轮写过什么。经验侧的 `promoted_to` 与晋升结论由 `completePromotion` 在**一次**
  * 条件写里落定，因此不存在「Skill 已存在、经验还没绑上」这个可被读到的中间态。
  *
+ * 第二步要写进去的是一条**跨实体的引用**，所以它还会被存储侧再验一次：那条技能必须存在、
+ * 属于本 Agent、且来源就是这条经验（判据见 ./promotion-integrity）。本执行器给的 id 来自
+ * 刚刚那次 `saveSkillIfAbsent`，正常情况下必然成立；不成立意味着存储里发生了别的事（技能
+ * 被删/被转移，或调用方塞了一条不属于这里的 id），此时 `completePromotion` 抛完整性错误，
+ * 下面那张分类表把它判为不可重试——**不会**把 `promoted_to` 写成指向别人的指针，也不会
+ * 拿这条永远不会成立的引用去占满重试名额。
+ *
  * 失败一律走 `failPromotion`（带 claim token 的 fencing 写），由共享状态机决定是退避重投
  * 还是死信。分类表（`classifyPromotionFailure`）：
  *
@@ -25,6 +32,7 @@
  * | --- | --- | --- |
  * | Agent 不在了 | delivery_missing | 死信——重投不会让 Agent 回来 |
  * | 载荷解析不了（ZodError） | payload_unreadable | 死信——重投读到的是同一份坏数据 |
+ * | 技能引用不成立（不存在 / 跨 Agent / 来源不符） | storage_error | 死信——重投不会让这条引用成立 |
  * | 连接/超时类 errno | downstream_unavailable | 退避重投 |
  * | 权限/路径类 errno | storage_error | 死信 |
  * | Skill 写了、经验没回写 | storage_error（显式可重试）| 退避重投，重试复用同一条 Skill |
@@ -53,6 +61,7 @@ import {
   type DeliveryFailureClassification,
 } from './delivery-error-classification';
 import type { DeliveryRetryPolicy } from './delivery-lifecycle';
+import { isPromotionSkillIntegrityError } from './promotion-integrity';
 import type {
   ClaimedPromotionCandidate,
   MemoryRepository,
@@ -368,6 +377,16 @@ export function buildPromotedSkill(
  */
 export function classifyPromotionFailure(error: unknown): DeliveryFailureClassification {
   const message = error instanceof Error ? error.message : String(error);
+  // 引用不成立（技能不存在 / 属于别的 Agent / 来源是另一条经验）：递来的是一条永远不会
+  // 成立的引用，重投多少次都是同一句拒绝。按存储侧的完整性错误落死信，而不是掉进
+  // `unknown`（可重试）白占五次名额。
+  if (isPromotionSkillIntegrityError(error)) {
+    return knownDeliveryFailure(
+      'storage_error',
+      `${message} (the reference itself is invalid, so retrying cannot fix it; this candidate needs human review)`,
+      false,
+    );
+  }
   if (message.startsWith(AGENT_MISSING_PREFIX) || isForeignKeyViolation(error)) {
     return knownDeliveryFailure(
       'delivery_missing',
@@ -388,4 +407,3 @@ function isForeignKeyViolation(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return false;
   return (error as { code?: unknown }).code === PG_FOREIGN_KEY_VIOLATION;
 }
-

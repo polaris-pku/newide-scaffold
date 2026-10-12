@@ -9,6 +9,12 @@
  * 执行完之后，Skill、经验、聚合根三处同时正确，并且「Skill 写了、经验没回写」这一步失败后
  * 重试会复用同一条 Skill（唯一键 `(role_id, promoted_from)`），不攒出第二条。
  *
+ * 3-B 的完整性面（`completePromotion` 落 promoted 时的跨实体引用校验）也在这份契约里：
+ * skill_id 不存在 / 属于别的 Agent / 来源是另一条经验，三种形状都必须抛同一个完整性错误且
+ * 经验一个字节不动。判据若是两边各写一遍，这一条最容易分叉——内存实现按 id 全库找得到
+ * 「别人的技能」，PG 带上 role 条件的单表查询会把它读成「不存在」，同一件事在两条腿上给出
+ * 两种结论——所以它必须由同一组期望钉住。
+ *
  * 同一份契约跑两个后端（InMemory 与 PGlite 上的 PgMemoryRepository）——这是模块的既有约定
  * （见各 ports 的文件注释）：测试替身不得掩盖生产行为差异。**重启**只在 PGlite 那侧验：
  * InMemory 的「重启」就是清空，用它验持久性会把内存的假象当成生产语义。
@@ -27,6 +33,7 @@ import { ensurePgMemorySchema } from '../adapters/pg-memory-schema';
 import { createPGlitePool } from '../adapters/pglite-pool';
 import { DEFAULT_PROMOTION_RETRY_POLICY, addMilliseconds } from '../services/delivery-lifecycle';
 import { promotionStateLabel } from '../services/promotion-candidates';
+import { PromotionSkillIntegrityError } from '../services/promotion-integrity';
 import {
   buildPromotedSkill,
   executePromotionCandidate,
@@ -97,6 +104,35 @@ function runPromotionStateContract(
       await repository.initializeAgent({ role_id, name: 'Promotion Agent' });
     });
 
+    /** 播种一条经验并 claim 到手 */
+    async function seedClaimed(overrides: Partial<ExperienceRecord> = {}) {
+      const experience = makeExperience(role_id, overrides);
+      await repository.saveExperience(role_id, experience);
+      const claimed = (await repository.claimNextPromotionCandidate(claimRequest(role_id, 'w')))!;
+      expect(claimed).toBeDefined();
+      return { experience, claimed };
+    }
+
+    /**
+     * 按给定来源经验造一条**真的落库**的技能：`promoted_to` 是跨表引用，回写前存储层要
+     * 按 id 把它查出来核对归属，所以「引用的技能不存在」与「引用的技能在库里」是两条不同的
+     * 代码路径，测试不能拿一个凭空编的 id 混过去。
+     */
+    async function seedSkill(owner_role_id: string, from: ExperienceRecord) {
+      const saved = await repository.saveSkillIfAbsent(
+        owner_role_id,
+        buildPromotedSkill(owner_role_id, from, NOW, 'auto_approve'),
+      );
+      return saved.skill;
+    }
+
+    /** 把一条经验读回来（断言「一个字节都没动」时两边必须来自同一条读取路径） */
+    async function storedExperience(id: string): Promise<ExperienceRecord> {
+      const found = (await repository.listExperiences(role_id)).find((item) => item.id === id);
+      expect(found).toBeDefined();
+      return found!;
+    }
+
     it('未评估的经验是候选，claim 之后变成 processing 并带上 token 与租约', async () => {
       const experience = makeExperience(role_id);
       await repository.saveExperience(role_id, experience);
@@ -164,29 +200,152 @@ function runPromotionStateContract(
     });
 
     it('结论与 promoted_to 在同一次写入里落定', async () => {
-      await repository.saveExperience(role_id, makeExperience(role_id));
-      const claimed = (await repository.claimNextPromotionCandidate(claimRequest(role_id, 'w')))!;
-      const skillId = randomUUID();
+      const { experience, claimed } = await seedClaimed();
+      const skill = await seedSkill(role_id, experience);
 
       const settled = await repository.completePromotion({
         role_id,
-        experience_id: claimed.experience.id,
+        experience_id: experience.id,
         claim_token: claimed.claim_token,
         outcome: 'promoted',
         strategy_version: STRATEGY_VERSION,
-        skill_id: skillId,
+        skill_id: skill.id,
         reasons: ['qualifies'],
         now: addMilliseconds(NOW, 1_000),
       });
 
-      expect(settled?.promoted_to).toBe(skillId);
+      expect(settled?.promoted_to).toBe(skill.id);
       expect(settled?.promotion?.outcome).toBe('promoted');
-      expect(settled?.promotion?.skill_id).toBe(skillId);
+      expect(settled?.promotion?.skill_id).toBe(skill.id);
       expect(settled?.promotion?.strategy_version).toBe(STRATEGY_VERSION);
       // 终态清掉租约与 token：它们是活着的凭据
       expect(settled?.promotion?.claim_token).toBeUndefined();
       expect(settled?.promotion?.lease_expires_at).toBeUndefined();
       expect(promotionStateLabel(settled!)).toBe('promoted');
+    });
+
+    /**
+     * 引用校验的三条不成立形状。每一条都断言两件事：**报出的是同一个完整性错误**（所以
+     * 测试对两个后端写同一组期望），以及**经验一个字节都没动**——结论、promoted_to、租约、
+     * token 全都停在 claim 那一刻。promoted_to 是一条跨表指针，写歪了没有任何东西会来修它。
+     */
+    const REFERENCE_CASES: ReadonlyArray<{
+      name: string;
+      violation: string;
+      arrange: (role_id: string) => Promise<string>;
+    }> = [
+      {
+        name: '技能根本不存在',
+        violation: 'missing',
+        arrange: async () => randomUUID(),
+      },
+      {
+        name: '技能属于别的 Agent',
+        violation: 'other_role',
+        arrange: async () => {
+          const other_role_id = `role_promotion_other_${randomUUID()}`;
+          await repository.initializeAgent({ role_id: other_role_id, name: 'Other Agent' });
+          const other = makeExperience(other_role_id);
+          await repository.saveExperience(other_role_id, other);
+          return (await seedSkill(other_role_id, other)).id;
+        },
+      },
+      {
+        name: '技能来自同 Agent 的另一条经验',
+        violation: 'other_source',
+        arrange: async (role_id) => {
+          const other = makeExperience(role_id);
+          await repository.saveExperience(role_id, other);
+          return (await seedSkill(role_id, other)).id;
+        },
+      },
+    ];
+
+    for (const referenceCase of REFERENCE_CASES) {
+      it(`promoted 指向的${referenceCase.name}：抛完整性错误，经验一个字节都不动`, async () => {
+        const { experience, claimed } = await seedClaimed();
+        const before = await storedExperience(experience.id);
+        const skill_id = await referenceCase.arrange(role_id);
+
+        await expect(
+          repository.completePromotion({
+            role_id,
+            experience_id: experience.id,
+            claim_token: claimed.claim_token,
+            outcome: 'promoted',
+            strategy_version: STRATEGY_VERSION,
+            skill_id,
+            reasons: ['qualifies'],
+            now: addMilliseconds(NOW, 1_000),
+          }),
+        ).rejects.toMatchObject({
+          name: 'PromotionSkillIntegrityError',
+          violation: referenceCase.violation,
+        });
+
+        // 校验失败不得写出半截状态：结论、promoted_to、凭据、载荷全都还是原样
+        const after = await storedExperience(experience.id);
+        expect(after).toEqual(before);
+        expect(after.promoted_to).toBeUndefined();
+        expect(after.promotion?.status).toBe('processing');
+        expect(after.promotion?.outcome).toBeUndefined();
+        expect(after.promotion?.claim_token).toBe(claimed.claim_token);
+      });
+    }
+
+    it('引用不成立时抛的是可诊断的完整性错误，不是一句泛泛的失败', async () => {
+      const { experience, claimed } = await seedClaimed();
+      const other_role_id = `role_promotion_foreign_${randomUUID()}`;
+      await repository.initializeAgent({ role_id: other_role_id, name: 'Foreign Agent' });
+      const other = makeExperience(other_role_id);
+      await repository.saveExperience(other_role_id, other);
+      const foreign = await seedSkill(other_role_id, other);
+
+      const error = await repository
+        .completePromotion({
+          role_id,
+          experience_id: experience.id,
+          claim_token: claimed.claim_token,
+          outcome: 'promoted',
+          strategy_version: STRATEGY_VERSION,
+          skill_id: foreign.id,
+          now: addMilliseconds(NOW, 1_000),
+        })
+        .then(
+          () => undefined,
+          (thrown: unknown) => thrown,
+        );
+
+      expect(error).toBeInstanceOf(PromotionSkillIntegrityError);
+      const violation = error as PromotionSkillIntegrityError;
+      // 定位所需的事实都在错误对象上：谁引用了谁、技能实际属于谁
+      expect(violation.role_id).toBe(role_id);
+      expect(violation.experience_id).toBe(experience.id);
+      expect(violation.skill_id).toBe(foreign.id);
+      expect(violation.found_role_id).toBe(other_role_id);
+      expect(violation.message).toContain(foreign.id);
+      expect(violation.message).toContain(other_role_id);
+    });
+
+    it('promoted 之外的结论不接受技能引用：不写 promoted_to，标记里也不记 skill_id', async () => {
+      const { experience, claimed } = await seedClaimed();
+      // 技能存在、归属正确、来源就是这条经验——一条合法的引用，rejected 也不该把它记下来
+      const skill = await seedSkill(role_id, experience);
+
+      const settled = await repository.completePromotion({
+        role_id,
+        experience_id: experience.id,
+        claim_token: claimed.claim_token,
+        outcome: 'rejected',
+        strategy_version: STRATEGY_VERSION,
+        skill_id: skill.id,
+        reasons: ['below_confidence_threshold'],
+        now: addMilliseconds(NOW, 1_000),
+      });
+
+      expect(settled?.promotion?.outcome).toBe('rejected');
+      expect(settled?.promoted_to).toBeUndefined();
+      expect(settled?.promotion?.skill_id).toBeUndefined();
     });
 
     it('decision 为 promoted 却不给 skill_id 时直接抛错（不写出半截状态）', async () => {

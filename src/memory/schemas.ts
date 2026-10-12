@@ -378,7 +378,7 @@ export const ExperiencePromotionSchema = z.object({
   strategy_version: z.string().optional(),
   /** 结论产生的时刻 */
   evaluated_at: z.iso.datetime().optional(),
-  /** 晋升出的 Skill id；`outcome === 'promoted'` 时与 Experience.promoted_to 一致 */
+  /** 晋升出的 Skill id；只在 `outcome === 'promoted'` 时有值，且与 Experience.promoted_to 一致 */
   skill_id: z.uuid().optional(),
   /** 结论的人读理由（策略给了什么、被哪条规则挡住） */
   reasons: z.array(z.string()).optional(),
