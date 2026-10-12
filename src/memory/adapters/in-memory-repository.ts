@@ -79,11 +79,16 @@ import {
 } from '../services/promotion-candidates';
 import {
   applyPersonaVersionLimit,
+  assertPersonaRoleId,
+  assertPersonaVersionMonotonic,
+  assertPersonaVersionRecordIdentity,
   buildRolledBackPersona,
   evolvedPersonaVersionRecord,
   manualPersonaVersionRecord,
   personaRollbackRecord,
+  personaVersionConflictMessage,
   resolvePersonaRollback,
+  resolvePersonaVersionAppend,
   seedPersonaVersionRecord,
 } from '../services/persona-version-history';
 import {
@@ -122,8 +127,11 @@ interface AgentStore {
    * 每一版 Persona 的正文与来历，按版本号索引（Phase 4 修复 B）。
    *
    * 用 `Map` 而不是数组：版本号是主键（Pg 那边就是 `PRIMARY KEY (role_id, persona_version)`），
-   * 「同一版本号只有一行」因此是数据结构本身的性质，不需要靠写入方自觉。读的时候按版本号
-   * 排序后返回，所以顺序不依赖插入顺序——版本号被写入方覆盖成更小的值时也不会串位。
+   * 「同一版本号只有一行」因此是数据结构本身的性质，不需要靠写入方自觉。**但 `Map` 只保证
+   * 「一行」，不保证「一行不改」**——`set` 会就地覆盖，所以三条写入路径都先走共享的
+   * `resolvePersonaVersionAppend` 判一次，冲突时在 `set` 之前就抛出去；`set` 调用点只有
+   * 「确认过这一版号还没有行」的那几处（Pg 那边由主键本身兑现同一件事）。读的时候按版本号
+   * 排序后返回，所以顺序不依赖插入顺序。
    *
    * 建 Agent 时就有第 1 版（种子那一行），因此「当前版本在历史里没有行」在这个后端不可能
    * 发生；Pg 那边只有 Phase B 之前落库的老 Agent 会缺，靠迁移补一行 `baseline`。
@@ -160,11 +168,14 @@ export class InMemoryRepository implements MemoryRepository {
 
     const persona = createSeedPersona(spec.role_id, spec.persona_seed);
     const metrics = createSeedMetrics(spec.role_id);
-    const handle = createSeedHandle(spec, persona, metrics);
+    // Handle 内嵌的是 Persona 的**副本**：这个后端里两份都要各存一份，共用同一个对象就等于
+    // 让「读 handle 改字段」与「读 persona 改字段」互相串味（Pg 那条腿过了 JSON 序列化，
+    // 天然没有这个耦合）。历史那一行同理，由 `seedPersonaVersionRecord` 自己深拷贝。
+    const handle = createSeedHandle(spec, structuredClone(persona), metrics);
 
     this.agents.set(spec.role_id, {
       handle,
-      persona,
+      persona: structuredClone(persona),
       metrics,
       skills: [],
       experiences: [],
@@ -209,12 +220,18 @@ export class InMemoryRepository implements MemoryRepository {
     return this.archives.get(roleId) ?? null;
   }
 
+  /**
+   * 聚合根快照。返回的是**副本**：Handle 内嵌着 Persona，而 Persona 又是带嵌套对象的结构，
+   * 把仓储里那一份交出去等于让调用方随手一改就改了仓储状态（Pg 那条腿每次读都过一遍
+   * JSON 反序列化，两边必须给出同样的边界）。
+   */
   async getAgent(role_id: string): Promise<AgentHandle> {
-    return this.requireStore(role_id).handle;
+    return structuredClone(this.requireStore(role_id).handle);
   }
 
+  /** 当前 Persona 快照；返回副本，理由同 `getAgent` */
   async getPersona(role_id: string): Promise<PersonaDef> {
-    return this.requireStore(role_id).persona;
+    return structuredClone(this.requireStore(role_id).persona);
   }
 
   async getMetrics(role_id: string): Promise<AgentMetrics> {
@@ -448,23 +465,53 @@ export class InMemoryRepository implements MemoryRepository {
     return { skill: stored, created: true };
   }
 
+  /**
+   * 写下一版 Persona（前端 PATCH、按需重生成，都写 `version + 1`）。
+   *
+   * 语义是「把当前 Persona 换成这一份」，**不是**「覆盖这个版本号」：历史是 append-only 的，
+   * 同一个版本号第二次来，要么是同一笔写的重放（幂等返回，什么都不改），要么内容不同——
+   * 那就拒绝，且当前 Persona、Handle 与历史一起停在原处。
+   *
+   * 「换一份正文」这件事本身仍然成立（这条路径不设乐观锁，与 Pg 那条腿一致）：换的是**新的
+   * 版本号**那一行，旧版本那一行一个字都不动。
+   */
   async savePersona(role_id: string, persona: PersonaDef): Promise<void> {
     const store = this.requireStore(role_id);
+    // 身份先判：入参角色与正文自己的角色不一致时，写下去就是把 A 的 Persona 记到 B 名下
+    assertPersonaRoleId(role_id, persona);
     const previous_version = store.persona.version;
-    store.persona = persona;
-    // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
-    store.handle = { ...store.handle, persona };
-    // 版本历史跟着这次覆盖写一起更新（Phase 4 修复 B）。这条路径是无条件覆盖（既有语义，
-    // 调用方是前端 PATCH 与按需重生成），因此这里**只登记**、不设条件：它保证的不变量是
-    // 「当前 Persona 的版本号那一行，内容就是当前 Persona」，而不是「版本号只会变大」。
-    store.personaVersions.set(
-      persona.version,
-      manualPersonaVersionRecord({
-        persona,
-        previous_version,
-        now: nowTimestamp(),
-      }),
+    const record = manualPersonaVersionRecord({
+      persona,
+      previous_version,
+      now: nowTimestamp(),
+    });
+
+    // 冲突与重放都在**任何一次赋值之前**判完：抛出去的时候 store 一个字段都没动过
+    const resolution = resolvePersonaVersionAppend(
+      store.personaVersions.get(record.persona_version),
+      record,
     );
+    if (resolution.kind === 'conflict') {
+      throw new Error(personaVersionConflictMessage(record));
+    }
+    if (resolution.kind === 'identical') {
+      // 幂等：这一版早就按同样的正文与来历落下过。历史一行不动，当前 Persona 也留在原处——
+      // 重放一笔已经生效的写，什么都不该变
+      return;
+    }
+    // 到这里才有新的一行可落，版本号必须往前（见 assertPersonaVersionMonotonic）
+    assertPersonaVersionMonotonic({
+      role_id,
+      current_version: previous_version,
+      next_version: record.persona_version,
+    });
+
+    const stored = structuredClone(persona);
+    store.persona = stored;
+    // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步。
+    // 两份各存一份副本（不是同一个对象），与 Pg 那条腿过序列化之后的形状一致
+    store.handle = { ...store.handle, persona: structuredClone(stored) };
+    store.personaVersions.set(record.persona_version, record);
   }
 
   /**
@@ -737,11 +784,7 @@ export class InMemoryRepository implements MemoryRepository {
         throw new Error('completePersonaEvolution requires a persona when the outcome is "evolved".');
       }
       // 版本号只能由父版本推出：让调用方自报一个跳版本的值，等于允许它写出一个不属于它的版本
-      if (persona.role_id !== request.role_id) {
-        throw new Error(
-          `completePersonaEvolution received a persona for ${persona.role_id}, not ${request.role_id}.`,
-        );
-      }
+      assertPersonaRoleId(request.role_id, persona);
       if (persona.version !== request.parent_version + 1) {
         throw new Error(
           `completePersonaEvolution requires persona version ${String(request.parent_version + 1)} `
@@ -777,33 +820,41 @@ export class InMemoryRepository implements MemoryRepository {
           current_version: resolution.current_version,
         };
       }
-      store.persona = persona;
-      // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
-      store.handle = { ...store.handle, persona };
-      // 历史与正文在**同一笔写**里落下（这里与下面两行之间没有 await，因此是一段临界区）：
-      // 「Persona 已经是 v5、历史里没有 v5」这个窗口一次都不该出现，它是回滚与审计唯一的依赖
-      store.personaVersions.set(
-        persona.version,
-        evolvedPersonaVersionRecord({
-          persona,
-          parent_version: request.parent_version,
-          source_run_id: request.source_run_id,
-          strategy_version: request.strategy_version,
-          input_snapshot_hash: request.input_snapshot_hash,
-          ...(request.change_summary !== undefined
-            ? { change_summary: request.change_summary }
-            : {}),
-          ...(request.reviewed_by !== undefined ? { reviewed_by: request.reviewed_by } : {}),
-          now: request.now,
-        }),
+      // 历史先判、再写正文。冲突时**一个字节都不写**：正文、聚合根快照与标记一起停在原处
+      // （标记也还在 processing，租约到期后这次判定会被重新捡起来），回滚与审计唯一依赖的
+      // 「Persona 已经是 v5、历史里没有 v5」那个窗口因此一次都不会出现。
+      const record = evolvedPersonaVersionRecord({
+        persona,
+        parent_version: request.parent_version,
+        source_run_id: request.source_run_id,
+        strategy_version: request.strategy_version,
+        input_snapshot_hash: request.input_snapshot_hash,
+        ...(request.change_summary !== undefined ? { change_summary: request.change_summary } : {}),
+        ...(request.reviewed_by !== undefined ? { reviewed_by: request.reviewed_by } : {}),
+        now: request.now,
+      });
+      const append = resolvePersonaVersionAppend(
+        store.personaVersions.get(record.persona_version),
+        record,
       );
+      if (append.kind === 'conflict') {
+        throw new Error(personaVersionConflictMessage(record));
+      }
+
+      const stored = structuredClone(persona);
+      store.persona = stored;
+      // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
+      store.handle = { ...store.handle, persona: structuredClone(stored) };
+      // 正文与历史在**同一段临界区**里落下（这里与上面几行之间没有 await）：分两笔写就会留下
+      // 「Persona 已经是 v5、历史里没有 v5」的窗口，而那个窗口正是回滚与审计唯一依赖的东西
+      if (append.kind === 'append') store.personaVersions.set(record.persona_version, record);
     }
 
     store.personaEvolution = settled;
     return {
       kind: 'applied',
       marker: { ...settled },
-      ...(request.outcome === 'evolved' ? { persona: { ...request.persona! } } : {}),
+      ...(request.outcome === 'evolved' ? { persona: structuredClone(request.persona!) } : {}),
     };
   }
 
@@ -899,6 +950,11 @@ export class InMemoryRepository implements MemoryRepository {
     // 解释，而调用方真正要修的是「你指的是哪一版」）
     const target = store.personaVersions.get(request.target_version);
     if (!target) return { kind: 'target_missing', target_version: request.target_version };
+    // 抄之前先认这一行：载荷必须属于这一行、版本号也得是这一行的，角色还得是请求的那个角色。
+    // 拿别的角色（或列与载荷各说各话）的正文当回滚目标，写出来的是一个「属于别人」的当前
+    // 版本，而且此后每个读口都看不出这件事
+    assertPersonaVersionRecordIdentity(target);
+    assertPersonaRoleId(request.role_id, target.persona);
 
     const resolution = resolvePersonaRollback({
       expected_current_version: request.expected_current_version,
@@ -930,15 +986,29 @@ export class InMemoryRepository implements MemoryRepository {
       ...(request.reviewed_by !== undefined ? { reviewed_by: request.reviewed_by } : {}),
       now: request.now,
     });
+    // 回滚写下的版本号必须是**新的**：撞上已有的一行就说明「当前版本 === 历史里最大的版本号」
+    // 这条不变量已经断了，此时拒绝比覆盖诚实——被覆盖的那一行是别人回滚或审计的目标
+    const append = resolvePersonaVersionAppend(
+      store.personaVersions.get(record.persona_version),
+      record,
+    );
+    if (append.kind === 'conflict') {
+      throw new Error(personaVersionConflictMessage(record));
+    }
 
-    store.persona = persona;
+    const stored = structuredClone(persona);
+    store.persona = stored;
     // AgentHandle 内嵌 persona 快照，AgentBoardQuery.getAgent 返回 handle.persona，需同步
-    store.handle = { ...store.handle, persona };
+    store.handle = { ...store.handle, persona: structuredClone(stored) };
     // 演化标记刻意不动：它的去重键是 (role_id, input_snapshot_hash, strategy_version)，输入
     // 没变时把它作废会让下一次演化把刚回滚掉的版本原样写回来（见 ports 的说明）
-    store.personaVersions.set(persona.version, record);
+    if (append.kind === 'append') store.personaVersions.set(record.persona_version, record);
 
-    return { kind: 'applied', persona: { ...persona }, record: structuredClone(record) };
+    return {
+      kind: 'applied',
+      persona: structuredClone(stored),
+      record: structuredClone(record),
+    };
   }
 
   /**
@@ -995,7 +1065,7 @@ export class InMemoryRepository implements MemoryRepository {
       marker: { ...claimed },
       claim_token: claimed.claim_token!,
       attempt_count: claimed.attempt_count,
-      persona: { ...store.persona },
+      persona: structuredClone(store.persona),
       snapshot,
       input_snapshot_hash,
       ...(last_evolution !== undefined ? { last_evolution } : {}),

@@ -10,6 +10,21 @@
  * 3. **回滚这一版的正文与摘要**（`buildRolledBackPersona` / `summarizePersonaRollback`）：
  *    正文抄自目标版本，版本号与生成时刻属于新的一版。
  *
+ * 修复 B 的第二轮（`resolvePersonaVersionAppend` 及其同组函数）加的是**历史不可变**这条
+ * 不变量，它同样只能有一份定义：
+ *
+ * - **一行历史一旦落下就不再改**：`(role_id, persona_version)` 是主键，第二次拿同一个版本号
+ *   来写，要么是同一笔写的重放（幂等，什么都不做），要么是**冲突**（拒绝，且当前 Persona、
+ *   聚合根快照与历史三者一起停在原处）。修复前两条腿都是「覆盖写」（内存是 `Map.set`，Pg 是
+ *   `ON CONFLICT ... DO UPDATE`），于是回滚的目标正文与审计事实会被后来的写悄悄改写。
+ * - **版本号只能往前**（`assertPersonaVersionMonotonic`）：`savePersona` 写下的版本必须严格
+ *   大于当前版本。它维护的是 `当前版本 === 历史里最大的版本号` 这条不变量，而回滚写下的
+ *   `当前版本 + 1`「一定是新的」正是靠它成立的——没有它，一次把版本号写小的 `savePersona`
+ *   就能让下一次回滚撞上已有的一行。
+ * - **身份自洽**（`assertPersonaRoleId` / `assertPersonaVersionRecordIdentity`）：入参角色必须
+ *   等于正文自己的角色，历史行的载荷必须属于这一行、版本号也必须是这一行的。少了这一层，
+ *   一次笔误就能把 A 的 Persona 记到 B 名下，而且此后每个读口都读不出这件事。
+ *
  * 为什么回滚要**新起一个版本号**而不是把版本号改回目标版本：`PersonaDef.version` 是这条通道
  * 的乐观锁（演化写回的前置条件就是「父版本 == 当前版本」）。把版本号改小等于让这个锁倒退，
  * 一个拿着 v5 判定结果的 worker 会在「当前版本又变回 v3」之后重新认为自己是对的，于是把刚被
@@ -42,6 +57,41 @@ export interface PersonaVersionRecordInput {
 }
 
 /**
+ * 身份校验：这一版正文属于哪个角色。
+ *
+ * 认的是**调用方的入参**与**正文自己带的 `role_id`** 是同一个：不一致时写下去就是把 A 的
+ * Persona 记到 B 名下——历史表的主键取入参、载荷取正文，两处从此各说各话，而且此后每个读口
+ * 都读不出这件事（`(role_id, persona_version)` 这个主键只保证「同一角色同一版本一行」，不保证
+ * 那一行的载荷属于这个角色）。两条腿共用这一份判据与同一句话，测试与生产看到的是同一句。
+ */
+export function assertPersonaRoleId(expected_role_id: string, persona: { role_id: string }): void {
+  if (persona.role_id !== expected_role_id) {
+    throw new Error(
+      `Persona role_id mismatch: expected ${expected_role_id}, got ${persona.role_id}.`,
+    );
+  }
+}
+
+/**
+ * 身份校验：一行历史记录内部必须自洽——载荷属于这一行，版本号也是这一行的。
+ *
+ * 主键（`role_id` + `persona_version`）与载荷是两个来源，能各说各话的地方就有这一条要挡的
+ * 东西：一行的列说它是 v3、载荷里写着 v5，回滚抄出来的正文就会是另一版的内容，而按列读的
+ * 调用方永远看不到这件事。`personaVersionRecord` 由正文派生列值，因此正常路径上这一条恒成立；
+ * 它挡的是**未来有人把列值与正文拆成两个来源**（Phase 3 的 `promoted_from` 正是这样分裂过
+ * 一次），以及从库里读回来的那些行。
+ */
+export function assertPersonaVersionRecordIdentity(record: PersonaVersionRecord): void {
+  assertPersonaRoleId(record.role_id, record.persona);
+  if (record.persona.version !== record.persona_version) {
+    throw new Error(
+      `Persona version mismatch: history row says v${String(record.persona_version)}, `
+        + `persona body says v${String(record.persona.version)}.`,
+    );
+  }
+}
+
+/**
  * 构造一行版本记录 —— **全仓唯一**把 `persona_version` 与 `persona.version` 摆在一起的地方。
  *
  * 版本号从正文派生而不是由调用方传：传进来的话就有两个来源，而它们迟早会分叉（Phase 3 的
@@ -52,7 +102,7 @@ export interface PersonaVersionRecordInput {
  * 「不知道它取代了谁」，写个 0 或 1 就成了编。
  */
 export function personaVersionRecord(input: PersonaVersionRecordInput): PersonaVersionRecord {
-  return {
+  const record: PersonaVersionRecord = {
     role_id: input.persona.role_id,
     persona_version: input.persona.version,
     // 深拷贝：记录一旦造出来就不再跟着调用方手里那一份走。内存后端不拷贝就等于把「历史」
@@ -73,6 +123,9 @@ export function personaVersionRecord(input: PersonaVersionRecordInput): PersonaV
     ...(input.reviewed_by !== undefined ? { reviewed_by: input.reviewed_by } : {}),
     created_at: input.created_at,
   };
+  // 造出来的那一行当场自检：列值与正文同源是本模块的职责，不是调用方的义务
+  assertPersonaVersionRecordIdentity(record);
+  return record;
 }
 
 /**
@@ -123,8 +176,8 @@ export function evolvedPersonaVersionRecord(input: {
 /**
  * 手动写入（`savePersona`）那一行。
  *
- * 这条路径是**无条件覆盖**（既有语义，本阶段不动它），因此 `parent_version` 记的是「写之前
- * 读到的那一版」，而且只在它**严格小于**写下的版本号时才记：
+ * 这条路径写的是「当前 Persona 换成这一份」，因此 `parent_version` 记的是**写之前读到的那
+ * 一版**，而且只在它**严格小于**写下的版本号时才记：
  *
  * - 写下的版本比当前大：这是一次推进，父版本就是它取代的那一版，如实记下。
  * - 同号重写（版本没动、只换了正文）：推不出一个诚实的父版本——「取代了自己」不是一种来历。
@@ -132,6 +185,10 @@ export function evolvedPersonaVersionRecord(input: {
  *
  * 后两种情形下宁可不写这个键：缺席读作「不知道」，编一个值则会在审计里变成一个看起来确凿的
  * 错误事实。
+ *
+ * **父版本是「写的那一刻的读数」，因此不参与「这是不是同一笔写」的判定**（见
+ * `isSamePersonaVersionWrite`）：同一笔写重放时，读到的当前版本已经变成这一版自己，推出来的
+ * 父版本从「上一版」变成缺席——内容一个字没变，这一格却变了。
  */
 export function manualPersonaVersionRecord(input: {
   persona: PersonaDef;
@@ -152,8 +209,133 @@ export function manualPersonaVersionRecord(input: {
 }
 
 // ═══════════════════════════════════════════
-//  回滚
+//  历史不可变：同一版本号只能落一次
 // ═══════════════════════════════════════════
+
+/**
+ * 两份正文是不是同一份 —— 逐字段列出来，不展开也不比 JSON 串。
+ *
+ * 不比 JSON 串有两个原因：键序取决于对象是怎么造出来的（调用方手写的字面量与 Zod 解析过的
+ * 对象键序可以不同，同一份内容会判成两份），而展开比对会让 `PersonaDef` 将来加的字段**默认
+ * 不参与判等**——那是一个没人会注意到的静默决定。列出来则会变成一次编译错误，逼人在那个
+ * 字段上做一次选择。
+ */
+function isSamePersonaBody(left: PersonaDef, right: PersonaDef): boolean {
+  return (
+    left.role_id === right.role_id &&
+    left.version === right.version &&
+    left.summary === right.summary &&
+    left.skills_overview === right.skills_overview &&
+    left.experience_coverage === right.experience_coverage &&
+    left.recent_performance === right.recent_performance &&
+    left.notes === right.notes &&
+    left.generated_at === right.generated_at
+  );
+}
+
+/**
+ * 两笔写是不是**同一笔写**。
+ *
+ * 判据是「正文与完整来历逐字段相等」，只有两格除外——它们记的都是**写的那一刻的读数**，
+ * 不是这一版的内容，重放同一笔写时必然不同：
+ *
+ * - `created_at`：「这一版什么时候落的」。重放时墙上时钟走过了一格，拿它当判据会让每一次
+ *   重放都变成「内容不同」。
+ * - `parent_version`：「写它的时候当前是第几版」。重放时读到的当前版本已经变成了这一版自己
+ *   （见 `manualPersonaVersionRecord` 的说明），因此同一笔写两次重放会推出两个父版本。
+ *
+ * 其余每一格（正文、`source`、run、策略版本、输入快照 hash、抄自哪一版、变更摘要、批准者）
+ * 都是这一版**是什么、从哪来**的事实，任何一处不同就是「拿另一个东西来占这个版本号」。其中
+ * `source` 尤其关键：同一个版本号先由演化写下、再被一次手工写重放，是两件不同的事，不因为
+ * 正文偶然相同就成一件事。
+ */
+export function isSamePersonaVersionWrite(
+  left: PersonaVersionRecord,
+  right: PersonaVersionRecord,
+): boolean {
+  return (
+    left.role_id === right.role_id &&
+    left.persona_version === right.persona_version &&
+    left.source === right.source &&
+    left.source_run_id === right.source_run_id &&
+    left.strategy_version === right.strategy_version &&
+    left.input_snapshot_hash === right.input_snapshot_hash &&
+    left.rollback_from_version === right.rollback_from_version &&
+    left.change_summary === right.change_summary &&
+    left.reviewed_by === right.reviewed_by &&
+    isSamePersonaBody(left.persona, right.persona)
+  );
+}
+
+/** 这一笔写该怎么落：追加一行、幂等命中、还是冲突 */
+export type PersonaVersionAppendResolution =
+  | { kind: 'append' }
+  | { kind: 'identical' }
+  | { kind: 'conflict'; existing: PersonaVersionRecord };
+
+/**
+ * 判这一笔写该怎么落——**三条写入路径（演化 / 手工 / 回滚）共用的那一份判据**。
+ *
+ * 版本号是主键，因此「这一版号已经有行」是本判据唯一的输入：
+ *
+ * - 没有这一行 → `append`：正常追加。
+ * - 有这一行且是同一笔写 → `identical`：**幂等**，调用方什么都不该改。它认的是「这一笔写
+ *   早就落下了」，重放不该失败，也不该把后来推进过的当前版本拖回来。
+ * - 有这一行但是别的内容 → `conflict`：**必须拒绝**。实现要么抛错、要么返回冲突，但两种情形
+ *   下都**一个字节都不许写**——当前 Persona、聚合根快照（Handle）与历史三者一起停在原处。
+ *
+ * 冲突没有「后来者居上」这一档：历史是回滚唯一能抄的东西，让它可改写等于让回滚的目标在
+ * 无人察觉的时候被换掉。
+ */
+export function resolvePersonaVersionAppend(
+  existing: PersonaVersionRecord | undefined,
+  incoming: PersonaVersionRecord,
+): PersonaVersionAppendResolution {
+  if (existing === undefined) return { kind: 'append' };
+  if (isSamePersonaVersionWrite(existing, incoming)) return { kind: 'identical' };
+  return { kind: 'conflict', existing };
+}
+
+/**
+ * 冲突时抛出的那一句话 —— 两条腿一字不差，测试与生产看到的是同一句。
+ *
+ * 说清三件事：哪一版、为什么被拒（同一版本号已有一行不同内容）、以及被拒之后**什么都没变**。
+ * 最后一句不是安慰：调用方据此决定是重读一遍再来，还是把这件事报给人。
+ */
+export function personaVersionConflictMessage(record: PersonaVersionRecord): string {
+  return (
+    `Persona version ${String(record.persona_version)} of ${record.role_id} is already recorded `
+    + `with different content; persona version history is append-only, so this write was rejected `
+    + `and neither the current persona nor the history changed.`
+  );
+}
+
+/**
+ * 版本号只能往前：`savePersona` 写下的版本必须**严格大于**当前版本。
+ *
+ * 它维护的是 `当前版本 === 历史里最大的版本号` 这条不变量，而这条不变量是回滚不覆盖历史的
+ * 依据——回滚落下的是 `当前版本 + 1`，只有在「当前版本就是历史里最大的那一号」时它才一定是
+ * 新的。少了这条约束，一次把版本号写小的 `savePersona` 就能让历史里出现比当前版本更大的号，
+ * 于是下一次回滚的 `当前版本 + 1` 会撞上一行**已经存在、内容不同**的历史（那正是被禁止的
+ * 覆盖），或者让「当前版本那一行在历史里」这条不变量断掉。
+ *
+ * 同号重写不走这里：那一定先被判成「重放（幂等）」或「冲突」，两件事都在版本号比较之前。
+ */
+export function assertPersonaVersionMonotonic(input: {
+  role_id: string;
+  /** 写之前读到的当前版本 */
+  current_version: number;
+  /** 这一笔写要落下的版本号 */
+  next_version: number;
+}): void {
+  if (input.next_version <= input.current_version) {
+    throw new Error(
+      `Persona version must advance: ${input.role_id} is at v${String(input.current_version)}, `
+        + `the write asked for v${String(input.next_version)}. Use rollbackPersona to put an older `
+        + `version back; it writes a new version rather than reusing an old one.`,
+    );
+  }
+}
 
 /** 一次回滚该不该发生：`apply` 时连带给出新版本号（当前版本 +1）与正文来源 */
 export type PersonaRollbackResolution =

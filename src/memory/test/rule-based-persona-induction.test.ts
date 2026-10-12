@@ -82,9 +82,12 @@ describe('ruleBasedPersonaInduction', () => {
     // 落在同一毫秒，`generated_at > current.generated_at` 就成了掷硬币。把当前 persona 的
     // 时间戳钉到一个过去的常量，断言仍然验证「新 persona 会重新盖时间戳」，但不再依赖
     // 「两次调用刚好跨过毫秒边界」。
+    //
+    // 钉在**本地这一份**上，不再写回仓储：版本历史是 append-only 的，v1 那一行落下之后不
+    // 许改写（改时间戳就是改历史）。归纳器读的是传进去的 `currentPersona`，不是仓储，因此
+    // 这份被钉过的正文照样进得了判定；写回的是它推出来的 v2。
     const seeded = await memory.getPersona();
     const current = { ...seeded, generated_at: '2020-01-01T00:00:00.000Z' };
-    await memory.savePersona(current);
     expect(current.version).toBe(1);
 
     const outcome = await ruleBasedPersonaInduction(memory, {

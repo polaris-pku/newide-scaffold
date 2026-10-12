@@ -153,7 +153,9 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
   // 追加一行），而且它的两种读法（按角色列出全部版本、按版本号取一行）都要能吃上索引；塞进
   // 一个 JSONB 列会让「取第 3 版」变成把整份历史读出来再筛。
   //
-  // 主键 `(role_id, persona_version)` 就是「同一角色同一版本号只有一行」这条不变量。列
+  // 主键 `(role_id, persona_version)` 就是「同一角色同一版本号只有一行」这条不变量，也是
+  // **历史不可变**的落点：三条写入路径（手工 / 演化 / 回滚）都靠 `ON CONFLICT DO NOTHING`
+  // 让这个主键去挡第二次写入，没有任何 `DO UPDATE`——一行历史一旦落下就不再改。列
   // `persona_version` 与载荷里的 `persona.version` 同源（都由 personaVersionRecord 从正文
   // 派生），列存在的意义是让主键与排序用得上索引——Phase 3 的 `promoted_from` 曾经列与载荷
   // 分裂过一次，这里从一开始就只留一个权威（正文）。
@@ -178,7 +180,7 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
   //
   // 这一步同时是**修复步骤**：某个 Agent 的当前版本若因为「建 Agent 与写历史之间进程消失」
   // 而缺行，下一次启动照样补上。`DO NOTHING` 而不是 `DO UPDATE`——这里登记的是既有事实，
-  // 不许改写历史（写入路径那边才用 `DO UPDATE`，见 PgMemoryRepository 的说明）。
+  // 不许改写历史；三条写入路径也只追加，不覆盖（见 PgMemoryRepository 的说明）。
   //
   // `created_at` 取正文自己的 `generated_at`：这一版什么时候生成的，正文自己带着答案，用迁移
   // 时刻是另一个意思（那一行是我们什么时候**登记**的）。两个正则护栏让脏数据**跳过**而不是

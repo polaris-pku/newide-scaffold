@@ -788,13 +788,17 @@ export {
 
 // ════════════════════════════════════════════════════════
 //  20c. Memory Maintenance：Persona 版本历史与回滚（Phase 4 修复 B）
-//      「每一版 Persona 的正文」本身：演化与回滚各追加一行，`savePersona` 覆盖写时登记
-//      当前版本那一行，迁移为老 Agent 补一行 `baseline`。
+//      「每一版 Persona 的正文」本身：演化、手工写入（`savePersona`）与回滚各追加一行，
+//      迁移为老 Agent 补一行 `baseline`。
 //
 //      读端口（`listPersonaVersions` / `getPersonaVersion` / `getCurrentPersonaVersion`）
 //      与回滚端口（`rollbackPersona`）都在 `MemoryRepository` 上——**必须**在那里：写下一版
 //      Persona 与登记这一版的历史是同一笔写，分成两个 store 就等于承认存在「Persona 已经是
 //      v5、历史里没有 v5」的窗口，而那个窗口正是回滚与审计唯一依赖的东西。
+//
+//      历史是 **append-only** 的：`(role_id, persona_version)` 已经有行时，同一份内容重放
+//      幂等成功、不同内容一律拒绝（`resolvePersonaVersionAppend` 是三条写入路径共用的判据，
+//      两个后端逐字相同）。冲突时当前 Persona、Handle 与历史一起停在原处。
 //
 //      回滚是**再写一版**而不是擦掉一版：正文抄自目标版本，版本号是当前版本 +1，旧历史一行
 //      不动；条件写落在当前版本上，并发回滚只有一个赢家，输的那个拿到明确的 version_conflict。
@@ -808,15 +812,22 @@ export type {
 } from './ports/memory-repository';
 export {
   applyPersonaVersionLimit,
+  assertPersonaRoleId,
+  assertPersonaVersionMonotonic,
+  assertPersonaVersionRecordIdentity,
   buildRolledBackPersona,
   evolvedPersonaVersionRecord,
+  isSamePersonaVersionWrite,
   manualPersonaVersionRecord,
   personaRollbackRecord,
+  personaVersionConflictMessage,
   personaVersionRecord,
   resolvePersonaRollback,
+  resolvePersonaVersionAppend,
   seedPersonaVersionRecord,
   summarizePersonaRollback,
   type PersonaRollbackResolution,
+  type PersonaVersionAppendResolution,
   type PersonaVersionRecordInput,
 } from './services/persona-version-history';
 
