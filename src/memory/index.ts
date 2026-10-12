@@ -578,9 +578,10 @@ export type { RoleTokenUsageReader } from './ports/role-token-usage';
 //      晋升标记上（claim/lease/fencing 与交付通道共用同一套状态机）。它不从 Context
 //      consumer、Feedback consumer、scheduleBuffer() 或在线 Driver 流程里被调用，也不
 //      调用它们中的任何一个。
-//      本阶段的边界：job 本体（run 循环与 run 收尾）在 Phase 3-C，此处交付契约、策略、
-//      持久化状态（3-A）与单条候选的执行内核（3-B：原子幂等写 Skill + 回写经验 + 失败
-//      分类）；因为 Profile/Persona 归 Phase 4，这里没有任何 Persona 相关入口。
+//      三段各自的落点：契约、策略、持久化状态（3-A）；单条候选的执行内核（3-B：原子幂等写
+//      Skill + 回写经验 + 失败分类）；批量外壳（3-C：claim 循环、批大小与墙钟上限、run
+//      记录与收尾、启动恢复、dry-run）。因为 Profile/Persona 归 Phase 4，这里没有任何
+//      Persona 相关入口；而把 job 接进调度器（谁在什么时候跑它）归 Phase 5。
 // ════════════════════════════════════════════════════════
 
 export {
@@ -628,6 +629,11 @@ export {
   type PromotionExecutionStatus,
   type PromotionExecutorDeps,
 } from './services/promotion-executor';
+export {
+  DefaultSkillPromotionJob,
+  DEFAULT_SKILL_PROMOTION_BATCH_SIZE,
+  DEFAULT_SKILL_PROMOTION_MAX_DURATION_MS,
+} from './runtime/skill-promotion-job';
 export type {
   PromotionCandidateOutcome,
   PromotionCandidateStatus,
