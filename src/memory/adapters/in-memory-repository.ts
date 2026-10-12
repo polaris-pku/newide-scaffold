@@ -54,6 +54,10 @@ import {
   planPromotionCandidate,
   type PromotionCandidateInput,
 } from '../services/promotion-candidates';
+import {
+  assertPromotedSkillReference,
+  type PromotedSkillFacts,
+} from '../services/promotion-integrity';
 import { applyFeedbackToExperience, averageConfidence, isFeedbackApplied } from '../services/usage-feedback';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 import { cosineSimilarity } from '../utils/vector';
@@ -396,13 +400,33 @@ export class InMemoryRepository implements MemoryRepository {
     store.handle = { ...store.handle, persona };
   }
 
+  /**
+   * 覆盖写入一条技能。
+   *
+   * `promoted_from` 是晋升幂等键的一半，所以这次写入也要过一遍唯一性检查：同一 role 下
+   * 已有另一条技能指向同一来源时，写入被拒、**记录保持原状**。PG 侧靠部分唯一索引在同一条
+   * UPDATE 里整句失败，两侧必须报同一件事——判据只写在一边，测试替身就会掩盖生产差异
+   * （见 ports/memory-repository.ts 里 updateSkill 的说明）。
+   *
+   * 检查与赋值之间没有 await：并发的另一次写入不可能插进「刚查过」与「写回」之间。
+   */
   async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
     const store = this.requireStore(role_id);
     const index = store.skills.findIndex((item) => item.id === skill.id);
     if (index === -1) {
       throw new Error(`Skill not found: ${skill.id}`);
     }
-    store.skills[index] = await this.withDescriptionEmbedding(skill);
+    const stored = await this.withDescriptionEmbedding(skill);
+    if (stored.promoted_from !== undefined) {
+      const clash = findSkillByPromotedFrom(store.skills, stored.promoted_from);
+      if (clash && clash.id !== stored.id) {
+        throw new Error(
+          `Skill for promoted_from=${stored.promoted_from} already exists in ${role_id}; ` +
+            `skill ${stored.id} was left unchanged.`,
+        );
+      }
+    }
+    store.skills[index] = stored;
   }
 
   async updateExperience(role_id: string, experience: ExperienceRecord): Promise<void> {
@@ -476,6 +500,21 @@ export class InMemoryRepository implements MemoryRepository {
     return undefined;
   }
 
+  /**
+   * 落一条结论（processing → processed）。
+   *
+   * 凭据（claim_token / owner / lease）不成立时返回 undefined、什么都不写——那是「这次没
+   * 轮到我们」，落盘的责任归当前持有者。凭据成立之后才轮到**引用校验**：`outcome='promoted'`
+   * 时 `promoted_to` 指向的技能必须存在、属于本 role、且来源就是这条经验（判据见
+   * services/promotion-integrity.ts）。不成立就抛，经验一个字节都不动——包括不写结论、
+   * 不写 promoted_to：两种半截状态都比失败更糟。
+   *
+   * 校验与写入之间没有 await，因此「凭据判断 → 引用判据 → 最终赋值」在 JS 单线程下就是
+   * 一段临界区：没有「刚验过就被删掉」的窗口，也不需要第二次确认。
+   *
+   * `promoted` 以外的结论不接受技能引用：调用方递来的 `skill_id` 既不进标记、也不进
+   * `promoted_to`（rejected / pending_review 没有产出技能可言）。
+   */
   async completePromotion(
     request: PromotionCompletionRequest,
   ): Promise<ExperienceRecord | undefined> {
@@ -488,13 +527,14 @@ export class InMemoryRepository implements MemoryRepository {
     const marker = experience.promotion;
     if (!marker) return undefined;
 
+    const promotedTo = request.outcome === 'promoted' ? request.skill_id : undefined;
     const completed = completeDeliveryRecord(
       {
         ...marker,
         outcome: request.outcome,
         strategy_version: request.strategy_version,
         evaluated_at: request.now,
-        skill_id: request.skill_id,
+        skill_id: promotedTo,
         reasons: request.reasons,
       },
       {
@@ -505,14 +545,23 @@ export class InMemoryRepository implements MemoryRepository {
     );
     if (!completed) return undefined;
 
+    if (promotedTo !== undefined) {
+      assertPromotedSkillReference(
+        {
+          role_id: request.role_id,
+          experience_id: request.experience_id,
+          skill_id: promotedTo,
+        },
+        this.findSkillFactsById(promotedTo),
+      );
+    }
+
     const next: ExperienceRecord = {
       ...experience,
       promotion: completed,
       // promoted_to 与结论在同一次写入里落定：读到「Skill 已存在、经验还没绑上」的中间态
       // 会让人把它当成没晋升过再晋升一次
-      ...(request.outcome === 'promoted' && request.skill_id !== undefined
-        ? { promoted_to: request.skill_id }
-        : {}),
+      ...(promotedTo !== undefined ? { promoted_to: promotedTo } : {}),
     };
     store.experiences[index] = next;
     return cloneExperience(next);
@@ -669,6 +718,22 @@ export class InMemoryRepository implements MemoryRepository {
     const experience = store.experiences[index];
     if (index === -1 || !experience) return undefined;
     return { store, index, experience };
+  }
+
+  /**
+   * 按 id 在**全部** Agent 的存储里找一条技能的事实（不限当前 role 的那一份）。
+   *
+   * 「跨 role 引用」与「根本不存在」是两种不同的完整性错误，只有全局查才分得开；判据本身
+   * 由 services/promotion-integrity.ts 给（与 PG 适配器同一份），这里只回答「查到了什么」。
+   * 市场池 Agent 也在 this.agents 里，因此被转移过去的技能照样找得到，并会以「归属不符」
+   * 而不是「不存在」被拒——那样排查时看得到它去了哪儿。
+   */
+  private findSkillFactsById(skill_id: string): PromotedSkillFacts | undefined {
+    for (const [role_id, store] of this.agents) {
+      const found = store.skills.find((skill) => skill.id === skill_id);
+      if (found) return { role_id, promoted_from: found.promoted_from };
+    }
+    return undefined;
   }
 
   async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {

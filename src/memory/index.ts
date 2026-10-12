@@ -578,8 +578,9 @@ export type { RoleTokenUsageReader } from './ports/role-token-usage';
 //      晋升标记上（claim/lease/fencing 与交付通道共用同一套状态机）。它不从 Context
 //      consumer、Feedback consumer、scheduleBuffer() 或在线 Driver 流程里被调用，也不
 //      调用它们中的任何一个。
-//      本阶段的边界：job 本体（run 循环与 run 收尾）在 Phase 3-C，此处交付契约、策略与
-//      持久化状态；因为 Profile/Persona 归 Phase 4，这里没有任何 Persona 相关入口。
+//      本阶段的边界：job 本体（run 循环与 run 收尾）在 Phase 3-C，此处交付契约、策略、
+//      持久化状态（3-A）与单条候选的执行内核（3-B：原子幂等写 Skill + 回写经验 + 失败
+//      分类）；因为 Profile/Persona 归 Phase 4，这里没有任何 Persona 相关入口。
 // ════════════════════════════════════════════════════════
 
 export {
@@ -617,6 +618,16 @@ export type {
   PromotionFailureRequest,
   PromotionRestoreOptions,
 } from './ports/memory-repository';
+export {
+  AGENT_MISSING_PREFIX,
+  buildPromotedSkill,
+  classifyPromotionFailure,
+  executePromotionCandidate,
+  type PromotionExecutionOptions,
+  type PromotionExecutionResult,
+  type PromotionExecutionStatus,
+  type PromotionExecutorDeps,
+} from './services/promotion-executor';
 export type {
   PromotionCandidateOutcome,
   PromotionCandidateStatus,

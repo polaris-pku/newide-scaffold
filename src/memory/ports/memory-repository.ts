@@ -210,7 +210,7 @@ export interface PromotionCompletionRequest {
   strategy_version: string;
   /** 结论的人读理由 */
   reasons?: string[];
-  /** 晋升出的 Skill id；`outcome === 'promoted'` 时必填 */
+  /** 晋升出的 Skill id；`outcome === 'promoted'` 时必填，其余结论**不接受**（传了也不落） */
   skill_id?: string;
   /** 参考时刻（注入时钟） */
   now: string;
@@ -393,7 +393,17 @@ export interface MemoryRepository {
   saveSkillIfAbsent(role_id: string, skill: SkillRecord): Promise<SkillSaveResult>;
   /** 覆盖写入当前 Persona 快照（如 Persona 演化后 version+1） */
   savePersona(role_id: string, persona: PersonaDef): Promise<void>;
-  /** 更新已有技能（如消融实验 auto-approve） */
+  /**
+   * 覆盖写入已有技能（如消融实验 auto-approve、人工审核裁决）。
+   *
+   * 覆盖的是**整条记录**：实现必须让 `promoted_from` 与载荷里的同名字段同步落地。它是晋升
+   * 幂等键的一半，也是归属校验（`completePromotion` 的引用判据）读的那个字段——只写载荷会
+   * 在库里留下「列说没有来源、载荷说是某条经验」的分裂状态，于是按列读的 PG 与按载荷读的
+   * 内存实现对同一条引用给出两种结论。
+   *
+   * `promoted_from` 改出来若与同 role 的另一条技能撞车，写入必须**整体失败**：技能记录停在
+   * 改之前，不得留下半截状态（PG 由 `(role_id, promoted_from)` 的部分唯一索引保证）。
+   */
   updateSkill(role_id: string, skill: SkillRecord): Promise<void>;
   /** 更新已有经验（如晋升后写入 promoted_to） */
   updateExperience(role_id: string, experience: ExperienceRecord): Promise<void>;
@@ -449,7 +459,24 @@ export interface MemoryRepository {
     request: PromotionClaimRequest,
   ): Promise<ClaimedPromotionCandidate | undefined>;
 
-  /** 落一条结论（processing → processed）；token 不匹配或租约已过期返回 undefined */
+  /**
+   * 落一条结论（processing → processed）；token 不匹配或租约已过期返回 undefined。
+   *
+   * 凭据（claim_token / owner / lease）不成立时**什么都不写**：那是「这次没轮到我们」，
+   * 结论归当前持有者。
+   *
+   * 凭据成立时，`outcome === 'promoted'` 还要过一次**引用校验**：`promoted_to` 指向的
+   * 技能必须存在、属于本 role、且 `promoted_from` 就是这条经验（`outcome !== 'promoted'`
+   * 时不需要 skill_id，也不会写 promoted_to）。校验不过时必须**整体失败**——不写结论、
+   * 不写 promoted_to、不改动经验，并抛出一个明确、可诊断的完整性错误（见
+   * services/promotion-integrity 的 `PromotionSkillIntegrityError`）。经验上的
+   * `promoted_to` 是一条跨实体的指针，写歪了没有任何东西会来修它：它既不会因为重试而
+   * 变正确，也不会被候选扫描重新捡起来（有 promoted_to 的经验不再入选）。
+   *
+   * 实现必须让这次校验落在**最终写入的一致性边界之内**：内存实现是同一段无 await 的临界区，
+   * PG 是 role 临界区加「写入谓词里带同一条技能的存在性」的条件写。在边界之外「先查再写」
+   * 留下的是「刚验过就被删掉/被转移」的窗口，那正是这条校验要挡的东西。
+   */
   completePromotion(request: PromotionCompletionRequest): Promise<ExperienceRecord | undefined>;
 
   /** 落一次失败（退避回队列或进死信）；token 不匹配或租约已过期返回 undefined */

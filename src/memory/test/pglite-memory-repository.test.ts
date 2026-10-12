@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { nowTimestamp } from '../../core';
+import { DEFAULT_PROMOTION_STRATEGY_VERSION } from '../adapters/default-promotion-strategy';
 import { HashEmbeddingProvider } from '../adapters/hash-embedding-provider';
 import { PgMemoryRepository } from '../adapters/pg-memory-repository';
 import { ensurePgMemorySchema } from '../adapters/pg-memory-schema';
@@ -94,6 +95,67 @@ function createSkill(role_id: string, overrides: Partial<SkillRecord> = {}): Ski
     updated_at: now,
     ...overrides,
   };
+}
+
+/**
+ * 直接插一条 `promoted_from` 列留空、载荷里有来源的技能行——**迁移前那批数据的形状**。
+ *
+ * 必须绕开仓库的写入路径（`saveSkill` / `saveSkillIfAbsent` 都会带上那一列），否则造不出
+ * 对账真正要处理的形状。
+ */
+async function insertLegacySkillRow(
+  pool: SqlPool,
+  role_id: string,
+  skill: SkillRecord,
+  vector: number[],
+): Promise<void> {
+  await insertSkillRow(pool, role_id, skill, vector, null);
+}
+
+/** 插一条技能行，`promoted_from` 列按给定值写入（null = 迁移前的形状） */
+async function insertSkillRow(
+  pool: SqlPool,
+  role_id: string,
+  skill: SkillRecord,
+  vector: number[],
+  promoted_from: string | null,
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO memory_skills (id, role_id, payload, description_embedding, promoted_from)
+     VALUES ($1::uuid, $2, $3::jsonb, $4::vector, $5::uuid)`,
+    [skill.id, role_id, JSON.stringify(skill), `[${vector.join(',')}]`, promoted_from],
+  );
+}
+
+/** 读 `promoted_from` **列**（不是载荷）：归属校验与幂等键读的都是它 */
+async function readPromotedFromColumn(pool: SqlPool, skill_id: string): Promise<string | null> {
+  const result = await pool.query<{ promoted_from: string | null }>(
+    `SELECT promoted_from FROM memory_skills WHERE id = $1::uuid`,
+    [skill_id],
+  );
+  return result.rows[0]?.promoted_from ?? null;
+}
+
+/** 读载荷里的同名字段；键不存在时是 NULL（与「值为 null」同形） */
+async function readPayloadPromotedFrom(pool: SqlPool, skill_id: string): Promise<string | null> {
+  const result = await pool.query<{ promoted_from: string | null }>(
+    `SELECT payload->>'promoted_from' AS promoted_from FROM memory_skills WHERE id = $1::uuid`,
+    [skill_id],
+  );
+  return result.rows[0]?.promoted_from ?? null;
+}
+
+/**
+ * 数行数用 SQL 而不是 `listSkills`：对账**跑之前**的行可能整条读不出来（载荷里的来源是
+ * 非法 UUID 时 `SkillRecordSchema` 直接解析失败），而这些用例正是要在那种状态下取数——
+ * 混进仓库读路径的解析行为，就把「对账是否幂等」和「载荷读不读得懂」搅成了一件事。
+ */
+async function countSkillRows(pool: SqlPool, role_id: string): Promise<number> {
+  const result = await pool.query<{ total: number }>(
+    `SELECT count(*)::int AS total FROM memory_skills WHERE role_id = $1`,
+    [role_id],
+  );
+  return result.rows[0]?.total ?? 0;
 }
 
 describe('PgMemoryRepository on embedded PGlite', () => {
@@ -537,6 +599,337 @@ describe('PgMemoryRepository on embedded PGlite', () => {
       skill_count: 0,
       promoted_skill_count: 0,
     });
+  });
+
+  /**
+   * `updateSkill` 覆盖的是整条技能记录，而 PG 把来源另存成了一列。两处必须一起走：
+   * 归属校验（completePromotion 的引用判据）读的是列，按载荷读的内存实现与它就会分叉。
+   */
+  it('updateSkill 同步写入 promoted_from 列：改来源两个地方都跟着变，清空时列写 NULL', async () => {
+    const role_id = `role_pglite_update_promoted_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Update Promoted From' });
+    const experience = createExperience(role_id);
+    const other = createExperience(role_id);
+    await repository.saveExperience(role_id, experience);
+    await repository.saveExperience(role_id, other);
+
+    const saved = await repository.saveSkillIfAbsent(
+      role_id,
+      createSkill(role_id, { promoted_from: experience.id, review_status: 'pending' }),
+    );
+    expect(await readPromotedFromColumn(pool, saved.skill.id)).toBe(experience.id);
+
+    await repository.updateSkill(role_id, { ...saved.skill, promoted_from: other.id });
+    expect(await readPromotedFromColumn(pool, saved.skill.id)).toBe(other.id);
+    expect(await readPayloadPromotedFrom(pool, saved.skill.id)).toBe(other.id);
+
+    // 清空来源：列是 NULL，载荷里连这个键都不该留（两种读法都读作「没有来源」）
+    await repository.updateSkill(role_id, { ...saved.skill, promoted_from: undefined });
+    expect(await readPromotedFromColumn(pool, saved.skill.id)).toBeNull();
+    expect(await readPayloadPromotedFrom(pool, saved.skill.id)).toBeNull();
+  });
+
+  it('改来源撞上唯一键：整条更新失败，载荷与列都停在改之前', async () => {
+    const role_id = `role_pglite_update_conflict_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Update Conflict' });
+    const first = createExperience(role_id);
+    const second = createExperience(role_id);
+    await repository.saveExperience(role_id, first);
+    await repository.saveExperience(role_id, second);
+
+    const firstSkill = await repository.saveSkillIfAbsent(
+      role_id,
+      createSkill(role_id, { promoted_from: first.id, review_status: 'pending' }),
+    );
+    const secondSkill = await repository.saveSkillIfAbsent(
+      role_id,
+      createSkill(role_id, { promoted_from: second.id, review_status: 'pending' }),
+    );
+
+    await expect(
+      repository.updateSkill(role_id, {
+        ...secondSkill.skill,
+        promoted_from: first.id,
+        content: 'mutated content body',
+      }),
+    ).rejects.toThrow(/promoted_from=.*already exists/);
+
+    // 列、载荷、内容三处都停在改之前——没有「列改了、载荷没改」这种半截状态
+    expect(await readPromotedFromColumn(pool, secondSkill.skill.id)).toBe(second.id);
+    expect(await readPayloadPromotedFrom(pool, secondSkill.skill.id)).toBe(second.id);
+    expect(await readPromotedFromColumn(pool, firstSkill.skill.id)).toBe(first.id);
+    const stored = (await repository.listSkills(role_id)).find(
+      (item) => item.id === secondSkill.skill.id,
+    );
+    expect(stored?.content).toBe(secondSkill.skill.content);
+  });
+
+  /**
+   * 对账：列是后加的，迁移前写入的技能只把来源放在载荷 JSONB 里。不管的话这些技能在晋升归属
+   * 校验里等于「没有来源」（判据读的是列），经验永远绑不上它们已经指向的技能。
+   */
+  it('schema 初始化把存量载荷里的 promoted_from 回填进列', async () => {
+    const role_id = `role_pglite_backfill_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Backfill Agent' });
+    const experience = createExperience(role_id);
+    await repository.saveExperience(role_id, experience);
+
+    const legacy = createSkill(role_id, { promoted_from: experience.id });
+    await insertLegacySkillRow(pool, role_id, legacy, await embedding.embed(legacy.description));
+    expect(await readPromotedFromColumn(pool, legacy.id)).toBeNull();
+
+    await ensurePgMemorySchema(pool, embedding.dimensions);
+
+    expect(await readPromotedFromColumn(pool, legacy.id)).toBe(experience.id);
+    // 载荷本来就认这个来源，因此一个字都没被改
+    expect(await readPayloadPromotedFrom(pool, legacy.id)).toBe(experience.id);
+  });
+
+  /**
+   * 修复前的 `updateSkill` 只写载荷、不动列，于是「列停在旧来源、载荷已经是新来源」是存量库里
+   * 的常态。分歧一律以载荷为准（见 pg-memory-schema.ts 的长注释）：载荷是前端、检索与导出读的
+   * 那一份，列永远只是它的落后一半。
+   */
+  it('列停在旧来源、载荷是新来源：迁移以载荷为准，两处都同步成新值', async () => {
+    const role_id = `role_pglite_reconcile_stale_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Reconcile Stale Agent' });
+    const oldSource = createExperience(role_id);
+    const newSource = createExperience(role_id);
+    await repository.saveExperience(role_id, oldSource);
+    await repository.saveExperience(role_id, newSource);
+
+    const skill = createSkill(role_id, { promoted_from: newSource.id });
+    await insertSkillRow(
+      pool,
+      role_id,
+      skill,
+      await embedding.embed(skill.description),
+      oldSource.id,
+    );
+    expect(await readPromotedFromColumn(pool, skill.id)).toBe(oldSource.id);
+
+    await ensurePgMemorySchema(pool, embedding.dimensions);
+
+    expect(await readPromotedFromColumn(pool, skill.id)).toBe(newSource.id);
+    expect(await readPayloadPromotedFrom(pool, skill.id)).toBe(newSource.id);
+  });
+
+  /**
+   * 两条 keep 行的列值互换：A 的列停在 X 而载荷已经是 Y，B 的载荷恰好是 X。一条语句里
+   * 「清列 + 写新值」会在中途撞上唯一索引（Postgres 的唯一索引不延迟检查），所以对账拆成
+   * 先清后填——这条用例就是那个顺序的回归点。
+   */
+  it('列上停着另一行的来源：两条各自归位，唯一索引没有在中途被撞破', async () => {
+    const role_id = `role_pglite_reconcile_swap_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Reconcile Swap Agent' });
+    const sourceX = createExperience(role_id);
+    const sourceY = createExperience(role_id);
+    await repository.saveExperience(role_id, sourceX);
+    await repository.saveExperience(role_id, sourceY);
+
+    // A 的载荷说 Y、列还停在 X；B 的载荷说 X、列是空的（X 此刻被 A 占着）
+    const a = createSkill(role_id, { promoted_from: sourceY.id });
+    await insertSkillRow(pool, role_id, a, await embedding.embed(a.description), sourceX.id);
+    const b = createSkill(role_id, { promoted_from: sourceX.id });
+    await insertLegacySkillRow(pool, role_id, b, await embedding.embed(b.description));
+
+    await expect(ensurePgMemorySchema(pool, embedding.dimensions)).resolves.toBeUndefined();
+
+    expect(await readPromotedFromColumn(pool, a.id)).toBe(sourceY.id);
+    expect(await readPromotedFromColumn(pool, b.id)).toBe(sourceX.id);
+    expect(await readPayloadPromotedFrom(pool, a.id)).toBe(sourceY.id);
+    expect(await readPayloadPromotedFrom(pool, b.id)).toBe(sourceX.id);
+  });
+
+  /**
+   * 载荷里缺失或不是合法 UUID 的来源：初始化不许崩（崩了整个记忆后端起不来），而这类行的终局
+   * 是「没有来源」——列清成 NULL，载荷里那个字段也一并删掉。两处一起清才叫不再分裂：只清列的
+   * 话 `listSkills()` 还会把一个读不懂的旧值当来源（Zod 直接解析失败）。
+   */
+  it('列有值但载荷缺失或非法：初始化不失败，迁移后两处都不留下来源', async () => {
+    const role_id = `role_pglite_reconcile_sourceless_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Reconcile Sourceless Agent' });
+
+    // 载荷里根本没有这个键（市场导入等路径写出来的形状），列上却停着一个旧来源
+    const keyless = createSkill(role_id);
+    await insertSkillRow(
+      pool,
+      role_id,
+      keyless,
+      await embedding.embed(keyless.description),
+      randomUUID(),
+    );
+    // 载荷里是个读不懂的字符串：迁移前 `listSkills()` 会在这一行上解析失败
+    const invalid = createSkill(role_id, { promoted_from: 'legacy-opaque-reference' });
+    await insertSkillRow(
+      pool,
+      role_id,
+      invalid,
+      await embedding.embed(invalid.description),
+      randomUUID(),
+    );
+
+    await expect(ensurePgMemorySchema(pool, embedding.dimensions)).resolves.toBeUndefined();
+
+    for (const skill of [keyless, invalid]) {
+      expect(await readPromotedFromColumn(pool, skill.id)).toBeNull();
+      expect(await readPayloadPromotedFrom(pool, skill.id)).toBeNull();
+    }
+    // 两条读法就此一致：记录读得出来，且都判作「没有来源」
+    const stored = await repository.listSkills(role_id);
+    expect(stored).toHaveLength(2);
+    expect(stored.every((item) => item.promoted_from === undefined)).toBe(true);
+  });
+
+  /**
+   * 同一 role 内两条旧技能指向同一来源：唯一索引随后就要建，若把两行都留着，`CREATE UNIQUE
+   * INDEX` 会直接失败，整个记忆后端起不来。留一条（id 最小的那条），被淘汰的那条**列和载荷
+   * 都清掉**——只清列的话它仍然以载荷的形式持有同一个来源，同一来源的两个持有者只是换了个地方。
+   */
+  it('同一 role 的重复来源只留 id 最小的一条，被淘汰的列与载荷都清掉', async () => {
+    const role_id = `role_pglite_backfill_dupe_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Backfill Duplicate Agent' });
+    const experience = createExperience(role_id);
+    await repository.saveExperience(role_id, experience);
+
+    const candidates = [
+      createSkill(role_id, { promoted_from: experience.id }),
+      createSkill(role_id, { promoted_from: experience.id }),
+    ].sort((left, right) => (left.id < right.id ? -1 : 1));
+    const keeper = candidates[0]!;
+    const loser = candidates[1]!;
+    await insertLegacySkillRow(pool, role_id, keeper, await embedding.embed(keeper.description));
+    // 被淘汰的那条列上还停着另一个来源：迁移后它不许再从任何一处暴露来源
+    await insertSkillRow(
+      pool,
+      role_id,
+      loser,
+      await embedding.embed(loser.description),
+      randomUUID(),
+    );
+
+    await expect(ensurePgMemorySchema(pool, embedding.dimensions)).resolves.toBeUndefined();
+
+    expect(await readPromotedFromColumn(pool, keeper.id)).toBe(experience.id);
+    expect(await readPayloadPromotedFrom(pool, keeper.id)).toBe(experience.id);
+    expect(await readPromotedFromColumn(pool, loser.id)).toBeNull();
+    expect(await readPayloadPromotedFrom(pool, loser.id)).toBeNull();
+
+    // 读路径与幂等键说同一件事：同一 role 里只有一条技能带着这个来源
+    const stored = await repository.listSkills(role_id);
+    expect(stored.find((item) => item.id === keeper.id)?.promoted_from).toBe(experience.id);
+    expect(stored.find((item) => item.id === loser.id)?.promoted_from).toBeUndefined();
+
+    // 索引真的在：再插一条同来源的行会被挡下来（被淘汰的行没有伪装成可用的幂等键）
+    const intruder = createSkill(role_id, { promoted_from: experience.id });
+    await expect(
+      insertSkillRow(
+        pool,
+        role_id,
+        intruder,
+        await embedding.embed(intruder.description),
+        experience.id,
+      ),
+    ).rejects.toThrow();
+  });
+
+  /**
+   * 对账跑完之后，三条读路必须认同一个来源：`listSkills()`（读载荷）、唯一键（读列）、
+   * `completePromotion()` 的引用校验（读列）。它们曾经可以各说各话——技能在前端显示「来自经验
+   * E」，而晋升回写回一句「技能不是来自这条经验」——这条用例把两者钉在一起。
+   */
+  it('迁移后的来源对三条读路是同一件事：listSkills 与 completePromotion 都认它', async () => {
+    const role_id = `role_pglite_reconcile_reads_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Reconcile Reads Agent' });
+    const experience = createExperience(role_id);
+    await repository.saveExperience(role_id, experience);
+
+    const skill = createSkill(role_id, { promoted_from: experience.id, review_status: 'pending' });
+    await insertLegacySkillRow(pool, role_id, skill, await embedding.embed(skill.description));
+
+    await ensurePgMemorySchema(pool, embedding.dimensions);
+
+    const listed = (await repository.listSkills(role_id)).find((item) => item.id === skill.id);
+    expect(listed?.promoted_from).toBe(experience.id);
+    expect(await readPromotedFromColumn(pool, skill.id)).toBe(experience.id);
+
+    const claimed = (await repository.claimNextPromotionCandidate({
+      role_id,
+      owner: 'worker-1',
+      now: '2026-10-10T12:00:00.000Z',
+      lease_ms: 60_000,
+      strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+      approval: 'auto_approve',
+    }))!;
+    expect(claimed.experience.id).toBe(experience.id);
+
+    const settled = await repository.completePromotion({
+      role_id,
+      experience_id: experience.id,
+      claim_token: claimed.claim_token,
+      outcome: 'promoted',
+      strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+      skill_id: skill.id,
+      reasons: ['qualifies'],
+      now: '2026-10-10T12:00:01.000Z',
+    });
+    expect(settled?.promoted_to).toBe(skill.id);
+  });
+
+  it('重复执行 schema 初始化是安全的：对账结果不变、索引还在、数据不动', async () => {
+    const role_id = `role_pglite_backfill_idempotent_${randomUUID()}`;
+    await repository.initializeAgent({ role_id, name: 'PGlite Backfill Idempotent Agent' });
+    const experience = createExperience(role_id);
+    const other = createExperience(role_id);
+    await repository.saveExperience(role_id, experience);
+    await repository.saveExperience(role_id, other);
+
+    // 四种形状各来一条：列为空 / 列停在另一个来源 / 载荷没有这个键 / 载荷不是合法 UUID。
+    // 第二次执行不能让第一次留下的任何一个终局发生变化。
+    const legacy = createSkill(role_id, { promoted_from: experience.id });
+    await insertLegacySkillRow(pool, role_id, legacy, await embedding.embed(legacy.description));
+    const stale = createSkill(role_id, { promoted_from: other.id });
+    await insertSkillRow(
+      pool,
+      role_id,
+      stale,
+      await embedding.embed(stale.description),
+      experience.id,
+    );
+    const keyless = createSkill(role_id);
+    await insertSkillRow(
+      pool,
+      role_id,
+      keyless,
+      await embedding.embed(keyless.description),
+      other.id,
+    );
+    const dirty = createSkill(role_id, { promoted_from: 'legacy-opaque-reference' });
+    await insertLegacySkillRow(pool, role_id, dirty, await embedding.embed(dirty.description));
+
+    await ensurePgMemorySchema(pool, embedding.dimensions);
+    const countsAfterFirst = await countSkillRows(pool, role_id);
+    const afterFirst = await repository.listSkills(role_id);
+
+    await ensurePgMemorySchema(pool, embedding.dimensions);
+    await ensurePgMemorySchema(pool, embedding.dimensions);
+
+    // 第一次的终局：两条真来源各归各位（列都从旧值改成载荷认的那个），没有来源的两条清空
+    expect(await readPromotedFromColumn(pool, legacy.id)).toBe(experience.id);
+    expect(await readPromotedFromColumn(pool, stale.id)).toBe(other.id);
+    expect(await readPayloadPromotedFrom(pool, stale.id)).toBe(other.id);
+    expect(await readPromotedFromColumn(pool, keyless.id)).toBeNull();
+    expect(await readPromotedFromColumn(pool, dirty.id)).toBeNull();
+    expect(await readPayloadPromotedFrom(pool, dirty.id)).toBeNull();
+    // 再跑两遍：载荷逐字节相同（对账第二次起是空操作，不是「每次都重写一遍」）
+    await expect(repository.listSkills(role_id)).resolves.toEqual(afterFirst);
+    // 行数不因为重复初始化而变多（对账是 UPDATE，不是补行）
+    expect(await countSkillRows(pool, role_id)).toBe(countsAfterFirst);
+
+    const indexes = await pool.query<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'memory_skills'`,
+    );
+    expect(indexes.rows.map((row) => row.indexname)).toContain('memory_skills_promoted_from_uniq');
   });
 });
 

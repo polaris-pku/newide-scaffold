@@ -66,6 +66,10 @@ import {
   type PromotionCandidateInput,
 } from '../services/promotion-candidates';
 import {
+  assertPromotedSkillReference,
+  type PromotedSkillFacts,
+} from '../services/promotion-integrity';
+import {
   applyFeedbackToExperience,
   averageConfidence,
   isFeedbackApplied,
@@ -870,20 +874,46 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  /**
+   * 覆盖写入一条技能：载荷、向量、以及 `promoted_from` 列**一起**更新。
+   *
+   * 列必须跟着载荷走：晋升归属校验（assertPromotedSkillReference）查的是列，幂等键也是列，
+   * 只写载荷会让「列说没有来源、载荷说是某条经验」这种分裂状态留在库里，于是完整性判据与
+   * 载荷各说各话——按载荷读的内存适配器认这条引用成立，按列读的 PG 认它不成立。
+   *
+   * 唯一键 (role_id, promoted_from) 靠下面这条部分唯一索引在这次 UPDATE 里兑现：改出来的
+   * 来源若与同 role 的另一条技能撞车，Postgres 整条语句失败，行的载荷、向量、列全都停在
+   * 改之前，不会留下「列改了、载荷没改」的半截状态。这里把驱动错误换成一句能直接看出
+   * 撞在哪儿的说明，与内存适配器报同一件事。
+   */
   async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
     await this.ensureSchema();
     const stored = await this.withDescriptionEmbedding(skill);
     SkillRecordSchema.parse(stored);
+    const promotedFrom = stored.promoted_from ?? null;
 
-    const result = await this.pool.query(
-      `UPDATE memory_skills
-       SET payload = $3::jsonb, description_embedding = $4::vector
-       WHERE role_id = $1 AND id = $2`,
-      [role_id, stored.id, JSON.stringify(stored), toPgVector(stored.description_embedding)],
-    );
-
-    if (result.rowCount === 0) {
-      throw new Error(`Skill not found: ${skill.id}`);
+    try {
+      const result = await this.pool.query(
+        `UPDATE memory_skills
+         SET payload = $3::jsonb, description_embedding = $4::vector, promoted_from = $5
+         WHERE role_id = $1 AND id = $2`,
+        [
+          role_id,
+          stored.id,
+          JSON.stringify(stored),
+          toPgVector(stored.description_embedding),
+          promotedFrom,
+        ],
+      );
+      if (result.rowCount === 0) {
+        throw new Error(`Skill not found: ${skill.id}`);
+      }
+    } catch (error) {
+      if (!isUniqueViolation(error) || promotedFrom === null) throw error;
+      throw new Error(
+        `Skill for promoted_from=${promotedFrom} already exists in ${role_id}; ` +
+          `skill ${stored.id} was left unchanged.`,
+      );
     }
   }
 
@@ -1079,6 +1109,24 @@ export class PgMemoryRepository implements MemoryRepository {
     return undefined;
   }
 
+  /**
+   * 落一条结论（processing → processed）。
+   *
+   * 与其余状态转移同一条骨架（role 临界区 + 条件写），只是多一条**跨实体引用校验**：
+   * `outcome='promoted'` 时 `promoted_to` 指向的技能必须存在、属于本 role、且来源就是这条
+   * 经验（判据见 services/promotion-integrity.ts）。校验点刻意放在凭据成立**之后**、写入
+   * **之前**：凭据不成立仍然是「这次没轮到我们」（返回 undefined，与既有 fencing 语义一致），
+   * 凭据成立才轮得到回答「这条引用成不成立」——不成立就抛，经验一个字节都不动，既没有结论
+   * 也没有 promoted_to。
+   *
+   * 「验过之后技能被删掉/被转走」的窗口由两件事一起关掉：校验跑在 role 临界区之内，且最终
+   * 那笔条件写的谓词里带着同一条技能的存在性（`expectedSkillId`）。条件写没写进去时才回头
+   * 复查一次——若复查发现引用已经不成立，那是完整性错误，不能伪装成「读到的这一版被别人
+   * 改过」那种「这次没轮到我们」。
+   *
+   * `promoted` 以外的结论不接受技能引用：调用方递来的 `skill_id` 既不进标记、也不进
+   * `promoted_to`。
+   */
   async completePromotion(
     request: PromotionCompletionRequest,
   ): Promise<ExperienceRecord | undefined> {
@@ -1086,35 +1134,46 @@ export class PgMemoryRepository implements MemoryRepository {
     if (request.outcome === 'promoted' && request.skill_id === undefined) {
       throw new Error('completePromotion requires a skill_id when the outcome is "promoted".');
     }
-    return this.transitionPromotion(request.role_id, request.experience_id, (current) => {
-      const marker = current.promotion;
-      if (!marker) return undefined;
-      const completed = completeDeliveryRecord(
-        {
-          ...marker,
-          outcome: request.outcome,
-          strategy_version: request.strategy_version,
-          evaluated_at: request.now,
-          skill_id: request.skill_id,
-          reasons: request.reasons,
-        },
-        {
-          ...(request.owner !== undefined ? { owner: request.owner } : {}),
-          claim_token: request.claim_token,
-          now: request.now,
-        },
-      );
-      if (!completed) return undefined;
-      return {
-        ...current,
-        promotion: completed,
-        // promoted_to 与结论在同一次条件写里落定：读到「Skill 已存在、经验还没绑上」的
-        // 中间态，会让人把它当成没晋升过再晋升一次
-        ...(request.outcome === 'promoted' && request.skill_id !== undefined
-          ? { promoted_to: request.skill_id }
-          : {}),
-      };
-    });
+    const promotedTo = request.outcome === 'promoted' ? request.skill_id : undefined;
+    return this.transitionPromotion(
+      request.role_id,
+      request.experience_id,
+      async (current) => {
+        const marker = current.promotion;
+        if (!marker) return undefined;
+        const completed = completeDeliveryRecord(
+          {
+            ...marker,
+            outcome: request.outcome,
+            strategy_version: request.strategy_version,
+            evaluated_at: request.now,
+            skill_id: promotedTo,
+            reasons: request.reasons,
+          },
+          {
+            ...(request.owner !== undefined ? { owner: request.owner } : {}),
+            claim_token: request.claim_token,
+            now: request.now,
+          },
+        );
+        if (!completed) return undefined;
+        if (promotedTo !== undefined) {
+          await this.assertPromotedSkillReference(
+            request.role_id,
+            request.experience_id,
+            promotedTo,
+          );
+        }
+        return {
+          ...current,
+          promotion: completed,
+          // promoted_to 与结论在同一次条件写里落定：读到「Skill 已存在、经验还没绑上」的
+          // 中间态，会让人把它当成没晋升过再晋升一次
+          ...(promotedTo !== undefined ? { promoted_to: promotedTo } : {}),
+        };
+      },
+      promotedTo,
+    );
   }
 
   async failPromotion(request: PromotionFailureRequest): Promise<ExperienceRecord | undefined> {
@@ -1174,19 +1233,83 @@ export class PgMemoryRepository implements MemoryRepository {
     });
   }
 
-  /** 读—判断—写的公共骨架：转移函数返回 undefined 就什么都不写 */
+  /**
+   * 促进晋升状态转移的公共骨架：role 临界区里「读 → 算出下一版 → 条件写」，转移函数返回
+   * undefined 就什么都不写。
+   *
+   * `apply` 允许是异步的：`completePromotion` 要在「凭据已成立、载荷还没写」之间再查一次
+   * 技能归属（见该方法）。这中间多出来的 await 不会削弱条件写的乐观并发——写下去的谓词
+   * 带的是**读到的这一版**，等待期间有人改过就写不进去，与同步回调是同一种结果。
+   *
+   * `expectedSkillId` 是可选的外部引用守卫：给了它，条件写的谓词里就多一条「这条技能仍然
+   * 存在、仍属于本 role、来源仍是这条经验」，因此不存在「刚验过就被删掉/被转走」的窗口。
+   */
   private async transitionPromotion(
     role_id: string,
     experience_id: string,
-    apply: (current: ExperienceRecord) => ExperienceRecord | undefined,
+    apply: (
+      current: ExperienceRecord,
+    ) => ExperienceRecord | undefined | Promise<ExperienceRecord | undefined>,
+    expectedSkillId?: string,
   ): Promise<ExperienceRecord | undefined> {
     return this.withRoleLock(role_id, async () => {
       const current = await this.readPromotionRow(role_id, experience_id);
       if (!current) return undefined;
-      const next = apply(current);
+      const next = await apply(current);
       if (!next) return undefined;
-      return this.writePromotionIfUnchanged(role_id, current, next);
+      const written = await this.writePromotionIfUnchanged(role_id, current, next, expectedSkillId);
+      if (written) return written;
+      // 条件写不进去有两种原因：读到的这一版经验被别人改过（凭据/载荷/聚合字段），那是
+      // 「这次没轮到我们」，返回 undefined 由调用方决定；或者刚验过的技能在写之前消失/
+      // 被转走了（校验之后到写入之间只有别的进程能插进来），那是完整性错误，不能伪装成
+      // 前一种让调用方以为稍后重试就轮得到它。
+      if (expectedSkillId !== undefined) {
+        await this.assertPromotedSkillReference(role_id, experience_id, expectedSkillId);
+      }
+      return undefined;
     });
+  }
+
+  /**
+   * 校验「这条经验要指向的那条技能」确实存在、确实属于这个 role、且来源就是这条经验。
+   *
+   * 按 id 单独查（不带 role 条件）是刻意的：**跨 role 引用**与**根本不存在**是两种不同的
+   * 完整性错误，带上 role 条件就会把前者读成后者，排查的人于是在「技能没了」这条错路上找。
+   * 归属判据本身在 services/promotion-integrity.ts（与内存适配器共用一份）。
+   *
+   * 查的是 `promoted_from` 列而不是载荷里的同名字段：完整性判据必须与幂等键同源，否则两者
+   * 可以各说各话。
+   */
+  private async assertPromotedSkillReference(
+    role_id: string,
+    experience_id: string,
+    skill_id: string,
+  ): Promise<void> {
+    assertPromotedSkillReference(
+      { role_id, experience_id, skill_id },
+      await this.readSkillFactsById(skill_id),
+    );
+  }
+
+  /**
+   * 读出一条技能与归属校验有关的事实；查不到（或 id 根本不是 uuid）返回 undefined。
+   *
+   * 形状判断不是多余的谨慎：`id = $1::uuid` 碰到非 uuid 文本时 Postgres 直接报
+   * `22P02 invalid_text_representation`，那会被通用分类读成「认不出来的失败」而白重投。
+   * 「格式不对」与「不存在」对调用方是同一个结论——这条引用成不成立都一样——所以合并。
+   */
+  private async readSkillFactsById(skill_id: string): Promise<PromotedSkillFacts | undefined> {
+    if (!UUID_PATTERN.test(skill_id)) return undefined;
+    const result = await this.pool.query<{ role_id: string; promoted_from: string | null }>(
+      `SELECT role_id, promoted_from FROM memory_skills WHERE id = $1::uuid`,
+      [skill_id],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      role_id: row.role_id,
+      promoted_from: row.promoted_from ?? undefined,
+    };
   }
 
   private async readPromotionRow(
@@ -1207,13 +1330,45 @@ export class PgMemoryRepository implements MemoryRepository {
    * 谓词分两段：前四个定位「读到的这一版晋升标记」（四者都为 NULL 时要求这条经验压根
    * 还没有晋升标记），后三个挡住「读之后有别的写路径改过这条经验」——晋升写回的是整份
    * 载荷，少了后三个就会把并发中刚应用上去的反馈整份抹掉。
+   *
+   * `expectedSkillId` 给了就再加一段：这条技能仍然存在、仍属于本 role、来源仍是这条经验。
+   * 这条引用是跨表的，`SELECT` 与 `UPDATE` 之间能插进来的只有别的进程（role 临界区管不到
+   * 它），所以判据必须**作为写入谓词出现**，而不是只在写之前查一次——否则技能刚被删掉/被
+   * 转移，引用照样落库，`promoted_to` 就成了指向别人的指针。
    */
   private async writePromotionIfUnchanged(
     role_id: string,
     current: ExperienceRecord,
     next: ExperienceRecord,
+    expectedSkillId?: string,
   ): Promise<ExperienceRecord | undefined> {
     const marker = current.promotion;
+    // $11 只可能来自 completePromotion：它在走到这里之前已经按 UUID_PATTERN 判过形状
+    // （见 readSkillFactsById），因此 ::uuid 转换没有报 22P02 的机会。$2 是刚刚 SELECT
+    // 到的经验 id，本来就是 uuid。
+    const skillGuard =
+      expectedSkillId === undefined
+        ? ''
+        : `
+         AND EXISTS (
+           SELECT 1 FROM memory_skills AS guarded
+           WHERE guarded.id = $11::uuid
+             AND guarded.role_id = $1
+             AND guarded.promoted_from = $2::uuid
+         )`;
+    const params = [
+      role_id,
+      current.id,
+      JSON.stringify(next),
+      marker?.status ?? null,
+      marker === undefined ? null : String(marker.attempt_count),
+      marker?.claim_token ?? null,
+      marker?.updated_at ?? null,
+      current.updated_at,
+      String(current.confidence),
+      String(current.referenced_count),
+    ];
+    if (expectedSkillId !== undefined) params.push(expectedSkillId);
     const result = await this.pool.query<{ payload: unknown }>(
       `UPDATE memory_experiences
        SET payload = $3::jsonb
@@ -1224,20 +1379,9 @@ export class PgMemoryRepository implements MemoryRepository {
          AND payload->'promotion'->>'updated_at' IS NOT DISTINCT FROM $7
          AND payload->>'updated_at' = $8
          AND payload->>'confidence' = $9
-         AND payload->>'referenced_count' = $10
+         AND payload->>'referenced_count' = $10${skillGuard}
        RETURNING payload`,
-      [
-        role_id,
-        current.id,
-        JSON.stringify(next),
-        marker?.status ?? null,
-        marker === undefined ? null : String(marker.attempt_count),
-        marker?.claim_token ?? null,
-        marker?.updated_at ?? null,
-        current.updated_at,
-        String(current.confidence),
-        String(current.referenced_count),
-      ],
+      params,
     );
     const row = result.rows[0];
     return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
@@ -1513,6 +1657,14 @@ function isUniqueViolation(error: unknown): boolean {
     (error as { code: string }).code === '23505'
   );
 }
+
+/**
+ * uuid 的形状判据（`memory_skills.id` 是 uuid 列）。
+ *
+ * 用处只有一个：把「不是 uuid」的引用挡在 `::uuid` 转换之前，让它以「不存在」的结论落在
+ * 完整性错误上，而不是让 Postgres 报 22P02、被通用分类读成可重试的下游故障。
+ */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ═══════════════════════════════════════════
 //  反馈应用的事务内读写（都走同一个 client）
