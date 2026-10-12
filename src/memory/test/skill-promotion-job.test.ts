@@ -74,8 +74,12 @@ import type {
   PromotionDecision,
   PromotionEvaluationInput,
   PromotionStrategy,
+  PromotionVerdict,
 } from '../ports/promotion-strategy';
-import type { SkillPromotionJobOptions } from '../ports/skill-promotion-job';
+import type {
+  PromotionCandidateStatus,
+  SkillPromotionJobOptions,
+} from '../ports/skill-promotion-job';
 import type { ExperienceRecord } from '../schemas';
 import type { SqlPool } from '../ports/sql-pool';
 
@@ -377,6 +381,19 @@ describe('assertPromotionDecisionConsistent — 运行时判定契约', () => {
         expected,
       ),
     ).not.toThrow();
+    // rejected 与审核模式无关：两种模式下都是同一个结论，因此两种配对都合法
+    expect(() =>
+      assertPromotionDecisionConsistent(
+        {
+          ...legalDecision(),
+          verdict: 'rejected',
+          approval: 'manual_review',
+          reasons: ['confidence 0.5 does not exceed the threshold.'],
+          blocking_rules: ['below_confidence_threshold'],
+        },
+        { ...expected, approval: 'manual_review' },
+      ),
+    ).not.toThrow();
   });
 
   it('每一类非法值都落在它自己的 violation 上，错误里带着 expected / actual / 经验 id', () => {
@@ -479,6 +496,9 @@ describe('assertPromotionDecisionConsistent — 运行时判定契约', () => {
       expect(error.contract_code, testCase.name).toBe(PROMOTION_DECISION_CONTRACT_CODE);
       // 经验 id 即使判定自身给不出也要能报出来：本次执行被 claim 给了谁，调用方知道
       expect(error.experience_id, testCase.name).toBe(experience_id);
+      // 只有配对那一类 violation 会在错误对象上带这两个值，其余保持缺席
+      expect(error.verdict, testCase.name).toBeUndefined();
+      expect(error.approval, testCase.name).toBeUndefined();
       expect(error.expected.length, testCase.name).toBeGreaterThan(0);
       // actual 有可能是空串（空版本/空经验 id 正是被拒的那一类值），因此这里只要求它被渲染
       // 进消息里；具体值由每个用例的 needle 钉住
@@ -533,6 +553,53 @@ describe('assertPromotionDecisionConsistent — 运行时判定契约', () => {
     for (const testCase of cases) {
       const error = violationOf(testCase.decision, { approval: testCase.approval });
       expect(error.violation, testCase.name).toBe('verdict_combination');
+    }
+  });
+
+  it('结论与审核模式必须配对：eligible 只配 auto_approve，pending_review 只配 manual_review', () => {
+    // 两个字段各自都合法、合起来却在说一件不可能的事。这里把 approval 报成「本次运行的那一个」
+    // （因此前面那条与运行对账的检查放行），被拒的唯一理由只剩配对——失败能干净地归因到这一条。
+    const cases: Array<{
+      name: string;
+      verdict: PromotionVerdict;
+      approval: PromotionApprovalMode;
+      expected: string;
+    }> = [
+      {
+        name: 'eligible + manual_review（会让执行内核在只许记录的模式下写 Skill）',
+        verdict: 'eligible',
+        approval: 'manual_review',
+        expected: 'eligible + auto_approve',
+      },
+      {
+        name: 'pending_review + auto_approve（会把该自动晋升的候选冻结成人再看一眼）',
+        verdict: 'pending_review',
+        approval: 'auto_approve',
+        expected: 'pending_review + manual_review',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const actual = `${testCase.verdict} + ${testCase.approval}`;
+      const error = violationOf(
+        { ...legalDecision(), verdict: testCase.verdict, approval: testCase.approval },
+        { approval: testCase.approval },
+      );
+
+      // 稳定标识分两个：配对（verdict_approval）与结论和数组的搭配（verdict_combination）
+      // 指向两种修法，聚合时不该混成一句「组合不对」
+      expect(error.violation, testCase.name).toBe('verdict_approval');
+      expect(error.contract_code, testCase.name).toBe(PROMOTION_DECISION_CONTRACT_CODE);
+      expect(error.experience_id, testCase.name).toBe(experience_id);
+      // 判定自报的那两个值单独挂在错误对象上：合成一个字符串之后就不好跨 run 计数了
+      expect(error.verdict, testCase.name).toBe(testCase.verdict);
+      expect(error.approval, testCase.name).toBe(testCase.approval);
+      // expected / actual 是给人读的两个组合串（该配哪一对、实际交回来哪一对）
+      expect(error.expected, testCase.name).toBe(testCase.expected);
+      expect(error.actual, testCase.name).toBe(actual);
+      expect(error.message, testCase.name).toContain(testCase.verdict);
+      expect(error.message, testCase.name).toContain(testCase.approval);
+      expect(error.message, testCase.name).toContain('not retried');
     }
   });
 
@@ -1165,6 +1232,326 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       expect(stored?.promotion?.outcome).toBeUndefined();
       expect(stored?.promoted_to).toBeUndefined();
       expect(stored?.promotion?.status).toBe('dead_letter');
+    });
+
+    it('判定的结论与审核模式配不上对（eligible + manual_review）：不写 Skill、不写成功结论，进死信', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const experience = experiences[0]!;
+      // 底稿取真结论：人工审核模式下真策略给的是 pending_review，这里只把结论改成 eligible。
+      // 「本次运行只被授权记录」这一点没变，变的只有策略自称的那个结论——因此若校验漏了这一格，
+      // 执行内核会照 eligible 走晋升分支，在一次无权写 Skill 的运行里把它写出来。
+      const lying = illegalDecisionStrategy(autoApprove, (decision) => ({
+        ...decision,
+        verdict: 'eligible',
+      }));
+
+      const result = await job({ strategy: lying }).run({ batchSize: 5, approval: 'manual_review' });
+
+      expect(result.approval).toBe('manual_review');
+      expect(result.outcomes[0]?.status).toBe('dead_letter');
+      expect(result.outcomes[0]?.failure).toMatchObject({
+        code: 'payload_unreadable',
+        retryable: false,
+      });
+      // 判定本身留在审计里：人要看的是策略到底交回了哪一对
+      expect(result.outcomes[0]?.decision?.verdict).toBe('eligible');
+      expect(result.outcomes[0]?.decision?.approval).toBe('manual_review');
+      const reported = result.outcomes[0]?.failure?.message ?? '';
+      expect(reported).toContain('verdict_approval');
+      expect(reported).toContain('eligible');
+      expect(reported).toContain('manual_review');
+      // 这一条是死信：既不是完成，也不是重投
+      expect(result.counts).toMatchObject({
+        claimed_count: 1,
+        dead_letter_count: 1,
+        completed_count: 0,
+        retried_count: 0,
+        failure_count: 0,
+      });
+
+      // 没有 Skill，也没有任何一种成功结论落到经验上
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await storedExperience(experience.id);
+      expect(promotionStateLabel(stored!)).toBe('dead_letter');
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(stored?.promotion?.strategy_version).toBeUndefined();
+      expect(stored?.promotion?.skill_id).toBeUndefined();
+      expect(stored?.promotion?.next_retry_at).toBeUndefined();
+      expect(stored?.promoted_to).toBeUndefined();
+      expect(stored?.promotion?.attempt_count).toBe(1);
+
+      // 死信只由人工放回：后续自动运行不会再 claim 它（也就不会反复问同一份错判定）
+      const again = await job({ strategy: lying }).run({ batchSize: 5, approval: 'manual_review' });
+      expect(again.counts.claimed_count).toBe(0);
+      expect(again.outcomes).toHaveLength(0);
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+    });
+
+    it('判定的结论与审核模式配不上对（pending_review + auto_approve）：不把合格候选冻结成待审核，进死信', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      // 底稿是真结论（自动批准模式下合格 → eligible），只把结论改成 pending_review：若不拦，
+      // 一个本该自动晋升的候选会被记成等人工放行，而这条运行里已经没有任何东西会再放行它
+      const lying = illegalDecisionStrategy(autoApprove, (decision) => ({
+        ...decision,
+        verdict: 'pending_review',
+      }));
+
+      const result = await job({ strategy: lying }).run({ batchSize: 5 });
+
+      expect(result.approval).toBe('auto_approve');
+      expect(result.outcomes[0]?.status).toBe('dead_letter');
+      expect(result.outcomes[0]?.failure).toMatchObject({
+        code: 'payload_unreadable',
+        retryable: false,
+      });
+      expect(result.outcomes[0]?.decision?.verdict).toBe('pending_review');
+      expect(result.counts).toMatchObject({
+        claimed_count: 1,
+        dead_letter_count: 1,
+        completed_count: 0,
+        retried_count: 0,
+      });
+
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await storedExperience(experiences[0]!.id);
+      // 既不是待审核结论（那会把这条线冻住），也不是已晋升
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(promotionStateLabel(stored!)).toBe('dead_letter');
+      expect(stored?.promoted_to).toBeUndefined();
+
+      const again = await job({ strategy: lying }).run({ batchSize: 5 });
+      expect(again.counts.claimed_count).toBe(0);
+      expect(again.outcomes).toHaveLength(0);
+    });
+
+    it('同一批里配不上对的判定只影响它自己：同批的另一条照常晋升', async () => {
+      const experiences = await seedExperiences(repository, role_id, 2);
+      const first = experiences[0]!;
+      const second = experiences[1]!;
+      // 只对第一条交出配不上对的结论（pending_review 落在自动批准模式下），第二条走真结论：
+      // 一条配置错不该把同批的候选一起拖下水
+      const lying = illegalDecisionStrategy(autoApprove, (decision, input) =>
+        input.experience.id === first.id ? { ...decision, verdict: 'pending_review' } : decision,
+      );
+
+      const result = await job({ strategy: lying }).run({ batchSize: 5 });
+
+      expect(result.outcomes.map((item) => item.status)).toEqual(['dead_letter', 'promoted']);
+      expect(result.counts).toMatchObject({
+        claimed_count: 2,
+        completed_count: 1,
+        dead_letter_count: 1,
+        retried_count: 0,
+        failure_count: 0,
+      });
+
+      const rejected = await storedExperience(first.id);
+      expect(promotionStateLabel(rejected!)).toBe('dead_letter');
+      expect(rejected?.promoted_to).toBeUndefined();
+      expect(rejected?.promotion?.outcome).toBeUndefined();
+
+      const promoted = await storedExperience(second.id);
+      expect(promoted?.promotion?.outcome).toBe('promoted');
+      const skills = await repository.listSkills(role_id);
+      expect(skills).toHaveLength(1);
+      expect(promoted?.promoted_to).toBe(skills[0]?.id);
+    });
+
+    it('直接调执行内核：配不上对的结论照样被拦住（契约不由外壳代为执行）', async () => {
+      const experiences = await seedExperiences(repository, role_id, 2);
+      const cases: Array<{
+        name: string;
+        approval: PromotionApprovalMode;
+        verdict: PromotionVerdict;
+      }> = [
+        { name: 'eligible + manual_review', approval: 'manual_review', verdict: 'eligible' },
+        {
+          name: 'pending_review + auto_approve',
+          approval: 'auto_approve',
+          verdict: 'pending_review',
+        },
+      ];
+
+      for (const [index, testCase] of cases.entries()) {
+        const experience = experiences[index]!;
+        const claimed = await repository.claimNextPromotionCandidate({
+          role_id,
+          owner: 'worker-1',
+          now: clock.now(),
+          lease_ms: DEFAULT_DELIVERY_LEASE_MS,
+          strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+          approval: testCase.approval,
+        });
+        expect(claimed?.experience.id, testCase.name).toBe(experience.id);
+
+        const result = await executePromotionCandidate(
+          {
+            repository,
+            strategy: illegalDecisionStrategy(autoApprove, (decision) => ({
+              ...decision,
+              verdict: testCase.verdict,
+            })),
+            now: clock.now,
+          },
+          claimed!,
+          { approval: testCase.approval, now: clock.now() },
+        );
+
+        expect(result.status, testCase.name).toBe('dead_letter');
+        expect(result.failure, testCase.name).toMatchObject({
+          code: 'payload_unreadable',
+          retryable: false,
+        });
+        expect(result.failure?.message, testCase.name).toContain('verdict_approval');
+        // 审计里留着策略交回来的那一对
+        expect(result.decision?.verdict, testCase.name).toBe(testCase.verdict);
+        expect(result.decision?.approval, testCase.name).toBe(testCase.approval);
+      }
+
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await repository.listExperiences(role_id);
+      expect(stored.every((item) => item.promotion?.status === 'dead_letter')).toBe(true);
+      expect(stored.every((item) => item.promotion?.outcome === undefined)).toBe(true);
+      expect(stored.every((item) => item.promoted_to === undefined)).toBe(true);
+    });
+
+    it('dry run：配不上对的结论记成 failed，不 claim、不落盘、计数全为零', async () => {
+      const cases: Array<{
+        name: string;
+        approval: PromotionApprovalMode;
+        verdict: PromotionVerdict;
+      }> = [
+        { name: 'eligible + manual_review', approval: 'manual_review', verdict: 'eligible' },
+        {
+          name: 'pending_review + auto_approve',
+          approval: 'auto_approve',
+          verdict: 'pending_review',
+        },
+      ];
+
+      for (const testCase of cases) {
+        const caseRole = `role_promotion_pairing_dryrun_${randomUUID()}`;
+        await repository.initializeAgent({ role_id: caseRole, name: 'Contract Pairing Agent' });
+        await seedExperiences(repository, caseRole, 2);
+        const before = await repository.listExperiences(caseRole);
+        const lying = illegalDecisionStrategy(autoApprove, (decision) => ({
+          ...decision,
+          verdict: testCase.verdict,
+        }));
+
+        const result = await job({ strategy: lying, role_id: caseRole }).run({
+          dryRun: true,
+          batchSize: 5,
+          approval: testCase.approval,
+        });
+
+        expect(result.dry_run, testCase.name).toBe(true);
+        // 演练里非法配对是 failed：不是 promoted / pending_review / rejected 里的任何一个，
+        // 也不是死信（演练不写终态）
+        expect(result.outcomes.map((item) => item.status), testCase.name).toEqual([
+          'failed',
+          'failed',
+        ]);
+        for (const outcome of result.outcomes) {
+          expect(outcome.failure, testCase.name).toMatchObject({
+            code: 'payload_unreadable',
+            retryable: false,
+          });
+          expect(outcome.failure?.message, testCase.name).toContain('verdict_approval');
+          expect(outcome.decision?.verdict, testCase.name).toBe(testCase.verdict);
+          expect(outcome.decision?.approval, testCase.name).toBe(testCase.approval);
+          // 诊断信息留在 warning 里：演练的结论是给人读的投影
+          const warnings = outcome.warnings.join(' ');
+          expect(warnings, testCase.name).toContain('verdict_approval');
+          expect(warnings, testCase.name).toContain(testCase.verdict);
+          expect(warnings, testCase.name).toContain(testCase.approval);
+        }
+        // 计数全零：演练没有 claim、没有终局，也没有因为判定非法而多出一次失败
+        expect(result.counts, testCase.name).toEqual({
+          claimed_count: 0,
+          completed_count: 0,
+          retried_count: 0,
+          dead_letter_count: 0,
+          skipped_count: 0,
+          failure_count: 0,
+        });
+        expect(await repository.listSkills(caseRole), testCase.name).toHaveLength(0);
+        expect(await repository.listExperiences(caseRole), testCase.name).toEqual(before);
+      }
+    });
+
+    it('四种合法配对一切照旧：结论、Skill 与经验标记都不变', async () => {
+      const cases: Array<{
+        name: string;
+        approval: PromotionApprovalMode;
+        confidence: number;
+        expected: PromotionCandidateStatus;
+      }> = [
+        {
+          name: 'eligible + auto_approve',
+          approval: 'auto_approve',
+          confidence: 0.99,
+          expected: 'promoted',
+        },
+        {
+          name: 'pending_review + manual_review',
+          approval: 'manual_review',
+          confidence: 0.99,
+          expected: 'pending_review',
+        },
+        {
+          name: 'rejected + auto_approve',
+          approval: 'auto_approve',
+          confidence: 0.5,
+          expected: 'rejected',
+        },
+        {
+          name: 'rejected + manual_review',
+          approval: 'manual_review',
+          confidence: 0.5,
+          expected: 'rejected',
+        },
+      ];
+
+      for (const testCase of cases) {
+        const caseRole = `role_promotion_pairing_ok_${randomUUID()}`;
+        await repository.initializeAgent({ role_id: caseRole, name: 'Legal Pairing Agent' });
+        // 置信度决定底稿落在哪一格结论上：判定合格的两种配对与两种被拒的配对都要覆盖
+        const [experience] = await seedExperiences(repository, caseRole, 1, {
+          confidence: testCase.confidence,
+        });
+
+        const result = await job({ strategy: autoApprove, role_id: caseRole }).run({
+          batchSize: 5,
+          approval: testCase.approval,
+        });
+
+        expect(result.outcomes[0]?.status, testCase.name).toBe(testCase.expected);
+        expect(result.outcomes[0]?.failure, testCase.name).toBeUndefined();
+        expect(result.counts, testCase.name).toMatchObject({
+          claimed_count: 1,
+          completed_count: 1,
+          dead_letter_count: 0,
+          retried_count: 0,
+          failure_count: 0,
+        });
+
+        const skills = await repository.listSkills(caseRole);
+        const stored = (await repository.listExperiences(caseRole)).find(
+          (item) => item.id === experience?.id,
+        );
+        expect(stored?.promotion?.outcome, testCase.name).toBe(testCase.expected);
+        if (testCase.expected === 'promoted') {
+          // 自动批准写出的技能直接就是 approved（没有第二条补批准的路）
+          expect(skills, testCase.name).toHaveLength(1);
+          expect(skills[0]?.review_status, testCase.name).toBe('approved');
+          expect(stored?.promoted_to, testCase.name).toBe(skills[0]?.id);
+        } else {
+          // 只记结论：没有 Skill，也没有绑定
+          expect(skills, testCase.name).toHaveLength(0);
+          expect(stored?.promoted_to, testCase.name).toBeUndefined();
+        }
+      }
     });
 
     it('注入的策略自称 v9、它返回的判定却标着 v1：拒掉，且 run 记的是注入的 v9', async () => {

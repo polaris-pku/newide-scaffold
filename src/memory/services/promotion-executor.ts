@@ -34,12 +34,20 @@
  * 进死信，并在消息里带上期望值与实际值。校验刻意放在执行内核而不是 job 的入口：内核也可以
  * 被别的调用方（脚本、后续的调度器）直接使用，契约不该由某一个外壳代为执行。
  *
+ * 其中 `approval` 与 `verdict` 之间还有一道**语义配对**，单个字段各自合法也看不出来：
+ * `eligible` 只在自动批准下成立、`pending_review` 只在人工审核下成立、`rejected` 两者皆可。
+ * 一个 `eligible + manual_review` 的判定会让本文件走晋升分支，在一次只被授权「记下来」的
+ * 运行里写出 Skill 并把经验标成已晋升；反过来 `pending_review + auto_approve` 会把一个本该
+ * 自动晋升的合格候选冻结成待审核，而这条运行里已经没有任何东西会再放行它。两种都是「字段
+ * 各自合法、合起来自相矛盾」，因此与上面那一族一样，在写任何东西之前拒掉。
+ *
  * 这道契约在**运行时不靠类型**（`assertPromotionDecisionConsistent` 收的是 `unknown`）：注入
  * 的策略可以绕过 TypeScript 交回 `null`、标量，或一个 `verdict: 'typo'` 的对象。最贵的一种
  * 是这个拼错的 verdict——它是个普通字符串，会一路滑过「非 eligible、非 pending_review」的
  * 判断被写成一条正常的 `rejected` 结论，实现错误就此伪装成判决结果，也不会进死信。因此校验
  * 先按真值表判形状（对象 / 三个结论 / 两个审核模式 / 非空版本与非空经验 id / 两个数组的元素
- * 逐个判），再判结论组合，**最后**才与本次执行对账。`reasons` 与 `blocking_rules` 的元素级
+ * 逐个判），再判这份内部自洽不自洽（`verdict` 与 `approval` 配不配对、`verdict` 与两个数组搭不搭），
+ * **最后**才与本次执行对账。`reasons` 与 `blocking_rules` 的元素级
  * 检查同理：它们是审计里人读与聚合的两半，一个空串或一个不存在的规则名写进去就再也分辨不出
  * 「策略拒了它」和「策略写错了」。
  *
@@ -51,7 +59,7 @@
  * | Agent 不在了 | delivery_missing | 死信——重投不会让 Agent 回来 |
  * | 载荷解析不了（ZodError） | payload_unreadable | 死信——重投读到的是同一份坏数据 |
  * | 技能引用不成立（不存在 / 跨 Agent / 来源不符） | storage_error | 死信——重投不会让这条引用成立 |
- * | 策略返回的判定违反契约（形状 / 结论 / 版本 / 经验 id / 审核模式 / 数组元素 / 结论组合对不上） | payload_unreadable | 死信——同一次判定重投多少次都是同一份错结论 |
+ * | 策略返回的判定违反契约（形状 / 结论 / 版本 / 经验 id / 审核模式 / 数组元素 / 结论与审核模式配不上对 / 结论组合不搭） | payload_unreadable | 死信——同一次判定重投多少次都是同一份错结论 |
  * | 连接/超时类 errno | downstream_unavailable | 退避重投 |
  * | 权限/路径类 errno | storage_error | 死信 |
  * | Skill 写了、经验没回写 | storage_error（显式可重试）| 退避重投，重试复用同一条 Skill |
@@ -94,6 +102,7 @@ import {
   type PromotionBlockerRule,
   type PromotionDecision,
   type PromotionStrategy,
+  type PromotionVerdict,
 } from '../ports/promotion-strategy';
 import type { ExperienceRecord, PromotionOutcome, SkillRecord } from '../schemas';
 
@@ -296,6 +305,15 @@ export class PromotionDecisionContractError extends Error {
   readonly expected: string;
   readonly actual: string;
   readonly experience_id: string;
+  /**
+   * 违反的是**结论与审核模式的配对**（`verdict_approval`）时，判定自报的那两个值；其余
+   * violation 上为 undefined。
+   *
+   * 单列出来是因为它们合成一句话就不好聚合了：「哪一对组合被策略交回来了」是个可以跨 run
+   * 计数的量，而 `expected` / `actual` 里那两个是给人读的组合串。
+   */
+  readonly verdict: string | undefined;
+  readonly approval: string | undefined;
 
   constructor(
     message: string,
@@ -304,6 +322,8 @@ export class PromotionDecisionContractError extends Error {
       expected: string;
       actual: string;
       experience_id: string;
+      verdict?: string;
+      approval?: string;
     },
   ) {
     super(message);
@@ -312,6 +332,8 @@ export class PromotionDecisionContractError extends Error {
     this.expected = details.expected;
     this.actual = details.actual;
     this.experience_id = details.experience_id;
+    this.verdict = details.verdict;
+    this.approval = details.approval;
   }
 }
 
@@ -323,6 +345,25 @@ export function isPromotionDecisionContractError(
   if (typeof error !== 'object' || error === null) return false;
   return (error as { contract_code?: unknown }).contract_code === PROMOTION_DECISION_CONTRACT_CODE;
 }
+
+/**
+ * `verdict` 与 `approval` 的合法配对表。
+ *
+ * 三个 `verdict` 里有两个带着审核模式的语义：`eligible` 的定义就是「够格**且本次是自动批准**」，
+ * `pending_review` 的定义是「够格**且本次是人工审核**」，只有 `rejected`
+ * 与审核模式无关（不合格在哪一种模式下都是不合格）。把这张表写成 `Record<PromotionVerdict, …>`
+ * 而不是一串 if：契约新增一个结论时这里**先编译不过**，校验器不会因为漏了一格而放行一份
+ * 它没见过的判定。
+ *
+ * 配对判定放在「与本次执行对账」之后：跑到这一步时 `decision.approval` 已经和本次运行**相等**，
+ * 因此这条校验等价的读法是「结论必须是本次运行有权得到的那一个」——人工审核的运行只可能得到
+ * `pending_review` / `rejected`，自动批准的运行只可能得到 `eligible` / `rejected`。
+ */
+const VERDICT_APPROVAL_PAIRING: Record<PromotionVerdict, readonly PromotionApprovalMode[]> = {
+  eligible: ['auto_approve'],
+  pending_review: ['manual_review'],
+  rejected: ['auto_approve', 'manual_review'],
+};
 
 /**
  * 校验一条判定与本次执行是否自洽，不自洽就抛 `PromotionDecisionContractError`。
@@ -346,8 +387,13 @@ export function isPromotionDecisionContractError(
  * 4. **两个数组的形状** —— `reasons` 必须是非空字符串数组，`blocking_rules` 必须是已知规则
  *    名的数组。它们是审计里人读与聚合的两半，一个空串或一个不存在的规则名写进去，事后就
  *    分辨不出「策略拒了它」和「策略写错了」。
- * 5. **结论组合** —— `rejected` 必须给出挡住的规则与理由（否则「为什么被拒」不可审计），
- *    `eligible` / `pending_review` 不得带挡住的规则（合格就不该有规则挡着）。
+ * 5. **结论与审核模式的配对** —— 见 `VERDICT_APPROVAL_PAIRING`。两个字段各自都合法也可能
+ *    合起来在说一件不可能的事：`eligible + manual_review` 会在一次只被授权「记下来」的运行里
+ *    写出 Skill，`pending_review + auto_approve` 会把本该自动晋升的候选冻结成人再看一眼。
+ *    前者留下的是「经验已 promoted 而 Skill 停在 pending」这一类终态，后者留下的是一条再也
+ *    等不到放行的候选——两种都不是重投能改的，因此在写任何东西之前拒掉。
+ * 6. **结论与两个数组的搭配** —— `rejected` 必须给出挡住的规则与理由（否则「为什么被拒」不可
+ *    审计），`eligible` / `pending_review` 不得带挡住的规则（合格就不该有规则挡着）。
  *
  * 这是调用方与策略之间的契约，不是数据校验：一份不自洽的判定只可能来自配置错误或实现缺陷，
  * 重投多少次都是同一份，因此调用方一律判成不可重试（`classifyPromotionFailure` 把它落成
@@ -476,6 +522,31 @@ export function assertPromotionDecisionConsistent(
     });
   }
 
+  // 结论与审核模式的配对：两个字段各自都是合法值，合起来却可能描述一件不可能的事。放在两个
+  // 数组之后、挡板搭配之前——它比「rejected 缺理由」更根本（前者会让执行内核走错分支，后者
+  // 只是审计少了一句话），但同样属于「这份判定内部自洽吗」，因此与结论组合同一个 violation 家族，
+  // 只是各占一个稳定标识（verdict_approval / verdict_combination），聚合时读得出来是哪一种。
+  const allowedApprovals = VERDICT_APPROVAL_PAIRING[decision.verdict];
+  if (!allowedApprovals.includes(decision.approval)) {
+    throw contractError('verdict_approval', {
+      expected: `${decision.verdict} + ${allowedApprovals.join(' | ')}`,
+      actual: `${decision.verdict} + ${decision.approval}`,
+      experience_id,
+      verdict: decision.verdict,
+      approval: decision.approval,
+      detail:
+        decision.verdict === 'eligible'
+          ? 'an eligible verdict is only meaningful under auto_approve, and this run is in '
+            + 'manual_review mode; the executor would write a Skill and bind the experience to it '
+            + 'in a run that was authorised to do nothing but record the qualification'
+          : decision.verdict === 'pending_review'
+            ? 'a pending_review verdict is only meaningful under manual_review, and this run is in '
+              + 'auto_approve mode; the candidate would be frozen as waiting for a human that this '
+              + 'run was supposed to make unnecessary'
+            : 'a rejected verdict cannot be paired with this approval mode',
+    });
+  }
+
   if (decision.verdict === 'rejected') {
     if (decision.blocking_rules.length === 0) {
       throw contractError('verdict_combination', {
@@ -507,7 +578,9 @@ export function assertPromotionDecisionConsistent(
  * 违反契约的形状（与检查顺序一致，见 `assertPromotionDecisionConsistent`）。
  *
  * 前七项判的是判定**自己的形状**（其中 `strategy_version` / `experience_id` / `approval`
- * 三项顺带也判与本次执行是否一致），最后一项判结论组合。
+ * 三项顺带也判与本次执行是否一致），后两项判它**内部搭不搭**：`verdict_approval` 判结论与
+ * 审核模式的配对，`verdict_combination` 判结论与两个数组的搭配。分成两个标识是因为它们
+ * 指向两种不同的修法（改结论的取值 vs 补/删审计内容），聚合时不该混成一句「组合不对」。
  */
 export type PromotionDecisionViolation =
   | 'decision_shape'
@@ -517,6 +590,7 @@ export type PromotionDecisionViolation =
   | 'approval'
   | 'reasons'
   | 'blocking_rules'
+  | 'verdict_approval'
   | 'verdict_combination';
 
 /**
@@ -590,7 +664,15 @@ function describeValue(value: unknown): string {
 
 function contractError(
   violation: PromotionDecisionViolation,
-  details: { expected: string; actual: string; experience_id: string; detail: string },
+  details: {
+    expected: string;
+    actual: string;
+    experience_id: string;
+    detail: string;
+    /** 只有 `verdict_approval` 会带上这两个：判定自报的结论与审核模式 */
+    verdict?: string;
+    approval?: string;
+  },
 ): PromotionDecisionContractError {
   return new PromotionDecisionContractError(
     `Promotion strategy returned an invalid decision for experience `
@@ -767,10 +849,10 @@ export function buildPromotedSkill(
  *
  * 2. **技能引用不成立**（`PromotionSkillIntegrityError`）：同一条不成立的引用，重投多少次
  *    都不成立。
- * 3. **策略判定违反契约**（`PromotionDecisionContractError`：形状不合法，或与本次执行对不上）：
- *    同一次判定重投多少次都还是那一份，修它的是改配置或改实现。这一类按 `payload_unreadable`
- *    落死信——它是「这条投递的内容我读不懂」的另一种形状，与坏数据同一条理由，而不是
- *    `unknown` 白占重试名额。
+ * 3. **策略判定违反契约**（`PromotionDecisionContractError`：形状不合法、与本次执行对不上，
+ *    或结论与审核模式配不上对）：同一次判定重投多少次都还是那一份，修它的是改配置或改实现。
+ *    这一类按 `payload_unreadable` 落死信——它是「这条投递的内容我读不懂」的另一种形状，与坏
+ *    数据同一条理由，而不是 `unknown` 白占重试名额。
  *
  * 这些信号由 promotion-executor 的契约测试钉住：适配器改了措辞或换了 SQLSTATE，那条
  * 测试先红，而不是让分类悄悄退化。
@@ -787,9 +869,10 @@ export function classifyPromotionFailure(error: unknown): DeliveryFailureClassif
       false,
     );
   }
-  // 策略判定违反契约（形状 / 结论 / 版本 / 经验 id / 审核模式 / 数组元素 / 结论组合）：同一次
-  // 判定重投多少次都还是那一份，修它的是改配置或改策略实现，不是再跑一遍。按
-  // `payload_unreadable`（坏输入，重试无意义）落死信，而不是掉进 `unknown`（可重试）白占名额。
+  // 策略判定违反契约（形状 / 结论 / 版本 / 经验 id / 审核模式 / 数组元素 / 结论与审核模式的
+  // 配对 / 结论与数组的搭配）：同一次判定重投多少次都还是那一份，修它的是改配置或改策略实现，
+  // 不是再跑一遍。按 `payload_unreadable`（坏输入，重试无意义）落死信，而不是掉进
+  // `unknown`（可重试）白占名额。
   if (isPromotionDecisionContractError(error)) {
     return knownDeliveryFailure(
       'payload_unreadable',

@@ -25,8 +25,10 @@
  *   （services/promotion-executor.ts 的 `assertPromotionDecisionConsistent`）在写任何东西
  *   之前核对判定的**运行时形状**（是不是对象、`verdict` 是否三个合法结论之一、版本与经验 id
  *   是不是非空字符串、两个数组的元素合不合法）以及它与本次执行的关系（版本、经验 id、审核
- *   模式、结论组合）。放在内核是因为内核也会被别的调用方直接用；本外壳只在自己的演练路径上
- *   复用同一份校验，失败的分类因此与真跑完全一致。
+ *   模式）和它**内部搭不搭**（`verdict` 与审核模式的配对——`eligible` 只配 `auto_approve`、
+ *   `pending_review` 只配 `manual_review`；以及 `verdict` 与两个数组的搭配）。放在内核是因为
+ *   内核也会被别的调用方直接用；本外壳只在自己的演练路径上复用同一份校验，失败的分类因此与
+ *   真跑完全一致。
  *
  * 几条不能松的约束（与 Phase 1/2 相同，理由也相同）：
  *
@@ -374,8 +376,9 @@ export class DefaultSkillPromotionJob implements SkillPromotionJob {
    *
    * 演练路径**自己**调一遍判定契约校验，而不是复用执行内核：这一步什么都不写，但结论会被
    * 人当成真跑的预演来读，而「策略会把一份不合法的判定交回来」正是演练最该提前暴露的一类
-   * 配置错。校验用的是**同一个函数**（因此同一套 violation、同一种失败分类），不过就记成
-   * `failed`（带规范化 failure），**不**退化成 `promoted` / `pending_review` / `rejected`
+   * 配置错。校验用的是**同一个函数**（因此同一套 violation、同一种失败分类，含结论与审核模式
+   * 配不上对的那一种），不过就记成 `failed`（带规范化 failure），**不**退化成 `promoted` /
+   * `pending_review` / `rejected`
    * 里的任何一个——那会把一次配置错伪装成一个正常结论。判定值先落在 `unknown` 上再做校验，
    * 因此一份 `null` / 标量判定只会变成本条 `failed`，不会在读字段时抛出 TypeError 掀掉整批。
    */
