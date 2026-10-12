@@ -239,6 +239,8 @@ export type {
 } from './ports/memory-repository';
 /** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
 export { MARKET_POOL_ROLE_ID } from './schemas';
+/** 某个字符串能不能命名一条经验（引用准入判据，见 schemas.canNameExperience） */
+export { canNameExperience } from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  8.7 三重门控退休检测（week3 RFC §8.2 触发机制）

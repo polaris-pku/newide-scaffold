@@ -346,7 +346,8 @@ describe('交付 claim / ack（服务层）', () => {
       buffer_seq: 1,
       references: [
         {
-          experience_id: 'exp_1',
+          // 引用得是经验 id 的形状（uuid），否则反馈入口就把它丢了
+          experience_id: '6e2c8a51-4d79-4b3c-a8f1-0d5e7c9b2a34',
           applied: true,
           effectiveness: 'fully_effective',
           note: 'worked',
@@ -357,7 +358,7 @@ describe('交付 claim / ack（服务层）', () => {
     const feedback = await f.service.claimDelivery({ channel: 'feedback', owner: 'merger' });
     expect(feedback).toMatchObject({ channel: 'feedback' });
     const record = (feedback as { feedback: DriverFeedbackRecord }).feedback;
-    expect(record).toMatchObject({ status: 'processing', attempt_count: 1, experience_id: 'exp_1' });
+    expect(record).toMatchObject({ status: 'processing', attempt_count: 1, experience_id: '6e2c8a51-4d79-4b3c-a8f1-0d5e7c9b2a34' });
 
     await f.service.ackDelivery({
       channel: 'feedback',

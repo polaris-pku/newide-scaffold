@@ -18,6 +18,7 @@ import {
   MARKET_POOL_ROLE_ID,
   PersonaDefSchema,
   SkillRecordSchema,
+  canNameExperience,
   type AgentArchiveRecord,
   type AgentHandle,
   type AgentMetrics,
@@ -901,6 +902,10 @@ export class PgMemoryRepository implements MemoryRepository {
     role_id: string,
     experience_id: string,
   ): Promise<ExperienceRecord | undefined> {
+    // 形状不对的 id 不可能在库里存在，先判掉：直接拿去比 uuid 列会抛 22P02，端口承诺的
+    // experience_missing 因此永远走不到，异常还会被分类器当成瞬时故障反复重试。同一个输入
+    // 在 InMemory 腿返回 missing、在这里抛错，正是契约分歧——判据与内存腿一致：查不到就是没有。
+    if (!canNameExperience(experience_id)) return undefined;
     const result = await this.pool.query<{ payload: unknown }>(
       `SELECT payload FROM memory_experiences WHERE role_id = $1 AND id = $2`,
       [role_id, experience_id],

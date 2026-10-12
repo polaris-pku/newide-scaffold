@@ -14,6 +14,7 @@ import { nowTimestamp } from '../../core';
 import {
   CONTEXT_DELIVERY_SCHEMA_VERSION,
   DRIVER_FEEDBACK_EVENT_VERSION,
+  canNameExperience,
   type ContextDeliveryItem,
   type DriverFeedbackRecord,
   type DriverFeedbackSource,
@@ -139,8 +140,12 @@ export interface DriverFeedbackInput {
 /**
  * 把 DriverReturn 的引用列表翻译成反馈记录。
  *
- * 不查 Experience 是否存在：引用不存在的经验是正常情况（跨 agent / 已处置 /
- * 下游还没提取出来），反馈照记，由下游按 experience_id 归并。
+ * **只收能命名一条经验的引用**（`canNameExperience`）：driver 报回来的 id 得是经验 id 的形状，
+ * 否则它对应不到任何一条经验——典型是 driver 把上下文占位条目的编号当成了经验 id。这类引用
+ * 不是「还没出现的经验」，等多久都不会出现，所以在入口就丢掉（由调用方计数），不进反馈表。
+ *
+ * 形状对、当下却查不到的引用**照记**：跨 agent、已处置、下游还没提取出来，都留给下游按
+ * experience_id 归并时决定——那才是「等一等可能就有」与「永远没有」的区别。
  *
  * 同一条经验在本次任务里被引用多次时键相同，只保留**第一次**——driver 对同一条
  * 经验给出两个互相矛盾的效果档位时，先到的那条为准；这与「重放不覆盖已有反馈」
@@ -153,6 +158,7 @@ export function buildDriverUsageFeedbackRecords(
   const event_version = input.event_version ?? DRIVER_FEEDBACK_EVENT_VERSION;
   const byKey = new Map<string, DriverFeedbackRecord>();
   for (const reference of input.references) {
+    if (!canNameExperience(reference.experience_id)) continue;
     const feedback_key = driverFeedbackKey({
       role_id: input.role_id,
       task_id: input.task_id,

@@ -14,6 +14,8 @@
  *   造一条上下文把它塞回提取流程，等于用另一个更大的问题盖住归并问题。
  * - **不晋升、不演化**：写进经验的只有置信度与使用计数，Skill 与 Persona 由各自独立的 job
  *   决定（见计划 §3）。这条边界由组合方式保证——本文件连那两个端口都不持有。
+ * - **等的是「经验还没出现」，不是「等一个不可能出现的 id」**：引用连经验 id 的形状都不对时
+ *   当场进死信（见 validateFeedback），只有形状对、当下查不到的才寄存待归并。
  * - **幂等靠 feedback_id，不靠调用方记得**：应用的幂等判据写在经验自己的置信度历史里
  *   （repository.applyExperienceFeedback），交付的幂等判据写在 claim 凭据与状态机上。
  *   两层合起来，重复投递、崩溃重跑、lease 过期被接手重跑，都只会得到同一条业务结果。
@@ -24,6 +26,7 @@
  */
 import {
   DRIVER_FEEDBACK_EVENT_VERSION,
+  canNameExperience,
   type DeliveryStatus,
   type DriverFeedbackContent,
   type DriverFeedbackRecord,
@@ -520,10 +523,13 @@ function validateFeedback(
       false,
     );
   }
-  if (!feedback.experience_id) {
+  if (!canNameExperience(feedback.experience_id)) {
+    // 这类引用不是「经验还没出现」，而是**永远不会有**的经验 id：它连形状都不对
+    // （典型是上下文占位条目的编号）。寄存起来等一条不存在的经验，只会白占一段保留期，
+    // 所以当场进死信——这也是停放（parked）与死信在这里的分界。
     return knownDeliveryFailure(
       'payload_unreadable',
-      `Feedback ${feedback.feedback_id} carries no experience_id to merge into.`,
+      `Feedback ${feedback.feedback_id} names "${feedback.experience_id}", which cannot be the id of an experience and will never appear; dead-lettering instead of parking.`,
       false,
     );
   }

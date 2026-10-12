@@ -302,6 +302,18 @@ export const ExperienceRecordSchema = z.object({
 });
 export type ExperienceRecord = z.infer<typeof ExperienceRecordSchema>;
 
+/**
+ * 这个字符串有没有可能命名一条已落库的经验。
+ *
+ * 判据直接取自上面的 schema（`id` 是 uuid），不另立一套：经验 id 一律由 randomUUID() 生成，
+ * 库里那一列也是 uuid 类型。因此满足不了它的引用**不可能**对应到任何一条经验——它只可能是
+ * 把别的东西当成了经验 id（典型：driver 把上下文占位条目的编号报回来）。这类引用不该进
+ * 反馈表，也不该被当成「还没出现的经验」去等待：等多久都不会出现。
+ */
+export function canNameExperience(experienceId: string): boolean {
+  return ExperienceRecordSchema.shape.id.safeParse(experienceId).success;
+}
+
 /** 经验溯源信息 */
 export const ExperienceSourceSchema = z.object({
   /** 经验 ID */

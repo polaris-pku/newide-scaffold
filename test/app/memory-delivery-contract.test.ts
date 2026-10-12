@@ -6,7 +6,7 @@
  *   1. 生产路径只交付上下文，本进程不提取经验 / 不晋升 / 不演化 Persona
  *   2. 交付项可被下游按稳定引用读回（DriverReturn + AgentContextSnapshot）
  *   3. 下游没上线、没消费、重启，都不影响已完成的任务；交付项可重放
- *   4. Driver 使用反馈独立于经验是否存在，且重复提交不重复累计
+ *   4. Driver 使用反馈独立于经验是否存在（但引用必须是经验 id 的形状），且重复提交不重复累计
  *   5. 实验路径（消融标签 / 显式 emulation）才在本进程模拟下游
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -45,6 +45,18 @@ afterEach(async () => {
 });
 
 const ROLE = 'role_delivery';
+
+/**
+ * 夹具用的经验 id。
+ *
+ * 引用准入（`canNameExperience`）要求 experience_id 是经验 id 的形状（uuid）：可读编号
+ * 命名不了任何一条经验，会在反馈入口被丢掉。因此「经验还不存在」的用例也得用 uuid——
+ * 它考的是「形状对、当下查不到」，不是「随便什么字符串都照收」。
+ */
+const EXP_REFERENCED = 'aaaaaaaa-0001-4001-8001-000000000001';
+const EXP_NOT_WRITTEN_YET = 'aaaaaaaa-0002-4002-8002-000000000002';
+const EXP_X = 'aaaaaaaa-0003-4003-8003-000000000003';
+const EXP_FROM_EARLIER_TASK = 'aaaaaaaa-0004-4004-8004-000000000004';
 
 interface Fixture {
   runner: BMemoryMaintenanceRunner;
@@ -274,7 +286,7 @@ describe('memory delivery contract (工作包 B)', () => {
     const seq = await writePending(repository, bufferRepository, 'task_no_outbox');
     const references = [
       {
-        experience_id: 'exp_referenced',
+        experience_id: EXP_REFERENCED,
         applied: true,
         effectiveness: 'fully_effective' as const,
         note: 'used it',
@@ -308,7 +320,7 @@ describe('memory delivery contract (工作包 B)', () => {
     const { runner, repository, bufferRepository, delivery } = await fixture();
     const references = [
       {
-        experience_id: 'exp_not_written_yet',
+        experience_id: EXP_NOT_WRITTEN_YET,
         applied: true,
         effectiveness: 'fully_effective' as const,
         note: 'used the boundary rule',
@@ -329,7 +341,7 @@ describe('memory delivery contract (工作包 B)', () => {
     expect(record).toMatchObject({
       role_id: ROLE,
       task_id: 'task_feedback',
-      experience_id: 'exp_not_written_yet',
+      experience_id: EXP_NOT_WRITTEN_YET,
       applied: true,
       effectiveness: 'fully_effective',
       note: 'used the boundary rule',
@@ -338,14 +350,14 @@ describe('memory delivery contract (工作包 B)', () => {
     });
     // 幂等键的五个因子都在键里：下游可以据此判断「这条反馈说的是哪件事」
     expect(record.feedback_key).toBe(
-      `${ROLE}:task_feedback:exp_not_written_yet:driver_usage:${record.event_version}`,
+      `${ROLE}:task_feedback:${EXP_NOT_WRITTEN_YET}:driver_usage:${record.event_version}`,
     );
 
     // 经验此刻还不存在，反馈照样在 outbox 里等
     await expect(repository.listExperiences(ROLE)).resolves.toEqual([]);
     const pendingForExperience = await delivery.listDriverFeedback({
       role_id: ROLE,
-      experience_id: 'exp_not_written_yet',
+      experience_id: EXP_NOT_WRITTEN_YET,
     });
     expect(pendingForExperience.map((item) => item.feedback_id)).toEqual([record.feedback_id]);
   });
@@ -353,8 +365,8 @@ describe('memory delivery contract (工作包 B)', () => {
   it('同一份 DriverReturn 重复提交反馈不会重复累计', async () => {
     const { runner, repository, bufferRepository, delivery } = await fixture();
     const references = [
-      { experience_id: 'exp_x', applied: true, effectiveness: 'partially_effective' as const, note: 'a' },
-      { experience_id: 'exp_x', applied: true, effectiveness: 'ineffective' as const, note: 'b' },
+      { experience_id: EXP_X, applied: true, effectiveness: 'partially_effective' as const, note: 'a' },
+      { experience_id: EXP_X, applied: true, effectiveness: 'ineffective' as const, note: 'b' },
     ];
     const seq = await writePending(repository, bufferRepository, 'task_feedback_idem', references);
     const request = {
@@ -572,7 +584,7 @@ describe('memory delivery contract (工作包 B)', () => {
         blockers: [],
         referenced_experiences: [
           {
-            experience_id: 'exp_from_earlier_task',
+            experience_id: EXP_FROM_EARLIER_TASK,
             applied: true,
             effectiveness: 'fully_effective',
             note: 'saved a round of rework',
@@ -612,7 +624,7 @@ describe('memory delivery contract (工作包 B)', () => {
     expect(records).toHaveLength(1);
     expect(records[0]).toMatchObject({
       task_id: taskId,
-      experience_id: 'exp_from_earlier_task',
+      experience_id: EXP_FROM_EARLIER_TASK,
       applied: true,
       effectiveness: 'fully_effective',
       feedback_source: 'driver_usage',

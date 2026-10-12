@@ -45,7 +45,11 @@ import {
   type DriverFeedbackRunResult,
 } from '../runtime/driver-feedback-worker';
 import { DefaultDriverFeedbackProcessor } from '../runtime/driver-feedback-processor';
-import { buildDriverUsageFeedbackRecords } from '../services/context-delivery';
+import {
+  buildDriverUsageFeedbackRecords,
+  driverFeedbackId,
+  driverFeedbackKey,
+} from '../services/context-delivery';
 import {
   DEFAULT_FEEDBACK_CONSUME_RETRY_POLICY,
   DEFAULT_PENDING_FEEDBACK_RETRY_POLICY,
@@ -55,7 +59,7 @@ import type { LeaseTimers } from '../services/lease-heartbeat';
 import type { MemoryDeliveryRepository } from '../ports/memory-delivery';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type { MaintenanceRunStore } from '../ports/maintenance-run-store';
-import { DriverFeedbackContentSchema } from '../schemas';
+import { DRIVER_FEEDBACK_EVENT_VERSION, DriverFeedbackContentSchema } from '../schemas';
 import type {
   DriverFeedbackRecord,
   ExperienceRecord,
@@ -780,6 +784,49 @@ describe.each(DELIVERY_CASES)('Driver Feedback Worker 归并 — $name', (adapte
     expect(result.outcomes[0]?.status).toBe('dead_letter');
     expect(result.outcomes[0]?.failure?.retryable).toBe(false);
     expect(result.counts.dead_letter_count).toBe(1);
+  });
+
+  /**
+   * 「经验还没出现」与「不可能出现的经验 id」必须分开：前者寄存等待，后者当场进死信。
+   * 这类记录只能由存储层直接写入（构造器已经在入口丢掉它们），所以这里手工造一条——
+   * 键与 id 自洽、只有 experience_id 的形状不对。
+   */
+  it('引用的 id 连经验 id 的形状都不对：当场进死信，不寄存也不重试', async () => {
+    const root = await tempRoot();
+    const h = await harness({ root, case: adapterCase });
+    const placeholderId = 'context-experience-1';
+    const feedback_key = driverFeedbackKey({
+      role_id: ROLE,
+      task_id: 'task_shape',
+      experience_id: placeholderId,
+      feedback_source: 'driver_usage',
+      event_version: DRIVER_FEEDBACK_EVENT_VERSION,
+    });
+    await h.submit({
+      feedback_id: driverFeedbackId(feedback_key),
+      feedback_key,
+      role_id: ROLE,
+      task_id: 'task_shape',
+      experience_id: placeholderId,
+      applied: true,
+      effectiveness: 'fully_effective',
+      note: 'driver misread a context placeholder as an experience id',
+      observed_at: START,
+      feedback_source: 'driver_usage',
+      event_version: DRIVER_FEEDBACK_EVENT_VERSION,
+      status: 'pending',
+      attempt_count: 0,
+      created_at: START,
+      updated_at: START,
+    });
+
+    const result = await h.worker.runOnce();
+
+    expect(result.outcomes[0]?.status).toBe('dead_letter');
+    expect(result.outcomes[0]?.failure?.retryable).toBe(false);
+    expect(result.counts.dead_letter_count).toBe(1);
+    // 不进待归并队列：等一条永远不会出现的经验只是白占一段保留期
+    expect(await h.delivery.listPendingFeedback({ role_id: ROLE })).toHaveLength(0);
   });
 
   it('寄存记录里的 feedback_id 与自己的因子对不上：归并时进死信', async () => {
