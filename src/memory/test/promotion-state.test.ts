@@ -293,6 +293,134 @@ function runPromotionStateContract(
       });
     }
 
+    /**
+     * 改动来源之后，归属校验必须跟着**新值**走。
+     *
+     * `updateSkill` 覆盖的是整条技能记录，来源是记录的一部分；PG 侧它还是一条独立的列
+     * （`memory_skills.promoted_from`），而校验读的正是那一列。列若没跟着载荷一起更新，
+     * 库里就留下「列说来自 A、载荷说来自 B」的分裂状态：按列判的 PG 与按载荷判的内存实现
+     * 对同一条引用给出两种结论。下面几条用例从几个方向钉住它。
+     */
+    it('技能来源被改成另一条经验后，原经验晋升到它会被判来源不符', async () => {
+      const { experience, claimed } = await seedClaimed();
+      const other = makeExperience(role_id);
+      await repository.saveExperience(role_id, other);
+      // 这条技能原本确实来自 experience：列与载荷都说同一件事，旧实现正是靠这份一致把
+      // 「来源已经被改成 other」这件事漏过去
+      const skill = await seedSkill(role_id, experience);
+      const before = await storedExperience(experience.id);
+
+      await repository.updateSkill(role_id, { ...skill, promoted_from: other.id });
+
+      await expect(
+        repository.completePromotion({
+          role_id,
+          experience_id: experience.id,
+          claim_token: claimed.claim_token,
+          outcome: 'promoted',
+          strategy_version: STRATEGY_VERSION,
+          skill_id: skill.id,
+          reasons: ['qualifies'],
+          now: addMilliseconds(NOW, 1_000),
+        }),
+      ).rejects.toMatchObject({
+        name: 'PromotionSkillIntegrityError',
+        violation: 'other_source',
+      });
+
+      expect(await storedExperience(experience.id)).toEqual(before);
+    });
+
+    it('技能来源被清空后，任何经验晋升到它都会被判来源不符', async () => {
+      const { experience, claimed } = await seedClaimed();
+      const skill = await seedSkill(role_id, experience);
+      const before = await storedExperience(experience.id);
+
+      await repository.updateSkill(role_id, { ...skill, promoted_from: undefined });
+      const stored = (await repository.listSkills(role_id)).find((item) => item.id === skill.id);
+      expect(stored?.promoted_from).toBeUndefined();
+
+      await expect(
+        repository.completePromotion({
+          role_id,
+          experience_id: experience.id,
+          claim_token: claimed.claim_token,
+          outcome: 'promoted',
+          strategy_version: STRATEGY_VERSION,
+          skill_id: skill.id,
+          reasons: ['qualifies'],
+          now: addMilliseconds(NOW, 1_000),
+        }),
+      ).rejects.toMatchObject({
+        name: 'PromotionSkillIntegrityError',
+        violation: 'other_source',
+      });
+
+      expect(await storedExperience(experience.id)).toEqual(before);
+    });
+
+    it('不带来源变更的 updateSkill 之后，来源仍然成立（审核流程照常走通）', async () => {
+      const { experience, claimed } = await seedClaimed();
+      const skill = await seedSkill(role_id, experience);
+
+      await repository.updateSkill(role_id, {
+        ...skill,
+        review_status: 'approved',
+        reviewed_by: 'reviewer-1',
+        reviewed_at: addMilliseconds(NOW, 500),
+      });
+
+      const stored = (await repository.listSkills(role_id)).find((item) => item.id === skill.id);
+      expect(stored?.review_status).toBe('approved');
+      expect(stored?.promoted_from).toBe(experience.id);
+
+      const settled = await repository.completePromotion({
+        role_id,
+        experience_id: experience.id,
+        claim_token: claimed.claim_token,
+        outcome: 'promoted',
+        strategy_version: STRATEGY_VERSION,
+        skill_id: skill.id,
+        reasons: ['qualifies'],
+        now: addMilliseconds(NOW, 1_000),
+      });
+      expect(settled?.promoted_to).toBe(skill.id);
+    });
+
+    /**
+     * 改出来的来源若与同 role 的另一条技能撞车，唯一键必须挡住它，且**什么都不改**：
+     * 半截状态（载荷改了、来源没改，或者反过来）比一次干脆的失败更难收拾。
+     */
+    it('改出来的来源与同 role 的另一条技能撞车：写入被拒，技能停在改之前', async () => {
+      const first = makeExperience(role_id);
+      const second = makeExperience(role_id);
+      await repository.saveExperience(role_id, first);
+      await repository.saveExperience(role_id, second);
+      const firstSkill = await seedSkill(role_id, first);
+      const secondSkill = await seedSkill(role_id, second);
+      const before = (await repository.listSkills(role_id)).find(
+        (item) => item.id === secondSkill.id,
+      );
+
+      await expect(
+        repository.updateSkill(role_id, {
+          ...secondSkill,
+          promoted_from: first.id,
+          content: 'mutated content body',
+        }),
+      ).rejects.toThrow(/promoted_from=.*already exists/);
+
+      // 载荷、来源、内容全都停在改之前；另一条技能也没被顺手改掉
+      const after = (await repository.listSkills(role_id)).find(
+        (item) => item.id === secondSkill.id,
+      );
+      expect(after).toEqual(before);
+      const untouched = (await repository.listSkills(role_id)).find(
+        (item) => item.id === firstSkill.id,
+      );
+      expect(untouched?.promoted_from).toBe(first.id);
+    });
+
     it('引用不成立时抛的是可诊断的完整性错误，不是一句泛泛的失败', async () => {
       const { experience, claimed } = await seedClaimed();
       const other_role_id = `role_promotion_foreign_${randomUUID()}`;

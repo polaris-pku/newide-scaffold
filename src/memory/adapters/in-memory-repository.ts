@@ -400,13 +400,33 @@ export class InMemoryRepository implements MemoryRepository {
     store.handle = { ...store.handle, persona };
   }
 
+  /**
+   * 覆盖写入一条技能。
+   *
+   * `promoted_from` 是晋升幂等键的一半，所以这次写入也要过一遍唯一性检查：同一 role 下
+   * 已有另一条技能指向同一来源时，写入被拒、**记录保持原状**。PG 侧靠部分唯一索引在同一条
+   * UPDATE 里整句失败，两侧必须报同一件事——判据只写在一边，测试替身就会掩盖生产差异
+   * （见 ports/memory-repository.ts 里 updateSkill 的说明）。
+   *
+   * 检查与赋值之间没有 await：并发的另一次写入不可能插进「刚查过」与「写回」之间。
+   */
   async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
     const store = this.requireStore(role_id);
     const index = store.skills.findIndex((item) => item.id === skill.id);
     if (index === -1) {
       throw new Error(`Skill not found: ${skill.id}`);
     }
-    store.skills[index] = await this.withDescriptionEmbedding(skill);
+    const stored = await this.withDescriptionEmbedding(skill);
+    if (stored.promoted_from !== undefined) {
+      const clash = findSkillByPromotedFrom(store.skills, stored.promoted_from);
+      if (clash && clash.id !== stored.id) {
+        throw new Error(
+          `Skill for promoted_from=${stored.promoted_from} already exists in ${role_id}; ` +
+            `skill ${stored.id} was left unchanged.`,
+        );
+      }
+    }
+    store.skills[index] = stored;
   }
 
   async updateExperience(role_id: string, experience: ExperienceRecord): Promise<void> {

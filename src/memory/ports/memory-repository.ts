@@ -393,7 +393,17 @@ export interface MemoryRepository {
   saveSkillIfAbsent(role_id: string, skill: SkillRecord): Promise<SkillSaveResult>;
   /** 覆盖写入当前 Persona 快照（如 Persona 演化后 version+1） */
   savePersona(role_id: string, persona: PersonaDef): Promise<void>;
-  /** 更新已有技能（如消融实验 auto-approve） */
+  /**
+   * 覆盖写入已有技能（如消融实验 auto-approve、人工审核裁决）。
+   *
+   * 覆盖的是**整条记录**：实现必须让 `promoted_from` 与载荷里的同名字段同步落地。它是晋升
+   * 幂等键的一半，也是归属校验（`completePromotion` 的引用判据）读的那个字段——只写载荷会
+   * 在库里留下「列说没有来源、载荷说是某条经验」的分裂状态，于是按列读的 PG 与按载荷读的
+   * 内存实现对同一条引用给出两种结论。
+   *
+   * `promoted_from` 改出来若与同 role 的另一条技能撞车，写入必须**整体失败**：技能记录停在
+   * 改之前，不得留下半截状态（PG 由 `(role_id, promoted_from)` 的部分唯一索引保证）。
+   */
   updateSkill(role_id: string, skill: SkillRecord): Promise<void>;
   /** 更新已有经验（如晋升后写入 promoted_to） */
   updateExperience(role_id: string, experience: ExperienceRecord): Promise<void>;

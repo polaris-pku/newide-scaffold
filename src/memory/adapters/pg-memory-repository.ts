@@ -874,20 +874,46 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  /**
+   * 覆盖写入一条技能：载荷、向量、以及 `promoted_from` 列**一起**更新。
+   *
+   * 列必须跟着载荷走：晋升归属校验（assertPromotedSkillReference）查的是列，幂等键也是列，
+   * 只写载荷会让「列说没有来源、载荷说是某条经验」这种分裂状态留在库里，于是完整性判据与
+   * 载荷各说各话——按载荷读的内存适配器认这条引用成立，按列读的 PG 认它不成立。
+   *
+   * 唯一键 (role_id, promoted_from) 靠下面这条部分唯一索引在这次 UPDATE 里兑现：改出来的
+   * 来源若与同 role 的另一条技能撞车，Postgres 整条语句失败，行的载荷、向量、列全都停在
+   * 改之前，不会留下「列改了、载荷没改」的半截状态。这里把驱动错误换成一句能直接看出
+   * 撞在哪儿的说明，与内存适配器报同一件事。
+   */
   async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
     await this.ensureSchema();
     const stored = await this.withDescriptionEmbedding(skill);
     SkillRecordSchema.parse(stored);
+    const promotedFrom = stored.promoted_from ?? null;
 
-    const result = await this.pool.query(
-      `UPDATE memory_skills
-       SET payload = $3::jsonb, description_embedding = $4::vector
-       WHERE role_id = $1 AND id = $2`,
-      [role_id, stored.id, JSON.stringify(stored), toPgVector(stored.description_embedding)],
-    );
-
-    if (result.rowCount === 0) {
-      throw new Error(`Skill not found: ${skill.id}`);
+    try {
+      const result = await this.pool.query(
+        `UPDATE memory_skills
+         SET payload = $3::jsonb, description_embedding = $4::vector, promoted_from = $5
+         WHERE role_id = $1 AND id = $2`,
+        [
+          role_id,
+          stored.id,
+          JSON.stringify(stored),
+          toPgVector(stored.description_embedding),
+          promotedFrom,
+        ],
+      );
+      if (result.rowCount === 0) {
+        throw new Error(`Skill not found: ${skill.id}`);
+      }
+    } catch (error) {
+      if (!isUniqueViolation(error) || promotedFrom === null) throw error;
+      throw new Error(
+        `Skill for promoted_from=${promotedFrom} already exists in ${role_id}; ` +
+          `skill ${stored.id} was left unchanged.`,
+      );
     }
   }
 
