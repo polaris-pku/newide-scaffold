@@ -80,7 +80,11 @@ import type {
   PersonaEvolutionStrategy,
 } from '../ports/persona-evolution-strategy';
 import type { PersonaEvolutionJobOptions } from '../ports/persona-evolution-job';
-import type { ExperienceRecord, SkillRecord } from '../schemas';
+import {
+  buildPersonaEvolutionSnapshot,
+  personaEvolutionInputSnapshotHash,
+} from '../services/persona-evolution-candidates';
+import type { ExperiencePromotion, ExperienceRecord, SkillRecord } from '../schemas';
 import type { SqlPool } from '../ports/sql-pool';
 
 const START = '2026-10-11T12:00:00.000Z';
@@ -168,6 +172,23 @@ async function seedExperience(
   const experience = makeExperience(role_id, overrides);
   await repository.saveExperience(role_id, experience);
   return experience;
+}
+
+/**
+ * 经验上的晋升标记（`experience.promotion`）——用来构造「已落定 / 未落定」的各种形状。
+ *
+ * 缺省是「已出结论且已落定」：这类经验参与演化（结论已定，读到的是稳定事实）。要造一个被
+ * 排除的形状只需要覆盖 `status` / `outcome`，过滤规则本身在 4-A 的表里、不在这里重复。
+ */
+function promotionMarker(overrides: Partial<ExperiencePromotion> = {}): ExperiencePromotion {
+  return {
+    status: 'processed',
+    outcome: 'promoted',
+    attempt_count: 1,
+    created_at: START,
+    updated_at: START,
+    ...overrides,
+  };
 }
 
 /**
@@ -323,6 +344,87 @@ function runPersonaEvolutionJobSuite(storeCase: JobStoreCase): void {
     }
 
     // ── 正常路径 ────────────────────────────────────────
+
+    it('输入过滤在存储这一层生效：不合格的技能与经验根本不进快照', async () => {
+      // 合格的两类：已批准且未被取代的技能；从未评估过、以及「已出结论但不合格」的经验
+      await seedSkill(repository, role_id);
+      await seedExperience(repository, role_id);
+      await seedExperience(repository, role_id, { promotion: promotionMarker({ outcome: 'promoted' }) });
+      await seedExperience(repository, role_id, {
+        type: 'negative',
+        promotion: promotionMarker({ outcome: 'rejected' }),
+      });
+      // 被排除的六种：等人工审核的技能、已被取代的技能、别人正在处理的、上一次失败退回队列的、
+      // 死信的，以及「结论是待审核」的经验（还没被批准）
+      await seedSkill(repository, role_id, { review_status: 'pending' });
+      await seedSkill(repository, role_id, { market_status: 'superseded' });
+      await seedExperience(repository, role_id, { promotion: promotionMarker({ status: 'processing' }) });
+      await seedExperience(repository, role_id, { promotion: promotionMarker({ status: 'pending' }) });
+      await seedExperience(repository, role_id, {
+        promotion: promotionMarker({ status: 'dead_letter', attempt_count: 5 }),
+      });
+      await seedExperience(repository, role_id, {
+        promotion: promotionMarker({ outcome: 'pending_review' }),
+      });
+
+      const result = await job().run({ batchSize: 5 });
+      expect(result.outcomes[0]?.status).toBe('evolved');
+
+      // 判定拿到的就是那一份：一技能、三经验（未评估 / 已晋升 / 已拒绝）
+      const persona = await repository.getPersona(role_id);
+      expect(persona.skills_overview).toContain('1 skills promoted');
+      expect(persona.experience_coverage).toContain('3 experiences (2 positive / 1 negative)');
+
+      // 记在标记上的 hash 必须等于「按同一份过滤规则从库里现算」的那一个：过滤规则只有一处
+      // 定义，判据与幂等键才不会各说各话
+      const recomputed = personaEvolutionInputSnapshotHash(
+        buildPersonaEvolutionSnapshot({
+          role_id,
+          skills: await repository.listSkills(role_id),
+          experiences: await repository.listExperiences(role_id),
+        }),
+      );
+      expect((await marker())?.input_snapshot_hash).toBe(recomputed);
+
+      // 再塞两条**不合格**的输入：hash 不该动，因此也不该多出一版 Persona
+      await seedSkill(repository, role_id, { review_status: 'pending' });
+      await seedExperience(repository, role_id, {
+        promotion: promotionMarker({ status: 'dead_letter', attempt_count: 5 }),
+      });
+
+      const again = await job().run({ batchSize: 5 });
+      expect(again.stop_reason).toBe('no_work');
+      expect(again.outcomes).toEqual([]);
+      expect(await personaVersion(repository, role_id)).toBe(2);
+      expect((await marker())?.input_snapshot_hash).toBe(recomputed);
+    });
+
+    it('两个 worker 并发跑同一个角色：只有一方 claim 到，Persona 只前进一版', async () => {
+      await seedSkill(repository, role_id);
+
+      const [left, right] = await Promise.all([
+        job({ worker_id: 'worker-left' }).run({ batchSize: 5 }),
+        job({ worker_id: 'worker-right' }).run({ batchSize: 5 }),
+      ]);
+
+      const sides = [left, right];
+      const claimed = sides.filter((side) => side.counts.claimed_count === 1);
+      const idle = sides.filter((side) => side.counts.claimed_count === 0);
+      expect(claimed).toHaveLength(1);
+      expect(idle).toHaveLength(1);
+      expect(claimed[0]?.outcomes[0]?.status).toBe('evolved');
+      // 落空的那一方是「没轮到我们」：不报失败、不重投、不进死信
+      expect(idle[0]?.stop_reason).toBe('no_work');
+      expect(idle[0]?.counts).toMatchObject({
+        retried_count: 0,
+        dead_letter_count: 0,
+        failure_count: 0,
+      });
+
+      expect(await personaVersion(repository, role_id)).toBe(2);
+      // 只 claim 过一次：没有第二次投递，也没有被别人接管
+      expect((await marker())?.attempt_count).toBe(1);
+    });
 
     it('正常演化一条：Persona 版本 +1、标记落定、run 计数与停止原因都对', async () => {
       await seedSkill(repository, role_id);
@@ -631,6 +733,41 @@ function runPersonaEvolutionJobSuite(storeCase: JobStoreCase): void {
       expect(result.counts.claimed_count).toBe(0);
       expect(result.run.status).toBe('completed');
       expect(await personaVersion(repository, role_id)).toBe(1);
+    });
+
+    it('run 审计：每次运行一条，dry-run 也留痕（计数全 0），两次运行不共用一个 run_id', async () => {
+      await seedSkill(repository, role_id);
+      const before = await runStore.list({ job_type: 'persona_evolution' });
+
+      const dry = await job().run({ batchSize: 5, dryRun: true });
+      const real = await job().run({ batchSize: 5 });
+
+      expect(real.run.run_id).not.toBe(dry.run.run_id);
+      const runs = await runStore.list({ job_type: 'persona_evolution' });
+      expect(runs.map((item) => item.run_id)).toEqual(
+        expect.arrayContaining([
+          ...before.map((item) => item.run_id),
+          dry.run.run_id,
+          real.run.run_id,
+        ]),
+      );
+
+      // 演练的运行照样可审计，但**一个数字都没有**：一次什么都没写的运行不该在吞吐指标里
+      // 留下痕迹，否则把各 run 的 completed_count 加起来的人会数到并没有发生的演化
+      expect(await runStore.get(dry.run.run_id)).toMatchObject({
+        job_type: 'persona_evolution',
+        status: 'completed',
+        worker_id: 'worker-1',
+        claimed_count: 0,
+        completed_count: 0,
+        retried_count: 0,
+        dead_letter_count: 0,
+        skipped_count: 0,
+        failure_count: 0,
+      });
+      expect((await runStore.get(dry.run.run_id))?.last_error).toBeUndefined();
+      // 同一条 job 跑第二次：写入的还是那一条候选，计数如实落在第二条 run 上
+      expect((await runStore.get(real.run.run_id))?.completed_count).toBe(1);
     });
 
     // ── 恢复与 fencing ──────────────────────────────────
