@@ -412,6 +412,7 @@ export {
   DEFAULT_DELIVERY_LEASE_MS,
   DEFAULT_DELIVERY_LOCK_TTL_MS,
   DEFAULT_DELIVERY_RETRY_POLICY,
+  newClaimToken,
   type DeliveryRetryPolicy,
 } from './services/delivery-lifecycle';
 

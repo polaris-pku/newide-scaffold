@@ -21,7 +21,10 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
   type BMemoryMaintenanceEvidenceStore,
 } from '../../src/app/b-memory-maintenance-runner';
-import { BMemoryBackendService } from '../../src/app/b-memory-backend-service';
+import {
+  BMemoryBackendService,
+  type DeliveryRecordPayload,
+} from '../../src/app/b-memory-backend-service';
 import type { BMemoryMaintenanceCapabilities } from '../../src/app/b-public-capabilities';
 import {
   FileBufferRepository,
@@ -63,6 +66,23 @@ async function tempRoot(): Promise<string> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 从 claim 的返回里取回 fencing 凭据 —— ack 必须凭它写回。
+ *
+ * 这条链路现在真的会拦人：不带凭据（或带错凭据）的 ack 一律返回 undefined，
+ * 所以测试里每一次 ack 都要拿 claim 时发下的那一个 token。
+ */
+function tokenOfClaim(payload: DeliveryRecordPayload | undefined): string {
+  const token =
+    payload === undefined
+      ? undefined
+      : payload.channel === 'context'
+        ? payload.delivery.claim_token
+        : payload.feedback.claim_token;
+  if (!token) throw new Error('claim did not issue a fencing token');
+  return token;
 }
 
 interface Fixture {
@@ -219,6 +239,7 @@ describe('交付 claim / ack（服务层）', () => {
       channel: 'context',
       role_id: ROLE,
       id: deliveryId,
+      claim_token: tokenOfClaim(claimed),
       owner: 'downstream-a',
       outcome: 'processed',
       processor_version: 'downstream-1.0',
@@ -247,6 +268,7 @@ describe('交付 claim / ack（服务层）', () => {
         channel: 'context',
         role_id: ROLE,
         id: item!.delivery_id,
+        claim_token: tokenOfClaim(claimed),
         owner: 'downstream',
         outcome: 'failed',
         error: `downstream unavailable ${String(attempt)}`,
@@ -291,11 +313,12 @@ describe('交付 claim / ack（服务层）', () => {
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
 
     // 让交付项进死信（不可重试的失败）
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'failed',
       error: 'permanent downstream error',
@@ -339,7 +362,8 @@ describe('交付 claim / ack（服务层）', () => {
     await f.service.ackDelivery({
       channel: 'feedback',
       role_id: ROLE,
-      id: record.feedback_id,
+      id: feedback?.channel === 'feedback' ? feedback.feedback.feedback_id : 'unreachable',
+      claim_token: tokenOfClaim(feedback),
       owner: 'merger',
       outcome: 'processed',
     });
@@ -363,11 +387,12 @@ describe('交付 ack 与源 Buffer 的生命周期', () => {
     });
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
 
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -397,11 +422,12 @@ describe('交付 ack 与源 Buffer 的生命周期', () => {
     });
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
 
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -449,11 +475,12 @@ describe('交付 ack 与源 Buffer 的生命周期', () => {
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
     const archiveSpy = vi.spyOn(f.bufferRepository, 'archiveBuffer');
 
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     const failedAck = await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'failed',
       error: 'downstream unavailable',
@@ -473,11 +500,12 @@ describe('交付 ack 与源 Buffer 的生命周期', () => {
     const f = await fixture();
     const seq = await deliverOnce(f);
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -501,11 +529,12 @@ describe('ack 与源 Buffer 归档的一致性（两个存储，没有跨存储�
     });
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
 
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     const acked = await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -531,11 +560,12 @@ describe('ack 与源 Buffer 归档的一致性（两个存储，没有跨存储�
       .spyOn(f.bufferRepository, 'markBufferProcessed')
       .mockRejectedValue(new Error('EIO: simulated archive I/O failure'));
 
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     const acked = await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -593,11 +623,12 @@ describe('ack 与源 Buffer 归档的一致性（两个存储，没有跨存储�
     const contextJson = await readFile(contextPath, 'utf8');
     await rm(contextPath);
 
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     const acked = await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -628,15 +659,16 @@ describe('ack 与源 Buffer 归档的一致性（两个存储，没有跨存储�
     const f = await fixture();
     await deliverOnce(f);
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     const request = {
       channel: 'context' as const,
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed' as const,
     };
 
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     const first = await f.service.ackDelivery(request);
     expect(first?.channel === 'context' ? first.archive : undefined).toEqual({ status: 'archived' });
 
@@ -757,11 +789,12 @@ describe('getContextDelivery：上下文损坏不被误判为「没有上下文�
       buffer_seq: seq,
     });
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -799,11 +832,12 @@ describe('两处死信的独立恢复（memory.retryExtraction）', () => {
     const f = await fixture();
     const seq = await deliverOnce(f);
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'failed',
       error: 'permanent downstream error',
@@ -826,11 +860,12 @@ describe('两处死信的独立恢复（memory.retryExtraction）', () => {
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
 
     // 让交付项进死信（不可重试的失败）
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'failed',
       error: 'permanent downstream error',
@@ -854,11 +889,12 @@ describe('两处死信的独立恢复（memory.retryExtraction）', () => {
     const seq = await deliverOnce(f);
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
     await f.bufferRepository.markBufferDeadLetter(ROLE, seq, 'extraction failed');
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'failed',
       error: 'permanent downstream error',
@@ -880,11 +916,12 @@ describe('两处死信的独立恢复（memory.retryExtraction）', () => {
     const f = await fixture();
     const seq = await deliverOnce(f);
     const [item] = await f.service.listContextDeliveries({ role_id: ROLE });
-    await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
+    const held = await f.service.claimDelivery({ channel: 'context', owner: 'downstream' });
     await f.service.ackDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item!.delivery_id,
+      claim_token: tokenOfClaim(held),
       owner: 'downstream',
       outcome: 'processed',
     });
@@ -936,6 +973,7 @@ describe('崩溃点恢复', () => {
       channel: 'context',
       role_id: ROLE,
       id: deliveryId,
+      claim_token: tokenOfClaim(resumed),
       owner: 'downstream-after-restart',
       outcome: 'processed',
     });
@@ -1031,9 +1069,14 @@ describe('capabilities 与 RPC 接线', () => {
     const [claimed] = await send(
       '{"jsonrpc":"2.0","id":2,"method":"memory.claimDelivery","params":{"channel":"context","owner":"rpc-consumer","lease_ms":60000}}',
     );
-    const claimedResult = claimed!.result as { delivery: { delivery: { delivery_id: string } } };
+    const claimedResult = claimed!.result as {
+      delivery: { delivery: { delivery_id: string; claim_token?: string } };
+    };
     const deliveryId = claimedResult.delivery.delivery.delivery_id;
+    const claimToken = claimedResult.delivery.delivery.claim_token;
     expect(claimedResult.delivery.delivery).toMatchObject({ status: 'processing' });
+    // 凭据随 claim 一起经 RPC 交到调用方手上，ack 才有东西可带
+    expect(claimToken).toBeTruthy();
 
     // 没人可投时就明确回 null，而不是报错
     const [nothing] = await send(
@@ -1050,6 +1093,7 @@ describe('capabilities 与 RPC 接线', () => {
           channel: 'context',
           role_id: ROLE,
           id: deliveryId,
+          claim_token: claimToken,
           owner: 'rpc-consumer',
           outcome: 'processed',
         },

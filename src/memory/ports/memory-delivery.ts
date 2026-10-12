@@ -161,6 +161,9 @@ export interface MemoryDeliveryRepository {
    *
    * 「检查 pending + 写 processing」必须在同一个临界区里完成，否则两个消费者
    * 会同时看到 pending。隔离方式见 `policy.claim_isolation`。
+   *
+   * 成功时实现**为本次 claim 生成一个新的 fencing token**（见 `newClaimToken`）并写进
+   * 记录；调用方必须原样带回 token 才能 renew / complete / fail 这条记录。
    */
   claimDelivery(
     input: DeliveryClaimRequest & { id: string },
@@ -169,18 +172,26 @@ export interface MemoryDeliveryRepository {
   /** claim 下一条可以投递的记录（按到期时刻先后；跨 role 缺省全局扫描） */
   claimNextDelivery(input: DeliveryClaimRequest): Promise<ClaimedDelivery | undefined>;
 
-  /** 延长自己持有的 lease（持有者必须匹配，且 lease 尚未过期） */
+  /**
+   * 延长自己持有的 lease。
+   *
+   * `claim_token` 必填且必须与记录上的 token 一致；lease 已过期时同样失败——过期即
+   * 视为已被别人接手，续租成功只会制造两个消费者同时在写的假象。`owner` 是可选的
+   * 交叉核对（用来早点发现传错了记录），**不是** fencing 本身。
+   */
   renewDeliveryClaim(
     input: DeliveryRecordLocator & {
-      owner: string;
+      claim_token: string;
+      owner?: string | undefined;
       lease_ms?: number | undefined;
       now?: string | undefined;
     },
   ): Promise<ClaimedDelivery | undefined>;
 
-  /** 交付完成：processing → processed（终止态） */
+  /** 交付完成：processing → processed（终止态）；token 必须匹配且 lease 未过期 */
   completeDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string | undefined;
       processor_version?: string | undefined;
       now?: string | undefined;
@@ -191,10 +202,11 @@ export interface MemoryDeliveryRepository {
    * 交付失败：可重试则退避后回到 pending，不可重试或已用满次数则进 dead_letter。
    *
    * `retryable` 由下游判断：连接失败/RPC 超时/临时存储错误是可重试的；
-   * schema 解析不了、role/seq 非法、配置永久错不是。
+   * schema 解析不了、role/seq 非法、配置永久错不是。`claim_token` 必填且必须匹配。
    */
   failDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string | undefined;
       error: string;
       retryable: boolean;

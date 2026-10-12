@@ -26,6 +26,7 @@ import {
   buildContextDeliveryItem,
   buildDriverUsageFeedbackRecords,
 } from '../services/context-delivery';
+import { newClaimToken } from '../services/delivery-lifecycle';
 import type {
   ClaimedContextDelivery,
   ClaimedDelivery,
@@ -107,6 +108,28 @@ function claimOne(
   });
 }
 
+/**
+ * 取回本次 claim 发下的 fencing token。
+ *
+ * schema 里 `claim_token` 是可选的——那是为了读得进旧记录；claim 成功时它一定在。
+ * 这里顺手把它断言出来，让「ack 必须带回凭据」这件事在测试里也是显式的。
+ */
+function tokenOf(claimed: ClaimedDelivery): string {
+  const token = claimed.item.claim_token;
+  if (!token) throw new Error('claim did not issue a fencing token');
+  return token;
+}
+
+/** claim 一条 context 交付并断言成功（多数用例都要拿着它去 ack） */
+async function hold(
+  store: MemoryDeliveryRepository,
+  id: string,
+  owner: string,
+  nowMs: number,
+): Promise<ClaimedContextDelivery> {
+  return asContext(await claimOne(store, id, owner, nowMs));
+}
+
 describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('两个消费者同时 claim 同一条：只有一个拿到', async () => {
     const store = await create(await tempRoot());
@@ -136,12 +159,14 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
     expect([first, second].filter(Boolean)).toHaveLength(1);
 
     // 可重试失败 → 退避窗口内不再被投递
+    const winner = asContext(first ?? second);
     const failed = asContext(
       await store.failDelivery({
         channel: 'context',
         role_id: ROLE,
         id,
-        owner: asContext(first ?? second).item.claim_owner,
+        claim_token: tokenOf(winner),
+        owner: winner.item.claim_owner,
         error: 'downstream unavailable',
         retryable: true,
         now: at(0),
@@ -204,6 +229,7 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
           channel: 'context',
           role_id: ROLE,
           id,
+          claim_token: tokenOf(claimed),
           owner: 'consumer',
           error: `downstream failed ${String(attempt)}`,
           retryable: true,
@@ -237,13 +263,14 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('不可重试的失败直接进 dead_letter，不消耗剩余次数', async () => {
     const store = await create(await tempRoot());
     const id = await seed(store);
-    asContext(await claimOne(store, id, 'consumer', 0));
+    const held = await hold(store, id, 'consumer', 0);
 
     const failed = asContext(
       await store.failDelivery({
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         owner: 'consumer',
         error: 'schema cannot be parsed',
         retryable: false,
@@ -257,13 +284,14 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('complete 是终止态：不再被投递，也不能再失败或重试', async () => {
     const store = await create(await tempRoot());
     const id = await seed(store);
-    asContext(await claimOne(store, id, 'consumer', 0));
+    const held = await hold(store, id, 'consumer', 0);
 
     const done = asContext(
       await store.completeDelivery({
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         owner: 'consumer',
         processor_version: 'downstream-1.2',
         now: at(1_000),
@@ -278,13 +306,25 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
     expect(done.lease_expires_at).toBeUndefined();
 
     expect(await claimOne(store, id, 'other', 2_000)).toBeUndefined();
+    // 终态不接受任何写入：拿着当次凭据也一样
     expect(
       await store.failDelivery({
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         error: 'too late',
         retryable: true,
+        now: at(2_000),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: tokenOf(held),
+        owner: 'consumer',
         now: at(2_000),
       }),
     ).toBeUndefined();
@@ -294,13 +334,15 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('只有持有者能续租与完成，且过期后不再续租', async () => {
     const store = await create(await tempRoot());
     const id = await seed(store);
-    asContext(await claimOne(store, id, 'consumer_a', 0));
+    const held = await hold(store, id, 'consumer_a', 0);
 
+    // 换个人来续租：owner 不匹配，token 也不匹配，两种检查都该拦下
     expect(
       await store.renewDeliveryClaim({
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         owner: 'consumer_b',
         lease_ms: LEASE,
         now: at(1_000),
@@ -311,6 +353,7 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         owner: 'consumer_b',
         now: at(1_000),
       }),
@@ -321,6 +364,7 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         owner: 'consumer_a',
         lease_ms: LEASE,
         now: at(30_000),
@@ -334,6 +378,7 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         owner: 'consumer_a',
         lease_ms: LEASE,
         now: at(90_000),
@@ -344,12 +389,13 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
   it('人工 retry 把 dead_letter 放回 pending 并清零次数', async () => {
     const store = await create(await tempRoot());
     const id = await seed(store);
-    asContext(await claimOne(store, id, 'consumer', 0));
+    const held = await hold(store, id, 'consumer', 0);
     asContext(
       await store.failDelivery({
         channel: 'context',
         role_id: ROLE,
         id,
+        claim_token: tokenOf(held),
         owner: 'consumer',
         error: 'permanent',
         retryable: false,
@@ -391,6 +437,7 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
       channel: 'feedback',
       role_id: ROLE,
       id: record.feedback_id,
+      claim_token: tokenOf(claimed!),
       owner: 'merger',
       now: at(1_000),
     });
@@ -406,11 +453,12 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
     const item = deliveryFor(ROLE, 'task_1');
     await store.ensureAgent(ROLE);
     await store.submitContextDelivery(item);
-    asContext(await claimOne(store, item.delivery_id, 'consumer', 0));
+    const held = await hold(store, item.delivery_id, 'consumer', 0);
     await store.completeDelivery({
       channel: 'context',
       role_id: ROLE,
       id: item.delivery_id,
+      claim_token: tokenOf(held),
       owner: 'consumer',
       now: at(1_000),
     });
@@ -428,13 +476,15 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
 
     expect(await store.listRetryableDeliveries({ channel: 'context', now: at(0) })).toHaveLength(2);
 
-    const first = asContext(
+    const firstHeld = asContext(
       await store.claimNextDelivery({ channel: 'context', owner: 'c', lease_ms: LEASE, now: at(0) }),
-    ).item;
+    );
+    const first = firstHeld.item;
     await store.failDelivery({
       channel: 'context',
       role_id: ROLE,
       id: first.delivery_id,
+      claim_token: tokenOf(firstHeld),
       owner: 'c',
       error: 'temporary',
       retryable: true,
@@ -444,6 +494,268 @@ describe.each(DELIVERY_ADAPTERS)('$name — 交付状态机', ({ create }) => {
     const due = await store.listRetryableDeliveries({ channel: 'context', now: at(0) });
     expect(due).toHaveLength(1);
     expect((due[0] as ClaimedContextDelivery).item.delivery_id).not.toBe(first.delivery_id);
+  });
+
+  // ── fencing token（Phase 0 审核修复） ─────────────────────────────
+  //
+  // 只凭 owner 挡不住过期持有者：owner 是稳定 worker 标识，同一个 worker 重启后
+  // 还是它，于是「上一个进程的持有」与「当前进程的持有」在数据上长得一模一样。
+  // 每次 claim 发一个新 token，才让「这条记录已经换人了」可判。
+
+  it('每次 claim 发一个新凭据；被接手之后旧凭据一律失效（同一个 owner 也不行）', async () => {
+    const store = await create(await tempRoot());
+    const id = await seed(store);
+
+    const first = await hold(store, id, 'consumer', 0);
+    const firstToken = tokenOf(first);
+    expect(firstToken).toMatch(/^claim_/);
+
+    // 租约过期后被**同一个 owner** 重新 claim：owner 字符串完全相同，只有 token 不同
+    await store.restoreExpiredDeliveryClaims({ channel: 'context', now: at(LEASE) });
+    const second = await hold(store, id, 'consumer', LEASE);
+    const secondToken = tokenOf(second);
+    expect(secondToken).not.toBe(firstToken);
+
+    // 旧凭据写不动新 claim 的任何东西
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: firstToken,
+        owner: 'consumer',
+        now: at(LEASE + 1_000),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.failDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: firstToken,
+        owner: 'consumer',
+        error: 'stale worker',
+        retryable: true,
+        now: at(LEASE + 1_000),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.renewDeliveryClaim({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: firstToken,
+        owner: 'consumer',
+        lease_ms: LEASE,
+        now: at(LEASE + 1_000),
+      }),
+    ).toBeUndefined();
+
+    // 记录仍是新持有者的在途状态：旧凭据连状态都没推动过
+    expect(await store.getContextDelivery(ROLE, id)).toMatchObject({
+      status: 'processing',
+      claim_token: secondToken,
+      attempt_count: 2,
+    });
+
+    // 新凭据照常可用
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: secondToken,
+        owner: 'consumer',
+        now: at(LEASE + 1_000),
+      }),
+    ).toMatchObject({ item: { status: 'processed' } });
+  });
+
+  it('租约过期后旧凭据立刻失效：renew / complete / fail 都不接受', async () => {
+    const store = await create(await tempRoot());
+    const id = await seed(store);
+    const held = await hold(store, id, 'consumer', 0);
+    const token = tokenOf(held);
+
+    // 过期那一刻起就失去写权——哪怕暂时还没有别人来接手
+    expect(
+      await store.renewDeliveryClaim({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: token,
+        lease_ms: LEASE,
+        now: at(LEASE),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: token,
+        now: at(LEASE),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.failDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: token,
+        error: 'too late',
+        retryable: true,
+        now: at(LEASE),
+      }),
+    ).toBeUndefined();
+
+    // 三个动作都没落下任何痕迹
+    expect(await store.getContextDelivery(ROLE, id)).toMatchObject({
+      status: 'processing',
+      claim_token: token,
+      attempt_count: 1,
+    });
+  });
+
+  it('新老两个凭据并发写同一行：只有一个成功，且赢的是当前那个', async () => {
+    const store = await create(await tempRoot());
+    await store.ensureAgent(ROLE);
+
+    async function contended(seq: number, outcome: 'complete' | 'fail') {
+      const item = deliveryFor(ROLE, `task_race_${String(seq)}`, seq);
+      await store.submitContextDelivery(item);
+      const first = await hold(store, item.delivery_id, 'consumer', 0);
+      const staleToken = tokenOf(first);
+      await store.restoreExpiredDeliveryClaims({ channel: 'context', now: at(LEASE) });
+      const current = await hold(store, item.delivery_id, 'consumer', LEASE);
+      const currentToken = tokenOf(current);
+
+      const [stale, fresh] = await Promise.all([
+        store.completeDelivery({
+          channel: 'context',
+          role_id: ROLE,
+          id: item.delivery_id,
+          claim_token: staleToken,
+          owner: 'consumer',
+          now: at(LEASE + 1_000),
+        }),
+        outcome === 'complete'
+          ? store.completeDelivery({
+              channel: 'context',
+              role_id: ROLE,
+              id: item.delivery_id,
+              claim_token: currentToken,
+              owner: 'consumer',
+              now: at(LEASE + 1_000),
+            })
+          : store.failDelivery({
+              channel: 'context',
+              role_id: ROLE,
+              id: item.delivery_id,
+              claim_token: currentToken,
+              owner: 'consumer',
+              error: 'downstream unavailable',
+              retryable: true,
+              now: at(LEASE + 1_000),
+            }),
+      ]);
+      expect(stale).toBeUndefined();
+      expect(fresh).toBeDefined();
+      return { id: item.delivery_id, outcome };
+    }
+
+    // 两个人抢着 complete：只有当前凭据那条写得进去
+    const completed = await contended(1, 'complete');
+    const afterComplete = await store.getContextDelivery(ROLE, completed.id);
+    expect(afterComplete).toMatchObject({ status: 'processed' });
+    // 终态不留活的凭据：字段本身不该还在（JSON 落盘会丢掉 undefined 键，所以单独断言）
+    expect(afterComplete?.claim_token).toBeUndefined();
+
+    // 老凭据 complete、新凭据 fail：同样只有新凭据生效，终局是 pending 而不是 processed
+    const failed = await contended(2, 'fail');
+    const afterFail = await store.getContextDelivery(ROLE, failed.id);
+    expect(afterFail).toMatchObject({ status: 'pending', attempt_count: 2 });
+    expect(afterFail?.claim_token).toBeUndefined();
+  });
+
+  it('终态拿旧凭据也改不动：processed / dead_letter 都不接受过期写入', async () => {
+    const store = await create(await tempRoot());
+    const id = await seed(store);
+    const held = await hold(store, id, 'consumer', 0);
+    const token = tokenOf(held);
+
+    await store.completeDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id,
+      claim_token: token,
+      owner: 'consumer',
+      now: at(1_000),
+    });
+
+    // 终态之后，同一个凭据（无论还带不带 owner）都只是在对着一条已收尾的记录说话
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: token,
+        now: at(2_000),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.failDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: token,
+        error: 'too late',
+        retryable: true,
+        now: at(2_000),
+      }),
+    ).toBeUndefined();
+    expect(await store.getContextDelivery(ROLE, id)).toMatchObject({ status: 'processed' });
+
+    // dead_letter 同样不接受旧凭据：死信要动只能走人工 retry，不是拿旧凭据再写一次
+    const deadId = (await store.submitContextDelivery(deliveryFor(ROLE, 'task_terminal', 9))).item
+      .delivery_id;
+    const deadHeld = await hold(store, deadId, 'consumer', 0);
+    const deadToken = tokenOf(deadHeld);
+    await store.failDelivery({
+      channel: 'context',
+      role_id: ROLE,
+      id: deadId,
+      claim_token: deadToken,
+      owner: 'consumer',
+      error: 'schema cannot be parsed',
+      retryable: false,
+      now: at(1_000),
+    });
+    expect(await store.getContextDelivery(ROLE, deadId)).toMatchObject({
+      status: 'dead_letter',
+      last_error: 'schema cannot be parsed',
+    });
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id: deadId,
+        claim_token: deadToken,
+        now: at(2_000),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.failDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id: deadId,
+        claim_token: deadToken,
+        error: 'again',
+        retryable: true,
+        now: at(2_000),
+      }),
+    ).toBeUndefined();
+    expect(await store.getContextDelivery(ROLE, deadId)).toMatchObject({ status: 'dead_letter' });
   });
 });
 
@@ -532,11 +844,12 @@ describe('FileMemoryDeliveryRepository — 锁文件与崩溃', () => {
     expect(restored).toHaveLength(1);
     expect(asContext(restored[0]).item).toMatchObject({ status: 'pending', attempt_count: 1 });
 
-    const resumed = asContext(await claimOne(restarted, id, 'consumer_b', LEASE));
+    const resumed = await hold(restarted, id, 'consumer_b', LEASE);
     await restarted.completeDelivery({
       channel: 'context',
       role_id: ROLE,
       id,
+      claim_token: tokenOf(resumed),
       owner: 'consumer_b',
       now: at(LEASE + 1_000),
     });
@@ -545,6 +858,106 @@ describe('FileMemoryDeliveryRepository — 锁文件与崩溃', () => {
     const all = await restarted.listContextDeliveries({ role_id: ROLE });
     expect(all).toHaveLength(1);
     expect(all[0]).toMatchObject({ status: 'processed', attempt_count: 2 });
-    void resumed;
+  });
+
+  it('重启后 token 仍然可验证：原持有者能凭它完成，凭据不对的一律写不进去', async () => {
+    const root = await tempRoot();
+    const first = await openStore(root);
+    const id = await seed(first);
+    const claimed = await hold(first, id, 'consumer_a', 0);
+    const token = tokenOf(claimed);
+
+    // 进程重启：lease 还没过期，持有者换了个实例但对同一次 claim 负责
+    const restarted = await openStore(root);
+    expect(await restarted.getContextDelivery(ROLE, id)).toMatchObject({
+      status: 'processing',
+      claim_token: token,
+      claim_owner: 'consumer_a',
+    });
+
+    const otherToken = newClaimToken();
+    expect(otherToken).not.toBe(token);
+    expect(
+      await restarted.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: otherToken,
+        now: at(1_000),
+      }),
+    ).toBeUndefined();
+    expect(
+      await restarted.failDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: otherToken,
+        error: 'wrong worker',
+        retryable: true,
+        now: at(1_000),
+      }),
+    ).toBeUndefined();
+
+    // 重启不会让凭据失效：原 token 仍然写得进去
+    expect(
+      await restarted.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: token,
+        owner: 'consumer_a',
+        now: at(1_000),
+      }),
+    ).toMatchObject({ item: { status: 'processed' } });
+  });
+
+  it('旧记录（processing 但无 lease、无 token）：谁也写不进去，只能被回收后重新 claim', async () => {
+    const root = await tempRoot();
+    const store = await openStore(root);
+    const id = await seed(store);
+
+    // 手工造一条更早版本留下的 processing 记录：既没有租约也没有凭据
+    const legacy = { ...deliveryFor(ROLE, 'task_legacy_hold'), status: 'processing' as const };
+    await writeFile(
+      recordPath(root, id),
+      `${JSON.stringify({ ...legacy, delivery_id: id }, null, 2)}\n`,
+      'utf8',
+    );
+
+    // 没有 token 可匹配，任何 ack 都写不进去——不会因为「缺字段」而被放行
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: newClaimToken(),
+        now: at(0),
+      }),
+    ).toBeUndefined();
+    expect(
+      await store.renewDeliveryClaim({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: newClaimToken(),
+        now: at(0),
+      }),
+    ).toBeUndefined();
+
+    // 恢复路径：无租约的 processing 视为已过期，回收后可重新 claim 并拿到新凭据
+    const restored = await store.restoreExpiredDeliveryClaims({ channel: 'context', now: at(0) });
+    expect(restored).toHaveLength(1);
+    const reclaimed = await hold(store, id, 'consumer_new', 0);
+    expect(reclaimed.item.claim_token).toBeTruthy();
+    expect(
+      await store.completeDelivery({
+        channel: 'context',
+        role_id: ROLE,
+        id,
+        claim_token: tokenOf(reclaimed),
+        owner: 'consumer_new',
+        now: at(1_000),
+      }),
+    ).toMatchObject({ item: { status: 'processed' } });
   });
 });

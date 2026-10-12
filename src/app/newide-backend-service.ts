@@ -741,13 +741,18 @@ export class NewideBackendService {
   }
 
   renewMemoryDeliveryClaim(
-    input: DeliveryRecordLocator & { owner: string; lease_ms?: number | undefined },
+    input: DeliveryRecordLocator & {
+      claim_token: string;
+      owner?: string | undefined;
+      lease_ms?: number | undefined;
+    },
   ): Promise<DeliveryRecordPayload | undefined> {
     return this.requireBMemoryService().renewDeliveryClaim(input);
   }
 
   ackMemoryDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string | undefined;
       outcome: 'processed' | 'failed';
       error?: string | undefined;

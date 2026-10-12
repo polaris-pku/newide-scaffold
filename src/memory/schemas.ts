@@ -650,6 +650,19 @@ const deliveryLifecycleFields = {
   claimed_at: z.iso.datetime().optional(),
   /** 当前持有者标识（下游消费者自己给；本仓不解释它的含义） */
   claim_owner: z.string().optional(),
+  /**
+   * 本次 claim 的 fencing token —— **每次 claim 唯一**，renew / complete / fail 必须原样带回。
+   *
+   * 与 `claim_owner` 的分工是刻意的：owner 是稳定 worker 标识（同一个人重启后还是它），
+   * 因此无法区分「上一个进程的持有」与「这个进程的持有」。token 每次 claim 都新生成，
+   * 于是租约过期后被别人抢走的记录，旧持有者拿着旧 token 再也写不进去——这就是
+   * 「过期 worker 不能覆盖新 worker 的成果」在数据上的落点。
+   *
+   * 可选是为了读得进工作包 B/C 之前的旧记录；**缺 token 不是绕过 fencing 的口子**，
+   * 而是明确的恢复路径：旧记录只能等租约过期（或本就无租约）被判为过期后回到队列，
+   * 由下一次 claim 重新发一个 token，任何持有者都无法凭旧记录写终态。
+   */
+  claim_token: z.string().optional(),
   /** 本次 lease 的到期时刻；过期即可被 restoreExpired* 放回队列 */
   lease_expires_at: z.iso.datetime().optional(),
   /** 退避后的最早可再投递时刻；缺席表示立即可投递 */
