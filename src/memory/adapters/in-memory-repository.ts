@@ -61,6 +61,7 @@ import {
 import {
   buildPersonaEvolutionSnapshot,
   personaEvolutionInputSnapshotHash,
+  personaEvolutionLastRun,
   planPersonaEvolutionCandidate,
 } from '../services/persona-evolution-candidates';
 import {
@@ -818,6 +819,8 @@ export class InMemoryRepository implements MemoryRepository {
       experiences: store.experiences,
     });
     const input_snapshot_hash = personaEvolutionInputSnapshotHash(snapshot);
+    // 上一次结论必须在**计划重置它之前**读出来：重评路径的第一步就是把结论字段清掉
+    const last_evolution = personaEvolutionLastRun(store.personaEvolution);
     const policy = request.policy ?? DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY;
     const plan = planPersonaEvolutionCandidate(store.personaEvolution, {
       now: request.now,
@@ -856,6 +859,7 @@ export class InMemoryRepository implements MemoryRepository {
       persona: { ...store.persona },
       snapshot,
       input_snapshot_hash,
+      ...(last_evolution !== undefined ? { last_evolution } : {}),
     };
   }
 

@@ -25,6 +25,7 @@ import type { DeliveryRetryPolicy } from '../services/delivery-lifecycle';
 import type {
   PersonaEvolutionApprovalMode,
   PersonaEvolutionInputSnapshot,
+  PersonaEvolutionLastRun,
 } from './persona-evolution-strategy';
 import type { PromotionApprovalMode } from './promotion-strategy';
 
@@ -280,6 +281,19 @@ export interface ClaimedPersonaEvolutionCandidate {
   snapshot: PersonaEvolutionInputSnapshot;
   /** 快照的 hash；幂等键的一半 */
   input_snapshot_hash: string;
+  /**
+   * 上一次演化的结论（Phase 4-C 新增）：判定能读到的唯一历史。
+   *
+   * 它必须在**计划执行之前**从标记上读出来，因为「重评」的第一件事就是把结论字段重置掉
+   * （见 `reevaluatePersonaEvolutionMarker`）——等到调用方拿到 claim 返回的标记时，那份历史
+   * 已经不在了。缺了它，默认策略的 `no_new_input` 永远判不出来，「策略版本变了、输入没变」
+   * 就只剩 `persona_unchanged` 兜底：版本一样不会多写，但审计里记的挡板从「输入没变」变成
+   * 「正文没变」。
+   *
+   * 只在**上一条结论出过**时有值（`personaEvolutionLastRun`）：正在处理、退回队列、死信都
+   * 没有结论可言。
+   */
+  last_evolution?: PersonaEvolutionLastRun | undefined;
 }
 
 /** 一次 claim 的入参（输入快照由适配器在临界区里自己算，见上面的说明） */
