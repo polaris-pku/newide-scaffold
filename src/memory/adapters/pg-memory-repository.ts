@@ -30,7 +30,9 @@ import {
   type SkillRecord,
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
+import type { PromotionApprovalMode } from '../ports/promotion-strategy';
 import type {
+  ClaimedPromotionCandidate,
   ExperienceFeedbackApplication,
   ExperienceFeedbackResult,
   ExperienceSaveResult,
@@ -38,9 +40,31 @@ import type {
   MarketSearchOptions,
   MemoryRepository,
   MemoryVectorSearchOptions,
+  PromotionCandidateQuery,
+  PromotionClaimRequest,
+  PromotionCompletionRequest,
+  PromotionFailureRequest,
+  PromotionRestoreOptions,
   SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
+import {
+  DEFAULT_PROMOTION_RETRY_POLICY,
+  claimDeliveryRecord,
+  completeDeliveryRecord,
+  expireDeliveryClaimRecord,
+  failDeliveryRecord,
+  isDeliveryClaimExpired,
+  newClaimToken,
+  resetDeliveryForRetry,
+  type DeliveryRetryPolicy,
+} from '../services/delivery-lifecycle';
+import {
+  comparePromotionCandidates,
+  planPromotionCandidate,
+  selectPromotionCandidates,
+  type PromotionCandidateInput,
+} from '../services/promotion-candidates';
 import {
   applyFeedbackToExperience,
   averageConfidence,
@@ -982,6 +1006,283 @@ export class PgMemoryRepository implements MemoryRepository {
     }
   }
 
+  // ── 技能晋升的状态面（Phase 3） ──────────────────────────────────
+  //
+  // 与交付存储的 claim 同一手法：**读 → 在内存里算出下一条 → 条件 UPDATE**，条件里带上
+  // 读到的那一版（晋升标记的 status/attempt_count/claim_token/updated_at，外加经验载荷上
+  // 会被别的写路径改动的三个字段）。写不进去就说明读之后有人改过这条经验，返回 undefined
+  // 由调用方决定跳过还是稍后再来——绝不「读出来、改一份内存副本、整份覆盖回去」。
+  //
+  // 条件里为什么要带上 confidence / referenced_count / updated_at：晋升的写回是**整份载荷**，
+  // 而反馈回写（applyExperienceFeedback）改的正是这三个。少了它们，一次晋升写回会把并发中
+  // 刚应用上去的反馈整份抹掉——而那条反馈的交付可能已被 ack，损失不可追回。
+
+  async listPromotionCandidates(query: PromotionCandidateQuery): Promise<ExperienceRecord[]> {
+    await this.ensureSchema();
+    const input = promotionCandidateInput(query);
+    const candidates: ExperienceRecord[] = [];
+    for (const role_id of await this.promotionRoleIds(query.role_id)) {
+      candidates.push(...(await this.scanPromotionCandidates(role_id, input)));
+    }
+    candidates.sort(comparePromotionCandidates);
+    return query.limit === undefined ? candidates : candidates.slice(0, Math.max(0, query.limit));
+  }
+
+  /**
+   * claim 下一条候选：逐条尝试条件写。
+   *
+   * 「逐条」而不是「取第一条就放弃」的理由与交付侧相同：排在前面的那条可能刚被另一个
+   * 进程条件更新走，这不该让整次 claim 空手而归。整个尝试在 role 的临界区里串行
+   * （见 withRoleLock），跨进程那一侧靠条件写本身成立。
+   */
+  async claimNextPromotionCandidate(
+    request: PromotionClaimRequest,
+  ): Promise<ClaimedPromotionCandidate | undefined> {
+    await this.ensureSchema();
+    const input = promotionCandidateInput(request);
+    const policy = request.policy ?? DEFAULT_PROMOTION_RETRY_POLICY;
+
+    for (const role_id of await this.promotionRoleIds(request.role_id)) {
+      const candidates = await this.scanPromotionCandidates(role_id, input);
+      for (const candidate of candidates) {
+        const written = await this.transitionPromotion(role_id, candidate.id, (current) => {
+          // 扫描之后可能已经被别人改过，按重读后的当前版本重算计划
+          const plan = planPromotionCandidate(current, input);
+          if (plan.kind === 'skip') return undefined;
+          const base =
+            plan.kind === 'expire_then_claim'
+              ? expireDeliveryClaimRecord(current.promotion!, { now: input.now, policy })
+              : plan.marker;
+          const claimedMarker = claimDeliveryRecord(base, {
+            owner: request.owner,
+            now: request.now,
+            lease_ms: request.lease_ms,
+            claim_token: newClaimToken(),
+            policy,
+          });
+          if (claimedMarker) return { ...current, promotion: claimedMarker };
+          // 回收之后可能直接进了死信（次数用满），claim 自然拿不到它——把回收结果落下来，
+          // 否则这条记录的租约永远停在过期状态，每次扫描都白跑一遍
+          return plan.kind === 'expire_then_claim' ? { ...current, promotion: base } : undefined;
+        });
+        const marker = written?.promotion;
+        if (written && marker?.status === 'processing' && marker.claim_token) {
+          return {
+            role_id,
+            experience: written,
+            claim_token: marker.claim_token,
+            attempt_count: marker.attempt_count,
+          };
+        }
+      }
+    }
+    return undefined;
+  }
+
+  async completePromotion(
+    request: PromotionCompletionRequest,
+  ): Promise<ExperienceRecord | undefined> {
+    await this.ensureSchema();
+    if (request.outcome === 'promoted' && request.skill_id === undefined) {
+      throw new Error('completePromotion requires a skill_id when the outcome is "promoted".');
+    }
+    return this.transitionPromotion(request.role_id, request.experience_id, (current) => {
+      const marker = current.promotion;
+      if (!marker) return undefined;
+      const completed = completeDeliveryRecord(
+        {
+          ...marker,
+          outcome: request.outcome,
+          strategy_version: request.strategy_version,
+          evaluated_at: request.now,
+          skill_id: request.skill_id,
+          reasons: request.reasons,
+        },
+        {
+          ...(request.owner !== undefined ? { owner: request.owner } : {}),
+          claim_token: request.claim_token,
+          now: request.now,
+        },
+      );
+      if (!completed) return undefined;
+      return {
+        ...current,
+        promotion: completed,
+        // promoted_to 与结论在同一次条件写里落定：读到「Skill 已存在、经验还没绑上」的
+        // 中间态，会让人把它当成没晋升过再晋升一次
+        ...(request.outcome === 'promoted' && request.skill_id !== undefined
+          ? { promoted_to: request.skill_id }
+          : {}),
+      };
+    });
+  }
+
+  async failPromotion(request: PromotionFailureRequest): Promise<ExperienceRecord | undefined> {
+    await this.ensureSchema();
+    return this.transitionPromotion(request.role_id, request.experience_id, (current) => {
+      const marker = current.promotion;
+      if (!marker) return undefined;
+      const failed = failDeliveryRecord(marker, {
+        ...(request.owner !== undefined ? { owner: request.owner } : {}),
+        claim_token: request.claim_token,
+        now: request.now,
+        error: request.error,
+        retryable: request.retryable,
+        policy: request.policy ?? DEFAULT_PROMOTION_RETRY_POLICY,
+      });
+      return failed ? { ...current, promotion: failed } : undefined;
+    });
+  }
+
+  async restoreExpiredPromotionClaims(
+    options: PromotionRestoreOptions,
+  ): Promise<ExperienceRecord[]> {
+    await this.ensureSchema();
+    const policy = options.policy ?? DEFAULT_PROMOTION_RETRY_POLICY;
+    const restored: ExperienceRecord[] = [];
+    for (const role_id of await this.promotionRoleIds(options.role_id)) {
+      for (const experience of await this.listPromotionRows(role_id)) {
+        const marker = experience.promotion;
+        if (!marker || !isDeliveryClaimExpired(marker, options.now)) continue;
+        // 在临界区里重读一遍再判过期：列举到写入之间可能有人完成了它，
+        // 那时过期判定已不成立，必须放过（否则会把一条已经晋升完的候选重投一次）
+        const updated = await this.transitionPromotion(role_id, experience.id, (current) => {
+          const currentMarker = current.promotion;
+          if (!currentMarker || !isDeliveryClaimExpired(currentMarker, options.now)) return undefined;
+          return {
+            ...current,
+            promotion: expireDeliveryClaimRecord(currentMarker, { now: options.now, policy }),
+          };
+        });
+        if (updated) restored.push(updated);
+      }
+    }
+    return restored;
+  }
+
+  async retryDeadLetterPromotion(request: {
+    role_id: string;
+    experience_id: string;
+    now: string;
+  }): Promise<ExperienceRecord | undefined> {
+    await this.ensureSchema();
+    return this.transitionPromotion(request.role_id, request.experience_id, (current) => {
+      const marker = current.promotion;
+      if (!marker) return undefined;
+      const reset = resetDeliveryForRetry(marker, { now: request.now });
+      return reset ? { ...current, promotion: reset } : undefined;
+    });
+  }
+
+  /** 读—判断—写的公共骨架：转移函数返回 undefined 就什么都不写 */
+  private async transitionPromotion(
+    role_id: string,
+    experience_id: string,
+    apply: (current: ExperienceRecord) => ExperienceRecord | undefined,
+  ): Promise<ExperienceRecord | undefined> {
+    return this.withRoleLock(role_id, async () => {
+      const current = await this.readPromotionRow(role_id, experience_id);
+      if (!current) return undefined;
+      const next = apply(current);
+      if (!next) return undefined;
+      return this.writePromotionIfUnchanged(role_id, current, next);
+    });
+  }
+
+  private async readPromotionRow(
+    role_id: string,
+    experience_id: string,
+  ): Promise<ExperienceRecord | undefined> {
+    const result = await this.pool.query<{ payload: unknown }>(
+      `SELECT payload FROM memory_experiences WHERE role_id = $1 AND id = $2`,
+      [role_id, experience_id],
+    );
+    const row = result.rows[0];
+    return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
+  }
+
+  /**
+   * 条件写回经验的载荷（描述没变，因此**不动** description_embedding 列）。
+   *
+   * 谓词分两段：前四个定位「读到的这一版晋升标记」（四者都为 NULL 时要求这条经验压根
+   * 还没有晋升标记），后三个挡住「读之后有别的写路径改过这条经验」——晋升写回的是整份
+   * 载荷，少了后三个就会把并发中刚应用上去的反馈整份抹掉。
+   */
+  private async writePromotionIfUnchanged(
+    role_id: string,
+    current: ExperienceRecord,
+    next: ExperienceRecord,
+  ): Promise<ExperienceRecord | undefined> {
+    const marker = current.promotion;
+    const result = await this.pool.query<{ payload: unknown }>(
+      `UPDATE memory_experiences
+       SET payload = $3::jsonb
+       WHERE role_id = $1 AND id = $2
+         AND payload->'promotion'->>'status' IS NOT DISTINCT FROM $4
+         AND payload->'promotion'->>'attempt_count' IS NOT DISTINCT FROM $5
+         AND payload->'promotion'->>'claim_token' IS NOT DISTINCT FROM $6
+         AND payload->'promotion'->>'updated_at' IS NOT DISTINCT FROM $7
+         AND payload->>'updated_at' = $8
+         AND payload->>'confidence' = $9
+         AND payload->>'referenced_count' = $10
+       RETURNING payload`,
+      [
+        role_id,
+        current.id,
+        JSON.stringify(next),
+        marker?.status ?? null,
+        marker === undefined ? null : String(marker.attempt_count),
+        marker?.claim_token ?? null,
+        marker?.updated_at ?? null,
+        current.updated_at,
+        String(current.confidence),
+        String(current.referenced_count),
+      ],
+    );
+    const row = result.rows[0];
+    return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
+  }
+
+  /** 扫描范围：给了 role 就只扫它，否则扫全部（隐藏的市场池 Agent 不算） */
+  private async promotionRoleIds(role_id: string | undefined): Promise<string[]> {
+    return role_id !== undefined ? [role_id] : this.listAgentIds();
+  }
+
+  /** 一次扫描的候选（过滤与排序都在共享规则里，SQL 只负责取数） */
+  private async scanPromotionCandidates(
+    role_id: string,
+    input: PromotionCandidateInput,
+  ): Promise<ExperienceRecord[]> {
+    return selectPromotionCandidates(await this.listPromotionRows(role_id), input);
+  }
+
+  /**
+   * 该 role 的全部经验（扫描面）。
+   *
+   * 读不懂的载荷**抛出**而不是跳过：一条坏记录悄悄消失会让「这条经验为什么一直没被晋升」
+   * 无从回答，而抛错至少把它写进 run 的失败原因里（交付侧的「损坏记录不拦住列表」是另一种
+   * 取舍——那里的记录是上游投进来的，这里是自己的记忆实体）。
+   */
+  private async listPromotionRows(role_id: string): Promise<ExperienceRecord[]> {
+    const result = await this.pool.query<{ id: string; payload: unknown }>(
+      `SELECT id, payload FROM memory_experiences
+       WHERE role_id = $1
+       ORDER BY payload->>'created_at' ASC, id ASC`,
+      [role_id],
+    );
+    return result.rows.map((row) => {
+      try {
+        return ExperienceRecordSchema.parse(row.payload);
+      } catch (error) {
+        throw new Error(
+          `Experience ${row.id} of ${role_id} could not be read for promotion: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    });
+  }
+
   async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {
     await this.ensureSchema();
     const result = await this.pool.query(
@@ -1296,4 +1597,19 @@ async function writeExperienceIfUnchanged(
   );
   const row = result.rows[0];
   return row ? ExperienceRecordSchema.parse(row.payload) : undefined;
+}
+
+/** 把扫描/claim 需要的语义参数收敛成一份（端口上的 Query 与 Request 都带这几个字段） */
+function promotionCandidateInput(source: {
+  now: string;
+  strategy_version: string;
+  approval: PromotionApprovalMode;
+  policy?: DeliveryRetryPolicy;
+}): PromotionCandidateInput {
+  return {
+    now: source.now,
+    strategy_version: source.strategy_version,
+    approval: source.approval,
+    ...(source.policy !== undefined ? { policy: source.policy } : {}),
+  };
 }

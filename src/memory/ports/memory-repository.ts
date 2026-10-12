@@ -15,9 +15,12 @@ import type {
   ExperienceRecord,
   MarketStatus,
   PersonaDef,
+  PromotionOutcome,
   RetiredReason,
   SkillRecord,
 } from '../schemas';
+import type { DeliveryRetryPolicy } from '../services/delivery-lifecycle';
+import type { PromotionApprovalMode } from './promotion-strategy';
 
 /** 向量检索参数（索引层 top-K 召回） */
 export interface MemoryVectorSearchOptions {
@@ -112,6 +115,132 @@ export interface ExperienceFeedbackResult {
   outcome: ExperienceFeedbackOutcome;
   /** 应用之后仓库里的那条经验；`experience_missing` 时缺席 */
   experience?: ExperienceRecord;
+}
+
+// ── 技能晋升的状态面（Phase 3） ──────────────────────────────────────
+//
+// Skill Promotion Job 需要四种当前端口表达不了的**原子**操作：扫候选、claim 一条候选、
+// 落一条结论、落一次失败/回收。它们全部作用在经验自己身上（晋升标记是 Experience 的
+// 可选字段，见 schemas.ts 的 ExperiencePromotionSchema），因此**不需要**第二套存储或第二套
+// 状态机：claim/lease/retry 的转移规则仍是 services/delivery-lifecycle.ts 里那一套，
+// 「谁算候选」是 services/promotion-candidates.ts 里那一份纯规则。
+//
+// 为什么不能拿 listExperiences + updateExperience 自己拼：读—判断—写之间隔着 await，
+// 两个 worker 会各自读到同一条未评估的经验、各自通过判断、各自写回——同一条经验被评估两次，
+// 而且后写的一方会把先写的那份结论盖掉。判断与写入必须在存储层的同一个临界区里完成
+// （与 saveExperienceIfAbsent / applyExperienceFeedback 同一条理由）。
+
+/**
+ * 扫候选的过滤条件。
+ *
+ * `strategy_version` 与 `approval` 是**语义**参数而不是优化参数：同一条判过的经验要不要
+ * 重评，取决于「策略换版本了没有」与「人工审核是否已放宽为自动批准」。少了它们，扫出来的
+ * 候选集合会与 promotion-candidates 的规则不一致。
+ */
+export interface PromotionCandidateQuery {
+  /** 只扫该 role 的经验；缺省跨全部 Agent（市场池除外） */
+  role_id?: string;
+  /** 参考时刻（注入时钟） */
+  now: string;
+  /** 当前生效的策略版本 */
+  strategy_version: string;
+  /** 本次运行的审核模式 */
+  approval: PromotionApprovalMode;
+  /** 重试预算；缺省用 DEFAULT_PROMOTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+  /** 最多返回多少条（按「先来的先处理」取前 N 条） */
+  limit?: number;
+}
+
+/** claim 一条候选：谁持有、持有多久、以什么时刻为准 */
+export interface PromotionClaimRequest {
+  /** 只在该 role 里找候选；缺省跨全部 Agent */
+  role_id?: string;
+  /** 消费者标识（下游自己给；本仓只做持有者比对，不解释它的含义） */
+  owner: string;
+  /** 参考时刻（注入时钟） */
+  now: string;
+  /** 租约时长（毫秒） */
+  lease_ms: number;
+  /** 当前生效的策略版本（决定判过的候选要不要先重置） */
+  strategy_version: string;
+  /** 本次运行的审核模式 */
+  approval: PromotionApprovalMode;
+  /** 重试预算；缺省用 DEFAULT_PROMOTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/**
+ * claim 到的一条候选。
+ *
+ * `claim_token` 必须原样带回 complete/fail —— 它是这次持有的凭据，租约过期后被别人拿走的
+ * 候选，旧持有者拿着旧 token 再也写不进去（fencing 与交付通道同源，见 schemas.ts 的
+ * lifecycleRecordFields）。
+ */
+export interface ClaimedPromotionCandidate {
+  /** 这条经验属于哪个 Agent（写回时要按它定位） */
+  role_id: string;
+  /** claim 之后的经验（`promotion` 已是 processing，带 lease 与 token） */
+  experience: ExperienceRecord;
+  /** 本次 claim 的 fencing token */
+  claim_token: string;
+  /** claim 时的投递次数（已经 +1） */
+  attempt_count: number;
+}
+
+/**
+ * 落一条结论：processing → processed。
+ *
+ * `outcome === 'promoted'` 时必须给出 `skill_id`，且实现要**同一次原子写入**里把
+ * `promoted_to` 也指过去——「Skill 已写入、经验还指向空」的中间态一旦能被读到，就会有人
+ * 把它当成「这条没晋升过」再晋升一次（虽有唯一键兜底，但审计上多出一轮无谓的处理）。
+ * 反过来 `outcome !== 'promoted'` 时不得写 `promoted_to`。
+ *
+ * token 不匹配、租约已过期、候选已被别人接手 → 返回 undefined（本次没写任何东西）。
+ */
+export interface PromotionCompletionRequest {
+  role_id: string;
+  experience_id: string;
+  /** claim 时发下的 token；不匹配就什么都写不进去 */
+  claim_token: string;
+  /** 可选的交叉核对：传了就必须与记录上的 claim_owner 一致 */
+  owner?: string;
+  outcome: PromotionOutcome;
+  /** 做出这个结论的策略版本 */
+  strategy_version: string;
+  /** 结论的人读理由 */
+  reasons?: string[];
+  /** 晋升出的 Skill id；`outcome === 'promoted'` 时必填 */
+  skill_id?: string;
+  /** 参考时刻（注入时钟） */
+  now: string;
+}
+
+/**
+ * 落一次失败：可重试则退避后回 pending，不可重试或已用满次数则进 dead_letter。
+ *
+ * `retryable` 由调用方判断（见 services/delivery-error-classification）：存储抖动可重试，
+ * 坏数据与配置永久错不可重试。token 不匹配 → 返回 undefined。
+ */
+export interface PromotionFailureRequest {
+  role_id: string;
+  experience_id: string;
+  claim_token: string;
+  owner?: string;
+  error: string;
+  retryable: boolean;
+  now: string;
+  /** 重试预算；缺省用 DEFAULT_PROMOTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/** 启动恢复：把租约过期仍停在 processing 的候选放回队列 */
+export interface PromotionRestoreOptions {
+  /** 只恢复该 role；缺省跨全部 Agent */
+  role_id?: string;
+  now: string;
+  /** 重试预算；缺省用 DEFAULT_PROMOTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
 }
 
 export interface MemoryRepository {
@@ -297,6 +426,53 @@ export interface MemoryRepository {
     role_id: string,
     input: ExperienceFeedbackApplication,
   ): Promise<ExperienceFeedbackResult>;
+
+  // ── 技能晋升的状态面（Phase 3） ──────────────────────────────────
+
+  /**
+   * 扫出本时刻该处理的候选（按「先来的先处理」排序）。
+   *
+   * 纯读：不 claim、不改状态。选候选的规则来自 services/promotion-candidates.ts 的
+   * `planPromotionCandidate`（两个适配器共用同一份），因此 InMemory 与 Pg 对「谁算候选」
+   * 不会有各自的解释。
+   */
+  listPromotionCandidates(query: PromotionCandidateQuery): Promise<ExperienceRecord[]>;
+
+  /**
+   * claim 下一条候选：未评估的一条落初始标记后进 processing，判过的一条按计划先
+   * 重置（换策略版本 / 人工审核转自动批准）或先回收过期租约，再进 processing。
+   *
+   * 「筛 → 判 → 写」在同一个临界区里完成；拿不到（没有候选、别人抢先、抢不到锁）返回
+   * undefined —— 与交付侧「返回 undefined 表示这次什么都没做」是同一种约定，不是错误。
+   */
+  claimNextPromotionCandidate(
+    request: PromotionClaimRequest,
+  ): Promise<ClaimedPromotionCandidate | undefined>;
+
+  /** 落一条结论（processing → processed）；token 不匹配或租约已过期返回 undefined */
+  completePromotion(request: PromotionCompletionRequest): Promise<ExperienceRecord | undefined>;
+
+  /** 落一次失败（退避回队列或进死信）；token 不匹配或租约已过期返回 undefined */
+  failPromotion(request: PromotionFailureRequest): Promise<ExperienceRecord | undefined>;
+
+  /**
+   * 启动恢复：把租约过期仍停在 processing 的候选放回队列，返回回收到的那些经验。
+   *
+   * 每一条都在自己的临界区里重新判一次过期，因此不会把「列举之后已经被别人完成了」的候选
+   * 重投一次。
+   */
+  restoreExpiredPromotionClaims(options: PromotionRestoreOptions): Promise<ExperienceRecord[]>;
+
+  /**
+   * 人工重试：dead_letter → pending，并清零投递次数（「再试一次」就是再给满额机会）。
+   *
+   * 只有死信可重试，其余状态返回 undefined。这是**运维入口**，自动路径不会调它。
+   */
+  retryDeadLetterPromotion(request: {
+    role_id: string;
+    experience_id: string;
+    now: string;
+  }): Promise<ExperienceRecord | undefined>;
 
   /**
    * 直写技能向量（memory.reindex 全量重建索引用）。

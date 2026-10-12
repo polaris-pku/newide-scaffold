@@ -38,6 +38,21 @@ export type RetiredReason = z.infer<typeof RetiredReasonSchema>;
 export const ExtractionStatusSchema = z.enum(['pending', 'processing', 'processed', 'dead_letter']);
 export type ExtractionStatus = z.infer<typeof ExtractionStatusSchema>;
 
+/**
+ * 交付状态机（定义在此处而非交付小节，是因为经验上的晋升标记也复用它，见
+ * ExperiencePromotionSchema——枚举必须先于使用它的 schema 求值）。
+ *
+ * 取值与 Buffer 的 ExtractionStatus 一致——上下文交付项与反馈 outbox 共用同一套状态
+ * 语义（见 工作包 C），但这里讲的是「交付给了下游」，所以不复用抽取那边的名字。
+ */
+export const DeliveryStatusSchema = z.enum([
+  'pending',
+  'processing',
+  'processed',
+  'dead_letter',
+]);
+export type DeliveryStatus = z.infer<typeof DeliveryStatusSchema>;
+
 /** 技能审核状态 */
 export const ReviewStatusSchema = z.enum(['pending', 'approved', 'rejected']);
 export type ReviewStatus = z.infer<typeof ReviewStatusSchema>;
@@ -235,6 +250,55 @@ export const BufferMetaSchema = z.object({
 export type BufferMeta = z.infer<typeof BufferMetaSchema>;
 
 // ═══════════════════════════════════════════
+//  共享状态机字段（交付通道 + 经验晋升标记）
+// ═══════════════════════════════════════════
+
+/**
+ * 上下文交付项、反馈 outbox、待归并反馈与经验上的晋升标记共用的**状态机字段**。
+ *
+ * 这四条记录走的是同一套 claim / lease / retry / dead-letter / fencing 语义，所以字段
+ * 只在这里定义一次，再由各 schema 各自展开——字段集合不可能漂移，
+ * `services/delivery-lifecycle.ts` 里那组纯规则函数也才能对它们一视同仁（它的
+ * `DeliveryLifecycleRecord` 要的正是这几个名字，晋升标记因此不必另写一套状态机）。
+ *
+ * `attempt_count` 给 `.default(0)`：工作包 B 落盘的历史记录没有这个字段，
+ * 默认值是它们的真实语义（还没投递过），不必写迁移脚本。
+ */
+const lifecycleRecordFields = {
+  /** 生命周期状态；推进规则见 services/delivery-lifecycle.ts */
+  status: DeliveryStatusSchema,
+  /** 已发起的投递次数（claim 一次算一次），达到重试上限后进 dead_letter */
+  attempt_count: z.number().int().min(0).default(0),
+  /** 当前持有者最后一次 claim 的时刻 */
+  claimed_at: z.iso.datetime().optional(),
+  /** 当前持有者标识（下游消费者自己给；本仓不解释它的含义） */
+  claim_owner: z.string().optional(),
+  /**
+   * 本次 claim 的 fencing token —— **每次 claim 唯一**，renew / complete / fail 必须原样带回。
+   *
+   * 与 `claim_owner` 的分工是刻意的：owner 是稳定 worker 标识（同一个人重启后还是它），
+   * 因此无法区分「上一个进程的持有」与「这个进程的持有」。token 每次 claim 都新生成，
+   * 于是租约过期后被别人抢走的记录，旧持有者拿着旧 token 再也写不进去——这就是
+   * 「过期 worker 不能覆盖新 worker 的成果」在数据上的落点。
+   *
+   * 可选是为了读得进工作包 B/C 之前的旧记录；**缺 token 不是绕过 fencing 的口子**，
+   * 而是明确的恢复路径：旧记录只能等租约过期（或本就无租约）被判为过期后回到队列，
+   * 由下一次 claim 重新发一个 token，任何持有者都无法凭旧记录写终态。
+   */
+  claim_token: z.string().optional(),
+  /** 本次 lease 的到期时刻；过期即可被 restoreExpired* 放回队列 */
+  lease_expires_at: z.iso.datetime().optional(),
+  /** 退避后的最早可再投递时刻；缺席表示立即可投递 */
+  next_retry_at: z.iso.datetime().optional(),
+  /** 最近一次失败原因（dead_letter 时保留最后一次） */
+  last_error: z.string().optional(),
+  /** 下游 processor 的版本位（由外部系统在 ack 时填充） */
+  processor_version: z.string().optional(),
+  created_at: z.iso.datetime(),
+  updated_at: z.iso.datetime(),
+};
+
+// ═══════════════════════════════════════════
 //  Experience
 // ═══════════════════════════════════════════
 
@@ -258,6 +322,70 @@ export const ConfidenceHistoryEntrySchema = z.object({
 });
 
 /**
+ * 一次晋升评估的结论 —— 策略判定这条经验该去哪。
+ *
+ * 与生命周期状态是两个维度：结论是**判定结果**（够不够格、要不要人看），`status` 是
+ * **处理进度**（谁在处理、处理完没有）。两者都记在 ExperiencePromotion 上，因此
+ * 「判定为 rejected」与「这条已经处理完」不会互相顶替。
+ */
+export const PromotionOutcomeSchema = z.enum([
+  /** 判定合格且当前是自动批准模式：调用方随即写入 Skill 并把 promoted_to 指过去 */
+  'promoted',
+  /** 判定合格但当前是人工审核模式：只留下这里，**不写 Skill**，等人工或后续自动批准的运行 */
+  'pending_review',
+  /** 判定不合格：留下理由，同一策略版本下不再重复评估 */
+  'rejected',
+]);
+export type PromotionOutcome = z.infer<typeof PromotionOutcomeSchema>;
+
+/**
+ * 经验上的晋升标记 —— Skill Promotion Job 处理这条经验时留下的一切。
+ *
+ * **可缺席即「从未评估」**：工作包 B 之前落盘的经验、以及新提取出来的经验都没有这个
+ * 字段，读作「还没被人评估过」，不需要迁移脚本（Pg 的载荷是 JSONB，老行只是少一个键）。
+ *
+ * 计划 §10 要求表达的那些语义落在这里：
+ *
+ * | 计划里的说法 | 本 schema 的落点 |
+ * | --- | --- |
+ * | 未评估       | `promotion === undefined` |
+ * | 处理中       | `status === 'processing'`（lease 未过期） |
+ * | 已晋升       | `status === 'processed'` 且 `outcome === 'promoted'` |
+ * | 待审核       | `status === 'processed'` 且 `outcome === 'pending_review'` |
+ * | 已拒绝       | `status === 'processed'` 且 `outcome === 'rejected'` |
+ * | 失败 / 可重试 | `status === 'pending'`、`attempt_count > 0`、`next_retry_at` 是退避后的时刻 |
+ * | 死信         | `status === 'dead_letter'`（用满次数或明确不可恢复） |
+ *
+ * 生命周期字段与交付项共用（见 lifecycleRecordFields），转移规则也共用
+ * services/delivery-lifecycle.ts：晋升没有第二套状态机，只有同一套骨架加上面那几列
+ * 结论字段。**候选的 claim 也不需要另一套** —— `claim_owner` / `claim_token` /
+ * `lease_expires_at` 就是这条候选的 claim，持久化在经验自己身上，进程内 Map 不参与防重。
+ *
+ * 审计（计划 §10 的「记录结果及策略版本」）：`strategy_version` 是判定它的策略版本，
+ * `evaluated_at` 是判定时刻，`reasons` 是判定理由，`attempt_count` / `last_error` 是
+ * 失败与重试的痕迹。`skill_id` 只在 `outcome === 'promoted'` 时有值，与经验上的
+ * `promoted_to` 同源。
+ *
+ * 刻意不加「outcome=promoted ⇒ skill_id 必填」的跨字段 refine：那是写入路径的
+ * 不变量（见 MemoryRepository.completePromotion 的说明），写在这里会让 schema 变成
+ * ZodEffects，失去后续复用 `.extend()` / `.shape` 的能力。
+ */
+export const ExperiencePromotionSchema = z.object({
+  ...lifecycleRecordFields,
+  /** 评估结论；缺席 = 还没得出结论（正在处理、或被判失败退回了队列） */
+  outcome: PromotionOutcomeSchema.optional(),
+  /** 做出该结论的策略版本；版本变了，同一条经验可以被重新评估 */
+  strategy_version: z.string().optional(),
+  /** 结论产生的时刻 */
+  evaluated_at: z.iso.datetime().optional(),
+  /** 晋升出的 Skill id；`outcome === 'promoted'` 时与 Experience.promoted_to 一致 */
+  skill_id: z.uuid().optional(),
+  /** 结论的人读理由（策略给了什么、被哪条规则挡住） */
+  reasons: z.array(z.string()).optional(),
+});
+export type ExperiencePromotion = z.infer<typeof ExperiencePromotionSchema>;
+
+/**
  * 经验记录 — Agent 每次任务后反思提取的结构化知识
  */
 export const ExperienceRecordSchema = z.object({
@@ -279,6 +407,11 @@ export const ExperienceRecordSchema = z.object({
   linked_negative_exp: z.array(z.string()).optional(),
   /** 若被晋升为技能，记录晋升后的技能 ID */
   promoted_to: z.uuid().optional(),
+  /**
+   * 晋升标记：Skill Promotion Job 处理这条经验时留下的 claim / 结论 / 审计信息。
+   * 缺席 = 从未被评估过（工作包 B 之前的旧经验，以及刚提取出来的经验）。
+   */
+  promotion: ExperiencePromotionSchema.optional(),
   /** 该经验成立所依赖的假设列表 */
   assumptions: z.array(z.string()).optional(),
   /** 置信度变更历史（用于追踪经验的可信度变化） */
@@ -635,66 +768,16 @@ export type ExtractResult = z.infer<typeof ExtractResultSchema>;
 //  Memory Delivery（上游交付契约）
 // ═══════════════════════════════════════════
 
-/**
- * 交付状态机。取值与 Buffer 的 ExtractionStatus 一致——上下文交付项与反馈
- * outbox 共用同一套状态语义（见 工作包 C），但这里讲的是「交付给了下游」，
- * 所以不复用抽取那边的名字。
- */
-export const DeliveryStatusSchema = z.enum([
-  'pending',
-  'processing',
-  'processed',
-  'dead_letter',
-]);
-export type DeliveryStatus = z.infer<typeof DeliveryStatusSchema>;
+// DeliveryStatusSchema 定义在文件开头的 Enums 一节：经验上的晋升标记（见
+// ExperiencePromotionSchema）也复用它，两边必须是同一个枚举。
 
 /** 上下文交付契约的版本；引用语义变化时递增，交付键随之改变 */
 export const CONTEXT_DELIVERY_SCHEMA_VERSION = 'context-delivery.v1';
 /** Driver 使用反馈契约的版本；反馈键与 event_version 都取自它 */
 export const DRIVER_FEEDBACK_EVENT_VERSION = 'driver-usage.v1';
 
-/**
- * 上下文交付项与反馈 outbox 共用的**状态机字段**。
- *
- * 两条通道必须走同一套 claim/lease/retry 语义，所以这些字段只在这里定义一次，
- * 再由两个 schema 各自展开——两条通道的字段集合不可能漂移。
- *
- * `attempt_count` 给 `.default(0)`：工作包 B 落盘的历史记录没有这个字段，
- * 默认值是它们的真实语义（还没投递过），不必写迁移脚本。
- */
-const deliveryLifecycleFields = {
-  /** 交付状态；推进规则见 services/delivery-lifecycle.ts */
-  status: DeliveryStatusSchema,
-  /** 已发起的投递次数（claim 一次算一次），达到重试上限后进 dead_letter */
-  attempt_count: z.number().int().min(0).default(0),
-  /** 当前持有者最后一次 claim 的时刻 */
-  claimed_at: z.iso.datetime().optional(),
-  /** 当前持有者标识（下游消费者自己给；本仓不解释它的含义） */
-  claim_owner: z.string().optional(),
-  /**
-   * 本次 claim 的 fencing token —— **每次 claim 唯一**，renew / complete / fail 必须原样带回。
-   *
-   * 与 `claim_owner` 的分工是刻意的：owner 是稳定 worker 标识（同一个人重启后还是它），
-   * 因此无法区分「上一个进程的持有」与「这个进程的持有」。token 每次 claim 都新生成，
-   * 于是租约过期后被别人抢走的记录，旧持有者拿着旧 token 再也写不进去——这就是
-   * 「过期 worker 不能覆盖新 worker 的成果」在数据上的落点。
-   *
-   * 可选是为了读得进工作包 B/C 之前的旧记录；**缺 token 不是绕过 fencing 的口子**，
-   * 而是明确的恢复路径：旧记录只能等租约过期（或本就无租约）被判为过期后回到队列，
-   * 由下一次 claim 重新发一个 token，任何持有者都无法凭旧记录写终态。
-   */
-  claim_token: z.string().optional(),
-  /** 本次 lease 的到期时刻；过期即可被 restoreExpired* 放回队列 */
-  lease_expires_at: z.iso.datetime().optional(),
-  /** 退避后的最早可再投递时刻；缺席表示立即可投递 */
-  next_retry_at: z.iso.datetime().optional(),
-  /** 最近一次失败原因（dead_letter 时保留最后一次） */
-  last_error: z.string().optional(),
-  /** 下游 processor 的版本位（由外部系统在 ack 时填充） */
-  processor_version: z.string().optional(),
-  created_at: z.iso.datetime(),
-  updated_at: z.iso.datetime(),
-};
+// lifecycleRecordFields（交付项 / 反馈 outbox / 待归并反馈 / 经验晋升标记共用的状态机
+// 字段）定义在 Experience 一节之前——经验上的晋升标记也用它，必须先生效。
 
 /**
  * 上下文交付项 — 一次 Agent 任务完成后交付给外部 Memory Maintenance 系统的输入。
@@ -727,7 +810,7 @@ export const ContextDeliveryItemSchema = z.object({
   source_driver: z.string(),
   /** 契约版本；下游据此判断自己能不能消费这条 */
   schema_version: z.string(),
-  ...deliveryLifecycleFields,
+  ...lifecycleRecordFields,
 });
 export type ContextDeliveryItem = z.infer<typeof ContextDeliveryItemSchema>;
 
@@ -790,7 +873,7 @@ export type DriverFeedbackContent = z.infer<typeof DriverFeedbackContentSchema>;
  */
 export const DriverFeedbackRecordSchema = z.object({
   ...driverFeedbackContentFields,
-  ...deliveryLifecycleFields,
+  ...lifecycleRecordFields,
 });
 export type DriverFeedbackRecord = z.infer<typeof DriverFeedbackRecordSchema>;
 
@@ -819,7 +902,7 @@ export const PendingFeedbackRecordSchema = z.object({
   experience_id: z.string(),
   /** 原始反馈的内容（效果档位、备注、观察时刻、来源与契约版本都在里面，归并时自足） */
   feedback: DriverFeedbackContentSchema,
-  ...deliveryLifecycleFields,
+  ...lifecycleRecordFields,
 });
 export type PendingFeedbackRecord = z.infer<typeof PendingFeedbackRecordSchema>;
 

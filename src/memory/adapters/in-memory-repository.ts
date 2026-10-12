@@ -20,7 +20,9 @@ import {
   type SkillRecord,
 } from '../schemas';
 import type { EmbeddingProvider } from '../ports/embedding-provider';
+import type { PromotionApprovalMode } from '../ports/promotion-strategy';
 import type {
+  ClaimedPromotionCandidate,
   ExperienceFeedbackApplication,
   ExperienceFeedbackResult,
   ExperienceSaveResult,
@@ -28,9 +30,30 @@ import type {
   MarketSearchOptions,
   MemoryRepository,
   MemoryVectorSearchOptions,
+  PromotionCandidateQuery,
+  PromotionClaimRequest,
+  PromotionCompletionRequest,
+  PromotionFailureRequest,
+  PromotionRestoreOptions,
   SkillSaveResult,
   TransferSkillToMarketOptions,
 } from '../ports/memory-repository';
+import {
+  DEFAULT_PROMOTION_RETRY_POLICY,
+  claimDeliveryRecord,
+  completeDeliveryRecord,
+  expireDeliveryClaimRecord,
+  failDeliveryRecord,
+  isDeliveryClaimExpired,
+  newClaimToken,
+  resetDeliveryForRetry,
+  type DeliveryRetryPolicy,
+} from '../services/delivery-lifecycle';
+import {
+  comparePromotionCandidates,
+  planPromotionCandidate,
+  type PromotionCandidateInput,
+} from '../services/promotion-candidates';
 import { applyFeedbackToExperience, averageConfidence, isFeedbackApplied } from '../services/usage-feedback';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
 import { cosineSimilarity } from '../utils/vector';
@@ -427,6 +450,227 @@ export class InMemoryRepository implements MemoryRepository {
     return { outcome: 'applied', experience: { ...next } };
   }
 
+  // ── 技能晋升的状态面（Phase 3） ──────────────────────────────────
+  //
+  // 与 applyExperienceFeedback 用的是同一手法：整段「读—判断—写」**一个 await 都没有**，
+  // 因此在 JS 单线程下就是一段临界区。晋升标记嵌在经验里，写回时不需要重算 embedding
+  // （描述没变），所以同步写回是安全的。
+
+  async listPromotionCandidates(query: PromotionCandidateQuery): Promise<ExperienceRecord[]> {
+    const input = promotionCandidateInput(query);
+    const candidates = this.scanPromotionCandidates(query.role_id, input);
+    const limited =
+      query.limit === undefined ? candidates : candidates.slice(0, Math.max(0, query.limit));
+    return limited.map((candidate) => cloneExperience(candidate.experience));
+  }
+
+  async claimNextPromotionCandidate(
+    request: PromotionClaimRequest,
+  ): Promise<ClaimedPromotionCandidate | undefined> {
+    const input = promotionCandidateInput(request);
+    const candidates = this.scanPromotionCandidates(request.role_id, input);
+    for (const candidate of candidates) {
+      const claimed = this.claimPromotionSync(candidate.role_id, candidate.experience.id, input, request);
+      if (claimed) return claimed;
+    }
+    return undefined;
+  }
+
+  async completePromotion(
+    request: PromotionCompletionRequest,
+  ): Promise<ExperienceRecord | undefined> {
+    if (request.outcome === 'promoted' && request.skill_id === undefined) {
+      throw new Error('completePromotion requires a skill_id when the outcome is "promoted".');
+    }
+    const located = this.locatePromotion(request.role_id, request.experience_id);
+    if (!located) return undefined;
+    const { store, index, experience } = located;
+    const marker = experience.promotion;
+    if (!marker) return undefined;
+
+    const completed = completeDeliveryRecord(
+      {
+        ...marker,
+        outcome: request.outcome,
+        strategy_version: request.strategy_version,
+        evaluated_at: request.now,
+        skill_id: request.skill_id,
+        reasons: request.reasons,
+      },
+      {
+        ...(request.owner !== undefined ? { owner: request.owner } : {}),
+        claim_token: request.claim_token,
+        now: request.now,
+      },
+    );
+    if (!completed) return undefined;
+
+    const next: ExperienceRecord = {
+      ...experience,
+      promotion: completed,
+      // promoted_to 与结论在同一次写入里落定：读到「Skill 已存在、经验还没绑上」的中间态
+      // 会让人把它当成没晋升过再晋升一次
+      ...(request.outcome === 'promoted' && request.skill_id !== undefined
+        ? { promoted_to: request.skill_id }
+        : {}),
+    };
+    store.experiences[index] = next;
+    return cloneExperience(next);
+  }
+
+  async failPromotion(
+    request: PromotionFailureRequest,
+  ): Promise<ExperienceRecord | undefined> {
+    const located = this.locatePromotion(request.role_id, request.experience_id);
+    if (!located) return undefined;
+    const { store, index, experience } = located;
+    const marker = experience.promotion;
+    if (!marker) return undefined;
+
+    const failed = failDeliveryRecord(marker, {
+      ...(request.owner !== undefined ? { owner: request.owner } : {}),
+      claim_token: request.claim_token,
+      now: request.now,
+      error: request.error,
+      retryable: request.retryable,
+      policy: request.policy ?? DEFAULT_PROMOTION_RETRY_POLICY,
+    });
+    if (!failed) return undefined;
+
+    const next: ExperienceRecord = { ...experience, promotion: failed };
+    store.experiences[index] = next;
+    return cloneExperience(next);
+  }
+
+  async restoreExpiredPromotionClaims(
+    options: PromotionRestoreOptions,
+  ): Promise<ExperienceRecord[]> {
+    const policy = options.policy ?? DEFAULT_PROMOTION_RETRY_POLICY;
+    const restored: ExperienceRecord[] = [];
+    for (const role_id of this.promotionRoleIds(options.role_id)) {
+      const store = this.agents.get(role_id);
+      if (!store) continue;
+      for (let index = 0; index < store.experiences.length; index += 1) {
+        const experience = store.experiences[index];
+        const marker = experience?.promotion;
+        if (!experience || !marker || !isDeliveryClaimExpired(marker, options.now)) continue;
+        const updated = expireDeliveryClaimRecord(marker, { now: options.now, policy });
+        const next: ExperienceRecord = { ...experience, promotion: updated };
+        store.experiences[index] = next;
+        restored.push(cloneExperience(next));
+      }
+    }
+    return restored;
+  }
+
+  async retryDeadLetterPromotion(request: {
+    role_id: string;
+    experience_id: string;
+    now: string;
+  }): Promise<ExperienceRecord | undefined> {
+    const located = this.locatePromotion(request.role_id, request.experience_id);
+    if (!located) return undefined;
+    const { store, index, experience } = located;
+    const marker = experience.promotion;
+    if (!marker) return undefined;
+
+    const reset = resetDeliveryForRetry(marker, { now: request.now });
+    if (!reset) return undefined;
+
+    const next: ExperienceRecord = { ...experience, promotion: reset };
+    store.experiences[index] = next;
+    return cloneExperience(next);
+  }
+
+  /**
+   * 一条候选的一次 claim。**整段同步**：调用方已经同步扫过候选，这里从重读到写回一个
+   * await 都没有，所以「扫描之后被别人改过」的唯一可能是同一轮里前一条候选的写回——
+   * 因此必须按**重读后的当前版本**重算计划，不能沿用扫描时那份（那正是把别人刚写下的
+   * 结论按旧计划盖掉的地方）。
+   */
+  private claimPromotionSync(
+    role_id: string,
+    experience_id: string,
+    input: PromotionCandidateInput,
+    request: PromotionClaimRequest,
+  ): ClaimedPromotionCandidate | undefined {
+    const located = this.locatePromotion(role_id, experience_id);
+    if (!located) return undefined;
+    const { store, index, experience } = located;
+
+    const plan = planPromotionCandidate(experience, input);
+    if (plan.kind === 'skip') return undefined;
+
+    const policy = request.policy ?? DEFAULT_PROMOTION_RETRY_POLICY;
+    const marker =
+      plan.kind === 'expire_then_claim'
+        ? expireDeliveryClaimRecord(experience.promotion!, { now: input.now, policy })
+        : plan.marker;
+
+    const claimed = claimDeliveryRecord(marker, {
+      owner: request.owner,
+      now: request.now,
+      lease_ms: request.lease_ms,
+      claim_token: newClaimToken(),
+      policy,
+    });
+
+    if (!claimed) {
+      // 回收之后可能直接进了死信（次数用满），claim 自然拿不到它——把回收结果写回去，
+      // 否则这条记录的租约永远停在过期状态，每次扫描都白跑一遍
+      if (plan.kind === 'expire_then_claim') {
+        store.experiences[index] = { ...experience, promotion: marker };
+      }
+      return undefined;
+    }
+
+    const next: ExperienceRecord = { ...experience, promotion: claimed };
+    store.experiences[index] = next;
+    return {
+      role_id,
+      experience: cloneExperience(next),
+      claim_token: claimed.claim_token!,
+      attempt_count: claimed.attempt_count,
+    };
+  }
+
+  /** 同步扫候选：按「先来的先处理」排序，规则见 services/promotion-candidates.ts */
+  private scanPromotionCandidates(
+    role_id: string | undefined,
+    input: PromotionCandidateInput,
+  ): Array<{ role_id: string; experience: ExperienceRecord }> {
+    const candidates: Array<{ role_id: string; experience: ExperienceRecord }> = [];
+    for (const currentRole of this.promotionRoleIds(role_id)) {
+      const store = this.agents.get(currentRole);
+      if (!store) continue;
+      for (const experience of store.experiences) {
+        if (planPromotionCandidate(experience, input).kind === 'skip') continue;
+        candidates.push({ role_id: currentRole, experience });
+      }
+    }
+    return candidates.sort((left, right) =>
+      comparePromotionCandidates(left.experience, right.experience),
+    );
+  }
+
+  /** 扫描范围：给了 role 就只扫它，否则扫全部（隐藏的市场池 Agent 不算） */
+  private promotionRoleIds(role_id: string | undefined): string[] {
+    if (role_id !== undefined) return [role_id];
+    return [...this.agents.keys()].filter((id) => id !== MARKET_POOL_ROLE_ID);
+  }
+
+  private locatePromotion(
+    role_id: string,
+    experience_id: string,
+  ): { store: AgentStore; index: number; experience: ExperienceRecord } | undefined {
+    const store = this.agents.get(role_id);
+    if (!store) return undefined;
+    const index = store.experiences.findIndex((item) => item.id === experience_id);
+    const experience = store.experiences[index];
+    if (index === -1 || !experience) return undefined;
+    return { store, index, experience };
+  }
+
   async updateSkillEmbedding(role_id: string, skill_id: string, embedding: number[]): Promise<void> {
     const store = this.requireStore(role_id);
     const index = store.skills.findIndex((item) => item.id === skill_id);
@@ -566,6 +810,28 @@ function findExperienceById(
   id: string,
 ): ExperienceRecord | undefined {
   return experiences.find((experience) => experience.id === id);
+}
+
+/** 把扫描/claim 需要的语义参数收敛成一份（端口上的 Query 与 Request 都带这几个字段） */
+function promotionCandidateInput(source: {
+  now: string;
+  strategy_version: string;
+  approval: PromotionApprovalMode;
+  policy?: DeliveryRetryPolicy;
+}): PromotionCandidateInput {
+  return {
+    now: source.now,
+    strategy_version: source.strategy_version,
+    approval: source.approval,
+    ...(source.policy !== undefined ? { policy: source.policy } : {}),
+  };
+}
+
+/** 返回给调用方的经验副本：晋升标记是嵌套对象，共享引用会让调用方改到仓库里的那份 */
+function cloneExperience(experience: ExperienceRecord): ExperienceRecord {
+  return experience.promotion === undefined
+    ? { ...experience }
+    : { ...experience, promotion: { ...experience.promotion } };
 }
 
 async function rankByVectorSimilarity<T extends SkillRecord | ExperienceRecord>(

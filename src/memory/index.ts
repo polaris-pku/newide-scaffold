@@ -422,6 +422,7 @@ export {
   DEFAULT_DELIVERY_RETRY_POLICY,
   DEFAULT_FEEDBACK_CONSUME_RETRY_POLICY,
   DEFAULT_PENDING_FEEDBACK_RETRY_POLICY,
+  DEFAULT_PROMOTION_RETRY_POLICY,
   newClaimToken,
   resolveChannelRetryPolicy,
   type DeliveryChannelKind,
@@ -451,6 +452,7 @@ export type {
   MaintenanceRunQuery,
 } from './ports/maintenance-run-store';
 export type {
+  ExperiencePromotion,
   MaintenanceFailure,
   MaintenanceFailureCode,
   MaintenanceJobType,
@@ -458,6 +460,7 @@ export type {
   MaintenanceRunCounts,
   MaintenanceRunStatus,
   PendingFeedbackRecord,
+  PromotionOutcome,
 } from './schemas';
 export {
   EMPTY_MAINTENANCE_RUN_COUNTS,
@@ -568,6 +571,62 @@ export type {
   ExperienceListFilter,
 } from './ports/agent-board-query';
 export type { RoleTokenUsageReader } from './ports/role-token-usage';
+
+// ════════════════════════════════════════════════════════
+//  2e. Memory Maintenance：技能晋升（Phase 3）
+//      独立的 Job：按可配置、可版本化的策略扫出候选，逐条判定，把结论落到经验自己的
+//      晋升标记上（claim/lease/fencing 与交付通道共用同一套状态机）。它不从 Context
+//      consumer、Feedback consumer、scheduleBuffer() 或在线 Driver 流程里被调用，也不
+//      调用它们中的任何一个。
+//      本阶段的边界：job 本体（run 循环与 run 收尾）在 Phase 3-C，此处交付契约、策略与
+//      持久化状态；因为 Profile/Persona 归 Phase 4，这里没有任何 Persona 相关入口。
+// ════════════════════════════════════════════════════════
+
+export {
+  DefaultPromotionStrategy,
+  DEFAULT_PROMOTION_STRATEGY_CONFIG,
+  DEFAULT_PROMOTION_STRATEGY_VERSION,
+} from './adapters/default-promotion-strategy';
+export type {
+  PromotionApprovalMode,
+  PromotionBlockerRule,
+  PromotionDecision,
+  PromotionEvaluationInput,
+  PromotionStrategy,
+  PromotionStrategyConfig,
+  PromotionVerdict,
+} from './ports/promotion-strategy';
+export {
+  comparePromotionCandidates,
+  initialPromotionMarker,
+  isPromotedExperience,
+  planPromotionCandidate,
+  promotionStateLabel,
+  reevaluatePromotionMarker,
+  selectPromotionCandidates,
+  type PromotionCandidateInput,
+  type PromotionCandidatePlan,
+  type PromotionSkipReason,
+  type PromotionStateLabel,
+} from './services/promotion-candidates';
+export type {
+  ClaimedPromotionCandidate,
+  PromotionCandidateQuery,
+  PromotionClaimRequest,
+  PromotionCompletionRequest,
+  PromotionFailureRequest,
+  PromotionRestoreOptions,
+} from './ports/memory-repository';
+export type {
+  PromotionCandidateOutcome,
+  PromotionCandidateStatus,
+  PromotionRestoreResult,
+  SkillPromotionJob,
+  SkillPromotionJobOptions,
+  SkillPromotionRunOptions,
+  SkillPromotionRunResult,
+  SkillPromotionStopReason,
+} from './ports/skill-promotion-job';
 
 // ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型
