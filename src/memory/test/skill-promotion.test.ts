@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { ZodError } from 'zod';
 import { ruleBasedSkillPromotion } from '../services/skill-promotion';
 import {
   DefaultPromotionStrategy,
@@ -11,14 +12,20 @@ import {
   promotionStateLabel,
   selectPromotionCandidates,
 } from '../services/promotion-candidates';
+import {
+  AGENT_MISSING_PREFIX,
+  buildPromotedSkill,
+  classifyPromotionFailure,
+  executePromotionCandidate,
+} from '../services/promotion-executor';
 import { persistExtractedExperiences, stableExperienceId } from '../services/memory-cycle';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { InMemoryBufferRepository } from '../adapters/in-memory-buffer-repository';
 import { createAgentMemoryScope } from '../adapters/agent-memory-scope';
 import type { AgentMemoryScope } from '../ports/agent-memory-scope';
 import type { PromotionStrategy } from '../ports/promotion-strategy';
-import type { ExperienceSaveResult } from '../ports/memory-repository';
-import { ExperienceRecordSchema } from '../schemas';
+import type { ExperienceSaveResult, SkillSaveResult } from '../ports/memory-repository';
+import { ExperienceRecordSchema, SkillRecordSchema } from '../schemas';
 import type { ExperiencePromotion, ExperienceRecord, SkillRecord } from '../schemas';
 import type { CandidateExperience } from '../types';
 import type { AgentTaskRequest } from '../agent-types';
@@ -947,5 +954,221 @@ describe('人工审核模式不写 Skill', () => {
     // 关键断言：人工审核不提前写 Skill，也不把经验绑上技能
     expect(await repository.listSkills(role_id)).toHaveLength(0);
     expect(settled?.promoted_to).toBeUndefined();
+  });
+});
+
+// ═══════════════════════════════════════════
+//  Phase 3-B：晋升执行内核（executePromotionCandidate）
+// ═══════════════════════════════════════════
+
+const EXEC_NOW = '2026-10-10T12:00:00.000Z';
+const EXEC_LEASE_MS = 60_000;
+
+/** 自动批准模式的策略：判定与人工审核同一套，差在合格之后的出口 */
+const autoApproveStrategy = new DefaultPromotionStrategy({ approval: 'auto_approve' });
+
+/**
+ * Skill 写入按给定异常失败的仓库。
+ *
+ * 造这个替身是为了走到**存储层故障**那几条分支：真实适配器在 Agent 行消失时会抛错，但要
+ * 在本进程里造出「Agent 没了、经验还在」的状态，PG 侧被外键级联挡住、内存侧要绕过 API——
+ * 与其伪造一个不可达的状态，不如直接让写入点按指定的异常失败，测分类与落盘的去向。
+ */
+class FailingSkillWriteRepository extends InMemoryRepository {
+  constructor(private readonly failure: unknown) {
+    super();
+  }
+
+  override async saveSkillIfAbsent(): Promise<SkillSaveResult> {
+    throw this.failure;
+  }
+}
+
+/** 播种一个 Agent 与一条高置信度正经验，并 claim 到手 */
+async function seedClaimedExperience(repository: InMemoryRepository, role_id: string) {
+  await repository.initializeAgent({ role_id, name: 'Promotion Exec Agent' });
+  const experience = makeExperience({
+    id: randomUUID(),
+    agent_id: role_id,
+    confidence: 0.99,
+    referenced_count: 1,
+  });
+  await repository.saveExperience(role_id, experience);
+  const claimed = await repository.claimNextPromotionCandidate({
+    role_id,
+    owner: 'worker-1',
+    now: EXEC_NOW,
+    lease_ms: EXEC_LEASE_MS,
+    strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+    approval: 'auto_approve',
+  });
+  expect(claimed).toBeDefined();
+  return { experience, claimed: claimed! };
+}
+
+describe('classifyPromotionFailure', () => {
+  it('Agent 不在了 → 不可重试的 delivery_missing（重投不会让 Agent 回来）', () => {
+    const classified = classifyPromotionFailure(new Error(`${AGENT_MISSING_PREFIX} role_x`));
+    expect(classified.code).toBe('delivery_missing');
+    expect(classified.retryable).toBe(false);
+  });
+
+  it('PG 侧的外键冲突（归属行没了）落进同一个结论，而不是 unknown 白重投', () => {
+    const violation = Object.assign(
+      new Error('insert or update on table "memory_skills" violates foreign key constraint'),
+      { code: '23503' },
+    );
+    const classified = classifyPromotionFailure(violation);
+    expect(classified.code).toBe('delivery_missing');
+    expect(classified.retryable).toBe(false);
+  });
+
+  it('载荷解析不了 → 不可重试的 payload_unreadable（重投读到的是同一份坏数据）', () => {
+    const classified = classifyPromotionFailure(new ZodError([]));
+    expect(classified.code).toBe('payload_unreadable');
+    expect(classified.retryable).toBe(false);
+  });
+
+  it('连接类 errno → 可重试的 downstream_unavailable', () => {
+    const classified = classifyPromotionFailure(
+      Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+    );
+    expect(classified.code).toBe('downstream_unavailable');
+    expect(classified.retryable).toBe(true);
+  });
+
+  it('认不出来的失败默认可重试：有上限的重投是安全的，判成永久失败才会让候选消失', () => {
+    const classified = classifyPromotionFailure(new Error('boom'));
+    expect(classified.code).toBe('unknown');
+    expect(classified.retryable).toBe(true);
+  });
+});
+
+describe('buildPromotedSkill', () => {
+  it('自动批准直接写 approved，审核人沿用既有系统那个值', () => {
+    const experience = makeExperience({ id: randomUUID() });
+    const skill = buildPromotedSkill('role_test', experience, EXEC_NOW, 'auto_approve');
+
+    expect(skill.promoted_from).toBe(experience.id);
+    expect(skill.agent_id).toBe('role_test');
+    expect(skill.promoted_at).toBe(EXEC_NOW);
+    expect(skill.review_status).toBe('approved');
+    expect(skill.reviewed_by).toBe('system:auto-approval');
+    expect(skill.reviewed_at).toBe(EXEC_NOW);
+    // tags 是复制而不是共享同一数组：技能落库后经验再被改动不会串味
+    expect(skill.tags).toEqual(experience.tags);
+    expect(skill.tags).not.toBe(experience.tags);
+  });
+
+  it('人工审核写 pending，且不带审核人与审核时间', () => {
+    const experience = makeExperience({ id: randomUUID() });
+    const skill = buildPromotedSkill('role_test', experience, EXEC_NOW, 'manual_review');
+
+    expect(skill.review_status).toBe('pending');
+    expect(skill.reviewed_by).toBeUndefined();
+    expect(skill.reviewed_at).toBeUndefined();
+  });
+
+  it('产出的技能自己就能过 SkillRecordSchema，不靠存储层兜底', () => {
+    const experience = makeExperience({ id: randomUUID() });
+    expect(() =>
+      SkillRecordSchema.parse(
+        buildPromotedSkill('role_test', experience, EXEC_NOW, 'auto_approve'),
+      ),
+    ).not.toThrow();
+  });
+});
+
+describe('executePromotionCandidate — 失败分类与落盘', () => {
+  it('Agent 不在了：直接死信，不占满重试名额，也不写技能', async () => {
+    const role_id = `role_exec_missing_${randomUUID()}`;
+    const repository = new FailingSkillWriteRepository(
+      new Error(`${AGENT_MISSING_PREFIX} ${role_id}`),
+    );
+    const { claimed } = await seedClaimedExperience(repository, role_id);
+
+    const result = await executePromotionCandidate(
+      { repository, strategy: autoApproveStrategy, now: () => EXEC_NOW },
+      claimed,
+      { approval: 'auto_approve', now: EXEC_NOW },
+    );
+
+    expect(result.status).toBe('dead_letter');
+    expect(result.failure?.code).toBe('delivery_missing');
+    expect(result.failure?.retryable).toBe(false);
+
+    const stored = (await repository.listExperiences(role_id))[0]!;
+    expect(stored.promotion?.status).toBe('dead_letter');
+    expect(stored.promotion?.last_error).toContain(AGENT_MISSING_PREFIX);
+    // 「失败后 retry 不丢审计信息」：次数与原因都留在记录上
+    expect(stored.promotion?.attempt_count).toBe(1);
+    expect(await repository.listSkills(role_id)).toHaveLength(0);
+    const metrics = await repository.getMetrics(role_id);
+    expect(metrics.skill_count).toBe(0);
+    expect(metrics.promoted_skill_count).toBe(0);
+  });
+
+  it('载荷读不懂：同样直接死信，原因落进 last_error', async () => {
+    const role_id = `role_exec_corrupt_${randomUUID()}`;
+    const repository = new FailingSkillWriteRepository(new ZodError([]));
+    const { claimed } = await seedClaimedExperience(repository, role_id);
+
+    const result = await executePromotionCandidate(
+      { repository, strategy: autoApproveStrategy, now: () => EXEC_NOW },
+      claimed,
+      { approval: 'auto_approve', now: EXEC_NOW },
+    );
+
+    expect(result.status).toBe('dead_letter');
+    expect(result.failure?.code).toBe('payload_unreadable');
+    expect((await repository.listExperiences(role_id))[0]!.promotion?.status).toBe('dead_letter');
+  });
+
+  it('存储抖动：退避重投，退避没到期之前不会被重新 claim', async () => {
+    const role_id = `role_exec_transient_${randomUUID()}`;
+    const repository = new FailingSkillWriteRepository(new Error('boom'));
+    const { experience, claimed } = await seedClaimedExperience(repository, role_id);
+
+    const result = await executePromotionCandidate(
+      { repository, strategy: autoApproveStrategy, now: () => EXEC_NOW },
+      claimed,
+      { approval: 'auto_approve', now: EXEC_NOW },
+    );
+
+    expect(result.status).toBe('retried');
+    expect(result.failure?.code).toBe('unknown');
+    expect(result.failure?.retryable).toBe(true);
+
+    const stored = (await repository.listExperiences(role_id))[0]!;
+    expect(stored.promotion?.status).toBe('pending');
+    expect(stored.promotion?.attempt_count).toBe(1);
+    expect(stored.promotion?.last_error).toBe('boom');
+    expect(stored.promotion?.next_retry_at).toBeDefined();
+    expect(promotionStateLabel(stored)).toBe('retryable');
+
+    // 退避窗口之内不是候选——否则「重试」会退化成忙等
+    await expect(
+      repository.claimNextPromotionCandidate({
+        role_id,
+        owner: 'worker-2',
+        now: EXEC_NOW,
+        lease_ms: EXEC_LEASE_MS,
+        strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+        approval: 'auto_approve',
+      }),
+    ).resolves.toBeUndefined();
+
+    // 到期之后重新可 claim，且经验还是那一条，次数记到 2
+    const due = stored.promotion!.next_retry_at!;
+    const reclaimed = await repository.claimNextPromotionCandidate({
+      role_id,
+      owner: 'worker-2',
+      now: due,
+      lease_ms: EXEC_LEASE_MS,
+      strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+      approval: 'auto_approve',
+    });
+    expect(reclaimed?.experience.id).toBe(experience.id);
+    expect(reclaimed?.attempt_count).toBe(2);
   });
 });

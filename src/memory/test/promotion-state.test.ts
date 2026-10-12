@@ -1,29 +1,39 @@
 /**
- * Skill Promotion 的持久化状态契约测试（Phase 3-A）
+ * Skill Promotion 的持久化状态与执行语义契约测试（Phase 3-A / 3-B）
  *
- * 覆盖 MemoryRepository 上那组晋升状态的**语义**：候选扫描、claim（owner / token / lease）、
- * 结论落地（outcome 与 promoted_to 同一次写入）、失败退避与死信、租约回收、人工重试、
- * 以及旧载荷（没有 promotion 字段）的读入。
+ * 3-A 覆盖 MemoryRepository 上那组晋升状态的**语义**：候选扫描、claim（owner / token /
+ * lease）、结论落地（outcome 与 promoted_to 同一次写入）、失败退避与死信、租约回收、人工
+ * 重试、以及旧载荷（没有 promotion 字段）的读入。
+ *
+ * 3-B 在同一份契约上再加一层**执行语义**：一条 claim 到的候选被 `executePromotionCandidate`
+ * 执行完之后，Skill、经验、聚合根三处同时正确，并且「Skill 写了、经验没回写」这一步失败后
+ * 重试会复用同一条 Skill（唯一键 `(role_id, promoted_from)`），不攒出第二条。
  *
  * 同一份契约跑两个后端（InMemory 与 PGlite 上的 PgMemoryRepository）——这是模块的既有约定
  * （见各 ports 的文件注释）：测试替身不得掩盖生产行为差异。**重启**只在 PGlite 那侧验：
  * InMemory 的「重启」就是清空，用它验持久性会把内存的假象当成生产语义。
  *
- * 本阶段刻意不覆盖的：跨后端并发的完整矩阵、晋升写回失败后的重试复用、聚合计数不漂移
- * ——那些是 Phase 3-B/3-D 的验收面。
+ * 本阶段刻意不覆盖的：批量外壳（claim 循环、run 收尾、批大小与墙钟上限）与完整的三后端
+ * 并发矩阵——那些是 Phase 3-C/3-D 的验收面。
  */
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { nowTimestamp } from '../../core';
+import { DEFAULT_PROMOTION_STRATEGY_VERSION, DefaultPromotionStrategy } from '../adapters/default-promotion-strategy';
 import { HashEmbeddingProvider } from '../adapters/hash-embedding-provider';
 import { InMemoryRepository } from '../adapters/in-memory-repository';
 import { PgMemoryRepository } from '../adapters/pg-memory-repository';
 import { ensurePgMemorySchema } from '../adapters/pg-memory-schema';
 import { createPGlitePool } from '../adapters/pglite-pool';
-import { DEFAULT_PROMOTION_STRATEGY_VERSION } from '../adapters/default-promotion-strategy';
 import { DEFAULT_PROMOTION_RETRY_POLICY, addMilliseconds } from '../services/delivery-lifecycle';
 import { promotionStateLabel } from '../services/promotion-candidates';
+import {
+  buildPromotedSkill,
+  executePromotionCandidate,
+  type PromotionExecutorDeps,
+} from '../services/promotion-executor';
 import type { MemoryRepository } from '../ports/memory-repository';
+import type { PromotionStrategy } from '../ports/promotion-strategy';
 import type { SqlPool } from '../ports/sql-pool';
 import type { ExperienceRecord } from '../schemas';
 
@@ -375,7 +385,322 @@ function runPromotionStateContract(
   });
 }
 
+/**
+ * 同一份**执行**契约，两个后端各跑一遍（Phase 3-B）。
+ *
+ * 这一层测的不是状态转移函数，而是 `executePromotionCandidate` 跑完之后存储里的三处事实：
+ * Skill 恰好一条、经验指向它、聚合根计数跟着动了一次。并发与「写了一半」的用例是重点——
+ * 幂等键失效的表现正是「多出一条没人引用的技能」，而它在单线程顺序执行下看不出来。
+ */
+function runPromotionExecutionContract(
+  label: string,
+  createRepository: () => Promise<MemoryRepository>,
+): void {
+  describe(`promotion execution contract — ${label}`, () => {
+    let repository: MemoryRepository;
+    let role_id: string;
+
+    /** 自动批准与人工审核各一份策略：判定逻辑同一套，差在合格之后的出口 */
+    const autoApprove = new DefaultPromotionStrategy({ approval: 'auto_approve' });
+    const manualReview = new DefaultPromotionStrategy({ approval: 'manual_review' });
+
+    beforeAll(async () => {
+      repository = await createRepository();
+    });
+
+    beforeEach(async () => {
+      role_id = `role_promotion_exec_${randomUUID()}`;
+      await repository.initializeAgent({ role_id, name: 'Promotion Execution Agent' });
+    });
+
+    function deps(strategy: PromotionStrategy): PromotionExecutorDeps {
+      return { repository, strategy, now: () => NOW };
+    }
+
+    /** 播种一条未评估的经验并 claim 到手 */
+    async function seedAndClaim(
+      overrides: Partial<ExperienceRecord> = {},
+      owner = 'worker-1',
+      now = NOW,
+    ) {
+      const experience = makeExperience(role_id, overrides);
+      await repository.saveExperience(role_id, experience);
+      const claimed = await repository.claimNextPromotionCandidate(
+        claimRequest(role_id, owner, now),
+      );
+      expect(claimed).toBeDefined();
+      return { experience, claimed: claimed! };
+    }
+
+    async function storedExperience(id: string): Promise<ExperienceRecord> {
+      const found = (await repository.listExperiences(role_id)).find((item) => item.id === id);
+      expect(found).toBeDefined();
+      return found!;
+    }
+
+    it('幂等键是 (role_id, promoted_from)：并发写同一来源只留一条，且只计一次数', async () => {
+      const experience = makeExperience(role_id);
+      await repository.saveExperience(role_id, experience);
+
+      const [left, right] = await Promise.all([
+        repository.saveSkillIfAbsent(
+          role_id,
+          buildPromotedSkill(role_id, experience, NOW, 'auto_approve'),
+        ),
+        repository.saveSkillIfAbsent(
+          role_id,
+          buildPromotedSkill(role_id, experience, NOW, 'auto_approve'),
+        ),
+      ]);
+
+      // 两次都拿到同一条技能，只有一方是「新建」
+      expect(left.skill.id).toBe(right.skill.id);
+      expect([left.created, right.created].filter(Boolean)).toHaveLength(1);
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(1);
+      expect(metrics.promoted_skill_count).toBe(1);
+      const handle = await repository.getAgent(role_id);
+      expect(handle.owned_skills).toEqual([left.skill.id]);
+    });
+
+    it('自动批准：Skill 落库、经验回写、聚合根各推进一次', async () => {
+      const { experience, claimed } = await seedAndClaim();
+
+      const result = await executePromotionCandidate(deps(autoApprove), claimed, {
+        approval: 'auto_approve',
+        now: NOW,
+      });
+
+      expect(result.status).toBe('promoted');
+      expect(result.skill_reused).toBe(false);
+      expect(result.failure).toBeUndefined();
+
+      const skills = await repository.listSkills(role_id);
+      expect(skills).toHaveLength(1);
+      const skill = skills[0]!;
+      expect(result.skill_id).toBe(skill.id);
+      expect(skill.promoted_from).toBe(experience.id);
+      // 自动批准写的是「已生效」的技能，而不是先 pending 再补一次 updateSkill
+      expect(skill.review_status).toBe('approved');
+      expect(skill.reviewed_by).toBe('system:auto-approval');
+
+      const stored = await storedExperience(experience.id);
+      expect(stored.promoted_to).toBe(skill.id);
+      expect(stored.promotion?.outcome).toBe('promoted');
+      expect(stored.promotion?.skill_id).toBe(skill.id);
+      expect(stored.promotion?.strategy_version).toBe(STRATEGY_VERSION);
+      expect(promotionStateLabel(stored)).toBe('promoted');
+
+      const handle = await repository.getAgent(role_id);
+      expect(handle.skill_count).toBe(1);
+      expect(handle.owned_skills).toEqual([skill.id]);
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(1);
+      expect(metrics.promoted_skill_count).toBe(1);
+    });
+
+    it('同一经验重复晋升：不再成为候选，计数也不第二次增加', async () => {
+      const { claimed } = await seedAndClaim();
+      await executePromotionCandidate(deps(autoApprove), claimed, {
+        approval: 'auto_approve',
+        now: NOW,
+      });
+
+      // 正常路径：已经晋升的经验扫不出来
+      await expect(
+        repository.claimNextPromotionCandidate(claimRequest(role_id, 'worker-2', NOW)),
+      ).resolves.toBeUndefined();
+
+      // 拿着已经用掉的凭据再执行一次：写不进去，也不会留下第二条 Skill
+      const again = await executePromotionCandidate(deps(autoApprove), claimed, {
+        approval: 'auto_approve',
+        now: NOW,
+      });
+      expect(again.status).toBe('failed');
+
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(1);
+      expect(metrics.promoted_skill_count).toBe(1);
+    });
+
+    it('Skill 已存在但经验未回写：重试复用那一条，不新建', async () => {
+      const { experience, claimed } = await seedAndClaim();
+
+      // 上一次尝试已经把 Skill 写进去了，只是经验没回写成功（这一条模拟那个中间态）
+      const orphan = await repository.saveSkillIfAbsent(
+        role_id,
+        buildPromotedSkill(role_id, experience, NOW, 'auto_approve'),
+      );
+      expect(orphan.created).toBe(true);
+
+      const result = await executePromotionCandidate(deps(autoApprove), claimed, {
+        approval: 'auto_approve',
+        now: NOW,
+      });
+
+      expect(result.status).toBe('promoted');
+      expect(result.skill_id).toBe(orphan.skill.id);
+      expect(result.skill_reused).toBe(true);
+      expect(result.warnings.join(' ')).toMatch(/already existed/);
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+      expect((await storedExperience(experience.id)).promoted_to).toBe(orphan.skill.id);
+      // 复用不计数：聚合根只加过一次（由那次 saveSkillIfAbsent 加的）
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(1);
+      expect(metrics.promoted_skill_count).toBe(1);
+    });
+
+    it('两个 worker 并发晋升同一条经验：只留下一条 Skill', async () => {
+      const { experience, claimed } = await seedAndClaim();
+
+      const [first, second] = await Promise.all([
+        executePromotionCandidate(deps(autoApprove), claimed, { approval: 'auto_approve', now: NOW }),
+        executePromotionCandidate(deps(autoApprove), claimed, { approval: 'auto_approve', now: NOW }),
+      ]);
+
+      // 同一个 token 只能落一次结论；输的那次复用了赢家写的 Skill，什么都没多写
+      const winner = first.status === 'promoted' ? first : second;
+      const loser = first.status === 'promoted' ? second : first;
+      expect(winner.status).toBe('promoted');
+      expect(loser.status).toBe('failed');
+      expect(loser.skill_reused).toBe(true);
+
+      const skills = await repository.listSkills(role_id);
+      expect(skills).toHaveLength(1);
+      expect(winner.skill_id).toBe(skills[0]!.id);
+      expect((await storedExperience(experience.id)).promoted_to).toBe(skills[0]!.id);
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(1);
+      expect(metrics.promoted_skill_count).toBe(1);
+    });
+
+    it('不同经验并发晋升：两条 Skill，聚合计数各加一次', async () => {
+      const first = await seedAndClaim();
+      const second = await seedAndClaim();
+      expect(first.claimed.experience.id).not.toBe(second.claimed.experience.id);
+
+      const [left, right] = await Promise.all([
+        executePromotionCandidate(deps(autoApprove), first.claimed, {
+          approval: 'auto_approve',
+          now: NOW,
+        }),
+        executePromotionCandidate(deps(autoApprove), second.claimed, {
+          approval: 'auto_approve',
+          now: NOW,
+        }),
+      ]);
+
+      expect(left.status).toBe('promoted');
+      expect(right.status).toBe('promoted');
+      expect(left.skill_id).not.toBe(right.skill_id);
+
+      const skills = await repository.listSkills(role_id);
+      expect(skills).toHaveLength(2);
+      const handle = await repository.getAgent(role_id);
+      expect(handle.skill_count).toBe(2);
+      expect(handle.owned_skills).toHaveLength(2);
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(2);
+      expect(metrics.promoted_skill_count).toBe(2);
+    });
+
+    it('人工审核：只记结论，不写 Skill', async () => {
+      const { experience, claimed } = await seedAndClaim();
+
+      const result = await executePromotionCandidate(deps(manualReview), claimed, {
+        approval: 'manual_review',
+        now: NOW,
+      });
+
+      expect(result.status).toBe('pending_review');
+      expect(result.skill_id).toBeUndefined();
+
+      const stored = await storedExperience(experience.id);
+      expect(stored.promoted_to).toBeUndefined();
+      expect(stored.promotion?.outcome).toBe('pending_review');
+      expect(stored.promotion?.strategy_version).toBe(STRATEGY_VERSION);
+      expect(promotionStateLabel(stored)).toBe('pending_review');
+
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(0);
+      expect(metrics.promoted_skill_count).toBe(0);
+    });
+
+    it('判定不合格：只记 rejected，不写 Skill', async () => {
+      const { experience, claimed } = await seedAndClaim({ confidence: 0.5 });
+
+      const result = await executePromotionCandidate(deps(autoApprove), claimed, {
+        approval: 'auto_approve',
+        now: NOW,
+      });
+
+      expect(result.status).toBe('rejected');
+      expect(result.decision?.blocking_rules).toContain('below_confidence_threshold');
+
+      const stored = await storedExperience(experience.id);
+      expect(stored.promoted_to).toBeUndefined();
+      expect(stored.promotion?.outcome).toBe('rejected');
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+    });
+
+    it('Skill 写了、经验没回写（凭据在回写前失效）：重试复用同一条 Skill', async () => {
+      const { experience, claimed } = await seedAndClaim({}, 'worker-1', NOW);
+
+      // worker 卡住太久，启动恢复把租约收回：凭据从这一刻起写不进任何东西
+      const expiredAt = addMilliseconds(NOW, LEASE_MS);
+      const restored = await repository.restoreExpiredPromotionClaims({ role_id, now: expiredAt });
+      expect(restored).toHaveLength(1);
+
+      const first = await executePromotionCandidate(deps(autoApprove), claimed, {
+        approval: 'auto_approve',
+        now: addMilliseconds(NOW, LEASE_MS + 1),
+      });
+      // 这一条既不是「处理失败」也不是「跳过」：Skill 真的落库了，经验只是没绑上
+      expect(first.status).toBe('failed');
+      expect(first.failure?.retryable).toBe(true);
+      expect(first.skill_id).toBeUndefined();
+
+      const skills = await repository.listSkills(role_id);
+      expect(skills).toHaveLength(1);
+      const orphanSkillId = skills[0]!.id;
+      const halfway = await storedExperience(experience.id);
+      expect(halfway.promoted_to).toBeUndefined();
+      expect(halfway.promotion?.status).toBe('pending');
+
+      // 下一轮 claim 到同一条，执行时命中唯一键、复用那条技能，经验这才指向它
+      const later = addMilliseconds(NOW, LEASE_MS + 2);
+      const reclaimed = await repository.claimNextPromotionCandidate(
+        claimRequest(role_id, 'worker-2', later),
+      );
+      expect(reclaimed?.experience.id).toBe(experience.id);
+
+      const second = await executePromotionCandidate(deps(autoApprove), reclaimed!, {
+        approval: 'auto_approve',
+        now: later,
+      });
+      expect(second.status).toBe('promoted');
+      expect(second.skill_id).toBe(orphanSkillId);
+      expect(second.skill_reused).toBe(true);
+
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+      expect((await storedExperience(experience.id)).promoted_to).toBe(orphanSkillId);
+      // 审计没丢：两次投递都记在经验上，最后一条结论带着完整的策略版本
+      const settled = await storedExperience(experience.id);
+      expect(settled.promotion?.attempt_count).toBe(2);
+      expect(settled.promotion?.strategy_version).toBe(STRATEGY_VERSION);
+      const metrics = await repository.getMetrics(role_id);
+      expect(metrics.skill_count).toBe(1);
+      expect(metrics.promoted_skill_count).toBe(1);
+    });
+  });
+}
+
 runPromotionStateContract('InMemoryRepository', async () => new InMemoryRepository());
+
+runPromotionExecutionContract('InMemoryRepository', async () => new InMemoryRepository());
 
 describe('promotion state contract — PgMemoryRepository on embedded PGlite', () => {
   const embedding = new HashEmbeddingProvider();
@@ -396,6 +721,11 @@ describe('promotion state contract — PgMemoryRepository on embedded PGlite', (
   });
 
   runPromotionStateContract(
+    'PgMemoryRepository (PGlite)',
+    async () => new PgMemoryRepository({ pool, embedding, autoMigrate: false }),
+  );
+
+  runPromotionExecutionContract(
     'PgMemoryRepository (PGlite)',
     async () => new PgMemoryRepository({ pool, embedding, autoMigrate: false }),
   );
