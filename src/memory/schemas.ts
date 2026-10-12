@@ -665,7 +665,7 @@ export const PersonaVersionSourceSchema = z.enum([
   /** 回滚写出的一版：正文抄自 `rollback_from_version`，版本号是新的 */
   'rollback',
   /**
-   * 其余写入路径覆盖写下的版本：前端 PATCH（`mergePersonaPatch`）、按需重生成
+   * 其余写入路径写下的版本：前端 PATCH（`mergePersonaPatch`）、按需重生成
    * （`regeneratePersona` 的归纳器）——它们都经 `savePersona`，在存储层看起来是同一种。
    */
   'manual',
@@ -676,8 +676,14 @@ export type PersonaVersionSource = z.infer<typeof PersonaVersionSourceSchema>;
  * 一版 Persona 的**正文 + 来历** —— 版本历史的一行（Phase 4 修复 B）。
  *
  * 修复前只有「当前 Persona」与「最新演化标记」两处：下一次演化覆盖标记之后，旧版本的正文
- * 就再也找不回来了——`PersonaDef` 是单实体单版本号的，`savePersona` 是覆盖写。于是
+ * 就再也找不回来了——`PersonaDef` 是单实体单版本号的，`savePersona` 那时也是覆盖写。于是
  * 「回滚」只能是一句空话。本表把每一版的正文按版本号留下来，回滚才有**可抄的东西**。
+ *
+ * **本表是 append-only 的**：一行一旦落下就不再改。同一个 `(role_id, persona_version)`
+ * 第二次来，要么是同一笔写的重放（幂等成功，什么都不做），要么内容不同（冲突，拒绝且一个
+ * 字节都不写）——三条写入路径（演化 / 手工 / 回滚）共用
+ * `services/persona-version-history` 的 `resolvePersonaVersionAppend` 这一份判据。语义上
+ * 没有「覆盖这一版」这件事：改一版 Persona 就是**再写一版**。
  *
  * 字段分三组，读法如下：
  *

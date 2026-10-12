@@ -86,11 +86,17 @@ import {
 } from '../services/persona-evolution-decision';
 import {
   applyPersonaVersionLimit,
+  assertPersonaRoleId,
+  assertPersonaVersionMonotonic,
+  assertPersonaVersionRecordIdentity,
   buildRolledBackPersona,
   evolvedPersonaVersionRecord,
+  isSamePersonaVersionWrite,
   manualPersonaVersionRecord,
   personaRollbackRecord,
+  personaVersionConflictMessage,
   resolvePersonaRollback,
+  resolvePersonaVersionAppend,
   seedPersonaVersionRecord,
 } from '../services/persona-version-history';
 import {
@@ -139,12 +145,42 @@ function toPgVector(values: number[]): string {
  * 这张表里的每一行都是自己写下的（老 Agent 的 `baseline` 行也由迁移生成，形状一致），因此
  * 解析失败只可能是真的坏了。此时抛错比返回 undefined 诚实：后者会把一次 `rollbackPersona`
  * 变成 `target_missing`（「你要的那一版不在」），而那一版明明在，只是读不动了。
+ *
+ * 解析之后当场自检载荷内部的身份（列值那一半由 `parsePersonaVersionRow` 比）：「列说 v3、
+ * 载荷里写着 v5」这种行读出来会给调用方一份错的正文，而它看起来完全正常。
  */
 function parsePersonaVersionRecord(payload: unknown): PersonaVersionRecord | undefined {
   if (payload === null || payload === undefined) return undefined;
-  return PersonaVersionRecordSchema.parse(
+  const record = PersonaVersionRecordSchema.parse(
     typeof payload === 'string' ? JSON.parse(payload) : payload,
   );
+  assertPersonaVersionRecordIdentity(record);
+  return record;
+}
+
+/**
+ * 解析一条 LEFT JOIN 出来的历史行 —— 列与载荷**两边都要对得上**。
+ *
+ * 三个读口都是这么取的：`memory_agents` 左连历史表，`payload` 为 NULL 就是「这一版没有行」
+ * （Phase B 之前落库的老 Agent 在迁移补 `baseline` 之前的形态，如实缺席）。既然列就在手边，
+ * 就顺手把「主键（`role_id` + `persona_version`）与载荷里的身份一致」验掉——这是唯一能看见
+ * 那件事的地方：列与载荷分裂的行按列查得到、按载荷读出来却是另一版的内容。
+ */
+function parsePersonaVersionRow(row: {
+  role_id: string | null;
+  persona_version: number | null;
+  payload: unknown | null;
+}): PersonaVersionRecord | undefined {
+  const record = parsePersonaVersionRecord(row.payload);
+  if (record === undefined) return undefined;
+  if (record.role_id !== row.role_id || record.persona_version !== row.persona_version) {
+    throw new Error(
+      `Persona version history row identity mismatch: key says `
+        + `${String(row.role_id)} v${String(row.persona_version)}, the payload says `
+        + `${record.role_id} v${String(record.persona_version)}.`,
+    );
+  }
+  return record;
 }
 
 /**
@@ -920,8 +956,32 @@ export class PgMemoryRepository implements MemoryRepository {
     return SkillRecordSchema.parse(row.payload);
   }
 
+  /**
+   * 写下一版 Persona（前端 PATCH、按需重生成，都写 `version + 1`）。
+   *
+   * 语义是「把当前 Persona 换成这一份」，**不是**「覆盖这个版本号」。历史是 append-only 的，
+   * 落到 SQL 上就是那条 `INSERT ... ON CONFLICT DO NOTHING`：主键 `(role_id, persona_version)`
+   * 是唯一的仲裁者，**没有任何 `DO UPDATE`**——一行历史一旦落下就不再改。
+   *
+   * 语句的形状值得记下来，因为它同时给出了原子性与「谁赢」。三步都在**一条语句**里，顺序是
+   * 「锁住 Agent 行 → 插历史（主键挡第二次写入） → 改 Agent 行」：
+   *
+   * - `locked` 那一步 `FOR UPDATE` 先把 Agent 行钉住。没有它，CTE 读到的 Agent 行与外层
+   *   UPDATE 写的那一刻可能不是同一版——跨进程时外层会因条件不成立而一行不改，而历史那一行
+   *   **已经插进去了**，于是留下「历史多了 v2、Persona 还在 v1」的半截状态。锁住之后三步
+   *   看到的是同一版 Agent 行，两个表只能一起变。
+   * - 历史行是 `ON CONFLICT DO NOTHING`，**没有 `DO UPDATE`**。这一版号已经被占时 INSERT
+   *   拿不到行，外层 UPDATE 的 `EXISTS (recorded)` 因此不成立，一行都不改。
+   * - 三步的先后（先锁 Agent、再历史、最后 Agent）在三条写入路径（手工 / 演化 / 回滚）上
+   *   一致，并发时就不构成交叉加锁。
+   *
+   * 版本号必须往前这一条写在 `locked` 的 `WHERE` 里（`当前版本 < 这一版`），因此它同样落在
+   * 同一笔写里：不满足时连历史行都不会插。见 `assertPersonaVersionMonotonic` 的说明。
+   */
   async savePersona(role_id: string, persona: PersonaDef): Promise<void> {
     await this.ensureSchema();
+    // 身份先判：入参角色与正文自己的角色不一致时，写下去就是把 A 的 Persona 记到 B 名下
+    assertPersonaRoleId(role_id, persona);
     PersonaDefSchema.parse(persona);
 
     // role 临界区里的「读当前版本 → 写正文 + 历史」：整段一笔写（见下面的 CTE），这里排队
@@ -933,10 +993,8 @@ export class PgMemoryRepository implements MemoryRepository {
       const current = PersonaDefSchema.parse(row.persona);
       const nextHandle = { ...handle, persona };
 
-      // 这条路径是无条件覆盖（既有语义，调用方是前端 PATCH 与按需重生成），因此历史这一行
-      // 只**登记**这一次覆盖写下的版本：它保证的不变量是「当前 Persona 的版本号那一行，内容
-      // 就是当前 Persona」，而不是「版本号只会变大」。同号重写与版本号回退推不出一个诚实的
-      // 父版本，那种情形下父版本缺席（见 services/persona-version-history）。
+      // 同号重写与版本号回退推不出一个诚实的父版本，那种情形下父版本缺席
+      // （见 services/persona-version-history）
       const record = manualPersonaVersionRecord({
         persona,
         previous_version: current.version,
@@ -944,16 +1002,23 @@ export class PgMemoryRepository implements MemoryRepository {
       });
 
       const result = await this.pool.query(
-        `WITH written AS (
-           UPDATE memory_agents
-           SET persona = $2::jsonb, handle = $3::jsonb
-           WHERE role_id = $1
-           RETURNING role_id
+        `WITH locked AS (
+           SELECT role_id FROM memory_agents
+            WHERE role_id = $1
+              AND (persona->>'version')::int < $4::int
+            FOR UPDATE
+         ),
+         recorded AS (
+           INSERT INTO memory_persona_versions (role_id, persona_version, payload)
+           SELECT role_id, $4::int, $5::jsonb FROM locked
+           ON CONFLICT (role_id, persona_version) DO NOTHING
+           RETURNING persona_version
          )
-         INSERT INTO memory_persona_versions (role_id, persona_version, payload)
-         SELECT role_id, $4::int, $5::jsonb FROM written
-         ON CONFLICT (role_id, persona_version) DO UPDATE SET payload = EXCLUDED.payload
-         RETURNING persona_version`,
+         UPDATE memory_agents
+            SET persona = $2::jsonb, handle = $3::jsonb
+          WHERE role_id = $1
+            AND EXISTS (SELECT 1 FROM recorded)
+          RETURNING role_id`,
         [
           role_id,
           JSON.stringify(persona),
@@ -963,9 +1028,30 @@ export class PgMemoryRepository implements MemoryRepository {
         ],
       );
 
-      if (result.rowCount === 0) {
-        throw new Error(`Agent not found: ${role_id}`);
+      if ((result.rowCount ?? 0) > 0) return;
+
+      // 没写进去，只可能是这一版号已经有行或版本号没往前。读回历史判前者：主键一被占住，
+      // 判据就只剩「这是不是同一笔写的重放」
+      const existing = await this.readPersonaVersionRecord(role_id, record.persona_version);
+      const resolution = resolvePersonaVersionAppend(existing, record);
+      if (resolution.kind === 'identical') return;
+      if (resolution.kind === 'conflict') {
+        throw new Error(personaVersionConflictMessage(record));
       }
+      // 这一版号没有行，那就只能是版本号没往前。重读一次当前行再判：跨进程时读与写之间可能
+      // 有人改过版本号，照刚才那份旧读数报出来的「现在是第几版」就是编的
+      const reread = await this.requireAgentRow(role_id);
+      const current_version = PersonaDefSchema.parse(reread.persona).version;
+      assertPersonaVersionMonotonic({
+        role_id,
+        current_version,
+        next_version: record.persona_version,
+      });
+      throw new Error(
+        `Persona version write for ${role_id} did not apply; `
+          + `the agent is at v${String(current_version)} and the history has no row for `
+          + `v${String(record.persona_version)}.`,
+      );
     });
   }
 
@@ -1376,11 +1462,7 @@ export class PgMemoryRepository implements MemoryRepository {
         throw new Error('completePersonaEvolution requires a persona when the outcome is "evolved".');
       }
       // 版本号只能由父版本推出：让调用方自报一个跳版本的值，等于允许它写出一个不属于它的版本
-      if (persona.role_id !== request.role_id) {
-        throw new Error(
-          `completePersonaEvolution received a persona for ${persona.role_id}, not ${request.role_id}.`,
-        );
-      }
+      assertPersonaRoleId(request.role_id, persona);
       if (persona.version !== request.parent_version + 1) {
         throw new Error(
           `completePersonaEvolution requires persona version ${String(request.parent_version + 1)} `
@@ -1533,8 +1615,14 @@ export class PgMemoryRepository implements MemoryRepository {
     query: PersonaVersionQuery = {},
   ): Promise<PersonaVersionRecord[]> {
     await this.ensureSchema();
-    const result = await this.pool.query<{ payload: unknown | null }>(
-      `SELECT versions.payload AS payload
+    const result = await this.pool.query<{
+      role_id: string | null;
+      persona_version: number | null;
+      payload: unknown | null;
+    }>(
+      `SELECT versions.role_id AS role_id,
+              versions.persona_version AS persona_version,
+              versions.payload AS payload
          FROM memory_agents AS agents
          LEFT JOIN memory_persona_versions AS versions ON versions.role_id = agents.role_id
         WHERE agents.role_id = $1
@@ -1543,7 +1631,7 @@ export class PgMemoryRepository implements MemoryRepository {
     );
     if (result.rows.length === 0) throw new Error(`Agent not found: ${role_id}`);
     const records = result.rows.flatMap((row) => {
-      const record = parsePersonaVersionRecord(row.payload);
+      const record = parsePersonaVersionRow(row);
       return record === undefined ? [] : [record];
     });
     // 过滤与排序已经在 SQL 里做完（那是索引的用武之地），limit 的「最近 N 条」语义拿共享
@@ -1556,8 +1644,14 @@ export class PgMemoryRepository implements MemoryRepository {
     version: number,
   ): Promise<PersonaVersionRecord | undefined> {
     await this.ensureSchema();
-    const result = await this.pool.query<{ payload: unknown | null }>(
-      `SELECT versions.payload AS payload
+    const result = await this.pool.query<{
+      role_id: string | null;
+      persona_version: number | null;
+      payload: unknown | null;
+    }>(
+      `SELECT versions.role_id AS role_id,
+              versions.persona_version AS persona_version,
+              versions.payload AS payload
          FROM memory_agents AS agents
          LEFT JOIN memory_persona_versions AS versions
            ON versions.role_id = agents.role_id AND versions.persona_version = $2
@@ -1566,7 +1660,7 @@ export class PgMemoryRepository implements MemoryRepository {
     );
     const row = result.rows[0];
     if (!row) throw new Error(`Agent not found: ${role_id}`);
-    return parsePersonaVersionRecord(row.payload);
+    return parsePersonaVersionRow(row);
   }
 
   async getCurrentPersonaVersion(
@@ -1575,8 +1669,14 @@ export class PgMemoryRepository implements MemoryRepository {
     await this.ensureSchema();
     // 当前版本号取自 `persona` 自己（唯一权威），在 SQL 里直接拿它去连历史——因此不存在
     // 「先读 Persona、再按读到的号查历史」中间被别的写入插一杠子的窗口
-    const result = await this.pool.query<{ payload: unknown | null }>(
-      `SELECT versions.payload AS payload
+    const result = await this.pool.query<{
+      role_id: string | null;
+      persona_version: number | null;
+      payload: unknown | null;
+    }>(
+      `SELECT versions.role_id AS role_id,
+              versions.persona_version AS persona_version,
+              versions.payload AS payload
          FROM memory_agents AS agents
          LEFT JOIN memory_persona_versions AS versions
            ON versions.role_id = agents.role_id
@@ -1586,7 +1686,7 @@ export class PgMemoryRepository implements MemoryRepository {
     );
     const row = result.rows[0];
     if (!row) throw new Error(`Agent not found: ${role_id}`);
-    return parsePersonaVersionRecord(row.payload);
+    return parsePersonaVersionRow(row);
   }
 
   async rollbackPersona(request: PersonaRollbackRequest): Promise<PersonaRollbackResult> {
@@ -1598,6 +1698,9 @@ export class PgMemoryRepository implements MemoryRepository {
       // 目标版本先判：请求本身就不可满足时先说这件事，不去比较版本条件
       const target = await this.readPersonaVersionRecord(request.role_id, request.target_version);
       if (!target) return { kind: 'target_missing', target_version: request.target_version };
+      // 抄之前先认这一行：载荷必须属于这一行、版本号也得是这一行的，角色还得是请求的那个角色
+      // （`parsePersonaVersionRow` 已经把前两条比过，这里补最后一条）
+      assertPersonaRoleId(request.role_id, target.persona);
 
       const resolution = resolvePersonaRollback({
         expected_current_version: request.expected_current_version,
@@ -1628,25 +1731,39 @@ export class PgMemoryRepository implements MemoryRepository {
         now: request.now,
       });
 
-      // 条件写在**当前版本**上：并发回滚只有一个能把行改掉（谓词里只有版本号这一个条件，因此
-      // 没中一定是版本变了）。正文、聚合根快照与新一版的历史是**同一条语句**——没有「Persona
-      // 换好了、历史还没写」的窗口。
+      // 条件写在**当前版本**上：并发回滚只有一个能把行改掉（谓词里与行内容有关的只有版本号
+      // 这一个，因此没中一定是版本变了，或者是这一版号已经被别人占了）。正文、聚合根快照与
+      // 新一版的历史是**同一条语句**——没有「Persona 换好了、历史还没写」的窗口。
+      //
+      // 语句形状与 `savePersona` 一致：**锁住 Agent 行 → 插历史 → 改 Agent 行**，一条语句
+      // 走完。`FOR UPDATE` 那一步让三层看到同一版 Agent 行，因此不存在「历史写了、正文没写」
+      // 的半截状态；历史那一行是 `ON CONFLICT DO NOTHING`（绝不 `DO UPDATE`）——回滚写下的
+      // 版本号必须是新的，撞上已有的一行就说明「当前版本 === 历史里最大的版本号」这条不变量
+      // 已经断了，此时拒绝比覆盖诚实（被覆盖的那一行是别人回滚或审计的目标）。三步的先后在
+      // 三条写入路径上一致，并发时因此不构成交叉加锁。
       //
       // 刻意不碰 `persona_evolution`：标记的去重键是 (role_id, input_snapshot_hash,
       // strategy_version)，输入没变时把它作废会让下一次演化把刚回滚掉的版本原样写回来。
       const result = await this.pool.query(
-        `WITH rolled AS (
-           UPDATE memory_agents
-           SET persona = $2::jsonb,
-               handle = jsonb_set(handle, '{persona}', $2::jsonb)
-           WHERE role_id = $1
-             AND (persona->>'version')::int = $3
-           RETURNING role_id
+        `WITH locked AS (
+           SELECT role_id FROM memory_agents
+            WHERE role_id = $1
+              AND (persona->>'version')::int = $3
+            FOR UPDATE
+         ),
+         recorded AS (
+           INSERT INTO memory_persona_versions (role_id, persona_version, payload)
+           SELECT role_id, $4::int, $5::jsonb FROM locked
+           ON CONFLICT (role_id, persona_version) DO NOTHING
+           RETURNING persona_version
          )
-         INSERT INTO memory_persona_versions (role_id, persona_version, payload)
-         SELECT role_id, $4::int, $5::jsonb FROM rolled
-         ON CONFLICT (role_id, persona_version) DO UPDATE SET payload = EXCLUDED.payload
-         RETURNING persona_version`,
+         UPDATE memory_agents
+            SET persona = $2::jsonb,
+                handle = jsonb_set(handle, '{persona}', $2::jsonb)
+          WHERE role_id = $1
+            AND (persona->>'version')::int = $3
+            AND EXISTS (SELECT 1 FROM recorded)
+          RETURNING role_id`,
         [
           request.role_id,
           JSON.stringify(persona),
@@ -1659,15 +1776,35 @@ export class PgMemoryRepository implements MemoryRepository {
         return { kind: 'applied', persona, record };
       }
 
-      // 条件写没中：重读一次把「现在是第几版」如实报出来。并发回滚的输家必须知道这件事，
+      // 条件写没中。重读一次把「现在是第几版」如实报出来：并发回滚的输家必须知道这件事，
       // 否则它会拿自己那份已经过期的判断再试一次，把赢家刚写下的结果盖掉
       const reread = await this.readPersonaEvolutionRow(request.role_id);
       if (!reread) throw new Error(`Agent not found: ${request.role_id}`);
-      return {
-        kind: 'version_conflict',
-        expected_version: request.expected_current_version,
+      const latest = resolvePersonaRollback({
+        expected_current_version: request.expected_current_version,
         current_version: reread.persona.version,
-      };
+        target_version: request.target_version,
+      });
+      if (latest.kind === 'conflict') {
+        return {
+          kind: 'version_conflict',
+          expected_version: latest.expected_version,
+          current_version: latest.current_version,
+        };
+      }
+      // 当前版本仍然对得上却还是没写进去：这一版号在历史里已经有一行内容不同的记录。
+      // 版本号本该是新的（回滚写的是当前版本 +1），因此走到这里说明不变量已经断了
+      const existing = await this.readPersonaVersionRecord(
+        request.role_id,
+        record.persona_version,
+      );
+      if (existing !== undefined && !isSamePersonaVersionWrite(existing, record)) {
+        throw new Error(personaVersionConflictMessage(record));
+      }
+      throw new Error(
+        `Persona rollback for ${request.role_id} did not apply; the current version is still `
+          + `v${String(reread.persona.version)} and v${String(record.persona_version)} is not free.`,
+      );
     });
   }
 
@@ -1676,11 +1813,17 @@ export class PgMemoryRepository implements MemoryRepository {
     role_id: string,
     version: number,
   ): Promise<PersonaVersionRecord | undefined> {
-    const result = await this.pool.query<{ payload: unknown }>(
-      `SELECT payload FROM memory_persona_versions WHERE role_id = $1 AND persona_version = $2`,
+    const result = await this.pool.query<{
+      role_id: string | null;
+      persona_version: number | null;
+      payload: unknown | null;
+    }>(
+      `SELECT role_id, persona_version, payload
+         FROM memory_persona_versions WHERE role_id = $1 AND persona_version = $2`,
       [role_id, version],
     );
-    return parsePersonaVersionRecord(result.rows[0]?.payload);
+    const row = result.rows[0];
+    return row === undefined ? undefined : parsePersonaVersionRow(row);
   }
 
   /** 读一个角色的演化状态（Persona 与标记）。Agent 不存在时返回 undefined */
@@ -1860,31 +2003,47 @@ export class PgMemoryRepository implements MemoryRepository {
             [guard[0], JSON.stringify(next), guard[1], guard[2], guard[3], guard[4]],
           )
         : await this.pool.query(
-            // 正文、标记与新一版的历史是**同一条语句**：数据修改 CTE 先做条件更新，外层 INSERT
-            // 只对「更新真的发生过」的那些行补一行历史。分两笔写就会留下「Persona 已经 v5、
-            // 历史里没有 v5」的窗口——那个窗口正是回滚与审计唯一依赖的东西。
+            // 正文、标记与新一版的历史是**同一条语句**：数据修改 CTE 先做条件写，外层只对
+            // 「真的写进去了」的那些行收尾。分两笔写就会留下「Persona 已经 v5、历史里没有
+            // v5」的窗口——那个窗口正是回滚与审计唯一依赖的东西。
             //
-            // 外层用 `DO UPDATE` 而不是 `DO NOTHING`：本语句的成功信号取自最外层 RETURNING 的
-            // 行数，而 `DO NOTHING` 在「这一版号已有一行」时会返回 0 行——那会把一次**已经生效**
-            // 的写入报成「没轮到我们」。那种情形只有「版本号先被回退、之后又涨回同一号」能造出来，
-            // 而那时旧内容早已不是当前内容；历史行跟着最后一次写入走，不变的是版本号序列。
-            `WITH settled AS (
-               UPDATE memory_agents
-               SET persona = $2::jsonb,
-                   handle = jsonb_set(handle, '{persona}', $2::jsonb),
-                   persona_evolution = $3::jsonb
-               WHERE role_id = $1
-                 AND (persona->>'version')::int = $4
-                 AND persona_evolution->>'status' IS NOT DISTINCT FROM $5
-                 AND persona_evolution->>'attempt_count' IS NOT DISTINCT FROM $6
-                 AND persona_evolution->>'claim_token' IS NOT DISTINCT FROM $7
-                 AND persona_evolution->>'updated_at' IS NOT DISTINCT FROM $8
-               RETURNING role_id
+            // 语句形状与 `savePersona` / `rollbackPersona` 一致：**锁住 Agent 行 → 插历史 →
+            // 改 Agent 行**，一条语句走完。`FOR UPDATE` 让三层看到同一版 Agent 行，不存在
+            // 「历史写了、正文与标记没写」的半截状态；历史那一行是 `ON CONFLICT DO NOTHING`
+            // （绝不 `DO UPDATE`）：一行历史一旦落下就不再改，同一个版本号第二次来只能被主键
+            // 挡下。三条路径的先后一致，并发时不会交叉。
+            //
+            // 三层带着**逐字相同**的条件：外壳拿 0 行时既可能是历史那一行先被占住（`EXISTS`
+            // 不成立），也可能是父版本/凭据过期。调用方拿到 0 行之后重读，按「先看父版本、
+            // 再看历史」的顺序把三件事分开——并发只可能有一个赢家，而输家要知道自己输在哪。
+            `WITH locked AS (
+               SELECT role_id FROM memory_agents
+                WHERE role_id = $1
+                  AND (persona->>'version')::int = $4
+                  AND persona_evolution->>'status' IS NOT DISTINCT FROM $5
+                  AND persona_evolution->>'attempt_count' IS NOT DISTINCT FROM $6
+                  AND persona_evolution->>'claim_token' IS NOT DISTINCT FROM $7
+                  AND persona_evolution->>'updated_at' IS NOT DISTINCT FROM $8
+                FOR UPDATE
+             ),
+             recorded AS (
+               INSERT INTO memory_persona_versions (role_id, persona_version, payload)
+               SELECT role_id, $9::int, $10::jsonb FROM locked
+               ON CONFLICT (role_id, persona_version) DO NOTHING
+               RETURNING persona_version
              )
-             INSERT INTO memory_persona_versions (role_id, persona_version, payload)
-             SELECT role_id, $9::int, $10::jsonb FROM settled
-             ON CONFLICT (role_id, persona_version) DO UPDATE SET payload = EXCLUDED.payload
-             RETURNING persona_version`,
+             UPDATE memory_agents
+                SET persona = $2::jsonb,
+                    handle = jsonb_set(handle, '{persona}', $2::jsonb),
+                    persona_evolution = $3::jsonb
+              WHERE role_id = $1
+                AND (persona->>'version')::int = $4
+                AND persona_evolution->>'status' IS NOT DISTINCT FROM $5
+                AND persona_evolution->>'attempt_count' IS NOT DISTINCT FROM $6
+                AND persona_evolution->>'claim_token' IS NOT DISTINCT FROM $7
+                AND persona_evolution->>'updated_at' IS NOT DISTINCT FROM $8
+                AND EXISTS (SELECT 1 FROM recorded)
+              RETURNING role_id`,
             [
               guard[0],
               JSON.stringify(evolved.persona),
@@ -1914,6 +2073,12 @@ export class PgMemoryRepository implements MemoryRepository {
       if (resolution.kind === 'conflict') {
         return { kind: 'parent_conflict', current_version: resolution.current_version };
       }
+    }
+    // 父版本条件成立却仍然没写进去：这一版号在历史里已经有一行**内容不同**的记录。这既不是
+    // 判定过期也不是「没轮到我们」，而是不可变被踩到——抛出去，不把它伪装成可重试的失败
+    const existing = await this.readPersonaVersionRecord(role_id, evolved.record.persona_version);
+    if (existing !== undefined && !isSamePersonaVersionWrite(existing, evolved.record)) {
+      throw new Error(personaVersionConflictMessage(evolved.record));
     }
     return { kind: 'claim_lost' };
   }

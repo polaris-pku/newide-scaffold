@@ -574,7 +574,26 @@ export interface MemoryRepository {
    * 计数只在真正新建时递增，幂等命中不重复计数。
    */
   saveSkillIfAbsent(role_id: string, skill: SkillRecord): Promise<SkillSaveResult>;
-  /** 覆盖写入当前 Persona 快照（如 Persona 演化后 version+1） */
+  /**
+   * 写下一版当前 Persona（前端 PATCH 与按需重生成，都写 `version + 1`）。
+   *
+   * 语义是「把当前 Persona 换成这一份」，**不是**「覆盖这个版本号」——版本历史是 append-only
+   * 的，这条路径换掉的是**新版本号**那一行，旧版本那一行一个字都不动。三条约束：
+   *
+   * 1. **身份**：`persona.role_id` 必须等于 `role_id`（不等就抛
+   *    `Persona role_id mismatch: expected …, got …`）。少了这一条，一次笔误就能把 A 的
+   *    Persona 记到 B 名下，而且此后每个读口都读不出来。
+   * 2. **版本号只能往前**：`persona.version` 必须严格大于当前版本。它维护的是
+   *    `当前版本 === 历史里最大的版本号` 这条不变量，而回滚写下的 `当前版本 + 1` 「一定是新
+   *    的」正是靠它成立。想回到旧版本用 `rollbackPersona`（它写新版本号，不复用旧的）。
+   * 3. **不可变**：`(role_id, persona.version)` 已经有行时，只接受「这是同一笔写的重放」
+   *    （幂等成功，什么都不改）；内容不同则**拒绝**——抛错，且当前 Persona、聚合根快照
+   *    （Handle）与历史三者一起停在原处，不留下半写状态。冲突不是「后来者居上」：历史是
+   *    回滚唯一能抄的东西，让它可改写等于让回滚的目标在无人察觉的时候被换掉。
+   *
+   * 两个后端共用 `services/persona-version-history` 的同一份判据与同一句话，因此「什么时候
+   * 算冲突、冲突时哪一边赢」不会在两个后端之间漂移。
+   */
   savePersona(role_id: string, persona: PersonaDef): Promise<void>;
   /**
    * 覆盖写入已有技能（如消融实验 auto-approve、人工审核裁决）。
@@ -765,12 +784,20 @@ export interface MemoryRepository {
   // 上面那组方法管的是**演化这条流水线**（候选、持有、结论）；这一组管的是它的**产物**：
   // 每一版 Persona 的正文本身。修复前只有「当前 Persona + 最新标记」两处，因此下一次演化
   // 覆盖标记之后，旧版本的正文就再也找不回来了——`PersonaDef` 是单实体单版本号的，
-  // `savePersona` 又是覆盖写。历史是回滚的**前提**：没有旧正文可抄，回滚只是一句空话。
+  // `savePersona` 那时也是覆盖写。历史是回滚的**前提**：没有旧正文可抄，回滚只是一句空话。
+  //
+  // 历史是 **append-only** 的，这是这一整组的中心约束（第二条修复 B 轮次）：一行历史一旦
+  // 落下就不再改。同一个 `(role_id, persona_version)` 第二次来，要么是同一笔写的重放（幂等），
+  // 要么内容不同（冲突，拒绝且一个字节都不写），没有第三种。三条写入路径——手工
+  // （`savePersona`）、演化落地（`completePersonaEvolution`）、回滚（`rollbackPersona`）——
+  // 都走同一份判据 `services/persona-version-history` 的 `resolvePersonaVersionAppend`，因此
+  // 「怎样算同一笔写、冲突时谁赢」在两个后端上逐字相同。
   //
   // 为什么历史长在这个端口上，而不是另起一个 HistoryStore：**原子性**。写下一版 Persona
   // 与登记这一版的历史必须是同一笔写——分成两个 store 就等于承认中间存在「Persona 已经是
   // v5、历史里没有 v5」的窗口，而那个窗口恰好是回滚与审计唯一依赖的东西。Pg 那边这一笔写
-  // 因此是**一条语句**（UPDATE ... RETURNING 配一个数据修改 CTE 的 INSERT），不是两笔。
+  // 因此是**一条语句**（锁住 Agent 行 → 数据修改 CTE 里 INSERT 历史行 → 外层 UPDATE 由它
+  // 驱动），不是两笔。
 
   /**
    * 一个角色的版本历史，按版本号升序（旧 → 新）。
@@ -808,10 +835,16 @@ export interface MemoryRepository {
    *    判定的 worker 重新变得「正确」，于是它会把刚回滚掉的那一版写回来。
    * 3. **旧历史一行不动**：回滚追加一行，`parent_version` 记取代了哪一版、
    *    `rollback_from_version` 记正文抄自哪一版、`change_summary` 带上原因、`created_at` 是
-   *    这一版的时刻。
+   *    这一版的时刻。这一行同样是 append-only：`当前版本 + 1` 若已经有行，实现**拒绝**而不是
+   *    覆盖（那说明「当前版本 === 历史里最大的版本号」已经断了，而被覆盖的那一行正是别人回滚
+   *    或审计的目标）。
    * 4. **不碰演化标记**：标记的去重键是 `(role_id, input_snapshot_hash, strategy_version)`，
    *    输入没变时把它作废会让下一次演化把刚回滚掉的版本原样写回来。回滚只是把当前版本往前
    *    推了一版，那份判定仍然「已经在这份输入上做过」。
+   *
+   * 身份自洽：目标那一行必须是**这个角色**的，且它的载荷必须属于这一行、版本号也得是这一行
+   * 的（`persona.role_id === role_id`、`persona.version === persona_version`）。不成立就抛错——
+   * 拿别的角色的正文当回滚目标，写出来的是一个「属于别人」的当前版本。
    *
    * 目标版本不存在返回 `target_missing`（在版本条件之前判：请求本身就不可满足时先说这件事）。
    * 回滚到当前版本是允许的退化情形——新的版本号、同样的正文，如实落下。

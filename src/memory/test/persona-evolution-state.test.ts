@@ -471,6 +471,7 @@ function runPersonaEvolutionStateContract(
         }),
       ).rejects.toThrow(/requires persona version 2/);
 
+      // 角色对不上与版本号对不上共用同一句话术（`assertPersonaRoleId`），两条腿逐字相同
       await expect(
         repository.completePersonaEvolution({
           ...base,
@@ -481,7 +482,7 @@ function runPersonaEvolutionStateContract(
             now: NOW,
           }),
         }),
-      ).rejects.toThrow(/not role_persona_evo_/);
+      ).rejects.toThrow(/Persona role_id mismatch: expected .*got role_someone_else/);
 
       await expect(repository.completePersonaEvolution(base)).rejects.toThrow(/requires a persona/);
 
