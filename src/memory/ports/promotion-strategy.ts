@@ -29,6 +29,24 @@ import type { ExperienceRecord, UserRating } from '../schemas';
 export type PromotionApprovalMode = 'auto_approve' | 'manual_review';
 
 /**
+ * 两种审核模式的**运行时**清单。
+ *
+ * 类型在运行时不存在，而「策略返回的 `approval` 是不是这两种之一」必须由值来回答：一个
+ * 绕过 TypeScript 的自定义策略可以给出 `'yolo'`，而这个字段决定本次执行能不能写 Skill，
+ * 也原样进经验与 run 的审计。真值表写成 `Record<PromotionApprovalMode, true>` 而不是裸数组，
+ * 是为了让契约新增或改名成员时**先编译不过**，校验器不会拿着过期的清单去拒掉一条合法判定。
+ */
+const APPROVAL_MODE_TABLE: Record<PromotionApprovalMode, true> = {
+  auto_approve: true,
+  manual_review: true,
+};
+
+/** `PromotionApprovalMode` 的取值清单（顺序与真值表的声明顺序一致） */
+export const PROMOTION_APPROVAL_MODES: readonly PromotionApprovalMode[] = Object.keys(
+  APPROVAL_MODE_TABLE,
+) as PromotionApprovalMode[];
+
+/**
  * 策略配置。阈值全部可注入，不散落 magic number；`version` 是它的身份。
  *
  * 默认值见 adapters/default-promotion-strategy.ts 的 DEFAULT_PROMOTION_STRATEGY_CONFIG。
@@ -70,6 +88,24 @@ export type PromotionVerdict =
   /** 不够格 —— 记录理由，同一策略版本下不再重评 */
   | 'rejected';
 
+/** 三个合法结论的**运行时**清单（同上：契约变了这里先编译不过） */
+const VERDICT_TABLE: Record<PromotionVerdict, true> = {
+  eligible: true,
+  pending_review: true,
+  rejected: true,
+};
+
+/**
+ * `PromotionVerdict` 的取值清单。
+ *
+ * 校验器拿它挡下最贵的一类策略缺陷：一个拼错的 `verdict`（`'typo'`）是**字符串**，会一路
+ * 通过「非 eligible、非 pending_review」的判断被写成一个正常的拒绝结论，于是实现错误伪装成
+ * 判决结果（见 services/promotion-executor.ts 的 `assertPromotionDecisionConsistent`）。
+ */
+export const PROMOTION_VERDICTS: readonly PromotionVerdict[] = Object.keys(
+  VERDICT_TABLE,
+) as PromotionVerdict[];
+
 /**
  * 挡住晋升的规则名（稳定的机器可读标识）。理由文本会变，这些名字不变，
  * 因此聚合「这批候选都栽在哪条规则上」时用的是它们。
@@ -87,6 +123,26 @@ export type PromotionBlockerRule =
   | 'too_recent'
   /** 来源评分未达到反馈质量门槛 */
   | 'insufficient_user_rating';
+
+/** 六个合法挡板规则的**运行时**清单（同上：契约变了这里先编译不过） */
+const BLOCKER_RULE_TABLE: Record<PromotionBlockerRule, true> = {
+  already_promoted: true,
+  negative_experience: true,
+  below_confidence_threshold: true,
+  insufficient_references: true,
+  too_recent: true,
+  insufficient_user_rating: true,
+};
+
+/**
+ * `PromotionBlockerRule` 的取值清单。
+ *
+ * 挡板规则是审计里**做聚合用的那一半**（理由文本会变，规则名不变），因此一个不在这张表里的
+ * 名字会被聚合成一条并不存在的规则——校验器据此拒掉它，而不是把它写进经验。
+ */
+export const PROMOTION_BLOCKER_RULES: readonly PromotionBlockerRule[] = Object.keys(
+  BLOCKER_RULE_TABLE,
+) as PromotionBlockerRule[];
 
 /** 一次判定的输入 */
 export interface PromotionEvaluationInput {

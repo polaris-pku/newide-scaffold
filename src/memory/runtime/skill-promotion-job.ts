@@ -23,8 +23,10 @@
  *   是 v2、实际按 v1 判」的 run 会比没有这条 run 更容易让人读错判决。
  * - **策略返回的判定也是一道断言**，但**不在这里**判：执行内核
  *   （services/promotion-executor.ts 的 `assertPromotionDecisionConsistent`）在写任何东西
- *   之前核对判定的版本、经验 id、审核模式与结论组合。放在内核是因为内核也会被别的调用方
- *   直接用；本外壳只在自己的演练路径上复用同一份校验。
+ *   之前核对判定的**运行时形状**（是不是对象、`verdict` 是否三个合法结论之一、版本与经验 id
+ *   是不是非空字符串、两个数组的元素合不合法）以及它与本次执行的关系（版本、经验 id、审核
+ *   模式、结论组合）。放在内核是因为内核也会被别的调用方直接用；本外壳只在自己的演练路径上
+ *   复用同一份校验，失败的分类因此与真跑完全一致。
  *
  * 几条不能松的约束（与 Phase 1/2 相同，理由也相同）：
  *
@@ -52,7 +54,7 @@ import { randomUUID } from 'node:crypto';
 import { nowTimestamp } from '../../core';
 import type { MaintenanceFailure, MaintenanceRunCounts } from '../schemas';
 import type { ClaimedPromotionCandidate } from '../ports/memory-repository';
-import type { PromotionApprovalMode, PromotionDecision } from '../ports/promotion-strategy';
+import type { PromotionApprovalMode } from '../ports/promotion-strategy';
 import type {
   PromotionCandidateOutcome,
   PromotionRestoreResult,
@@ -67,6 +69,7 @@ import { DEFAULT_DELIVERY_LEASE_MS } from '../services/delivery-lifecycle';
 import { EMPTY_MAINTENANCE_RUN_COUNTS } from '../services/maintenance-run-lifecycle';
 import {
   assertPromotionDecisionConsistent,
+  auditPromotionDecision,
   classifyPromotionFailure,
   describeContractFailure,
   executePromotionCandidate,
@@ -369,10 +372,12 @@ export class DefaultSkillPromotionJob implements SkillPromotionJob {
    * ——它们的名字在契约里就是同一件事。策略自己抛错时记成这一条的失败（包含分类），演练因此
    * 也能回答「换个配置跑一次会不会有候选先炸掉」。
    *
-   * 演练路径**自己**做一遍判定契约校验，而不是复用执行内核：这一步什么都不写，但结论会被
-   * 人当成真跑的预演来读，而「策略会把一份自相矛盾的判定交回来」正是演练最该提前暴露的
-   * 一类配置错。校验不过就记成 `failed`（带规范化 failure），**不**退化成 `promoted` /
-   * `pending_review` / `rejected` 里的任何一个——那会把一次配置错伪装成一个正常结论。
+   * 演练路径**自己**调一遍判定契约校验，而不是复用执行内核：这一步什么都不写，但结论会被
+   * 人当成真跑的预演来读，而「策略会把一份不合法的判定交回来」正是演练最该提前暴露的一类
+   * 配置错。校验用的是**同一个函数**（因此同一套 violation、同一种失败分类），不过就记成
+   * `failed`（带规范化 failure），**不**退化成 `promoted` / `pending_review` / `rejected`
+   * 里的任何一个——那会把一次配置错伪装成一个正常结论。判定值先落在 `unknown` 上再做校验，
+   * 因此一份 `null` / 标量判定只会变成本条 `failed`，不会在读字段时抛出 TypeError 掀掉整批。
    */
   private async previewOne(
     experience: ExperienceRecord,
@@ -386,9 +391,12 @@ export class DefaultSkillPromotionJob implements SkillPromotionJob {
       run_id: context.run_id,
     };
 
-    let decision: PromotionDecision;
+    // 策略交回来的东西在运行时是未知的（自定义策略可以绕过类型层）：先落在 `unknown` 上，
+    // 校验过了才读字段——否则一份 `null` 或标量判定会在读 `verdict` 时抛出 TypeError，把
+    // 一次配置错变成一次外壳崩溃
+    let returned: unknown;
     try {
-      decision = await this.options.strategy.evaluate({
+      returned = await this.options.strategy.evaluate({
         role_id,
         experience,
         now: this.now(),
@@ -409,22 +417,26 @@ export class DefaultSkillPromotionJob implements SkillPromotionJob {
       strategy_version: context.strategy_version,
     };
     try {
-      assertPromotionDecisionConsistent(decision, expected);
+      // 与执行内核同一份校验、同一种失败分类：演练的结论会被人当成真跑的预演来读，两条路径
+      // 对「什么叫非法判定」必须给出同一个答案
+      assertPromotionDecisionConsistent(returned, expected);
     } catch (error) {
+      const audited = auditPromotionDecision(returned);
       return {
         ...base,
         status: 'failed',
-        decision,
+        ...(audited !== undefined ? { decision: audited } : {}),
         failure: classifyPromotionFailure(error),
         warnings: [
           DRY_RUN_WARNING,
           isPromotionDecisionContractError(error)
             ? describeContractFailure(error)
-            : 'The strategy returned an inconsistent decision while previewing this candidate.',
+            : 'The strategy returned an invalid decision while previewing this candidate.',
         ],
       };
     }
 
+    const decision = returned;
     return {
       ...base,
       status: decision.verdict === 'eligible' ? 'promoted' : decision.verdict,

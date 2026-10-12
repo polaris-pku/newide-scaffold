@@ -65,10 +65,12 @@ import {
   assertPromotionDecisionConsistent,
   executePromotionCandidate,
   isPromotionDecisionContractError,
+  type PromotionDecisionContractError,
 } from '../services/promotion-executor';
 import type { MaintenanceRunStore } from '../ports/maintenance-run-store';
 import type { MemoryRepository } from '../ports/memory-repository';
 import type {
+  PromotionApprovalMode,
   PromotionDecision,
   PromotionEvaluationInput,
   PromotionStrategy,
@@ -270,6 +272,283 @@ function claimingApprovalStrategy(
     },
   };
 }
+
+/**
+ * 让策略交回一份**运行时非法**的判定（形状任意，连对象都可以不是）。
+ *
+ * 与 `tamperingStrategy` 的分工：那个在真结论上改一个字段，交回去的仍然是一份判定——被注入
+ * 的差异只有那一处，失败归因干净；这个用来造真策略**不可能**产出的东西：`null`、标量、字段
+ * 类型全错、或者一个拼错的 verdict。绕开 TypeScript 正是被审计的自定义策略会做的事，因此
+ * 替身也照做——端口声明的是 `PromotionDecision`，这里只能把非法值 `as` 过去。
+ *
+ * 底稿同样取真结论（合格的那一份），并**原样透出**让用例只改它要改的地方。
+ */
+function illegalDecisionStrategy(
+  base: DefaultPromotionStrategy,
+  corrupt: (
+    decision: PromotionDecision,
+    input: PromotionEvaluationInput,
+    call: number,
+  ) => unknown,
+): PromotionStrategy {
+  let calls = 0;
+  return {
+    version: base.version,
+    config: base.config,
+    evaluate: async (input) => {
+      calls += 1;
+      return corrupt(await base.evaluate(input), input, calls) as PromotionDecision;
+    },
+  };
+}
+
+/**
+ * 从一份判定里删掉一个字段（造「字段缺席」用）。
+ *
+ * 与 `{ ...decision, verdict: undefined }` 是两种不同的坏法（后者是键在而值为 undefined），
+ * 校验对两者给出同一个结论，这里用「键都不在」这一种。
+ */
+function without(decision: PromotionDecision, key: keyof PromotionDecision): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...decision };
+  delete copy[key];
+  return copy;
+}
+
+/**
+ * 校验器本身的契约：一份非法判定**各自**落在哪一个 violation 上，错误对象上带着哪几个数。
+ *
+ * 它不碰存储（纯函数），因此不跟着双后端契约跑两遍。放在这里是因为 job 的演练路径与执行内核
+ * 用的是同一个函数：两种故障（形状不合法 / 与本次执行对不上）在失败消息里长得很像，必须由
+ * violation 稳定地区分开——聚合一个 run 里「策略到底错在哪」时读的是它，不是消息文本。
+ */
+describe('assertPromotionDecisionConsistent — 运行时判定契约', () => {
+  const experience_id = 'exp_contract_1';
+  /** 本次执行的权威口径（与执行内核接到的那一份同形） */
+  const expected: {
+    experience_id: string;
+    approval: PromotionApprovalMode;
+    strategy_version: string;
+  } = {
+    experience_id,
+    approval: 'auto_approve',
+    strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+  };
+
+  /** 一份合法判定的底稿：每个用例只破坏其中一处 */
+  function legalDecision(): PromotionDecision {
+    return {
+      verdict: 'eligible',
+      strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+      approval: 'auto_approve',
+      reasons: ['Candidate qualifies.'],
+      blocking_rules: [],
+      experience_id,
+    };
+  }
+
+  /** 跑一次校验，把抛出来的契约错误取回来（没抛就是不合法判定从这道门溜过去了） */
+  function violationOf(decision: unknown, overrides: Partial<typeof expected> = {}) {
+    let thrown: unknown;
+    try {
+      assertPromotionDecisionConsistent(decision, { ...expected, ...overrides });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isPromotionDecisionContractError(thrown)).toBe(true);
+    return thrown as PromotionDecisionContractError;
+  }
+
+  it('合法判定一律放行（自动批准 / 人工审核 / 拒绝三种结论）', () => {
+    expect(() => assertPromotionDecisionConsistent(legalDecision(), expected)).not.toThrow();
+    expect(() =>
+      assertPromotionDecisionConsistent(
+        { ...legalDecision(), verdict: 'pending_review', approval: 'manual_review' },
+        { ...expected, approval: 'manual_review' },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertPromotionDecisionConsistent(
+        {
+          ...legalDecision(),
+          verdict: 'rejected',
+          reasons: ['confidence 0.5 does not exceed the threshold.'],
+          blocking_rules: ['below_confidence_threshold'],
+        },
+        expected,
+      ),
+    ).not.toThrow();
+  });
+
+  it('每一类非法值都落在它自己的 violation 上，错误里带着 expected / actual / 经验 id', () => {
+    const cases: Array<{ name: string; decision: unknown; violation: string; needle?: string }> = [
+      { name: 'decision 为 null', decision: null, violation: 'decision_shape' },
+      { name: 'decision 为 undefined', decision: undefined, violation: 'decision_shape' },
+      { name: 'decision 为标量', decision: 'eligible', violation: 'decision_shape' },
+      { name: 'decision 为数组', decision: [], violation: 'decision_shape' },
+      { name: 'verdict 缺失', decision: without(legalDecision(), 'verdict'), violation: 'verdict' },
+      {
+        name: 'verdict 是自造的值',
+        decision: { ...legalDecision(), verdict: 'typo' },
+        violation: 'verdict',
+        needle: 'typo',
+      },
+      {
+        name: 'verdict 不是字符串',
+        decision: { ...legalDecision(), verdict: 1 },
+        violation: 'verdict',
+      },
+      {
+        name: 'strategy_version 为空串',
+        decision: { ...legalDecision(), strategy_version: '' },
+        violation: 'strategy_version',
+      },
+      {
+        name: 'strategy_version 不是字符串',
+        decision: { ...legalDecision(), strategy_version: 7 },
+        violation: 'strategy_version',
+      },
+      {
+        name: 'strategy_version 与执行不符',
+        decision: { ...legalDecision(), strategy_version: 'promotion-threshold.v9' },
+        violation: 'strategy_version',
+        needle: 'promotion-threshold.v9',
+      },
+      {
+        name: 'experience_id 为空串',
+        decision: { ...legalDecision(), experience_id: '   ' },
+        violation: 'experience_id',
+      },
+      {
+        name: 'experience_id 不是字符串',
+        decision: { ...legalDecision(), experience_id: null },
+        violation: 'experience_id',
+      },
+      {
+        name: 'experience_id 指向别处',
+        decision: { ...legalDecision(), experience_id: 'exp_other' },
+        violation: 'experience_id',
+        needle: 'exp_other',
+      },
+      {
+        name: 'approval 不是合法模式',
+        decision: { ...legalDecision(), approval: 'yolo' },
+        violation: 'approval',
+        needle: 'yolo',
+      },
+      {
+        name: 'approval 与本次运行不符',
+        decision: { ...legalDecision(), approval: 'manual_review' },
+        violation: 'approval',
+      },
+      {
+        name: 'reasons 不是数组',
+        decision: { ...legalDecision(), reasons: 'Candidate qualifies.' },
+        violation: 'reasons',
+      },
+      {
+        name: 'reasons 元素不是字符串',
+        decision: { ...legalDecision(), reasons: [1] },
+        violation: 'reasons',
+      },
+      {
+        name: 'reasons 元素是空串',
+        decision: { ...legalDecision(), reasons: [''] },
+        violation: 'reasons',
+      },
+      {
+        name: 'blocking_rules 不是数组',
+        decision: { ...legalDecision(), blocking_rules: 'already_promoted' },
+        violation: 'blocking_rules',
+      },
+      {
+        name: 'blocking_rules 元素不是字符串',
+        decision: { ...legalDecision(), blocking_rules: [1] },
+        violation: 'blocking_rules',
+      },
+      {
+        name: 'blocking_rules 是未知规则名',
+        decision: { ...legalDecision(), blocking_rules: ['looks_suspicious'] },
+        violation: 'blocking_rules',
+        needle: 'looks_suspicious',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const error = violationOf(testCase.decision);
+      expect(error.violation, testCase.name).toBe(testCase.violation);
+      expect(error.contract_code, testCase.name).toBe(PROMOTION_DECISION_CONTRACT_CODE);
+      // 经验 id 即使判定自身给不出也要能报出来：本次执行被 claim 给了谁，调用方知道
+      expect(error.experience_id, testCase.name).toBe(experience_id);
+      expect(error.expected.length, testCase.name).toBeGreaterThan(0);
+      // actual 有可能是空串（空版本/空经验 id 正是被拒的那一类值），因此这里只要求它被渲染
+      // 进消息里；具体值由每个用例的 needle 钉住
+      expect(error.message, testCase.name).toContain('got "');
+      // 消息里要能读出「哪个字段、该是什么、实际是什么」，以及这是一次配置错而不是抖动
+      expect(error.message, testCase.name).toContain(experience_id);
+      expect(error.message, testCase.name).toContain(testCase.violation);
+      expect(error.message, testCase.name).toContain('not retried');
+      if (testCase.needle) expect(error.message, testCase.name).toContain(testCase.needle);
+    }
+  });
+
+  it('结论组合：rejected 必须给出挡板与理由，合格的两个结论不得带挡板', () => {
+    const cases: Array<{ name: string; decision: unknown; approval: PromotionApprovalMode }> = [
+      {
+        name: 'rejected 却没有挡板规则',
+        decision: {
+          ...legalDecision(),
+          verdict: 'rejected',
+          reasons: ['confidence is too low'],
+          blocking_rules: [],
+        },
+        approval: 'auto_approve',
+      },
+      {
+        name: 'rejected 却没有理由',
+        decision: {
+          ...legalDecision(),
+          verdict: 'rejected',
+          reasons: [],
+          blocking_rules: ['below_confidence_threshold'],
+        },
+        approval: 'auto_approve',
+      },
+      {
+        name: 'eligible 却带着挡板规则',
+        decision: { ...legalDecision(), blocking_rules: ['below_confidence_threshold'] },
+        approval: 'auto_approve',
+      },
+      {
+        name: 'pending_review 却带着挡板规则',
+        decision: {
+          ...legalDecision(),
+          verdict: 'pending_review',
+          approval: 'manual_review',
+          blocking_rules: ['below_confidence_threshold'],
+        },
+        approval: 'manual_review',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const error = violationOf(testCase.decision, { approval: testCase.approval });
+      expect(error.violation, testCase.name).toBe('verdict_combination');
+    }
+  });
+
+  it('渲染不出来的 actual 不会变成第二个错误源（循环引用 / BigInt 都只写成一句话）', () => {
+    const circular: Record<string, unknown> = { ...legalDecision(), verdict: 'typo' };
+    circular.self = circular;
+    // 一份既循环引用、verdict 又不合法的判定：校验要拒它，而不是在拼消息时炸掉
+    expect(violationOf(circular).violation).toBe('verdict');
+    expect(violationOf(circular).actual).toBe('typo');
+
+    const withBigInt = { ...legalDecision(), strategy_version: 1n };
+    const error = violationOf(withBigInt);
+    expect(error.violation).toBe('strategy_version');
+    expect(error.actual).toBe('1');
+  });
+});
 
 interface JobStoreCase {
   name: string;
@@ -996,6 +1275,329 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
         });
         expect(await repository.listSkills(role_id), testCase.name).toHaveLength(0);
         expect(await repository.listExperiences(role_id), testCase.name).toEqual(before);
+      }
+    });
+
+    it('拼错的 verdict：进死信，不会被当成一条 rejected 结论写下去', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      // 底稿是真结论（合格），只把 verdict 换成一个不存在的值——这正是「实现错误会伪装成
+      // 正常拒绝」的形状：它既不是 eligible 也不是 pending_review，若不拦就会被当成第三种
+      const lying = illegalDecisionStrategy(autoApprove, (decision) => ({
+        ...decision,
+        verdict: 'typo',
+      }));
+
+      const result = await job({ strategy: lying }).run({ batchSize: 5 });
+
+      expect(result.outcomes[0]?.status).toBe('dead_letter');
+      expect(result.outcomes[0]?.failure).toMatchObject({
+        code: 'payload_unreadable',
+        retryable: false,
+      });
+      // 错误要能回答「哪个字段、该是什么、实际是什么」，而不是一句泛泛的对不上
+      expect(result.outcomes[0]?.failure?.message).toContain('verdict');
+      expect(result.outcomes[0]?.failure?.message).toContain('typo');
+      // 判定本身留在审计里（人要看的是策略到底返回了什么）；类型里没有 'typo' 这个值，
+      // 这里读的正是被伪造出来的那一个
+      expect(result.outcomes[0]?.decision?.verdict as string | undefined).toBe('typo');
+      // 不写 Skill、不写任何成功结论、也不进重试
+      expect(result.counts).toMatchObject({
+        claimed_count: 1,
+        dead_letter_count: 1,
+        completed_count: 0,
+        retried_count: 0,
+        failure_count: 0,
+      });
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await storedExperience(experiences[0]!.id);
+      expect(promotionStateLabel(stored!)).toBe('dead_letter');
+      expect(stored?.promoted_to).toBeUndefined();
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(stored?.promotion?.strategy_version).toBeUndefined();
+      expect(stored?.promotion?.next_retry_at).toBeUndefined();
+
+      // 死信只由人工放回：同一份非法判定不会被自动路径反复问一遍
+      const again = await job({ strategy: lying }).run({ batchSize: 5 });
+      expect(again.counts.claimed_count).toBe(0);
+      expect(again.outcomes).toHaveLength(0);
+    });
+
+    it('判定结构非法：每一种形状都进死信，不写 Skill、不写成功结论', async () => {
+      const cases: Array<{ name: string; corrupt: (decision: PromotionDecision) => unknown }> = [
+        { name: 'decision 是 null', corrupt: () => null },
+        { name: 'decision 是标量', corrupt: () => 'eligible' },
+        { name: 'verdict 缺失', corrupt: (decision) => without(decision, 'verdict') },
+        { name: 'verdict 不是字符串', corrupt: (decision) => ({ ...decision, verdict: 1 }) },
+        {
+          name: 'strategy_version 为空串',
+          corrupt: (decision) => ({ ...decision, strategy_version: '' }),
+        },
+        {
+          name: 'strategy_version 不是字符串',
+          corrupt: (decision) => ({ ...decision, strategy_version: 7 }),
+        },
+        { name: 'experience_id 为空串', corrupt: (decision) => ({ ...decision, experience_id: '' }) },
+        {
+          name: 'experience_id 不是字符串',
+          corrupt: (decision) => ({ ...decision, experience_id: null }),
+        },
+        { name: 'approval 不是合法模式', corrupt: (decision) => ({ ...decision, approval: 'yolo' }) },
+        {
+          name: 'reasons 不是数组',
+          corrupt: (decision) => ({ ...decision, reasons: 'Candidate qualifies.' }),
+        },
+        { name: 'reasons 元素不是字符串', corrupt: (decision) => ({ ...decision, reasons: [1] }) },
+        {
+          name: 'blocking_rules 不是数组',
+          corrupt: (decision) => ({ ...decision, blocking_rules: 'already_promoted' }),
+        },
+        {
+          name: 'blocking_rules 元素不是字符串',
+          corrupt: (decision) => ({ ...decision, blocking_rules: [null] }),
+        },
+      ];
+
+      for (const testCase of cases) {
+        // 每种形状换一条新的候选：上一轮的候选已经进了死信，不该被同一批用例复用
+        const caseRole = `role_promotion_contract_${randomUUID()}`;
+        await repository.initializeAgent({ role_id: caseRole, name: 'Contract Case Agent' });
+        const [experience] = await seedExperiences(repository, caseRole, 1);
+        const lying = illegalDecisionStrategy(autoApprove, testCase.corrupt);
+
+        const result = await job({ strategy: lying, role_id: caseRole }).run({ batchSize: 5 });
+
+        expect(result.outcomes[0]?.status, testCase.name).toBe('dead_letter');
+        expect(result.outcomes[0]?.failure, testCase.name).toMatchObject({
+          code: 'payload_unreadable',
+          retryable: false,
+        });
+        expect(await repository.listSkills(caseRole), testCase.name).toHaveLength(0);
+        const stored = (await repository.listExperiences(caseRole)).find(
+          (item) => item.id === experience?.id,
+        );
+        expect(stored?.promotion?.status, testCase.name).toBe('dead_letter');
+        expect(stored?.promoted_to, testCase.name).toBeUndefined();
+        expect(stored?.promotion?.outcome, testCase.name).toBeUndefined();
+        expect(stored?.promotion?.strategy_version, testCase.name).toBeUndefined();
+      }
+    });
+
+    it('自造的挡板规则名：契约错、进死信，不会当成一条正常的拒绝结论', async () => {
+      const experiences = await seedExperiences(repository, role_id, 1);
+      const lying = illegalDecisionStrategy(autoApprove, (decision) => ({
+        ...decision,
+        verdict: 'rejected',
+        blocking_rules: ['looks_suspicious'],
+        reasons: ['the strategy does not like it'],
+      }));
+
+      const result = await job({ strategy: lying }).run({ batchSize: 5 });
+
+      expect(result.outcomes[0]?.status).toBe('dead_letter');
+      expect(result.outcomes[0]?.failure).toMatchObject({
+        code: 'payload_unreadable',
+        retryable: false,
+      });
+      // 名字要出现在消息里：排查时要知道是哪一个自造值被拒了
+      expect(result.outcomes[0]?.failure?.message).toContain('blocking_rules');
+      expect(result.outcomes[0]?.failure?.message).toContain('looks_suspicious');
+
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await storedExperience(experiences[0]!.id);
+      expect(stored?.promotion?.status).toBe('dead_letter');
+      expect(stored?.promotion?.outcome).toBeUndefined();
+      expect(stored?.promoted_to).toBeUndefined();
+    });
+
+    it('结论组合不合法：rejected 缺挡板/缺理由、合格却带挡板，一律进死信', async () => {
+      const cases: Array<{
+        name: string;
+        confidence: number;
+        approval: PromotionApprovalMode;
+        corrupt: (decision: PromotionDecision) => unknown;
+      }> = [
+        {
+          name: 'rejected 却没有挡板规则',
+          confidence: 0.5,
+          approval: 'auto_approve',
+          corrupt: (decision) => ({ ...decision, blocking_rules: [] }),
+        },
+        {
+          name: 'rejected 却没有理由',
+          confidence: 0.5,
+          approval: 'auto_approve',
+          corrupt: (decision) => ({ ...decision, reasons: [] }),
+        },
+        {
+          name: 'eligible 却带着挡板规则',
+          confidence: 0.99,
+          approval: 'auto_approve',
+          corrupt: (decision) => ({
+            ...decision,
+            blocking_rules: ['below_confidence_threshold'],
+          }),
+        },
+        {
+          name: 'pending_review 却带着挡板规则',
+          confidence: 0.99,
+          approval: 'manual_review',
+          corrupt: (decision) => ({
+            ...decision,
+            blocking_rules: ['below_confidence_threshold'],
+          }),
+        },
+      ];
+
+      for (const testCase of cases) {
+        const caseRole = `role_promotion_combo_${randomUUID()}`;
+        await repository.initializeAgent({ role_id: caseRole, name: 'Contract Combo Agent' });
+        // 底稿必须真的落在那一格结论上（置信度决定真策略给的是 rejected 还是合格），
+        // 这样「被注入的差异只有组合」才是唯一能解释失败的原因
+        const [experience] = await seedExperiences(repository, caseRole, 1, {
+          confidence: testCase.confidence,
+        });
+        const lying = illegalDecisionStrategy(autoApprove, testCase.corrupt);
+
+        const result = await job({ strategy: lying, role_id: caseRole }).run({
+          batchSize: 5,
+          approval: testCase.approval,
+        });
+
+        expect(result.outcomes[0]?.status, testCase.name).toBe('dead_letter');
+        expect(result.outcomes[0]?.failure?.message, testCase.name).toContain('verdict_combination');
+        expect(await repository.listSkills(caseRole), testCase.name).toHaveLength(0);
+        const stored = (await repository.listExperiences(caseRole)).find(
+          (item) => item.id === experience?.id,
+        );
+        expect(stored?.promotion?.status, testCase.name).toBe('dead_letter');
+        expect(stored?.promotion?.outcome, testCase.name).toBeUndefined();
+      }
+    });
+
+    it('直接调执行内核：同一份非法判定照样被拦住（契约不由外壳代为执行）', async () => {
+      const experiences = await seedExperiences(repository, role_id, 3);
+      const cases: Array<{ name: string; corrupt: (decision: PromotionDecision) => unknown }> = [
+        { name: '拼错的 verdict', corrupt: (decision) => ({ ...decision, verdict: 'typo' }) },
+        { name: '不是对象的判定', corrupt: () => null },
+        {
+          name: '自造的挡板规则名',
+          corrupt: (decision) => ({
+            ...decision,
+            verdict: 'rejected',
+            blocking_rules: ['looks_suspicious'],
+            reasons: ['the strategy does not like it'],
+          }),
+        },
+      ];
+
+      for (const [index, testCase] of cases.entries()) {
+        const experience = experiences[index]!;
+        const claimed = await repository.claimNextPromotionCandidate({
+          role_id,
+          owner: 'worker-1',
+          now: clock.now(),
+          lease_ms: DEFAULT_DELIVERY_LEASE_MS,
+          strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+          approval: 'auto_approve',
+        });
+        expect(claimed?.experience.id, testCase.name).toBe(experience.id);
+
+        const result = await executePromotionCandidate(
+          {
+            repository,
+            strategy: illegalDecisionStrategy(autoApprove, testCase.corrupt),
+            now: clock.now,
+          },
+          claimed!,
+          { approval: 'auto_approve', now: clock.now() },
+        );
+
+        expect(result.status, testCase.name).toBe('dead_letter');
+        expect(result.failure, testCase.name).toMatchObject({
+          code: 'payload_unreadable',
+          retryable: false,
+        });
+      }
+
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+      const stored = await repository.listExperiences(role_id);
+      expect(stored.every((item) => item.promotion?.status === 'dead_letter')).toBe(true);
+      expect(stored.every((item) => item.promoted_to === undefined)).toBe(true);
+    });
+
+    it('dry run：非法判定记成 failed，一个字节都不落盘，计数全为零', async () => {
+      const cases: Array<{
+        name: string;
+        corrupt: (decision: PromotionDecision) => unknown;
+        needle: string;
+      }> = [
+        {
+          name: '拼错的 verdict',
+          corrupt: (decision) => ({ ...decision, verdict: 'typo' }),
+          needle: 'typo',
+        },
+        {
+          name: 'reasons 不是数组',
+          corrupt: (decision) => ({ ...decision, reasons: 'Candidate qualifies.' }),
+          needle: 'reasons',
+        },
+        {
+          name: '自造的挡板规则名',
+          corrupt: (decision) => ({
+            ...decision,
+            verdict: 'rejected',
+            blocking_rules: ['looks_suspicious'],
+            reasons: ['the strategy does not like it'],
+          }),
+          needle: 'looks_suspicious',
+        },
+      ];
+
+      for (const testCase of cases) {
+        const caseRole = `role_promotion_dryrun_${randomUUID()}`;
+        await repository.initializeAgent({ role_id: caseRole, name: 'Contract Dry Run Agent' });
+        await seedExperiences(repository, caseRole, 2);
+        const before = await repository.listExperiences(caseRole);
+        const lying = illegalDecisionStrategy(autoApprove, testCase.corrupt);
+
+        const result = await job({ strategy: lying, role_id: caseRole }).run({
+          dryRun: true,
+          batchSize: 5,
+        });
+
+        expect(result.dry_run, testCase.name).toBe(true);
+        // 演练里非法判定是 failed：不是任何一种结论，也不是死信（演练不写终态）
+        expect(
+          result.outcomes.map((item) => item.status),
+          testCase.name,
+        ).toEqual(['failed', 'failed']);
+        for (const outcome of result.outcomes) {
+          expect(outcome.failure, testCase.name).toMatchObject({
+            code: 'payload_unreadable',
+            retryable: false,
+          });
+          expect(outcome.failure?.message, testCase.name).toContain(testCase.needle);
+          // 诊断信息留在 warning 里：演练的结论是给人读的投影
+          expect(
+            outcome.warnings.some((text) => text.startsWith('Dry run')),
+            testCase.name,
+          ).toBe(true);
+          expect(
+            outcome.warnings.some((text) => text.includes(testCase.needle)),
+            testCase.name,
+          ).toBe(true);
+        }
+        // 计数全零：演练没有 claim、没有终局，也没有因为判定非法而多出一次失败
+        expect(result.counts, testCase.name).toEqual({
+          claimed_count: 0,
+          completed_count: 0,
+          retried_count: 0,
+          dead_letter_count: 0,
+          skipped_count: 0,
+          failure_count: 0,
+        });
+        expect(await repository.listSkills(caseRole), testCase.name).toHaveLength(0);
+        expect(await repository.listExperiences(caseRole), testCase.name).toEqual(before);
       }
     });
 

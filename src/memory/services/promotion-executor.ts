@@ -34,6 +34,15 @@
  * 进死信，并在消息里带上期望值与实际值。校验刻意放在执行内核而不是 job 的入口：内核也可以
  * 被别的调用方（脚本、后续的调度器）直接使用，契约不该由某一个外壳代为执行。
  *
+ * 这道契约在**运行时不靠类型**（`assertPromotionDecisionConsistent` 收的是 `unknown`）：注入
+ * 的策略可以绕过 TypeScript 交回 `null`、标量，或一个 `verdict: 'typo'` 的对象。最贵的一种
+ * 是这个拼错的 verdict——它是个普通字符串，会一路滑过「非 eligible、非 pending_review」的
+ * 判断被写成一条正常的 `rejected` 结论，实现错误就此伪装成判决结果，也不会进死信。因此校验
+ * 先按真值表判形状（对象 / 三个结论 / 两个审核模式 / 非空版本与非空经验 id / 两个数组的元素
+ * 逐个判），再判结论组合，**最后**才与本次执行对账。`reasons` 与 `blocking_rules` 的元素级
+ * 检查同理：它们是审计里人读与聚合的两半，一个空串或一个不存在的规则名写进去就再也分辨不出
+ * 「策略拒了它」和「策略写错了」。
+ *
  * 失败一律走 `failPromotion`（带 claim token 的 fencing 写），由共享状态机决定是退避重投
  * 还是死信。分类表（`classifyPromotionFailure`）：
  *
@@ -42,7 +51,7 @@
  * | Agent 不在了 | delivery_missing | 死信——重投不会让 Agent 回来 |
  * | 载荷解析不了（ZodError） | payload_unreadable | 死信——重投读到的是同一份坏数据 |
  * | 技能引用不成立（不存在 / 跨 Agent / 来源不符） | storage_error | 死信——重投不会让这条引用成立 |
- * | 策略返回的判定违反契约（版本/经验 id/审核模式/结论组合对不上） | payload_unreadable | 死信——同一次判定重投多少次都是同一份错结论 |
+ * | 策略返回的判定违反契约（形状 / 结论 / 版本 / 经验 id / 审核模式 / 数组元素 / 结论组合对不上） | payload_unreadable | 死信——同一次判定重投多少次都是同一份错结论 |
  * | 连接/超时类 errno | downstream_unavailable | 退避重投 |
  * | 权限/路径类 errno | storage_error | 死信 |
  * | Skill 写了、经验没回写 | storage_error（显式可重试）| 退避重投，重试复用同一条 Skill |
@@ -77,10 +86,14 @@ import type {
   MemoryRepository,
   SkillSaveResult,
 } from '../ports/memory-repository';
-import type {
-  PromotionApprovalMode,
-  PromotionDecision,
-  PromotionStrategy,
+import {
+  PROMOTION_APPROVAL_MODES,
+  PROMOTION_BLOCKER_RULES,
+  PROMOTION_VERDICTS,
+  type PromotionApprovalMode,
+  type PromotionBlockerRule,
+  type PromotionDecision,
+  type PromotionStrategy,
 } from '../ports/promotion-strategy';
 import type { ExperienceRecord, PromotionOutcome, SkillRecord } from '../schemas';
 
@@ -149,30 +162,42 @@ export async function executePromotionCandidate(
   const now = options.now ?? deps.now?.() ?? nowTimestamp();
   const { role_id, experience, claim_token, attempt_count } = candidate;
 
-  let decision: PromotionDecision | undefined;
+  // 策略交回来的东西在运行时是**未知的**：自定义策略可以绕过类型层，交回 null、标量，或一个
+  // 字段自相矛盾的对象。因此它先落在 `unknown` 上，由契约校验决定它能不能往下走。
+  let returned: unknown;
   try {
-    // 先接住判定、再校验：校验要拒的正是这份判定，audit 里必须留着它到底返回了什么——只留
-    // 一句「对不上」而不留对不上的那个值，排查时还得去复现一次才看得到
-    decision = await deps.strategy.evaluate({
+    returned = await deps.strategy.evaluate({
       role_id,
       experience,
       now,
       approval: options.approval,
     });
+  } catch (error) {
+    // 策略自己抛错（配置非法、注入的实现有 bug）：按通用分类落盘，不让它掀掉整批
+    return recordFailure(deps, candidate, classifyPromotionFailure(error), now, {});
+  }
+
+  try {
     // 契约校验必须在写任何东西之前：判定里的版本、经验 id 与审核模式都会被原样落到别处，
-    // 对不上就意味着这次执行会写出一条与 run 审计对不上的记录
-    assertPromotionDecisionConsistent(decision, {
+    // 对不上就意味着这次执行会写出一条与 run 审计对不上的记录；形状不合法的判定（拼错的
+    // verdict、缺席的字段、不是数组的理由）也在这里被挡住，不会退化成一条 rejected 结论
+    assertPromotionDecisionConsistent(returned, {
       experience_id: experience.id,
       approval: options.approval,
       strategy_version: deps.strategy.version,
     });
   } catch (error) {
-    // 策略自己抛错（配置非法、注入的实现有 bug）、或返回了一份对不上的判定：按通用分类落盘，
-    // 不让它掀掉整批
+    // 校验要拒的正是这份判定，audit 里必须留着它到底返回了什么——只留一句「对不上」而不留
+    // 对不上的那个值，排查时还得去复现一次才看得到。只有形状上确实是一份判定的返回值进得了
+    // 审计（标量与空值无处可挂），它同样只出现在失败消息的 actual 里。
+    const audited = auditPromotionDecision(returned);
     return recordFailure(deps, candidate, classifyPromotionFailure(error), now, {
-      ...(decision !== undefined ? { decision } : {}),
+      ...(audited !== undefined ? { decision: audited } : {}),
     });
   }
+
+  // 走到这里返回值已经过契约校验（断言签名把它收窄成一份合法判定），写路径才开始
+  const decision: PromotionDecision = returned;
 
   if (decision.verdict !== 'eligible') {
     const outcome: PromotionOutcome =
@@ -302,22 +327,36 @@ export function isPromotionDecisionContractError(
 /**
  * 校验一条判定与本次执行是否自洽，不自洽就抛 `PromotionDecisionContractError`。
  *
- * 四条检查各自挡一类具体的事故，顺序也是「最先被写出去的那个字段」的顺序：
+ * 它收的是 `unknown` 而不是 `PromotionDecision`：类型只对写得出类型的那一侧成立，而这份值
+ * 来自**注入的策略**——绕过 TypeScript 的实现（脚本、编译过来的别的语言、测试替身）完全
+ * 可以让 `evaluate` 交回 `null`、一个标量，或一个 `verdict: 'typo'` 的对象。这道校验是契约
+ * 唯一的执行点，因此先按**运行时真值**判形状，再判这份判定与本次执行的关系。
  *
- * 1. **版本** —— 判定说自己是 v2、注入的策略是 v1 时，经验会记着 v2、run 会记着 v1；
- *    后果不止是审计对不上，还让这条经验被两个版本各判一次（版本是重评判据）。
- * 2. **经验 id** —— 判定挂到别的经验上，晋升就会把结论与 `promoted_to` 写到一条没被
- *    判过的经验上（技能那侧还有唯一键兜底，经验这侧没有）。
- * 3. **审核模式** —— 判定说自己是 auto_approve、本次运行是 manual_review 时，人工审核的
- *    约定会被悄悄放过（或反过来：合格的经验被记成待审核）。
- * 4. **结论组合** —— `rejected` 必须给出挡住的规则与理由（否则「为什么被拒」不可审计），
+ * 检查顺序即「最先被写出去的那个字段」的顺序，每一层各自挡一类具体的事故：
+ *
+ * 1. **形状** —— 非 null 对象才有字段可读（数组不算一份判定）。形状不对时没有 `verdict`
+ *    可言，也没有任何字段可以安全地读出来。
+ * 2. **结论** —— 三个值之外的一律拒掉。这一条挡的是最贵的一类策略缺陷：拼错的 `verdict`
+ *    是个普通字符串，执行内核只能按「eligible / pending_review / 其余」三分支走，于是它会
+ *    被写成一条正常的 `rejected` 结论——实现错误伪装成判决结果，还进不了死信。
+ * 3. **版本 / 经验 id / 审核模式** —— 先各判「是不是非空字符串（或合法枚举）」，再判与本次
+ *    执行是否一致。三个字段都会被原样写到别处：版本进经验的晋升标记（版本变更是重评判据，
+ *    分裂会让同一条经验被两个版本各判一次）、经验 id 决定结论挂给谁、审核模式决定这次能不能
+ *    写 Skill。
+ * 4. **两个数组的形状** —— `reasons` 必须是非空字符串数组，`blocking_rules` 必须是已知规则
+ *    名的数组。它们是审计里人读与聚合的两半，一个空串或一个不存在的规则名写进去，事后就
+ *    分辨不出「策略拒了它」和「策略写错了」。
+ * 5. **结论组合** —— `rejected` 必须给出挡住的规则与理由（否则「为什么被拒」不可审计），
  *    `eligible` / `pending_review` 不得带挡住的规则（合格就不该有规则挡着）。
  *
- * 这是调用方与策略之间的契约，不是数据校验：策略是注入进来的，一份不自洽的判定只可能来自
- * 配置错误或实现缺陷，重投多少次都是同一份，因此调用方一律判成不可重试。
+ * 这是调用方与策略之间的契约，不是数据校验：一份不自洽的判定只可能来自配置错误或实现缺陷，
+ * 重投多少次都是同一份，因此调用方一律判成不可重试（`classifyPromotionFailure` 把它落成
+ * `payload_unreadable` 的死信）。
+ *
+ * 断言签名让调用方在校验之后直接拿到收窄过的判定：**写路径必须从这里开始**。
  */
 export function assertPromotionDecisionConsistent(
-  decision: PromotionDecision,
+  decision: unknown,
   expected: {
     /** 被判定的那条经验（候选自己带过来，权威） */
     experience_id: string;
@@ -326,8 +365,41 @@ export function assertPromotionDecisionConsistent(
     /** 注入策略的版本，也是 run 审计里记下的那一个 */
     strategy_version: string;
   },
-): void {
+): asserts decision is PromotionDecision {
   const { experience_id, approval, strategy_version } = expected;
+
+  if (!isDecisionObject(decision)) {
+    throw contractError('decision_shape', {
+      expected: 'a promotion decision object',
+      actual: describeValue(decision),
+      experience_id,
+      detail:
+        'there is no verdict to act on and no field that can be read safely, so nothing about this '
+        + 'candidate can be settled',
+    });
+  }
+
+  if (!isOneOf(decision.verdict, PROMOTION_VERDICTS)) {
+    throw contractError('verdict', {
+      expected: PROMOTION_VERDICTS.join(' | '),
+      actual: describeValue(decision.verdict),
+      experience_id,
+      detail:
+        'only those verdicts have a defined outcome, and anything else would be settled as an '
+        + 'ordinary rejection, hiding the strategy defect behind a plausible conclusion',
+    });
+  }
+
+  if (!isNonEmptyString(decision.strategy_version)) {
+    throw contractError('strategy_version', {
+      expected: `a non-empty version string (the injected strategy declares "${strategy_version}")`,
+      actual: describeValue(decision.strategy_version),
+      experience_id,
+      detail:
+        'the version is recorded on the experience as the marker that decides whether the '
+        + 'candidate is re-evaluated',
+    });
+  }
 
   if (decision.strategy_version !== strategy_version) {
     throw contractError('strategy_version', {
@@ -340,12 +412,33 @@ export function assertPromotionDecisionConsistent(
     });
   }
 
+  if (!isNonEmptyString(decision.experience_id)) {
+    throw contractError('experience_id', {
+      expected: `a non-empty experience id (this execution was claimed for "${experience_id}")`,
+      actual: describeValue(decision.experience_id),
+      experience_id,
+      detail:
+        'the conclusion would be recorded against nothing that can be reconciled with the claim',
+    });
+  }
+
   if (decision.experience_id !== experience_id) {
     throw contractError('experience_id', {
       expected: experience_id,
       actual: decision.experience_id,
       experience_id,
       detail: 'the conclusion would be written to an experience the strategy never evaluated',
+    });
+  }
+
+  if (!isOneOf(decision.approval, PROMOTION_APPROVAL_MODES)) {
+    throw contractError('approval', {
+      expected: PROMOTION_APPROVAL_MODES.join(' | '),
+      actual: describeValue(decision.approval),
+      experience_id,
+      detail:
+        'the approval mode is what decides whether this execution may write a Skill, and it is '
+        + 'written to the experience verbatim',
     });
   }
 
@@ -360,6 +453,26 @@ export function assertPromotionDecisionConsistent(
             + 'would be settled as if it had been approved'
           : 'it claims a verdict the run did not authorise, so a candidate allowed to be promoted '
             + 'would be settled as if a human still had to look at it',
+    });
+  }
+
+  if (!isNonEmptyStringArray(decision.reasons)) {
+    throw contractError('reasons', {
+      expected: 'an array of non-empty strings',
+      actual: describeValue(decision.reasons),
+      experience_id,
+      detail: 'the reasons are the human-readable half of the record and are written verbatim',
+    });
+  }
+
+  if (!isBlockerRuleArray(decision.blocking_rules)) {
+    throw contractError('blocking_rules', {
+      expected: `an array of known blocker rules (${PROMOTION_BLOCKER_RULES.join(' | ')})`,
+      actual: describeValue(decision.blocking_rules),
+      experience_id,
+      detail:
+        'the blocker rules are the machine-readable half of the record, so an unknown name would '
+        + 'be aggregated as a rule that does not exist',
     });
   }
 
@@ -390,19 +503,97 @@ export function assertPromotionDecisionConsistent(
   }
 }
 
-/** 违反契约的四种形状（与检查顺序一致） */
+/**
+ * 违反契约的形状（与检查顺序一致，见 `assertPromotionDecisionConsistent`）。
+ *
+ * 前七项判的是判定**自己的形状**（其中 `strategy_version` / `experience_id` / `approval`
+ * 三项顺带也判与本次执行是否一致），最后一项判结论组合。
+ */
 export type PromotionDecisionViolation =
+  | 'decision_shape'
+  | 'verdict'
   | 'strategy_version'
   | 'experience_id'
   | 'approval'
+  | 'reasons'
+  | 'blocking_rules'
   | 'verdict_combination';
+
+/**
+ * 策略返回值里**可以进审计**的那一部分。
+ *
+ * 判定在结果与 run 记录里是一个结构化字段（`decision?: PromotionDecision`），而策略交回来的
+ * 东西在运行时可能根本不是对象（`null`、字符串、`undefined`）。原样塞进去会写出一条形状对不上
+ * 任何读口的记录；这里只保留「非 null 且非数组的对象」——它至少还能回答「策略返回了什么」。
+ * 标量与空值无处可挂，它们只出现在失败消息的 actual 里（`describeValue` 负责渲染）。
+ */
+export function auditPromotionDecision(value: unknown): PromotionDecision | undefined {
+  // 双重断言是刻意的：一个「运行时是对象」的值与 PromotionDecision 之间没有可用的类型关系，
+  // 这里只把「非 null 对象」这一层留在审计里，它是不是一份**合法**判定由
+  // assertPromotionDecisionConsistent 回答，读这个字段的人也应当先过那道校验
+  return isDecisionObject(value) ? (value as unknown as PromotionDecision) : undefined;
+}
+
+/** 运行时是不是一份「判定对象」：非 null 且不是数组的 object */
+function isDecisionObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** 非空（去掉首尾空白之后仍有内容）的字符串 */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/** 每个元素都是非空字符串的数组 */
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => isNonEmptyString(item));
+}
+
+/** 每个元素都是**已知**挡板规则名的数组 */
+function isBlockerRuleArray(value: unknown): value is PromotionBlockerRule[] {
+  return Array.isArray(value) && value.every((item) => isOneOf(item, PROMOTION_BLOCKER_RULES));
+}
+
+/** `list` 里有没有这个运行时值（把 `readonly T[]` 的成员判断收窄成一个普通字符串比对） */
+function isOneOf<T extends string>(value: unknown, list: readonly T[]): value is T {
+  return typeof value === 'string' && (list as readonly string[]).includes(value);
+}
+
+/** 报告里一条 expected / actual 的最大长度；超了截断，免得一份畸形判定把消息撑爆 */
+const MAX_DESCRIBED_VALUE_LENGTH = 160;
+
+/**
+ * 把任意运行时值渲染成一段短文本，给失败消息的 expected / actual 用。
+ *
+ * 渲染本身**不许成为新的失败源**：循环引用、抛错的 `toString`、`BigInt` 都在这里收敛成一句
+ * 说明。字符串原样返回（消息模板自己会加引号），其余按 JSON / `String` 渲染。
+ */
+function describeValue(value: unknown): string {
+  let text: string;
+  try {
+    if (typeof value === 'string') {
+      text = value;
+    } else if (value === null) {
+      text = 'null';
+    } else if (typeof value === 'object') {
+      text = JSON.stringify(value) ?? 'null';
+    } else {
+      text = String(value);
+    }
+  } catch {
+    text = `[a ${typeof value} that could not be rendered]`;
+  }
+  return text.length > MAX_DESCRIBED_VALUE_LENGTH
+    ? `${text.slice(0, MAX_DESCRIBED_VALUE_LENGTH)}…`
+    : text;
+}
 
 function contractError(
   violation: PromotionDecisionViolation,
   details: { expected: string; actual: string; experience_id: string; detail: string },
 ): PromotionDecisionContractError {
   return new PromotionDecisionContractError(
-    `Promotion strategy returned an inconsistent decision for experience `
+    `Promotion strategy returned an invalid decision for experience `
       + `${details.experience_id} (${violation}): expected "${details.expected}", got `
       + `"${details.actual}"; ${details.detail}. The decision contract is a configuration error, `
       + 'not a transient failure, so this candidate is not retried.',
@@ -576,9 +767,10 @@ export function buildPromotedSkill(
  *
  * 2. **技能引用不成立**（`PromotionSkillIntegrityError`）：同一条不成立的引用，重投多少次
  *    都不成立。
- * 3. **策略判定违反契约**（`PromotionDecisionContractError`）：同一次判定重投多少次都还是
- *    那一份，修它的是改配置或改实现。这一类按 `payload_unreadable` 落死信——它是「这条投递
- *    的内容我读不懂」的另一种形状，与坏数据同一条理由，而不是 `unknown` 白占重试名额。
+ * 3. **策略判定违反契约**（`PromotionDecisionContractError`：形状不合法，或与本次执行对不上）：
+ *    同一次判定重投多少次都还是那一份，修它的是改配置或改实现。这一类按 `payload_unreadable`
+ *    落死信——它是「这条投递的内容我读不懂」的另一种形状，与坏数据同一条理由，而不是
+ *    `unknown` 白占重试名额。
  *
  * 这些信号由 promotion-executor 的契约测试钉住：适配器改了措辞或换了 SQLSTATE，那条
  * 测试先红，而不是让分类悄悄退化。
@@ -595,13 +787,13 @@ export function classifyPromotionFailure(error: unknown): DeliveryFailureClassif
       false,
     );
   }
-  // 策略判定违反契约（版本 / 经验 id / 审核模式 / 结论组合）：同一次判定重投多少次都还是
-  // 那一份，修它的是改配置或改策略实现，不是再跑一遍。按 `payload_unreadable`（坏输入，
-  // 重试无意义）落死信，而不是掉进 `unknown`（可重试）白占五次名额。
+  // 策略判定违反契约（形状 / 结论 / 版本 / 经验 id / 审核模式 / 数组元素 / 结论组合）：同一次
+  // 判定重投多少次都还是那一份，修它的是改配置或改策略实现，不是再跑一遍。按
+  // `payload_unreadable`（坏输入，重试无意义）落死信，而不是掉进 `unknown`（可重试）白占名额。
   if (isPromotionDecisionContractError(error)) {
     return knownDeliveryFailure(
       'payload_unreadable',
-      `${message} (the strategy decision itself is inconsistent, so retrying cannot fix it; this is a configuration error that needs a human)`,
+      `${message} (the strategy decision itself is invalid, so retrying cannot fix it; this is a configuration error or a strategy defect that needs a human)`,
       false,
     );
   }

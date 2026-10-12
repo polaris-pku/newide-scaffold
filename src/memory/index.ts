@@ -589,6 +589,11 @@ export {
   DEFAULT_PROMOTION_STRATEGY_CONFIG,
   DEFAULT_PROMOTION_STRATEGY_VERSION,
 } from './adapters/default-promotion-strategy';
+export {
+  PROMOTION_APPROVAL_MODES,
+  PROMOTION_BLOCKER_RULES,
+  PROMOTION_VERDICTS,
+} from './ports/promotion-strategy';
 export type {
   PromotionApprovalMode,
   PromotionBlockerRule,
@@ -624,6 +629,7 @@ export {
   PROMOTION_DECISION_CONTRACT_CODE,
   PromotionDecisionContractError,
   assertPromotionDecisionConsistent,
+  auditPromotionDecision,
   buildPromotedSkill,
   classifyPromotionFailure,
   describeContractFailure,
