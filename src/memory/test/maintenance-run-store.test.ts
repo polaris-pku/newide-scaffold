@@ -16,12 +16,15 @@
  *   3. 终态只写一次：收尾过的 run 不被第二次收尾覆盖，并发收尾只有一个成功
  *   4. 过滤 / 排序 / limit（最近 N 条）
  *   5. 持久化后端重启后 run 还在
+ *   6. 结构化审计（`audit`）原样往返：开跑时写下的那份能在收尾后读回，收尾报的字段按字段合并
+ *      进去而不是互相覆盖；旧记录里没有这个键时读作缺席，而不是空对象
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { FileMaintenanceRunStore } from '../adapters/file-maintenance-run-store';
 import {
   RUN_STORE_ADAPTERS,
 } from './maintenance-adapters';
@@ -233,6 +236,7 @@ describe.each(RUN_STORE_ADAPTERS)('$name — 维护 run 契约', ({ create, reop
       worker_id: 'w',
       run_id: 'mr_restart',
       now: at(0),
+      audit: { strategy_version: 'persona-threshold.v1' },
     });
 
     const restarted = await reopen(root, store);
@@ -247,9 +251,178 @@ describe.each(RUN_STORE_ADAPTERS)('$name — 维护 run 契约', ({ create, reop
     expect(await restarted.get('mr_restart')).toMatchObject({
       status: 'running',
       started_at: at(0),
+      // 审计随整条记录一起持久化：重启后按 run_id 查得到，而不是只活在写它的那个进程里
+      audit: { strategy_version: 'persona-threshold.v1' },
     });
     await expect(
       restarted.finish('mr_restart', { completed_count: 1, now: at(1_000) }),
-    ).resolves.toMatchObject({ status: 'completed', completed_count: 1 });
+    ).resolves.toMatchObject({
+      status: 'completed',
+      completed_count: 1,
+      audit: { strategy_version: 'persona-threshold.v1' },
+    });
+  });
+
+  it('run 审计：开跑时写下的事实，收尾没报也留着', async () => {
+    const store = await create(await tempRoot());
+    await store.start({
+      job_type: 'persona_evolution',
+      worker_id: 'w',
+      run_id: 'mr_audit_start',
+      now: at(0),
+      audit: { strategy_version: 'persona-threshold.v1', approval: 'auto_approve' },
+    });
+
+    // 收尾一个审计字段都没报：开跑那份原样留着——「没报」不等于「清空」。
+    // 这条正是「worker 跑到一半死掉」之外最要紧的那个情形：收尾变了终局，事实不该跟着丢
+    const finished = await store.finish('mr_audit_start', { completed_count: 1, now: at(1_000) });
+    expect(finished?.audit).toEqual({
+      strategy_version: 'persona-threshold.v1',
+      approval: 'auto_approve',
+    });
+
+    // 读回来的那一份也必须带着它，且 list 与 get 说的是同一件事
+    expect(await store.get('mr_audit_start')).toMatchObject({
+      audit: { strategy_version: 'persona-threshold.v1', approval: 'auto_approve' },
+    });
+    const listed = await store.list({ job_type: 'persona_evolution' });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.audit).toEqual({
+      strategy_version: 'persona-threshold.v1',
+      approval: 'auto_approve',
+    });
+  });
+
+  it('run 审计：嵌套的逐候选摘要原样往返，收尾报的字段按字段合并进去', async () => {
+    const store = await create(await tempRoot());
+    await store.start({
+      job_type: 'persona_evolution',
+      worker_id: 'w',
+      run_id: 'mr_audit_merge',
+      now: at(0),
+      audit: { strategy_version: 'persona-threshold.v1' },
+    });
+
+    const audit = {
+      strategy_version: 'persona-threshold.v2',
+      approval: 'auto_approve',
+      dry_run: false,
+      input_snapshot: {
+        digest: 'a'.repeat(64),
+        candidate_count: 2,
+        counts: { skills: 3, experiences: 5 },
+      },
+      parent_version_range: { min: 1, max: 4 },
+      parent_conflict_count: 1,
+      candidates: [
+        {
+          candidate_id: 'role_a',
+          input_snapshot_hash: 'b'.repeat(64),
+          parent_version: 1,
+          result_version: 2,
+          input_counts: { skills: 2, experiences: 3 },
+          outcome: 'evolved',
+          parent_conflict_count: 0,
+        },
+        {
+          candidate_id: 'role_b',
+          input_snapshot_hash: 'c'.repeat(64),
+          parent_version: 4,
+          input_counts: { skills: 1, experiences: 2 },
+          outcome: 'retried',
+          parent_conflict_count: 1,
+        },
+      ],
+    };
+    const finished = await store.finish('mr_audit_merge', {
+      claimed_count: 2,
+      audit,
+      now: at(1_000),
+    });
+
+    // 对象、数组、数字都不该在往返里被拍平或丢掉：审计是**结构化**的，读的人按字段取
+    expect(finished?.audit).toEqual(audit);
+    expect(await store.get('mr_audit_merge')).toMatchObject({ audit });
+  });
+
+  it('run 审计：缺席就是缺席，不会被填成 0 或空对象', async () => {
+    const store = await create(await tempRoot());
+    const run = await store.start({
+      job_type: 'context_delivery',
+      worker_id: 'w',
+      run_id: 'mr_audit_none',
+      now: at(0),
+    });
+    // 两条消费者通道只记计数、不记审计：缺席说的是「这次没记」，不是「什么都没发生」。
+    // 因此读口不许补一个 `{}`——那会把「没记」伪装成「记了，是空的」
+    expect(run.audit).toBeUndefined();
+
+    const finished = await store.finish('mr_audit_none', { completed_count: 1, now: at(1_000) });
+    expect(finished?.audit).toBeUndefined();
+    expect(await store.get('mr_audit_none')).not.toHaveProperty('audit');
+    expect((await store.list({ worker_id: 'w' }))[0]).not.toHaveProperty('audit');
+  });
+
+  it('结构化审计不是调用方手里那份的别名：写完再改调用方对象，记录不受影响', async () => {
+    const store = await create(await tempRoot());
+    const audit = { parent_conflict_count: 0, candidates: [{ candidate_id: 'role_alias' }] };
+    const started = await store.start({
+      job_type: 'persona_evolution',
+      worker_id: 'w',
+      run_id: 'mr_audit_alias',
+      now: at(0),
+      audit,
+    });
+
+    // 调用方（job 把自己的上下文对象交出来之后）再动它就是改自己那份，不是改记录
+    audit.candidates[0]!.candidate_id = 'role_tampered';
+    audit.parent_conflict_count = 99;
+
+    expect((await store.get('mr_audit_alias'))?.audit).toEqual({
+      parent_conflict_count: 0,
+      candidates: [{ candidate_id: 'role_alias' }],
+    });
+    expect(started.audit).toEqual({
+      parent_conflict_count: 0,
+      candidates: [{ candidate_id: 'role_alias' }],
+    });
+  });
+});
+
+/**
+ * 旧记录兼容：Phase 4 之前落盘的 run 没有 `audit` 键。读口必须照旧读得回来，且**不许**给
+ * 缺失的字段编一个默认值——「那次运行没记审计」与「那次运行没有冲突」是两件不同的事。
+ *
+ * 这里只有 File 与 Pg 两条腿：内存实现没有「旧记录」可言（它不假装持久化）。
+ */
+describe('维护 run 的旧记录兼容（Phase 4 之前没有 audit 键）', () => {
+  it('File：旧文件照旧读得回来，audit 读作缺席', async () => {
+    const root = await tempRoot();
+    const legacy = {
+      run_id: 'mr_legacy_file',
+      job_type: 'context_delivery',
+      status: 'completed',
+      worker_id: 'w',
+      started_at: at(0),
+      finished_at: at(1_000),
+      claimed_count: 1,
+      completed_count: 1,
+      retried_count: 0,
+      dead_letter_count: 0,
+      skipped_count: 0,
+      failure_count: 0,
+    };
+    await writeFile(join(root, 'mr_legacy_file.json'), `${JSON.stringify(legacy, null, 2)}\n`, 'utf8');
+
+    const store = new FileMaintenanceRunStore({ root });
+    const read = await store.get('mr_legacy_file');
+    expect(read).toMatchObject({
+      run_id: 'mr_legacy_file',
+      status: 'completed',
+      completed_count: 1,
+      finished_at: at(1_000),
+    });
+    expect(read?.audit).toBeUndefined();
+    expect((await store.list())[0]).not.toHaveProperty('audit');
   });
 });

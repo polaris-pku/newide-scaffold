@@ -8,6 +8,11 @@
  * run 由**一个** worker 写：同一次运行不会有两个进程同时收尾它。所以这里用不上
  * 交付侧的跨进程独占锁——同进程内按 run_id 串行即可挡住「同一次 run 的两次收尾」，
  * 跨进程的重复由 run_id 唯一性挡在 `start` 那一步（文件已存在即报错）。
+ *
+ * 结构化审计（`MaintenanceRun.audit`）随整条记录一起落在这个文件里，不需要额外的列或文件：
+ * 它只按 `run_id` 读回、从不参与过滤或排序，因此没有理由把它拆出去——拆开只会多出一处
+ * 「记录写了、审计没写」的可能。读回时由 `MaintenanceRunSchema` 解析，旧文件里没有这个键
+ * 就是缺席，不是空对象。
  */
 import { mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';

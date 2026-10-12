@@ -82,6 +82,7 @@ import type {
 import type { PersonaEvolutionJobOptions } from '../ports/persona-evolution-job';
 import {
   buildPersonaEvolutionSnapshot,
+  personaEvolutionBatchSnapshotDigest,
   personaEvolutionInputSnapshotHash,
 } from '../services/persona-evolution-candidates';
 import type { ExperiencePromotion, ExperienceRecord, SkillRecord } from '../schemas';
@@ -260,6 +261,27 @@ function mispairedVerdictStrategy(base: PersonaEvolutionStrategy): PersonaEvolut
 
 async function personaVersion(repository: MemoryRepository, role_id: string): Promise<number> {
   return (await repository.getPersona(role_id)).version;
+}
+
+/**
+ * claim 读不动存储的 repository 替身——外壳自己失败那条路径的唯一入口。
+ *
+ * 与晋升测试里的同类替身同一个形状：只换 `claimNextPersonaEvolutionCandidate` 一个方法，
+ * 其余照常透传，因此「外壳炸了」与「候选处理得怎么样」是两件分得开的事。
+ */
+function createFailOnClaimRepository(inner: MemoryRepository): MemoryRepository {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === 'claimNextPersonaEvolutionCandidate') {
+        return async () => {
+          throw Object.assign(new Error('database is temporarily unavailable'), {
+            code: 'ECONNRESET',
+          });
+        };
+      }
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  });
 }
 
 // ════════════════════════════════════════════════════════
@@ -768,6 +790,119 @@ function runPersonaEvolutionJobSuite(storeCase: JobStoreCase): void {
       expect((await runStore.get(dry.run.run_id))?.last_error).toBeUndefined();
       // 同一条 job 跑第二次：写入的还是那一条候选，计数如实落在第二条 run 上
       expect((await runStore.get(real.run.run_id))?.completed_count).toBe(1);
+
+      // 演练的审计也留着，只是标着它是**投影**：一次没写任何东西的运行，读口必须一眼看得出来
+      expect((await runStore.get(dry.run.run_id))?.audit).toMatchObject({
+        strategy_version: DEFAULT_PERSONA_EVOLUTION_STRATEGY_VERSION,
+        approval: 'auto_approve',
+        dry_run: true,
+      });
+      expect((await runStore.get(real.run.run_id))?.audit?.dry_run).toBe(false);
+    });
+
+    it('run 审计：策略版本、输入快照 digest 与逐候选 hash 都落在 run 上', async () => {
+      await seedSkill(repository, role_id);
+
+      const first = await job().run({ batchSize: 5 });
+      const firstAudit = (await runStore.get(first.run.run_id))?.audit;
+      expect(firstAudit).toMatchObject({
+        strategy_version: DEFAULT_PERSONA_EVOLUTION_STRATEGY_VERSION,
+        approval: 'auto_approve',
+        dry_run: false,
+        parent_conflict_count: 0,
+        input_snapshot: { candidate_count: 1, counts: { skills: 1, experiences: 0 } },
+        parent_version_range: { min: 1, max: 1 },
+      });
+      expect(firstAudit?.candidates).toHaveLength(1);
+      const firstCandidate = firstAudit?.candidates?.[0];
+      expect(firstCandidate).toMatchObject({
+        candidate_id: role_id,
+        parent_version: 1,
+        result_version: 2,
+        outcome: 'evolved',
+        input_counts: { skills: 1, experiences: 0 },
+        parent_conflict_count: 0,
+      });
+      const firstHash = firstCandidate?.input_snapshot_hash;
+      expect(firstHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(firstAudit?.input_snapshot?.digest).toBe(
+        personaEvolutionBatchSnapshotDigest([firstHash!]),
+      );
+
+      // 再演化一次：输入变了，role 上的标记被新的一版覆盖——而第一条 run 记下的那份输入标识
+      // 必须原样留着。这正是「run_id 事后能自证当时依据哪份输入」的落点，也是本阶段要修的那件
+      // 事：这些事实此前只活在会被下一次运行覆盖的标记上
+      await seedSkill(repository, role_id);
+      const second = await job().run({ batchSize: 5 });
+      expect(await personaVersion(repository, role_id)).toBe(3);
+      expect((await marker())?.input_snapshot_hash).not.toBe(firstHash);
+
+      const reread = (await runStore.get(first.run.run_id))?.audit;
+      expect(reread?.candidates?.[0]?.input_snapshot_hash).toBe(firstHash);
+      expect(reread?.input_snapshot?.digest).toBe(firstAudit?.input_snapshot?.digest);
+      expect(reread?.candidates?.[0]?.input_counts).toEqual({ skills: 1, experiences: 0 });
+      // 第二条 run 记的是另一份输入：两次运行的 digest 不相同（批量摘要不是常量）
+      const secondAudit = (await runStore.get(second.run.run_id))?.audit;
+      expect(secondAudit?.input_snapshot?.digest).not.toBe(firstAudit?.input_snapshot?.digest);
+      expect(secondAudit?.candidates?.[0]?.result_version).toBe(3);
+    });
+
+    it('多个候选的 snapshot hash 不丢失：一次跨角色的运行把逐候选摘要都记下来', async () => {
+      const peer = `role_persona_batch_${randomUUID()}`;
+      await repository.initializeAgent({ role_id: peer, name: 'Batch Peer' });
+      await seedSkill(repository, role_id);
+      await seedSkill(repository, peer);
+      await seedExperience(repository, peer);
+
+      // 跨角色跑一次：批量运行下「这一次依据的是哪份输入」只能是一个集合
+      const result = await fleetJob().run({ batchSize: 50 });
+      const audit = (await runStore.get(result.run.run_id))?.audit;
+
+      // 审计与逐条结果一一对应：有一条结果就有一条摘要，没有丢行
+      expect(audit?.candidates).toHaveLength(result.outcomes.length);
+      expect(audit?.input_snapshot?.candidate_count).toBe(result.outcomes.length);
+
+      // digest 覆盖的正是这一组逐候选 hash（同一个函数、同一份输入）
+      const hashes = (audit?.candidates ?? []).map((item) => item.input_snapshot_hash ?? '');
+      expect(hashes.every((hash) => /^[0-9a-f]{64}$/.test(hash))).toBe(true);
+      expect(audit?.input_snapshot?.digest).toBe(personaEvolutionBatchSnapshotDigest(hashes));
+
+      // 本用例刚造出来的两个角色都在里面，各自的 hash 不同——两条不同的输入没有被拍成一条
+      const mine = (audit?.candidates ?? []).filter(
+        (item) => item.candidate_id === role_id || item.candidate_id === peer,
+      );
+      expect(mine.map((item) => item.outcome)).toEqual(['evolved', 'evolved']);
+      expect(new Set(mine.map((item) => item.input_snapshot_hash)).size).toBe(2);
+      expect(mine.map((item) => item.input_counts)).toEqual(
+        expect.arrayContaining([
+          { skills: 1, experiences: 0 },
+          { skills: 1, experiences: 1 },
+        ]),
+      );
+    });
+
+    it('外壳自己失败：run 记 failed，审计照样落在上面', async () => {
+      await seedSkill(repository, role_id);
+
+      const result = await job({ repository: createFailOnClaimRepository(repository) }).run({
+        batchSize: 5,
+      });
+
+      expect(result.stop_reason).toBe('worker_error');
+      expect(result.run.status).toBe('failed');
+
+      // 一个候选都没处理完的 run 同样说得清自己按哪一版判据跑：策略版本在**开跑时**就写下了，
+      // 收尾只是把逐候选的账补上——那条 run 永远不会收尾时（进程被杀）留下的就是这一份
+      const stored = await runStore.get(result.run.run_id);
+      expect(stored?.audit).toMatchObject({
+        strategy_version: DEFAULT_PERSONA_EVOLUTION_STRATEGY_VERSION,
+        approval: 'auto_approve',
+        dry_run: false,
+        input_snapshot: { candidate_count: 0 },
+      });
+      expect(stored?.last_error).toContain('downstream_unavailable');
+      // 没有候选就没有逐候选摘要：缺席，而不是一条空行或一个假条目
+      expect(stored?.audit?.candidates).toBeUndefined();
     });
 
     // ── 恢复与 fencing ──────────────────────────────────
@@ -931,6 +1066,18 @@ function runPersonaEvolutionJobSuite(storeCase: JobStoreCase): void {
       expect(outcome.failure?.retryable).toBe(true);
       expect(outcome.failure?.message).toContain('v7');
       expect(result.counts).toMatchObject({ claimed_count: 1, retried_count: 1, completed_count: 0 });
+
+      // run 审计按**失败情形**计数，而不是按失败码：冲突与「存储抖了一下」共享
+      // `storage_error`，只有情形分得开「有人抢先改了 Persona」这件可自愈的事
+      const audit = (await runStore.get(result.run.run_id))?.audit;
+      expect(audit?.parent_conflict_count).toBe(1);
+      expect(audit?.candidates?.[0]).toMatchObject({
+        candidate_id: role_id,
+        outcome: 'retried',
+        parent_conflict_count: 1,
+      });
+      // 冲突的那一条什么都没写：审计里也不该出现一个「写下的版本」
+      expect(audit?.candidates?.[0]?.result_version).toBeUndefined();
 
       // 别人写下的那一版完好无损：父版本冲突的落点就是「不覆盖」
       const persona = await repository.getPersona(role_id);

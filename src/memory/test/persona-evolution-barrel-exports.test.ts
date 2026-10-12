@@ -47,6 +47,8 @@ import {
   buildPersonaEvolutionSnapshot,
   classifyPersonaEvolutionFailure,
   executePersonaEvolutionCandidate,
+  mergeMaintenanceRunAudit,
+  personaEvolutionBatchSnapshotDigest,
   personaEvolutionIdempotencyKey,
   personaEvolutionInputSnapshotHash,
   personaEvolutionLastRun,
@@ -56,6 +58,8 @@ import {
   type ExperienceRecord,
   type MaintenanceRunStore,
   type MemoryRepository,
+  type MaintenanceRunAudit,
+  type MaintenanceRunCandidateAudit,
   type PersonaDef,
   type PersonaEvolutionCandidateOutcome,
   type PersonaEvolutionCandidateStatus,
@@ -65,6 +69,7 @@ import {
   type PersonaEvolutionEvaluationInput,
   type PersonaEvolutionExecutionResult,
   type PersonaEvolutionExecutionStatus,
+  type PersonaEvolutionFailureClassification,
   type PersonaEvolutionFailureKind,
   type PersonaEvolutionJob,
   type PersonaEvolutionJobOptions,
@@ -143,6 +148,9 @@ type BarrelPersonaEvolutionSurface = {
   skipReason: PersonaEvolutionSkipReason;
   stateLabel: PersonaEvolutionStateLabel;
   failureKind: PersonaEvolutionFailureKind;
+  failureClassification: PersonaEvolutionFailureClassification;
+  runAudit: MaintenanceRunAudit;
+  candidateAudit: MaintenanceRunCandidateAudit;
   violation: PersonaEvolutionViolation;
   claimRequest: PersonaEvolutionClaimRequest;
   completionRequest: PersonaEvolutionCompletionRequest;
@@ -168,6 +176,10 @@ describe('Persona 演化的 barrel 导出面', () => {
     expect(typeof personaEvolutionLastRun).toBe('function');
     expect(typeof buildPersonaEvolutionSnapshot).toBe('function');
     expect(typeof planPersonaEvolutionCandidate).toBe('function');
+    // 审计面的两个入口也在 barrel 上：一是这次运行处理的那组输入怎么被摘要成一个标识
+    // （外部 runner 要对账「两次运行的输入是不是同一批」），二是审计怎么按字段合并
+    expect(typeof personaEvolutionBatchSnapshotDigest).toBe('function');
+    expect(typeof mergeMaintenanceRunAudit).toBe('function');
     expect(typeof InMemoryRepository).toBe('function');
     expect(typeof InMemoryMaintenanceRunStore).toBe('function');
     // 常量也是装配的一部分：外部 runner 要能照默认值表达「我没改批量上限 / 我没换判据」
@@ -229,6 +241,15 @@ describe('Persona 演化的 barrel 导出面', () => {
     expect(label).toBe('evolved');
     // 上一次结论也是从同一入口读的：判定要看的「历史」就在这里
     expect(personaEvolutionLastRun(stored)?.persona_version).toBe(2);
+
+    // run 审计同样从 barrel 的类型接住：这次按哪一版判据、依据哪一份输入，run 记录说得清
+    const audit: MaintenanceRunAudit | undefined = (await runStore.get(result.run.run_id))?.audit;
+    expect(audit?.strategy_version).toBe(DEFAULT_PERSONA_EVOLUTION_STRATEGY_VERSION);
+    expect(audit?.input_snapshot?.candidate_count).toBe(1);
+    const candidate: MaintenanceRunCandidateAudit | undefined = audit?.candidates?.[0];
+    expect(candidate?.candidate_id).toBe(role_id);
+    expect(candidate?.result_version).toBe(2);
+    expect(candidate?.input_snapshot_hash).toBe(stored?.input_snapshot_hash);
 
     // 再跑一次是幂等命中：没有活，版本不动
     const again: PersonaEvolutionRunResult = await job.run({ batchSize: 5 });
