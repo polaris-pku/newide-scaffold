@@ -1000,9 +1000,18 @@ export class BMemoryBackendService {
     return claimed ? toDeliveryPayload(claimed) : undefined;
   }
 
-  /** 延长自己持有的 lease（memory.renewDeliveryClaim） */
+  /**
+   * 延长自己持有的 lease（memory.renewDeliveryClaim）。
+   *
+   * `claim_token` 必填：它是 fencing 凭据，claim 时发给调用方。只凭 `owner` 无法区分
+   * 「同一个 worker 的上一个进程」与「当前进程」，因此 owner 只作为可选的交叉核对。
+   */
   async renewDeliveryClaim(
-    input: DeliveryRecordLocator & { owner: string; lease_ms?: number | undefined },
+    input: DeliveryRecordLocator & {
+      claim_token: string;
+      owner?: string | undefined;
+      lease_ms?: number | undefined;
+    },
   ): Promise<DeliveryRecordPayload | undefined> {
     const claimed = await this.requireDeliveryRepository(
       'Delivery claim renewal',
@@ -1028,9 +1037,14 @@ export class BMemoryBackendService {
    * `archive.status='failed'`，缺口同时出现在 getBufferState 的 `archive_backlog` 里，
    * 运维可用 retryExtraction 补做。重复 ack 是幂等的：completeDelivery 只对 processing
    * 生效，第二次直接返回 undefined，也就不会再归档一次。
+   *
+   * `claim_token` 必填且必须与 claim 时拿到的那一个一致：租约过期后记录可能已经被别人
+   * 接手，这时旧持有者的 ack 一律写不进去（返回 undefined），既不会把别人的成果覆盖成
+   * processed，也不会把一条属于别人的在途交付推进死信。
    */
   async ackDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string | undefined;
       outcome: 'processed' | 'failed';
       error?: string | undefined;
@@ -1044,6 +1058,7 @@ export class BMemoryBackendService {
         channel: input.channel,
         role_id: input.role_id,
         id: input.id,
+        claim_token: input.claim_token,
         owner: input.owner,
         processor_version: input.processor_version,
       });
@@ -1062,6 +1077,7 @@ export class BMemoryBackendService {
       channel: input.channel,
       role_id: input.role_id,
       id: input.id,
+      claim_token: input.claim_token,
       owner: input.owner,
       error: input.error ?? 'Delivery failed without a reason',
       retryable: input.retryable ?? false,

@@ -1,27 +1,37 @@
 /**
- * delivery-lifecycle — 上下文交付项与反馈 outbox 的状态机（工作包 C）
+ * delivery-lifecycle — 上下文交付项与反馈 outbox 的状态机（工作包 C + Phase 0 fencing）
  *
  * 两条通道（context delivery / driver feedback）共用同一套状态语义，所以转移规则
- * 在这里只写一次，由两个适配器共同调用：适配器只负责「怎么读写」，规则的「怎么变」
+ * 在这里只写一次，由三个适配器共同调用：适配器只负责「怎么读写」，规则的「怎么变」
  * 全在这个文件里。这样测试替身与生产实现不可能各有一套解释。
  *
  * 一个投递回合的完整形状：
  *
- *   pending --claim(owner, lease)--> processing --complete--> processed
- *                                       |  |
- *                        fail(retryable) |  | lease 过期 / 崩溃
- *                                       v  v
- *                              pending(next_retry_at) 或 dead_letter
+ *   pending --claim(owner, token, lease)--> processing --complete(token)--> processed
+ *                                              |  |
+ *                               fail(token,retryable) |  | lease 过期 / 崩溃
+ *                                              v  v
+ *                                     pending(next_retry_at) 或 dead_letter
  *
  * 关键约定：
  * - **attempt_count 在 claim 时递增**：一次投递尝试就是一次 claim。失败与 lease
  *   过期都不再各加一次，避免同一回合被记两次；超过 `max_attempts` 之后既不再
  *   claim，也不再有记录回到 pending。
+ * - **每次 claim 发一个新 token**（fencing token）。renew / complete / fail 都必须
+ *   原样带回，写不匹配就什么都不做。只有 owner 是不够的：owner 是稳定 worker 标识，
+ *   同一个 worker 重启后还是它，无法区分「上一个进程的持有」与「这个进程的持有」。
+ * - **lease 过期即失去写权**：过期的持有者连 complete/fail 都不许——它可能已经在
+ *   毫不知情的情况下被新 worker 接手了。这条与 token 一起构成 fencing：token 挡住
+ *   「别人接手后的写入」，lease 检查挡住「自己过期后的写入」。
  * - 达到上限（或下游明确报不可重试）时进 `dead_letter`，并保留最后一次 `last_error`。
  * - `processed` 是终止态：不再能被 claim，也不参与过期恢复。
+ * - token 是**活着的凭据**，不是历史：离开 processing（完成/失败/过期恢复/人工重试）
+ *   时一律清掉；`claim_owner`/`claimed_at` 作为审计信息保留。
  *
  * 纯规则函数都接收显式的 `now`，不自己读时钟——退避与 lease 的测试因此不依赖真实时间。
+ * token 由调用方（适配器）生成，规则函数只接收它，保持可预测。
  */
+import { randomUUID } from 'node:crypto';
 import type { DeliveryStatus } from '../schemas';
 
 /** 重试策略：指数退避 + 次数上限 */
@@ -56,10 +66,23 @@ export interface DeliveryLifecycleRecord {
   attempt_count: number;
   claimed_at?: string | undefined;
   claim_owner?: string | undefined;
+  /** 本次 claim 的 fencing token；见 schemas.ts 的 deliveryLifecycleFields */
+  claim_token?: string | undefined;
   lease_expires_at?: string | undefined;
   next_retry_at?: string | undefined;
   last_error?: string | undefined;
   updated_at: string;
+}
+
+/**
+ * 生成一次 claim 的 fencing token。
+ *
+ * 只要「每次 claim 唯一」这一点成立即可，因此用 UUID；前缀只是为了在落盘记录与
+ * 日志里一眼认出这是 claim 凭据而不是别的 id。**不要**用派生的确定性值（例如
+ * owner+时刻）：同一毫秒内的两次 claim 会撞成同一个 token，fencing 就废了。
+ */
+export function newClaimToken(): string {
+  return `claim_${randomUUID()}`;
 }
 
 /** ISO 时刻 + 毫秒 → ISO 时刻 */
@@ -83,10 +106,18 @@ export function isDeliveryDue(record: DeliveryLifecycleRecord, now: string): boo
   return Date.parse(record.next_retry_at) <= Date.parse(now);
 }
 
-/** 这条记录是否是一次已经无人持有的投递（下游崩在 processing 里） */
+/**
+ * 这条记录是否是一次已经无人持有的投递（下游崩在 processing 里）。
+ *
+ * 「processing 但没有 lease」同样算过期，这是**旧记录的恢复策略**而不是宽松判定：
+ * 本状态机写出的 processing 一定带 lease（claim 时写死），所以没有 lease 的
+ * processing 只能来自更早的版本或手工改动。把它当作过期，那条记录还能回到队列被
+ * 重新 claim（拿到新 token）；不这样处理，它就会永远卡在 processing —— 既没有人
+ * 持得住（没有租约可续），也没有任何人能完成它（没有 token 可匹配）。
+ */
 export function isDeliveryClaimExpired(record: DeliveryLifecycleRecord, now: string): boolean {
   if (record.status !== 'processing') return false;
-  if (record.lease_expires_at === undefined) return false;
+  if (record.lease_expires_at === undefined) return true;
   return Date.parse(record.lease_expires_at) <= Date.parse(now);
 }
 
@@ -94,6 +125,8 @@ export interface ClaimDeliveryRecordInput {
   owner: string;
   now: string;
   lease_ms: number;
+  /** 本次 claim 的 fencing token（由适配器生成，见 newClaimToken） */
+  claim_token: string;
   policy?: DeliveryRetryPolicy;
 }
 
@@ -101,12 +134,19 @@ export interface ClaimDeliveryRecordInput {
  * claim：pending → processing。
  *
  * 不是 pending、还没到退避窗口、已经用完投递次数，都返回 undefined（本次没拿到）。
- * 拿到的记录带上 owner、lease 到期时刻，并把 attempt_count 记上一次。
+ * 拿到的记录带上 owner、**新 token**、lease 到期时刻，并把 attempt_count 记上一次。
+ *
+ * token 为空是调用方的编程错误：没有 token 的 processing 记录谁也 fence 不住，
+ * 而它又拦不住任何人写终态——这种记录一旦落盘就只能靠租约过期回收。宁可在这里
+ * 拒绝，也不要写出一条「看起来被持有、实际无人可负责」的记录。
  */
 export function claimDeliveryRecord<T extends DeliveryLifecycleRecord>(
   record: T,
   input: ClaimDeliveryRecordInput,
 ): T | undefined {
+  if (!input.claim_token) {
+    throw new Error('claimDeliveryRecord requires a non-empty claim_token.');
+  }
   const policy = input.policy ?? DEFAULT_DELIVERY_RETRY_POLICY;
   if (!isDeliveryDue(record, input.now)) return undefined;
   if (record.attempt_count >= policy.max_attempts) return undefined;
@@ -116,10 +156,33 @@ export function claimDeliveryRecord<T extends DeliveryLifecycleRecord>(
     attempt_count: record.attempt_count + 1,
     claimed_at: input.now,
     claim_owner: input.owner,
+    claim_token: input.claim_token,
     lease_expires_at: addMilliseconds(input.now, input.lease_ms),
     next_retry_at: undefined,
     updated_at: input.now,
   };
+}
+
+/**
+ * 持有者凭据校验：状态、token、可选 owner、租约都要过关。
+ *
+ * 四项缺一不可，且各自挡的是不同的东西：
+ * - status：只对 processing 生效，终态谁也不许再改
+ * - token：挡住「被接手之后还拿旧凭据写」
+ * - lease：挡住「自己已经过期还写」（过期即视为被别人接手，哪怕暂时没人来抢）
+ * - owner：可选的交叉核对，用来早点发现「把别人的记录传进来了」，不是 fencing 本身
+ */
+function isHeldBy(
+  record: DeliveryLifecycleRecord,
+  input: { claim_token: string; owner?: string | undefined },
+  now: string,
+): boolean {
+  if (record.status !== 'processing') return false;
+  if (record.claim_token === undefined) return false;
+  if (record.claim_token !== input.claim_token) return false;
+  if (input.owner !== undefined && record.claim_owner !== input.owner) return false;
+  if (isDeliveryClaimExpired(record, now)) return false;
+  return true;
 }
 
 /**
@@ -130,11 +193,9 @@ export function claimDeliveryRecord<T extends DeliveryLifecycleRecord>(
  */
 export function renewDeliveryClaimRecord<T extends DeliveryLifecycleRecord>(
   record: T,
-  input: { owner: string; now: string; lease_ms: number },
+  input: { owner?: string | undefined; claim_token: string; now: string; lease_ms: number },
 ): T | undefined {
-  if (record.status !== 'processing') return undefined;
-  if (record.claim_owner !== input.owner) return undefined;
-  if (isDeliveryClaimExpired(record, input.now)) return undefined;
+  if (!isHeldBy(record, input, input.now)) return undefined;
   return {
     ...record,
     lease_expires_at: addMilliseconds(input.now, input.lease_ms),
@@ -146,17 +207,23 @@ export function renewDeliveryClaimRecord<T extends DeliveryLifecycleRecord>(
  * complete：processing → processed（终止态）。
  *
  * `claimed_at` / `claim_owner` 保留下来当审计信息——「谁处理完的」比「现在有没有人
- * 持有」更值得留；lease 与退避字段一起清掉，因为终止态不再有租约。
+ * 持有」更值得留；token 与 lease 一起清掉：它们是**活着的凭据**，终态不再有人持有，
+ * 留着只会让一条过期的凭据看起来还管用。
  */
 export function completeDeliveryRecord<T extends DeliveryLifecycleRecord>(
   record: T,
-  input: { owner?: string | undefined; now: string; processor_version?: string | undefined },
+  input: {
+    owner?: string | undefined;
+    claim_token: string;
+    now: string;
+    processor_version?: string | undefined;
+  },
 ): T | undefined {
-  if (record.status !== 'processing') return undefined;
-  if (input.owner !== undefined && record.claim_owner !== input.owner) return undefined;
+  if (!isHeldBy(record, input, input.now)) return undefined;
   return {
     ...record,
     status: 'processed',
+    claim_token: undefined,
     lease_expires_at: undefined,
     next_retry_at: undefined,
     last_error: undefined,
@@ -169,6 +236,7 @@ export function completeDeliveryRecord<T extends DeliveryLifecycleRecord>(
 
 export interface FailDeliveryRecordInput {
   owner?: string | undefined;
+  claim_token: string;
   now: string;
   error: string;
   /** 下游判断这次失败能不能靠重投解决；不可重试的直接 dead_letter */
@@ -181,19 +249,22 @@ export interface FailDeliveryRecordInput {
  *
  * 不可重试的错误（schema 解析不了、role/seq 非法、配置永久错）不看次数直接进死信；
  * 可重试的错误在退避窗口后回到 pending，直到用完 `max_attempts`。
+ *
+ * 两条分支都清掉 token：回到 pending 就是交还持有权，下一个消费者 claim 时会拿到
+ * 自己的新 token。
  */
 export function failDeliveryRecord<T extends DeliveryLifecycleRecord>(
   record: T,
   input: FailDeliveryRecordInput,
 ): T | undefined {
-  if (record.status !== 'processing') return undefined;
-  if (input.owner !== undefined && record.claim_owner !== input.owner) return undefined;
+  if (!isHeldBy(record, input, input.now)) return undefined;
   const policy = input.policy ?? DEFAULT_DELIVERY_RETRY_POLICY;
   const exhausted = record.attempt_count >= policy.max_attempts;
   if (!input.retryable || exhausted) {
     return {
       ...record,
       status: 'dead_letter',
+      claim_token: undefined,
       lease_expires_at: undefined,
       next_retry_at: undefined,
       last_error: input.error,
@@ -203,6 +274,7 @@ export function failDeliveryRecord<T extends DeliveryLifecycleRecord>(
   return {
     ...record,
     status: 'pending',
+    claim_token: undefined,
     lease_expires_at: undefined,
     next_retry_at: addMilliseconds(input.now, deliveryRetryDelayMs(record.attempt_count, policy)),
     last_error: input.error,
@@ -211,14 +283,17 @@ export function failDeliveryRecord<T extends DeliveryLifecycleRecord>(
 }
 
 /**
- * 崩溃恢复：processing 且 lease 已过期 → 回到 pending（立即可投递）或 dead_letter。
+ * 崩溃恢复：processing 且 lease 已过期（或本就无租约）→ 回到 pending（立即可投递）
+ * 或 dead_letter。
  *
  * 与 fail 的区别在语义：这里没有下游的判断，只有「拿着它的人不见了」。因此不套
  * 退避窗口（立即可重投），但仍然计入次数上限——反复被 claim 又从不完成，正是
  * 一条毒记录的形状，无限重投只会让消费者反复倒下。
  *
  * `claim_owner`/`claimed_at` 与 complete 一样保留下来当审计（「上一次是谁拿着它」
- * 是排查崩溃循环最直接的线索）；真正表示「现在有人持有」的是 lease，它在这里被清掉。
+ * 是排查崩溃循环最直接的线索）；表示「现在有人持有」的 lease 与被回收的 token 一起
+ * 清掉——这正是 fencing 生效的时刻：被回收的记录再被 claim 时发新 token，旧持有者
+ * 手里的那一个从此写不进任何东西。
  */
 export function expireDeliveryClaimRecord<T extends DeliveryLifecycleRecord>(
   record: T,
@@ -230,6 +305,7 @@ export function expireDeliveryClaimRecord<T extends DeliveryLifecycleRecord>(
     return {
       ...record,
       status: 'dead_letter',
+      claim_token: undefined,
       lease_expires_at: undefined,
       next_retry_at: undefined,
       last_error: error,
@@ -239,6 +315,7 @@ export function expireDeliveryClaimRecord<T extends DeliveryLifecycleRecord>(
   return {
     ...record,
     status: 'pending',
+    claim_token: undefined,
     lease_expires_at: undefined,
     next_retry_at: undefined,
     last_error: error,
@@ -264,6 +341,7 @@ export function resetDeliveryForRetry<T extends DeliveryLifecycleRecord>(
     attempt_count: 0,
     claimed_at: undefined,
     claim_owner: undefined,
+    claim_token: undefined,
     lease_expires_at: undefined,
     next_retry_at: undefined,
     last_error: undefined,

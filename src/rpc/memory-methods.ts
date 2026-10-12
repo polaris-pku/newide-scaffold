@@ -135,13 +135,24 @@ export interface MemoryMethodsService {
   claimMemoryDelivery(
     input: DeliveryClaimRequest & { id?: string | undefined },
   ): Promise<DeliveryRecordPayload | undefined>;
-  /** 下游交付：延长自己持有的 lease（memory.renewDeliveryClaim） */
+  /**
+   * 下游交付：延长自己持有的 lease（memory.renewDeliveryClaim）。
+   * `claim_token` 是 claim 时发下的 fencing 凭据，必填且必须一致。
+   */
   renewMemoryDeliveryClaim(
-    input: DeliveryRecordLocator & { owner: string; lease_ms?: number | undefined },
+    input: DeliveryRecordLocator & {
+      claim_token: string;
+      owner?: string | undefined;
+      lease_ms?: number | undefined;
+    },
   ): Promise<DeliveryRecordPayload | undefined>;
-  /** 下游交付：ack 一次交付（memory.ackDelivery）；context 通道附带源 Buffer 归档结果 */
+  /**
+   * 下游交付：ack 一次交付（memory.ackDelivery）；context 通道附带源 Buffer 归档结果。
+   * `claim_token` 必填：租约过期后被别人接手的交付，旧凭据一律写不进去。
+   */
   ackMemoryDelivery(
     input: DeliveryRecordLocator & {
+      claim_token: string;
       owner?: string | undefined;
       outcome: 'processed' | 'failed';
       error?: string | undefined;
@@ -436,7 +447,9 @@ const renewDeliveryClaimParamsSchema = z
     channel: deliveryChannelSchema,
     role_id: z.string().trim().min(1),
     id: z.string().trim().min(1),
-    owner: z.string().trim().min(1),
+    /** claim 时发下的 fencing 凭据；必填，缺了就只能拒绝而不是放行 */
+    claim_token: z.string().trim().min(1),
+    owner: z.string().trim().min(1).optional(),
     lease_ms: z.number().int().positive().optional(),
   })
   .strict();
@@ -445,6 +458,8 @@ const ackDeliveryParamsSchema = z
     channel: deliveryChannelSchema,
     role_id: z.string().trim().min(1),
     id: z.string().trim().min(1),
+    /** claim 时发下的 fencing 凭据；必填，缺了就只能拒绝而不是放行 */
+    claim_token: z.string().trim().min(1),
     owner: z.string().trim().min(1).optional(),
     outcome: z.enum(['processed', 'failed']),
     /** outcome='failed' 时的失败原因 */

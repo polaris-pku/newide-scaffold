@@ -225,7 +225,6 @@ describe.each(RUN_STORE_ADAPTERS)('$name — 维护 run 契约', ({ create, reop
       'mr_list_2',
     ]);
   });
-
   it('持久化后端：重启后 run 还在，且能继续收尾', async () => {
     const root = await tempRoot();
     const store = await create(root);

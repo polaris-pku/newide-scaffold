@@ -6,8 +6,12 @@
  * 看到同一条 pending。
  *
  * 适配器提供 `DeliveryRecordStore`（怎么读写、怎么加锁），编排逻辑只写一次，因此
- * 内存实现与文件实现共用完全相同的转移顺序与失败处理。抢不到锁时统一返回
- * undefined，含义是「本次什么都没做」，与「状态不允许」对调用方是同一件事。
+ * 三个实现共用完全相同的转移顺序与失败处理。抢不到锁时统一返回 undefined，含义是
+ * 「本次什么都没做」，与「状态不允许」「token 不匹配」「lease 已过期」对调用方是
+ * 同一件事：这条记录现在不归你，稍后再试或放弃。
+ *
+ * fencing token 由适配器在 claim 时生成并写进记录，renew / complete / fail 原样带回；
+ * 本模块只负责把它传进规则函数，判断全在 delivery-lifecycle.ts 里。
  */
 import {
   claimDeliveryRecord,
@@ -77,7 +81,8 @@ export function claimRecord<T extends DeliveryLifecycleRecord>(
  * claim 下一条可投递记录：按到期时刻排序后逐条尝试。
  *
  * 逐条而不是取第一条就放弃——排在前面那条可能正被别人改（抢不到锁），
- * 这不该让整次 claim 空手而归。
+ * 这不该让整次 claim 空手而归。整次调用共用同一个 token：至多有一条记录真的被写
+ * 进去，其余候选读到的还是 pending；下一次 claim 会拿到新 token。
  */
 export async function claimNextRecord<T extends DeliveryLifecycleRecord>(
   store: DeliveryRecordStore<T>,
@@ -94,27 +99,32 @@ export async function claimNextRecord<T extends DeliveryLifecycleRecord>(
   return undefined;
 }
 
-/** 延长 lease；持有者不匹配或已过期 → undefined */
+/** 延长 lease；token 不匹配、持有者不匹配或已过期 → undefined */
 export function renewRecordClaim<T extends DeliveryLifecycleRecord>(
   store: DeliveryRecordStore<T>,
   role_id: string,
   id: string,
-  input: { owner: string; now: string; lease_ms: number },
+  input: { claim_token: string; owner?: string | undefined; now: string; lease_ms: number },
 ): Promise<T | undefined> {
   return mutateRecord(store, role_id, id, (record) => renewDeliveryClaimRecord(record, input));
 }
 
-/** 交付完成 */
+/** 交付完成（token 必匹配，且 lease 未过期） */
 export function completeRecord<T extends DeliveryLifecycleRecord>(
   store: DeliveryRecordStore<T>,
   role_id: string,
   id: string,
-  input: { owner?: string | undefined; now: string; processor_version?: string | undefined },
+  input: {
+    claim_token: string;
+    owner?: string | undefined;
+    now: string;
+    processor_version?: string | undefined;
+  },
 ): Promise<T | undefined> {
   return mutateRecord(store, role_id, id, (record) => completeDeliveryRecord(record, input));
 }
 
-/** 交付失败（可重试 → 退避后 pending；否则 dead_letter） */
+/** 交付失败（可重试 → 退避后 pending；否则 dead_letter）；token 必匹配 */
 export function failRecord<T extends DeliveryLifecycleRecord>(
   store: DeliveryRecordStore<T>,
   role_id: string,
