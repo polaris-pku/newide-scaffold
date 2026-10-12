@@ -462,6 +462,10 @@ export type {
   PendingFeedbackRecord,
   PromotionOutcome,
 } from './schemas';
+// 晋升状态的读取面返回的就是这两个实体：`listPromotionCandidates` / `listExperiences` 给
+// `ExperienceRecord`，`listSkills` / `saveSkillIfAbsent` 给 `SkillRecord`。外部维护 runner
+// 要能接住这两个返回值，所以它们必须是一等导出，而不是只能绕 `schemas` 命名空间拿
+export type { ExperienceRecord, SkillRecord } from './schemas';
 export {
   EMPTY_MAINTENANCE_RUN_COUNTS,
   applyMaintenanceRunLimit,
