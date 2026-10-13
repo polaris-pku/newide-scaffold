@@ -112,6 +112,23 @@ export const DEFAULT_PROMOTION_RETRY_POLICY: DeliveryRetryPolicy = {
 };
 
 /**
+ * Persona 演化（Persona Evolution Job）的默认重试预算。
+ *
+ * 与晋升**同值**，这是刻意的而不是抄漏了：两条通道的失败面几乎一样（存储故障可立刻重投、
+ * 契约错当场进死信），而演化的失败面多一类——`model_error`（策略/归纳器调模型时的超时与
+ * 限流），它和网络抖动是同一种东西，退避曲线也照同一个形状走。在没有证据说明它需要一份
+ * 不同的预算之前给一个不同的数字，只会让运维多记一组没有理由的参数。
+ *
+ * 它是单独的常量而不是复用上面那个，理由与「通道之间必须能各自定价」相同：将来其中一条
+ * 要改（例如演化接了更贵的模型、需要更长的退避），改这里不会顺手改掉晋升。
+ */
+export const DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY: DeliveryRetryPolicy = {
+  max_attempts: 5,
+  base_delay_ms: 30_000,
+  max_delay_ms: 15 * 60_000,
+};
+
+/**
  * 解析某条通道实际使用的重试策略。
  *
  * 通道之间必须能各自定价：消费一条交付项的失败（存储抖动）值得立刻重投，等待 Experience

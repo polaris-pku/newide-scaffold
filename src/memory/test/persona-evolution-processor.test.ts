@@ -113,10 +113,12 @@ describe('PersonaEvolutionProcessor', () => {
     it('定期门控：距上次归纳超过周期且有新经验时演化', async () => {
       const { memory, role_id } = await createTestInfra('role_evolve_periodic');
 
-      // 先把 persona 生成时间拨回 8 天前（模拟久未演化）
+      // 先把当前 Persona 换成一份生成时刻很旧的正文（模拟久未演化）。版本号 +1：版本历史是
+      // append-only 的，换正文只能换**新的版本号**，不能就地改写已经落下的那一版
       const old = await memory.getPersona();
       await memory.savePersona({
         ...old,
+        version: old.version + 1,
         generated_at: new Date(Date.now() - 8 * DAY).toISOString(),
       });
 
@@ -141,7 +143,8 @@ describe('PersonaEvolutionProcessor', () => {
 
       const results = await defaultProcessor().checkAndEvolve(memory);
       expect(results).toHaveLength(1);
-      expect((await memory.getPersona()).version).toBe(2);
+      // 拨旧的那一份正文是 v2，这次演化写下的是 v3
+      expect((await memory.getPersona()).version).toBe(3);
     });
 
     it('无新数据时 no-op（version 不变）', async () => {

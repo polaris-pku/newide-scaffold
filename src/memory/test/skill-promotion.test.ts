@@ -14,6 +14,7 @@ import {
 } from '../services/promotion-candidates';
 import {
   AGENT_MISSING_PREFIX,
+  assertPromotionDecisionConsistent,
   buildPromotedSkill,
   classifyPromotionFailure,
   executePromotionCandidate,
@@ -1078,6 +1079,44 @@ describe('classifyPromotionFailure', () => {
     expect(classified.code).toBe('storage_error');
     expect(classified.retryable).toBe(false);
     expect(classified.message).toContain('does not exist');
+  });
+
+  it('策略判定违反契约 → 不可重试的 payload_unreadable（形状不对与自相矛盾都算）', () => {
+    const experience_id = 'exp_contract';
+    const expected = {
+      experience_id,
+      approval: 'auto_approve' as const,
+      strategy_version: 'promotion-threshold.v1',
+    };
+    const legal = {
+      verdict: 'eligible',
+      strategy_version: 'promotion-threshold.v1',
+      approval: 'auto_approve',
+      reasons: ['Candidate qualifies.'],
+      blocking_rules: [],
+      experience_id,
+    };
+    // 三类各自最贵的一种：形状不合法（`null`）、结论不认识（`typo`）、与本次执行对不上
+    // （rejected 却拿不出挡住的规则）
+    const decisions: unknown[] = [
+      null,
+      { ...legal, verdict: 'typo' },
+      { ...legal, verdict: 'rejected', reasons: ['turned down'], blocking_rules: [] },
+    ];
+
+    for (const decision of decisions) {
+      let thrown: unknown;
+      try {
+        assertPromotionDecisionConsistent(decision, expected);
+      } catch (error) {
+        thrown = error;
+      }
+      const classified = classifyPromotionFailure(thrown);
+      // 一次配置错既不是抖动（重投读到的是同一份），也不该消失在 unknown 里白占重试名额
+      expect(classified.code).toBe('payload_unreadable');
+      expect(classified.retryable).toBe(false);
+      expect(classified.message).toContain('retrying cannot fix it');
+    }
   });
 });
 

@@ -46,9 +46,11 @@ async function seedLearner(
   tags: string[] = ['typescript'],
 ): Promise<AgentHandle> {
   await repository.initializeAgent({ role_id: 'learner', name: 'Learner', tags });
+  // v2 而不是 v1：版本历史是 append-only 的，种子那一版（v1）落下之后不许原地改写，换正文
+  // 只能换新的版本号。这里要的是「这个角色的 Persona 长这样」，版本号是几与断言无关
   await repository.savePersona('learner', {
     role_id: 'learner',
-    version: 1,
+    version: 2,
     summary: 'typescript service expert',
     skills_overview: 'building typescript services',
     experience_coverage: 'api design',

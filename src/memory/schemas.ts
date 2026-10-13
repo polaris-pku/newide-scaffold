@@ -560,6 +560,183 @@ export const PersonaDefSchema = z.object({
 });
 export type PersonaDef = z.infer<typeof PersonaDefSchema>;
 
+/**
+ * 一次演化的结论 —— 这条角色的演化流走到了哪一格（Phase 4）。
+ *
+ * 与晋升的 `PromotionOutcome` 是同一族语义，只换了落脚点：晋升的产物是「多了一条技能」，
+ * 演化的产物是「Persona 版本 +1」，所以第一格叫 `evolved` 而不是 `promoted`。
+ *
+ * `eligible`（策略说够格）**不在**这里——那是判定，`evolved` 是事实：自动批准时前者导致
+ * 后者，人工审核时前者导致 `pending_review`。把「够格」写进这个枚举，就再也分不出
+ * 「够格但没人放行」和「已经写进库」。
+ */
+export const PersonaEvolutionOutcomeSchema = z.enum([
+  /** 判定合格且当前是自动批准模式：新 Persona 版本已经写在库里 */
+  'evolved',
+  /** 判定合格但当前是人工审核模式：只留下这里，**不写 Persona**，等人工或后续自动批准的运行 */
+  'pending_review',
+  /** 判定不合格：留下理由与挡板规则，同一输入快照与策略版本下不再重复评估 */
+  'rejected',
+]);
+export type PersonaEvolutionOutcome = z.infer<typeof PersonaEvolutionOutcomeSchema>;
+
+/**
+ * 演化标记 —— Persona Evolution Job 处理**一个角色**时留下的一切（Phase 4）。
+ *
+ * **可缺席即「从未演化过」**：Phase 4 之前落库的 Agent、以及新建的 Agent 都没有这个字段，
+ * 读作「这条演化流还没被人碰过」，不需要迁移脚本（Pg 侧是一个可空的 JSONB 列，老行是 NULL）。
+ *
+ * 与晋升标记（`ExperiencePromotionSchema`）是**同一套骨架 + 不同的结论字段**：生命周期字段
+ * 共用 `lifecycleRecordFields`，转移规则共用 `services/delivery-lifecycle.ts`，因此这条通道
+ * 没有第二套状态机。三处刻意的差异，都是「候选是角色而不是行」的直接后果：
+ *
+ * 1. **候选的粒度是 role**：claim/lease 按角色持有（一个角色同时只有一条演化流），因此
+ *    逐条结果与幂等键都以 `role_id` 为主，而不像晋升那样每条经验各自持有。
+ * 2. **多了一组版本字段**：`parent_version`（判定与写回的前置条件）、`persona_version`
+ *    （这次写下的版本）、`input_snapshot_hash`（幂等键的一半）、`strategy_version`、
+ *    `source_run_id`、`change_summary`。计划 §11 要求 Persona 更新「记录 source run、
+ *    strategy version、input snapshot 与变更摘要」，落点就是这里。
+ * 3. **没有 `skill_id` 这种「产物指针」**：产物是 Persona 本身（同一行、版本号 +1），
+ *    不需要跨实体引用，因而也没有晋升那条「引用成立性」校验。
+ *
+ * 版本模型读法（计划 §11 的「Persona 版本」一节）：
+ *
+ * | 问题 | 读法 |
+ * | --- | --- |
+ * | 当前 Persona 是第几版 | `PersonaDef.version` |
+ * | 它是由哪一版演化来的 | 本标记的 `parent_version` → `persona_version` |
+ * | 它依据什么输入 | `input_snapshot_hash` |
+ * | 按哪一版判据 | `strategy_version` |
+ * | 是谁、哪一次运行产生的 | `source_run_id` + `reviewed_by` |
+ * | 变了什么 | `change_summary`（人读） |
+ * | 审核状态 | `outcome`（`pending_review` = 等人工；`evolved` + `reviewed_by` = 自动批准） |
+ *
+ * **落点**：标记挂在 **Agent 记录**上（InMemory 是 `AgentStore` 的一个字段，Pg 是
+ * `memory_agents` 的一个可空 JSONB 列，见 Phase 4-B），**不放进 `AgentHandle`、也不放进
+ * `PersonaDef`**。理由是它属于维护状态而不是对外视图：`AgentHandle` 是前端与 Coordinator
+ * 读的那份载荷，把 claim token、重试次数、失败原因塞进去等于给在线读口加了一组它不该看见
+ * 的字段；而 `PersonaDef` 是一次演化的**产物**，把「上一次演化是怎么来的」记在产物里会让
+ * 产物与状态互相耦合（前端 PATCH Persona 时还得决定这一组字段怎么办）。
+ */
+export const PersonaEvolutionMarkerSchema = z.object({
+  ...lifecycleRecordFields,
+  /** 最近一次演化的结论；缺席 = 还没得出结论（正在处理、或被判失败退回了队列） */
+  outcome: PersonaEvolutionOutcomeSchema.optional(),
+  /** 这次判定与写回所基于的父 Persona 版本：条件写的前置条件 */
+  parent_version: z.number().int().positive().optional(),
+  /** 这次演化写下的 Persona 版本；只在 `outcome === 'evolved'` 时有值，且等于它 +1 */
+  persona_version: z.number().int().positive().optional(),
+  /** 做出该结论的策略版本；版本变了，同一份输入可以被重新评估 */
+  strategy_version: z.string().optional(),
+  /** 判定所依据的输入快照 hash —— 与 `strategy_version` 一起构成「要不要重评」的判据 */
+  input_snapshot_hash: z.string().optional(),
+  /** 产生这次结论的 maintenance run */
+  source_run_id: z.string().optional(),
+  /** 结论产生的时刻 */
+  evaluated_at: z.iso.datetime().optional(),
+  /** 结论的人读理由（策略给了什么、被哪条规则挡住） */
+  reasons: z.array(z.string()).optional(),
+  /** 变更摘要（人读）：这次演化把 Persona 从哪一版推到哪一版、依据什么规模 */
+  change_summary: z.string().optional(),
+  /** 自动批准时的批准者标识；与技能晋升同一个值（`system:auto-approval`） */
+  reviewed_by: z.string().optional(),
+});
+export type PersonaEvolutionMarker = z.infer<typeof PersonaEvolutionMarkerSchema>;
+
+/**
+ * 一版 Persona 是怎么来的（Phase 4 修复 B）。
+ *
+ * 这五个值对应**五条写入路径**，而不是五种人。分得细是因为它们回答的是不同的问题：
+ * 前两个是「这一版不是谁写出来的，是被登记下来的」，后三个是「谁把它写成了这样」。
+ */
+export const PersonaVersionSourceSchema = z.enum([
+  /** Agent 建出来时的种子版本（`PersonaDef.version === 1`，正文来自 createSeedPersona） */
+  'seed',
+  /**
+   * 迁移时为**已存在**的 Agent 登记的当前版本。
+   *
+   * 它的正文就是迁移那一刻库里的 Persona，但**来源无从考证**：Phase B 之前落库的版本
+   * 没有父版本、没有策略版本、没有 run。登记它而不是假装有历史，是为了让「当前版本」在
+   * 历史里始终有一行（回滚有目标、当前版本可读），同时把「这一版的来历不明」如实说出来。
+   */
+  'baseline',
+  /** Persona 演化 job 写出的一版（`completePersonaEvolution` 的 `evolved` 出口） */
+  'evolution',
+  /** 回滚写出的一版：正文抄自 `rollback_from_version`，版本号是新的 */
+  'rollback',
+  /**
+   * 其余写入路径写下的版本：前端 PATCH（`mergePersonaPatch`）、按需重生成
+   * （`regeneratePersona` 的归纳器）——它们都经 `savePersona`，在存储层看起来是同一种。
+   */
+  'manual',
+]);
+export type PersonaVersionSource = z.infer<typeof PersonaVersionSourceSchema>;
+
+/**
+ * 一版 Persona 的**正文 + 来历** —— 版本历史的一行（Phase 4 修复 B）。
+ *
+ * 修复前只有「当前 Persona」与「最新演化标记」两处：下一次演化覆盖标记之后，旧版本的正文
+ * 就再也找不回来了——`PersonaDef` 是单实体单版本号的，`savePersona` 那时也是覆盖写。于是
+ * 「回滚」只能是一句空话。本表把每一版的正文按版本号留下来，回滚才有**可抄的东西**。
+ *
+ * **本表是 append-only 的**：一行一旦落下就不再改。同一个 `(role_id, persona_version)`
+ * 第二次来，要么是同一笔写的重放（幂等成功，什么都不做），要么内容不同（冲突，拒绝且一个
+ * 字节都不写）——三条写入路径（演化 / 手工 / 回滚）共用
+ * `services/persona-version-history` 的 `resolvePersonaVersionAppend` 这一份判据。语义上
+ * 没有「覆盖这一版」这件事：改一版 Persona 就是**再写一版**。
+ *
+ * 字段分三组，读法如下：
+ *
+ * | 问题 | 读法 |
+ * | --- | --- |
+ * | 这是哪一版、正文是什么 | `persona_version` + `persona`（完整 PersonaDef） |
+ * | 它取代了哪一版 | `parent_version`（与演化标记的 `parent_version` 同义：写它的时候当前是第几版） |
+ * | 它是怎么来的 | `source`（五条写入路径之一） |
+ * | 它按哪一版判据、依据什么输入、哪一次 run | `strategy_version` / `input_snapshot_hash` / `source_run_id` |
+ * | 回滚从哪一版抄来 | `rollback_from_version`（只有 `source === 'rollback'` 有） |
+ * | 变了什么、谁批的 | `change_summary` / `reviewed_by` |
+ * | 什么时候落的 | `created_at` |
+ *
+ * **`persona_version` 与 `persona.version` 同源**：它不是第二个权威，而是在**唯一的构造点**
+ * （services/persona-version-history 的 `personaVersionRecord`）从正文派生出来的，数据库那一列
+ * 也由同一个值填入。这样「按列查出来的版本号」与「载荷里的版本号」不可能各说各话——Phase 3
+ * 的 `promoted_from` 就是列与载荷分裂过一次的地方，这里从一开始就只留一个权威（正文）。
+ *
+ * **内容字段是完整的 `PersonaDef`，不是差异**：回滚要的是能直接写回去的完整正文；
+ * 存差异就得先能重放整条链，而那要求链上没有断点——老版本恰恰是有断点的（见 `baseline`）。
+ *
+ * 缺席的字段一律读作**「这一版没有这件事」**，不补默认值：`parent_version` 缺席是「不知道
+ * 它取代了谁」（baseline 那一行就是这样），而不是「它取代了第 0 版」；`source_run_id` 缺席是
+ * 「这一版不是某次维护 run 写出来的」，而不是「run 是空字符串」。
+ */
+export const PersonaVersionRecordSchema = z.object({
+  /** 这一版属于哪个角色 */
+  role_id: z.string(),
+  /** 版本号；与 `persona.version` 同源（由构造点派生，见上面的说明） */
+  persona_version: z.number().int().positive(),
+  /** 这一版的完整正文 —— 回滚抄的就是它 */
+  persona: PersonaDefSchema,
+  /** 这一版是经哪条路径写下的 */
+  source: PersonaVersionSourceSchema,
+  /** 写它的时候当前是第几版；不知道时为缺席（不编） */
+  parent_version: z.number().int().positive().optional(),
+  /** 产生这一版的维护 run；只有演化写过 run 时为缺席 */
+  source_run_id: z.string().optional(),
+  /** 判定用的策略版本（演化） */
+  strategy_version: z.string().optional(),
+  /** 判定所依据的输入快照 hash（演化） */
+  input_snapshot_hash: z.string().optional(),
+  /** 回滚时正文抄自哪一版（只有 `source === 'rollback'` 有） */
+  rollback_from_version: z.number().int().positive().optional(),
+  /** 变更摘要（人读） */
+  change_summary: z.string().optional(),
+  /** 审批 / 操作者标识；自动批准是 `system:auto-approval`（与标记同词同义） */
+  reviewed_by: z.string().optional(),
+  /** 这一版落下来的时刻 */
+  created_at: z.iso.datetime(),
+});
+export type PersonaVersionRecord = z.infer<typeof PersonaVersionRecordSchema>;
+
 // ═══════════════════════════════════════════
 //  Metrics
 // ═══════════════════════════════════════════
@@ -985,6 +1162,106 @@ export const MaintenanceRunCountsSchema = z.object({
 export type MaintenanceRunCounts = z.infer<typeof MaintenanceRunCountsSchema>;
 
 /**
+ * 一条候选的 run 审计摘要（Phase 4 补全）。
+ *
+ * 每个「本次处理过的候选」一条：它是谁（`candidate_id`）、依据哪份输入（快照 hash 与规模）、
+ * 从哪一版出发（父版本）、走到哪里（结论；真的写出新版本时还有 `result_version`），以及这条
+ * 候选这次被父版本条件写挡下过几次。
+ *
+ * 与六个计数**并列而不是替代**：计数回答「这一批几条成功几条失败」，这里回答「分别是哪几条、
+ * 凭哪份输入判的」。两者都必须落在 run 上而不是只落在候选自己身上——候选的状态会被下一次
+ * 运行继续往前推（Persona 演化会覆盖演化标记、晋升会重写晋升标记），那一刻「上一次用的是哪
+ * 份输入」就没了；只有 run 上的这份摘要能让 `run_id` 事后自证。
+ *
+ * 字段全部可选，且**缺失就是缺失**：旧 run 没有这些字段，读出来也不该被填一个假值（填
+ * `parent_conflict_count: 0` 会被读成「那次没有冲突」，而我们并不知道）。写下的那一侧必须
+ * 如实给出「观察到的 0」，因此这个 0 是写入方的结论，不是读取方的默认值。
+ */
+export const MaintenanceRunCandidateAuditSchema = z.object({
+  /** 候选标识：Persona 演化是 `role_id`（候选就是一个角色一条演化流） */
+  candidate_id: z.string(),
+  /** 这次判定依据的输入快照 hash（逐候选的那一个，幂等键的一半） */
+  input_snapshot_hash: z.string().optional(),
+  /** 这次判定依据的父版本（写回前置条件的前件） */
+  parent_version: z.number().int().positive().optional(),
+  /** 这次真正写出的版本；只有写出版本的那条结论才有 */
+  result_version: z.number().int().positive().optional(),
+  /** 判定依据的输入规模，按各通道自己的口径记键（演化是 `skills` / `experiences`） */
+  input_counts: z.record(z.string(), z.number().int().min(0)).optional(),
+  /** 这条候选本次的结论，用各通道自己的状态词（`evolved` / `pending_review` / …） */
+  outcome: z.string().optional(),
+  /** 这条候选本次被父版本条件写挡下的次数 */
+  parent_conflict_count: z.number().int().min(0).optional(),
+});
+export type MaintenanceRunCandidateAudit = z.infer<typeof MaintenanceRunCandidateAuditSchema>;
+
+/** run 审计里的输入快照摘要：批量运行下逐候选 hash 有多个，因此给的是整体 digest + 规模 */
+export const MaintenanceRunInputSnapshotAuditSchema = z.object({
+  /**
+   * 覆盖本次全部候选的稳定 digest（逐候选 hash 排序后聚合）。
+   *
+   * 它是「这一次运行的输入」的**一个**可比对的标识：单候选时能直接对上那一条的 hash，多候选
+   * 时给出集合级的同一性。一个候选都没有时缺席——缺席说的是「没处理任何输入」，与「处理了
+   * 若干条、它们的摘要恰好是空」不是一件事。
+   */
+  digest: z.string().optional(),
+  /** 本次处理的候选数 */
+  candidate_count: z.number().int().min(0).optional(),
+  /** 各通道自己的输入规模合计（演化是 `skills` / `experiences` 的条数之和） */
+  counts: z.record(z.string(), z.number().int().min(0)).optional(),
+});
+export type MaintenanceRunInputSnapshotAudit = z.infer<
+  typeof MaintenanceRunInputSnapshotAuditSchema
+>;
+
+/** 本次处理到的候选所依据的父版本范围（候选一个都没有时缺席） */
+export const MaintenanceRunParentVersionRangeSchema = z.object({
+  min: z.number().int().positive(),
+  max: z.number().int().positive(),
+});
+export type MaintenanceRunParentVersionRange = z.infer<
+  typeof MaintenanceRunParentVersionRangeSchema
+>;
+
+/**
+ * 维护 run 的**结构化**审计载荷（Phase 4 补全）。
+ *
+ * 六个计数与 `last_error` 回答「跑了多大一批、成不成」，但回答不了「按什么判据、依据哪份
+ * 输入」——那几件事此前只落在**候选自己**的标记上（Persona 演化标记的 `strategy_version` /
+ * `input_snapshot_hash` / `parent_version`）。标记是会被下一次运行覆盖的活状态，于是演化一
+ * 遍之后，`run_id` 就再也说不清当时用的是哪一版策略、哪一份输入。这份载荷把那些事实按 run
+ * 落定一次，此后只读不改。
+ *
+ * 形状是**对象而不是字符串**，且每一条事实各占一格：审计要能被聚合（「这一版策略下有多少
+ * 次父版本冲突」），拼成一句人读的话就只能靠正则再解析回来。批量运行的形状也是刻意的——
+ * 多候选时逐候选摘要进 `candidates`，整体只给 digest 与范围，不假装一次运行只有一个候选。
+ *
+ * **可扩展靠加字段**（都是可选字段，旧记录读进来就是缺席），不靠一个无类型的口袋：新增一种
+ * 事实就在这份 schema 上加一格，读它的人不必知道写它的人当时在想什么。因此这里没有
+ * `details: unknown` 之类的口子。
+ *
+ * 向后兼容：工作包 A/B/C 与 Phase 1–3 落盘的 run 都没有这个键，读作「那次运行没记审计」；
+ * 不迁移、不补默认值，也不把这些缺失当成空集。
+ */
+export const MaintenanceRunAuditSchema = z.object({
+  /** 本次运行真正生效的策略版本（可版本化判定的通道才有：技能晋升 / Persona 演化） */
+  strategy_version: z.string().optional(),
+  /** 本次运行的审核模式（同上两条通道才有；它决定「合格」落成写出版本还是等人工） */
+  approval: z.string().optional(),
+  /** 本次是否只演练不落地（演练的审计描述的是「考虑过什么」，不是「写过什么」） */
+  dry_run: z.boolean().optional(),
+  /** 本次处理的输入快照摘要 */
+  input_snapshot: MaintenanceRunInputSnapshotAuditSchema.optional(),
+  /** 本次处理到的候选所依据的父版本范围 */
+  parent_version_range: MaintenanceRunParentVersionRangeSchema.optional(),
+  /** 本次运行里被父版本条件写挡下的次数合计（逐候选的计数之和） */
+  parent_conflict_count: z.number().int().min(0).optional(),
+  /** 逐候选摘要，按处理顺序 */
+  candidates: z.array(MaintenanceRunCandidateAuditSchema).optional(),
+});
+export type MaintenanceRunAudit = z.infer<typeof MaintenanceRunAuditSchema>;
+
+/**
  * 维护 run — 观测与审计实体，**不是业务事务边界**。
  *
  * 它回答的是「这一次调度发生了什么、多久、带走了什么失败码」，不参与
@@ -1002,6 +1279,13 @@ export const MaintenanceRunSchema = z.object({
   /** 终止态才有；`running` 时缺席 */
   finished_at: z.iso.datetime().optional(),
   ...MaintenanceRunCountsSchema.shape,
+  /**
+   * 结构化审计事实（见 `MaintenanceRunAuditSchema`）。
+   *
+   * 可选：Phase 4 之前落盘的 run、以及不需要审计的通道（两条消费者只记计数）都没有它，
+   * 缺席读作「这次运行没记审计」，而不是「审计是空对象」。
+   */
+  audit: MaintenanceRunAuditSchema.optional(),
   /** 终局失败原因（`failed` 时保留；`completed` 也可带，表示部分失败） */
   last_error: z.string().optional(),
 });

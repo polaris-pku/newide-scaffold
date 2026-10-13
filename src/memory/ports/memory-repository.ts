@@ -15,11 +15,19 @@ import type {
   ExperienceRecord,
   MarketStatus,
   PersonaDef,
+  PersonaEvolutionMarker,
+  PersonaEvolutionOutcome,
+  PersonaVersionRecord,
   PromotionOutcome,
   RetiredReason,
   SkillRecord,
 } from '../schemas';
 import type { DeliveryRetryPolicy } from '../services/delivery-lifecycle';
+import type {
+  PersonaEvolutionApprovalMode,
+  PersonaEvolutionInputSnapshot,
+  PersonaEvolutionLastRun,
+} from './persona-evolution-strategy';
 import type { PromotionApprovalMode } from './promotion-strategy';
 
 /** 向量检索参数（索引层 top-K 召回） */
@@ -243,6 +251,181 @@ export interface PromotionRestoreOptions {
   policy?: DeliveryRetryPolicy;
 }
 
+// ── Persona 演化的状态面（Phase 4-B） ────────────────────────────────
+//
+// 与晋升（经验上的一个标记）同一套骨架，只有一处结构差异：**候选是「角色」而不是「行」**。
+// 一个角色同时只有一条演化流，因此状态按 role 持有，claim/lease/fencing 也按 role 生效；
+// 而「这条候选此刻该不该动」需要先看清这个角色的输入（已批准技能 + 已落定的经验）——
+// 那份输入必须与标记在**同一个临界区**里读出来，否则「同一份输入」这句话就没有依据。
+//
+// 因此 claim 的入参刻意**不带**输入快照或 hash：适配器自己在临界区里读 Persona、技能、
+// 经验，算出快照与 hash，再据此做计划。把 hash 交给调用方算，等于让「判据」与「被判的
+// 那份输入」之间开出一个窗口——窗口里落进来的新经验会让人按旧快照判、按新快照记。
+
+/**
+ * 一条已 claim 的演化候选。
+ *
+ * 它同时是「这次判定的全部依据」：判定必须基于 `snapshot`，`parent_version` 取自
+ * `persona.version`，写回时把 `claim_token` 与 `parent_version` 原样带回。
+ */
+export interface ClaimedPersonaEvolutionCandidate {
+  role_id: string;
+  /** claim 之后的标记（`processing`，带租约与 token） */
+  marker: PersonaEvolutionMarker;
+  /** 本次 claim 的 fencing token；落结论与落失败都要原样带回 */
+  claim_token: string;
+  /** claim 时的投递次数（已经 +1） */
+  attempt_count: number;
+  /** claim 那一刻读到的 Persona —— 父版本的权威读口，也是这次判定的 `parent_version` */
+  persona: PersonaDef;
+  /** claim 那一刻算出来的输入快照 —— 判定唯一能读到的输入 */
+  snapshot: PersonaEvolutionInputSnapshot;
+  /** 快照的 hash；幂等键的一半 */
+  input_snapshot_hash: string;
+  /**
+   * 上一次演化的结论（Phase 4-C 新增）：判定能读到的唯一历史。
+   *
+   * 它必须在**计划执行之前**从标记上读出来，因为「重评」的第一件事就是把结论字段重置掉
+   * （见 `reevaluatePersonaEvolutionMarker`）——等到调用方拿到 claim 返回的标记时，那份历史
+   * 已经不在了。缺了它，默认策略的 `no_new_input` 永远判不出来，「策略版本变了、输入没变」
+   * 就只剩 `persona_unchanged` 兜底：版本一样不会多写，但审计里记的挡板从「输入没变」变成
+   * 「正文没变」。
+   *
+   * 只在**上一条结论出过**时有值（`personaEvolutionLastRun`）：正在处理、退回队列、死信都
+   * 没有结论可言。
+   */
+  last_evolution?: PersonaEvolutionLastRun | undefined;
+}
+
+/** 一次 claim 的入参（输入快照由适配器在临界区里自己算，见上面的说明） */
+export interface PersonaEvolutionClaimRequest {
+  owner: string;
+  now: string;
+  lease_ms: number;
+  /** 当前生效的策略版本：决定判过的候选要不要重评 */
+  strategy_version: string;
+  /** 本次运行的审核模式：决定 `pending_review` 要不要被自动批准接起来 */
+  approval: PersonaEvolutionApprovalMode;
+  /** 只处理该 role；缺省按 `listAgentIds()` 的顺序逐条尝试 */
+  role_id?: string;
+  /** 重试预算；缺省用 DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/** 落一条结论的入参 */
+export interface PersonaEvolutionCompletionRequest {
+  role_id: string;
+  claim_token: string;
+  /** 交叉核对的持有者标识；真正的 fencing 是 claim_token */
+  owner?: string;
+  /** 判定所依据的父版本：**条件写的前置条件** */
+  parent_version: number;
+  /** 本次的结论 */
+  outcome: PersonaEvolutionOutcome;
+  /** 判定用的策略版本；写进标记，也是「要不要重评」的判据 */
+  strategy_version: string;
+  /** 判定所依据的输入快照；写进标记，也是幂等键的一半 */
+  input_snapshot_hash: string;
+  /** 产生这次结论的 maintenance run */
+  source_run_id: string;
+  /** 判定理由（人读） */
+  reasons: string[];
+  /** 变更摘要（人读）；`evolved` 时应当给 */
+  change_summary?: string;
+  /** 自动批准时的批准者标识 */
+  reviewed_by?: string;
+  /**
+   * `outcome === 'evolved'` 时必填：这一版的**完整** Persona。
+   *
+   * 实现要校验 `persona.version === parent_version + 1` 且 `persona.role_id === role_id`：
+   * 版本号只能由父版本推出，让调用方自报一个跳版本的值就等于允许它写出一个不属于它的版本。
+   */
+  persona?: PersonaDef;
+  now: string;
+}
+
+/**
+ * 落一条结论的结果。
+ *
+ * 三种终局必须分得开，因为它们的处置完全不同：`applied` 是落地了，`claim_lost` 是「这次没
+ * 轮到我们」（落盘责任归当前持有者），而 `parent_conflict` 是**判据过期**——别的 worker 或
+ * 前端 PATCH 在读到与写回之间改了 Persona，此时绝不能覆盖（那是「不得破坏旧版本」的落点），
+ * 但也**不是**永久失败：重投会重新读、重算快照、重判一次。
+ */
+export type PersonaEvolutionCompletionResult =
+  | { kind: 'applied'; marker: PersonaEvolutionMarker; persona?: PersonaDef | undefined }
+  | { kind: 'claim_lost' }
+  | { kind: 'parent_conflict'; expected_parent_version: number; current_version: number };
+
+/** 落一次失败的入参（退避回队列或进死信） */
+export interface PersonaEvolutionFailureRequest {
+  role_id: string;
+  claim_token: string;
+  owner?: string;
+  error: string;
+  retryable: boolean;
+  now: string;
+  /** 重试预算；缺省用 DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/** 启动恢复的入参 */
+export interface PersonaEvolutionRestoreOptions {
+  /** 只恢复该 role；缺省跨全部 Agent */
+  role_id?: string;
+  now: string;
+  /** 重试预算；缺省用 DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY */
+  policy?: DeliveryRetryPolicy;
+}
+
+/** 恢复出来的一条候选：标记本身不带 role，因此成对返回 */
+export interface RestoredPersonaEvolutionClaim {
+  role_id: string;
+  marker: PersonaEvolutionMarker;
+}
+
+// ── Persona 版本历史与回滚（Phase 4 修复 B） ─────────────────────────
+
+/** 版本历史的读入参 */
+export interface PersonaVersionQuery {
+  /** 只要最近的 N 条（返回仍按版本号升序）；缺省全部 */
+  limit?: number;
+}
+
+/** 一次回滚的入参 */
+export interface PersonaRollbackRequest {
+  role_id: string;
+  /** 正文抄自哪一版 */
+  target_version: number;
+  /**
+   * 调用方读到的当前版本 —— **必填**，条件写的前置条件。
+   *
+   * 不给它留「不给就无论如何都写」的余地：那会把回滚退化成一次无条件覆盖，两个并发回滚
+   * 会各自以为自己成功了。想要「不管当前是第几版」的调用方，先读一次再传进来——把那一步
+   * 显式留在他手里，比在这里替他猜要诚实。
+   */
+  expected_current_version: number;
+  /** 人读原因，摊进 `change_summary` */
+  reason?: string;
+  /** 操作者标识（`reviewed_by`） */
+  reviewed_by?: string;
+  now: string;
+}
+
+/**
+ * 一次回滚的结果。三种终局必须分得开，因为处置完全不同：
+ *
+ * - `applied`：落地了，返回新的正文与那一行历史。
+ * - `version_conflict`：**你以为的当前版本已经不是当前版本**（并发回滚、期间有人演化或
+ *   改过 Persona）。一个字节都没写；重投要重新读、重新决定以哪一版为准。
+ * - `target_missing`：这一版不在历史里——请求本身就不可满足（老 Agent 在 Phase B 之前
+ *   的版本没有正文可考，历史起点是 `baseline` 那一行）。
+ */
+export type PersonaRollbackResult =
+  | { kind: 'applied'; persona: PersonaDef; record: PersonaVersionRecord }
+  | { kind: 'version_conflict'; expected_version: number; current_version: number }
+  | { kind: 'target_missing'; target_version: number };
+
 export interface MemoryRepository {
   /** 确保 Agent 存在（不存在则用种子数据初始化） */
   ensureAgent(role_id: string): Promise<void>;
@@ -391,7 +574,26 @@ export interface MemoryRepository {
    * 计数只在真正新建时递增，幂等命中不重复计数。
    */
   saveSkillIfAbsent(role_id: string, skill: SkillRecord): Promise<SkillSaveResult>;
-  /** 覆盖写入当前 Persona 快照（如 Persona 演化后 version+1） */
+  /**
+   * 写下一版当前 Persona（前端 PATCH 与按需重生成，都写 `version + 1`）。
+   *
+   * 语义是「把当前 Persona 换成这一份」，**不是**「覆盖这个版本号」——版本历史是 append-only
+   * 的，这条路径换掉的是**新版本号**那一行，旧版本那一行一个字都不动。三条约束：
+   *
+   * 1. **身份**：`persona.role_id` 必须等于 `role_id`（不等就抛
+   *    `Persona role_id mismatch: expected …, got …`）。少了这一条，一次笔误就能把 A 的
+   *    Persona 记到 B 名下，而且此后每个读口都读不出来。
+   * 2. **版本号只能往前**：`persona.version` 必须严格大于当前版本。它维护的是
+   *    `当前版本 === 历史里最大的版本号` 这条不变量，而回滚写下的 `当前版本 + 1` 「一定是新
+   *    的」正是靠它成立。想回到旧版本用 `rollbackPersona`（它写新版本号，不复用旧的）。
+   * 3. **不可变**：`(role_id, persona.version)` 已经有行时，只接受「这是同一笔写的重放」
+   *    （幂等成功，什么都不改）；内容不同则**拒绝**——抛错，且当前 Persona、聚合根快照
+   *    （Handle）与历史三者一起停在原处，不留下半写状态。冲突不是「后来者居上」：历史是
+   *    回滚唯一能抄的东西，让它可改写等于让回滚的目标在无人察觉的时候被换掉。
+   *
+   * 两个后端共用 `services/persona-version-history` 的同一份判据与同一句话，因此「什么时候
+   * 算冲突、冲突时哪一边赢」不会在两个后端之间漂移。
+   */
   savePersona(role_id: string, persona: PersonaDef): Promise<void>;
   /**
    * 覆盖写入已有技能（如消融实验 auto-approve、人工审核裁决）。
@@ -500,6 +702,154 @@ export interface MemoryRepository {
     experience_id: string;
     now: string;
   }): Promise<ExperienceRecord | undefined>;
+
+  // ── Persona 演化的状态面（Phase 4-B） ────────────────────────────
+
+  /**
+   * 读一个角色的演化标记。
+   *
+   * 从未演化过返回 `undefined` —— 那不是错误，是「这条演化流还没被人碰过」（Phase 4 之前
+   * 落库的 Agent、以及刚建的 Agent）。**必须是持久层的事实**，不能靠进程内缓存兜：它是
+   * 「要不要 claim」的第一手判据。
+   */
+  getPersonaEvolutionMarker(role_id: string): Promise<PersonaEvolutionMarker | undefined>;
+
+  /**
+   * claim 下一个该演化的角色：读出它的输入、算出快照、按计划把标记推进到 `processing`。
+   *
+   * 「读输入 → 算快照 → 判计划 → 写标记」必须在**同一个临界区**里完成：计划的判据之一是
+   * 「这份输入与上一次演化过的是不是同一份」，而输入是由同一个角色名下的技能与经验算出来的
+   * ——中间插进来一条新经验，就会出现「按旧快照判、按新快照记」。因此入参不带快照，适配器
+   * 自己在临界区里算（这也让两个适配器不可能对「输入是什么」有各自的解释）。
+   *
+   * 拿不到（没有候选、别人抢先、抢不到锁）返回 undefined —— 与交付侧「返回 undefined 表示
+   * 这次什么都没做」是同一种约定，不是错误。
+   */
+  claimNextPersonaEvolutionCandidate(
+    request: PersonaEvolutionClaimRequest,
+  ): Promise<ClaimedPersonaEvolutionCandidate | undefined>;
+
+  /**
+   * 落一条结论（`processing` → `processed`），并在 `evolved` 时**条件写入**新 Persona 版本。
+   *
+   * 两道条件缺一不可，且必须在同一次原子写里成立：
+   *
+   * 1. **凭据**（`claim_token` / 可选 `owner` / 租约未过期、标记仍是 `processing`）：不成立
+   *    返回 `{ kind: 'claim_lost' }` 且**什么都不写**——那是「这次没轮到我们」，结论归当前
+   *    持有者，硬写只会把别人的结论盖掉。
+   * 2. **父版本**（写回那一刻读到的 `persona.version` 必须等于 `request.parent_version`）：
+   *    不成立返回 `{ kind: 'parent_conflict' }` 且**不覆盖**——Persona 是单实体单版本号的，
+   *    版本号就是乐观锁。冲突说明这份判定已经过期（别的 worker 先写了一步，或前端 PATCH
+   *    改过），重投会重新读、重算、重判。
+   *
+   * 落地的形态：Persona 行换成 `request.persona`（版本 = 父版本 + 1），标记写成
+   * `processed` + 结论 + `parent_version` / `persona_version` / `strategy_version` /
+   * `input_snapshot_hash` / `source_run_id` / `reasons` / `change_summary` / `reviewed_by`，
+   * 并清掉凭据（token 与租约是**活着的**凭据，终态不再有人持有）。
+   *
+   * **重复执行不产生重复版本**靠的是「凭据 + 父版本」这两道条件：第二次调用时标记已经不是
+   * `processing`（或 token 已换），因此 `claim_lost`，一个字节都不会写。
+   */
+  completePersonaEvolution(
+    request: PersonaEvolutionCompletionRequest,
+  ): Promise<PersonaEvolutionCompletionResult>;
+
+  /** 落一次失败（退避回队列或进死信）；凭据不成立返回 undefined */
+  failPersonaEvolution(
+    request: PersonaEvolutionFailureRequest,
+  ): Promise<PersonaEvolutionMarker | undefined>;
+
+  /**
+   * 启动恢复：把租约过期仍停在 `processing` 的演化标记放回队列。
+   *
+   * 每一条都在自己的临界区里重新判一次过期，因此不会把「列举之后已经被别人完成了」的候选
+   * 重投一次。
+   */
+  restoreExpiredPersonaEvolutionClaims(
+    options: PersonaEvolutionRestoreOptions,
+  ): Promise<RestoredPersonaEvolutionClaim[]>;
+
+  /**
+   * 人工重试：`dead_letter` → `pending`，并清零投递次数（「再试一次」就是再给满额机会）。
+   *
+   * 只有死信可重试，其余状态返回 undefined。这是**运维入口**，自动路径不会调它。
+   */
+  retryDeadLetterPersonaEvolution(request: {
+    role_id: string;
+    now: string;
+  }): Promise<PersonaEvolutionMarker | undefined>;
+
+  // ── Persona 版本历史与回滚（Phase 4 修复 B） ─────────────────────
+  //
+  // 上面那组方法管的是**演化这条流水线**（候选、持有、结论）；这一组管的是它的**产物**：
+  // 每一版 Persona 的正文本身。修复前只有「当前 Persona + 最新标记」两处，因此下一次演化
+  // 覆盖标记之后，旧版本的正文就再也找不回来了——`PersonaDef` 是单实体单版本号的，
+  // `savePersona` 那时也是覆盖写。历史是回滚的**前提**：没有旧正文可抄，回滚只是一句空话。
+  //
+  // 历史是 **append-only** 的，这是这一整组的中心约束（第二条修复 B 轮次）：一行历史一旦
+  // 落下就不再改。同一个 `(role_id, persona_version)` 第二次来，要么是同一笔写的重放（幂等），
+  // 要么内容不同（冲突，拒绝且一个字节都不写），没有第三种。三条写入路径——手工
+  // （`savePersona`）、演化落地（`completePersonaEvolution`）、回滚（`rollbackPersona`）——
+  // 都走同一份判据 `services/persona-version-history` 的 `resolvePersonaVersionAppend`，因此
+  // 「怎样算同一笔写、冲突时谁赢」在两个后端上逐字相同。
+  //
+  // 为什么历史长在这个端口上，而不是另起一个 HistoryStore：**原子性**。写下一版 Persona
+  // 与登记这一版的历史必须是同一笔写——分成两个 store 就等于承认中间存在「Persona 已经是
+  // v5、历史里没有 v5」的窗口，而那个窗口恰好是回滚与审计唯一依赖的东西。Pg 那边这一笔写
+  // 因此是**一条语句**（锁住 Agent 行 → 数据修改 CTE 里 INSERT 历史行 → 外层 UPDATE 由它
+  // 驱动），不是两笔。
+
+  /**
+   * 一个角色的版本历史，按版本号升序（旧 → 新）。
+   *
+   * 只读，且**不改写任何东西**：老 Agent 的历史起点是迁移时登记的 `baseline` 那一行，
+   * Phase B 之前的版本不会在这里凭空出现（没有正文可考，编不出来）。
+   */
+  listPersonaVersions(
+    role_id: string,
+    query?: PersonaVersionQuery,
+  ): Promise<PersonaVersionRecord[]>;
+
+  /** 某一版的完整记录；这一版不存在（或属于别的角色）返回 undefined */
+  getPersonaVersion(role_id: string, version: number): Promise<PersonaVersionRecord | undefined>;
+
+  /**
+   * 当前版本的记录 —— 「现在这一版是什么、怎么来的」一次问完。
+   *
+   * 当前版本号取自 `getPersona()`（唯一权威），因此它与 `getPersonaVersion(role_id, 那个号)`
+   * 是同一件事；单独有一个方法是为了让调用方不必先读 Persona 再读历史，并且让「当前版本在
+   * 历史里没有行」这件事**只可能**是迁移之前留下的老数据（Phase B 之后每一笔写都同时落两处）。
+   */
+  getCurrentPersonaVersion(role_id: string): Promise<PersonaVersionRecord | undefined>;
+
+  /**
+   * 把角色回滚到某一版的正文 —— **再写一版**，不是擦掉一版。
+   *
+   * 语义（每一条都有它挡的东西）：
+   *
+   * 1. **条件写**：只有当写下去那一刻读到的当前版本仍等于 `expected_current_version` 时才落。
+   *    不成立返回 `version_conflict`，一个字节都不写——并发回滚只有一个赢家，输的那个必须
+   *    知道，否则它会用自己那份「读到的东西」覆盖赢家刚写下的结果。
+   * 2. **新版本号**：落下的是 `当前版本 + 1`，正文抄自 `target_version`。**不复用旧版本号**：
+   *    `PersonaDef.version` 是演化写回的前置条件（乐观锁），把版本号改回去等于让一个拿着旧
+   *    判定的 worker 重新变得「正确」，于是它会把刚回滚掉的那一版写回来。
+   * 3. **旧历史一行不动**：回滚追加一行，`parent_version` 记取代了哪一版、
+   *    `rollback_from_version` 记正文抄自哪一版、`change_summary` 带上原因、`created_at` 是
+   *    这一版的时刻。这一行同样是 append-only：`当前版本 + 1` 若已经有行，实现**拒绝**而不是
+   *    覆盖（那说明「当前版本 === 历史里最大的版本号」已经断了，而被覆盖的那一行正是别人回滚
+   *    或审计的目标）。
+   * 4. **不碰演化标记**：标记的去重键是 `(role_id, input_snapshot_hash, strategy_version)`，
+   *    输入没变时把它作废会让下一次演化把刚回滚掉的版本原样写回来。回滚只是把当前版本往前
+   *    推了一版，那份判定仍然「已经在这份输入上做过」。
+   *
+   * 身份自洽：目标那一行必须是**这个角色**的，且它的载荷必须属于这一行、版本号也得是这一行
+   * 的（`persona.role_id === role_id`、`persona.version === persona_version`）。不成立就抛错——
+   * 拿别的角色的正文当回滚目标，写出来的是一个「属于别人」的当前版本。
+   *
+   * 目标版本不存在返回 `target_missing`（在版本条件之前判：请求本身就不可满足时先说这件事）。
+   * 回滚到当前版本是允许的退化情形——新的版本号、同样的正文，如实落下。
+   */
+  rollbackPersona(request: PersonaRollbackRequest): Promise<PersonaRollbackResult>;
 
   /**
    * 直写技能向量（memory.reindex 全量重建索引用）。
