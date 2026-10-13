@@ -325,6 +325,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const onDriverEvent: DriverStreamEventListener | undefined = options?.onDriverEvent
       ? (event) => options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
       : undefined;
+    onDriverEvent?.({
+      schema_version: 'driver-event.v1',
+      event_type: 'driver.session_initializing',
+      task_id: input.task_id,
+      run_id: input.run_id,
+      created_at: nowTimestamp(),
+    });
     let result = await runDriverPromptWithSignal(
       driver, prompt, options?.signal, onDriverEvent,
     );

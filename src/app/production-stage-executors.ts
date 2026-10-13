@@ -272,7 +272,8 @@ export function createProductionStageExecutors(
             schema_version: SCHEMA_VERSION,
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
-            ...(sessionId && context.restarted_from_run_id ? { resume_session: true } : {}),
+            ...(sessionId && context.restarted_from_run_id && context.native_task_prompt_dispatched !== false
+              ? { resume_session: true } : {}),
             ...(context.cursor_input.mailbox_delivery_id
               ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
               : {}),
@@ -1001,7 +1002,8 @@ async function executeFinalCouncilPlan(input: {
         role_id: input.primary.role_id,
         instruction: retryInstruction,
         driver_instruction: retryInstruction,
-        ...(input.context.restarted_from_run_id ? { resume_session: true } : {}),
+        ...(input.context.restarted_from_run_id && input.context.native_task_prompt_dispatched !== false
+          ? { resume_session: true } : {}),
         workspace_path: workspace,
         session_id: input.primary.session_id,
         input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),

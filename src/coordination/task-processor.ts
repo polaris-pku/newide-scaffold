@@ -130,6 +130,8 @@ export interface TaskRunExecutionState {
    * 拿不到 gate/execute 阶段的产物。
    */
   restarted_from_run_id?: string;
+  /** False means the saved session only reached initialization, not its task prompt. */
+  native_task_prompt_dispatched?: boolean;
 }
 
 export interface FinishTaskRunInput {
@@ -853,6 +855,23 @@ export class TaskProcessor {
   getRunExecutionState(runId: string): TaskRunExecutionState {
     const aggregate = this.requireAggregateForRun(runId);
     const run = requireRun(aggregate, runId);
+    const lineage = new Set<string>();
+    let ancestor: PersistedRunState | undefined = run;
+    while (ancestor && !lineage.has(ancestor.run_id)) {
+      lineage.add(ancestor.run_id);
+      ancestor = ancestor.restarted_from_run_id
+        ? aggregate.runs.find(candidate => candidate.run_id === ancestor?.restarted_from_run_id)
+        : undefined;
+    }
+    const primaryRole = aggregate.runtime_state.cursor_input?.cursor === 'execute_agent'
+      ? aggregate.runtime_state.cursor_input.winner_agent_id
+      : aggregate.task.owner_agent_id ?? aggregate.task.role_id;
+    const nativeEvents = aggregate.events.filter(event =>
+      event.run_id && lineage.has(event.run_id) &&
+      (!primaryRole || event.payload.role_id === primaryRole),
+    );
+    const taskPromptDispatched = nativeEvents.some(event => event.event_type === 'driver.prompt_dispatching');
+    const sessionInitializing = nativeEvents.some(event => event.event_type === 'driver.session_initializing');
     const memoryAblation = readMemoryAblation(
       aggregate.runtime_state.diagnostics.memory_ablation,
     );
@@ -860,6 +879,9 @@ export class TaskProcessor {
       task_id: aggregate.task.task_id,
       run_id: runId,
       mode: run.mode,
+      ...(taskPromptDispatched || sessionInitializing
+        ? { native_task_prompt_dispatched: taskPromptDispatched }
+        : {}),
       ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
       task_request: {
         spec: aggregate.task.spec,

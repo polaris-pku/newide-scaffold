@@ -2267,6 +2267,12 @@ export class NewideBackendService {
   private persistRunEvent(identity: { run_id: string; task_id: string }, event: Event): void {
     const processor = this.taskProcessor;
     if (!processor) return;
+    if (event.event_type === 'driver.prompt_dispatching' || event.event_type === 'driver.session_initializing') {
+      // These are recovery facts, not optional observations. They are emitted
+      // synchronously before launch, so a failed commit must prevent execution.
+      processor.recordRunEvent(identity.run_id, { ...event, ...identity });
+      return;
+    }
     try {
       processor.recordRunEvent(identity.run_id, {
         ...event,

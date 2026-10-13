@@ -18,6 +18,33 @@ afterEach(() => {
 });
 
 describe('TaskProcessor', () => {
+  it('distinguishes initialization-only sessions from dispatched task turns across resume', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({ task_id: 'task_processor', run_id: 'run_processor',
+      task_request: taskRequest, workspace_path: '/workspace', mode: 'single_agent' });
+    processor.recordRunEvent('run_processor', event('market_native', 'market.selected', { winner_agent_id: 'role_ts_engineer' }));
+    processor.recordRunEvent('run_processor', event('native_init', 'driver.session_initializing', { role_id: 'role_ts_engineer' }));
+    processor.recordRunEvent('run_processor', event('native_ready', 'driver.turn_started', { role_id: 'role_ts_engineer', session_id: 'native_initialization' }));
+    // Dispatch by another role cannot prove the primary received its task.
+    processor.recordRunEvent('run_processor', event('other_dispatch', 'driver.prompt_dispatching', { role_id: 'reviewer' }));
+    expect(processor.getRunExecutionState('run_processor').native_task_prompt_dispatched).toBe(false);
+    processor.interruptRun('run_processor', { source: 'user', reason: 'pause before primary task prompt' });
+    const checkpoint = store.getLatestCheckpoint('task_processor')!;
+    processor.beginRun({ task_id: 'task_processor', run_id: 'run_native_resumed', task_request: taskRequest,
+      workspace_path: '/workspace', mode: 'single_agent', session_id: 'native_initialization',
+      restarted_from_run_id: 'run_processor', resume_checkpoint_id: checkpoint.checkpoint_id,
+      requested_resume_cursor: checkpoint.resume_cursor, cursor_input: checkpoint.cursor_input!,
+      run_intent: { type: 'checkpoint_resume', strategy: 'from_checkpoint' },
+    });
+    expect(processor.getRunExecutionState('run_native_resumed').native_task_prompt_dispatched).toBe(false);
+    processor.recordRunEvent('run_native_resumed', {
+      ...event('native_task_dispatch', 'driver.prompt_dispatching', { role_id: 'role_ts_engineer' }),
+      run_id: 'run_native_resumed',
+    });
+    expect(processor.getRunExecutionState('run_native_resumed').native_task_prompt_dispatched).toBe(true);
+    store.close();
+  });
+
   it('begins a run and advances only through finite resume cursors', () => {
     const { processor, store } = createProcessor();
     const started = processor.beginRun({

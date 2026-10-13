@@ -70,6 +70,7 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
    * 续跑 run 需要据此回溯读取上一 run 已完成 stage 的产物。
    */
   restarted_from_run_id?: string;
+  native_task_prompt_dispatched?: boolean;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
   on_event?: (event: Event) => void;
@@ -717,6 +718,9 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     cursor_input: cursorInput,
     ...(state.restarted_from_run_id
       ? { restarted_from_run_id: state.restarted_from_run_id }
+      : {}),
+    ...(state.native_task_prompt_dispatched !== undefined
+      ? { native_task_prompt_dispatched: state.native_task_prompt_dispatched }
       : {}),
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
