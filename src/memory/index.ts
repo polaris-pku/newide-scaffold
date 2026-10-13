@@ -617,6 +617,7 @@ export {
   initialPromotionMarker,
   isPromotedExperience,
   planPromotionCandidate,
+  promotionInputSnapshotHash,
   promotionStateLabel,
   reevaluatePromotionMarker,
   selectPromotionCandidates,

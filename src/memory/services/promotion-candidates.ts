@@ -9,8 +9,11 @@
  * 为什么不能简单用「status === 'pending' 就算候选」：
  *
  * - **已晋升**（`promoted_to` 指向一条 Skill）永远不再进来，否则会攒出重复技能。
- * - **判过且结论已定**（rejected / pending_review）在同一策略版本下不重评 —— 重评的判据只能是
- *   「策略变了」或「人工审核模式放宽成自动批准」，不是「又跑了一轮」。
+ * - **判过且结论已定**（rejected / pending_review）在**同一策略版本、同一份输入**下不重评 ——
+ *   重评的判据是「策略变了」「输入变了」或「人工审核模式放宽成自动批准」，不是「又跑了一轮」。
+ *   输入这一项是最容易漏掉的一半：晋升是个按周期扫的通道，少了它，一条刚提取出来（置信度还低）
+ *   的经验会在**第一次被看到的那一轮**就判 `rejected` 并永久冻结——此后 Driver 反馈把它的置信度
+ *   抬过门槛，也没有任何东西会再看它一眼。那正好把「反馈滚雪球、最终跨过阈值」这条故事反过来写。
  * - **人工审核模式下判出的 pending_review** 必须能被后续一次 auto_approve 的运行接起来，
  *   否则「先记下来等批准」就永远等不到批准（没有任何东西会再碰它）。这就是
  *   `reevaluate_then_claim` 存在的理由。
@@ -19,6 +22,7 @@
  * 排序取 `created_at` 升序（再按 id），即「先来的先处理」：与交付侧按到期时刻排序同一个
  * 意图 —— 顺序确定、可复现，且不会被「每次运行换一个顺序」搅乱观测。
  */
+import { createHash } from 'node:crypto';
 import {
   DEFAULT_PROMOTION_RETRY_POLICY,
   isDeliveryClaimExpired,
@@ -40,7 +44,7 @@ export type PromotionSkipReason =
   | 'not_due'
   /** 投递次数已用满（正常路径下应已进死信，这里兜底） */
   | 'attempts_exhausted'
-  /** 同一策略版本下已经判过，结论是不合格 */
+  /** 同一策略版本、同一份输入下已经判过，结论是不合格 */
   | 'evaluated_under_current_strategy'
   /** 同一策略版本下判为待审核，而本次运行还是人工审核模式 */
   | 'waiting_for_manual_review';
@@ -128,12 +132,50 @@ export function planPromotionCandidate(
           : { kind: 'skip', reason: 'waiting_for_manual_review' };
       }
       if (marker.outcome === 'rejected') {
-        return { kind: 'skip', reason: 'evaluated_under_current_strategy' };
+        // 输入变了就重评：置信度被反馈抬上来、被手工改过、引用次数变了，都会让这条经验变成
+        // 另一条候选。判据是**指纹**而不是「又跑了一轮」——同一份输入下重评只是把同一个结论
+        // 再算一遍，而漏掉一次重评的代价是这条经验永远不再被考虑。
+        return marker.input_snapshot_hash === promotionInputSnapshotHash(experience)
+          ? { kind: 'skip', reason: 'evaluated_under_current_strategy' }
+          : {
+              kind: 'reevaluate_then_claim',
+              marker: reevaluatePromotionMarker(marker, input.now),
+            };
       }
       // 结论缺席：这条 processed 记录读不出判定（旧数据 / 被手工改过），重评一次
       return { kind: 'reevaluate_then_claim', marker: reevaluatePromotionMarker(marker, input.now) };
     }
   }
+}
+
+/**
+ * 一条经验的**判定输入指纹**：策略判这条候选时读到的那些字段的规范摘要。
+ *
+ * 它回答的是「这条结论还是对同一个问题给出的吗」。喂进去的是参与判定的那几个字段：
+ * `type` / `confidence` / `referenced_count` / `source_user_rating`，外加 `updated_at`
+ * 作为兜底——任何一次写入（反馈回写、人工编辑）都会推动它，因此**改了内容就一定会重评**，
+ * 不必在这里逐个列举「哪些写入算数」。
+ *
+ * 为什么是手工拼串而不是 `JSON.stringify(experience)`：后者的键顺序取决于对象是怎么被构造
+ * 出来的（今天恰好稳定，那是实现的偶然），而这份串的每一段都由这里显式定序，于是「同内容必然
+ * 同 hash」是被保证的。字段之间用不可打印分隔符隔开，避免拼接歧义（`["ab","c"]` 与
+ * `["a","bc"]` 必须不同）。
+ *
+ * **已知不含的一项**：`min_age_ms` 这类由时间推动的门槛。它默认关闭；打开时，一条被判
+ * `too_recent` 的经验要等到输入再次变化才会重评，而不是到点自动重评。把「当前时刻」也搅进
+ * 指纹会让每一轮都判定为「输入变了」，那是拿周期性重评换收敛性，得不偿失。
+ */
+export function promotionInputSnapshotHash(experience: ExperienceRecord): string {
+  const parts = [
+    'promotion-input.v1',
+    experience.id,
+    experience.type,
+    String(experience.confidence),
+    String(experience.referenced_count),
+    experience.source_user_rating ?? 'not_rated',
+    experience.updated_at,
+  ];
+  return createHash('sha256').update(parts.join('\u001f'), 'utf8').digest('hex');
 }
 
 /** 本次该处理的经验（过滤掉 skip 的那些），按「先来的先处理」排序 */
@@ -169,10 +211,10 @@ export function initialPromotionMarker(now: string): ExperiencePromotion {
 }
 
 /**
- * 把一条已判过的标记重置为「待评估」，用于换策略版本重评、或人工审核转自动批准。
+ * 把一条已判过的标记重置为「待评估」，用于换策略版本重评、输入变化后重评、或人工审核转自动批准。
  *
- * 重置的是**判定**（结论、策略版本、理由、技能绑定）与**投递痕迹**（次数、持有的 token、
- * 退避、上次错误）：新策略下的第一次评估应当和从没评过一样，不该继承上一版策略的退避。
+ * 重置的是**判定**（结论、策略版本、输入指纹、理由、技能绑定）与**投递痕迹**（次数、持有的
+ * token、退避、上次错误）：重评的那一次应当和从没评过一样，不该继承上一版策略的退避。
  * `created_at` 保留 —— 那是这条标记的来历，不是结论。
  */
 export function reevaluatePromotionMarker(
@@ -191,6 +233,7 @@ export function reevaluatePromotionMarker(
     last_error: undefined,
     outcome: undefined,
     strategy_version: undefined,
+    input_snapshot_hash: undefined,
     evaluated_at: undefined,
     skill_id: undefined,
     reasons: undefined,

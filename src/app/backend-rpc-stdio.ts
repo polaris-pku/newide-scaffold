@@ -315,8 +315,9 @@ export async function createProductionBackendService(
           autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
         },
       });
-    // 消费端（Phase 1 + Phase 2）：把在线登记的两条 outbox 真的消费成 Experience 与置信度
-    // 回写。构造在这里、启动在维护定时器旁边（见下面的 start），因此关停仍是一条路径。
+    // 消费端（Phase 1–4）：把在线登记的两条 outbox 真的消费成 Experience 与置信度回写，
+    // 再把经验与反馈真的变成 Skill 与 Persona 版本（后两条是独立 job，见文件头）。
+    // 构造在这里、启动在维护定时器旁边（见下面的 start），因此关停仍是一条路径。
     memoryDeliveryConsumers = new MemoryDeliveryConsumers({
       repository: bRuntime.repository,
       bufferRepository: bRuntime.bufferRepository,
@@ -326,6 +327,7 @@ export async function createProductionBackendService(
       }),
       evidenceStore: maintenanceEvidenceStore,
       llm: memoryLlm,
+      ...readMemoryJobOptions(env),
       logger: (message) => {
         process.stderr.write(`[newide] ${message}\n`);
       },
@@ -536,9 +538,9 @@ export async function createProductionBackendService(
     );
     maintenanceScheduler.start(readIntEnv(env.NEWIDE_MAINTENANCE_INTERVAL_MS, 3600_000));
     // 消费端的定时器与维护定时器共用同一条关停路径（见 closeRuntime），但周期是独立的一个开关：
-    // 「多久扫一次退休/自学习」与「多久把 outbox 抽干一次」是两件事，缺省取维护周期只是为了让
-    // 部署里只配一个值也能跑。新开关必须是正整数——0 会让 start() 安静地什么都不做，配置错误
-    // 不该长得像「已经配好了」。
+    // 「多久扫一次退休/自学习」与「多久把离线半场抽干一次（两条 outbox + 两条 job）」是两件事，
+    // 缺省取维护周期只是为了让部署里只配一个值也能跑。新开关必须是正整数——0 会让 start() 安静地
+    // 什么都不做，配置错误不该长得像「已经配好了」。
     memoryDeliveryConsumers.start(
       readPositiveIntEnv(
         'NEWIDE_B_DELIVERY_DRAIN_INTERVAL_MS',
@@ -688,9 +690,28 @@ export async function createProductionBackendService(
 }
 
 /**
+ * 两条 job 通道（Skill 晋升、Persona 演化）的审核配置。抽成一处，是因为 boot 与手动补跑必须
+ * 给出同一个答案：同一个库、同一条经验，因为「这次是 CLI 跑的」而判出不一样的结论，是最难查的
+ * 那类分歧。两个开关缺省都关，于是接上以后两条通道先只记结论，不写 Skill、不新增 Persona 版本。
+ */
+function readMemoryJobOptions(env: NodeJS.ProcessEnv): {
+  promotion: { min_confidence: number; auto_approve: boolean };
+  personaEvolution: { auto_approve: boolean };
+} {
+  return {
+    promotion: {
+      // 与 BMemoryMaintenanceRunner 的 promotion.confidenceThreshold 同源同值。
+      min_confidence: readNumberEnv(env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD, 0.95),
+      auto_approve: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
+    },
+    personaEvolution: { auto_approve: env.NEWIDE_B_PERSONA_AUTO_APPROVE === '1' },
+  };
+}
+
+/**
  * 手动补跑口（CLI：`newide memory drain`）。
  *
- * 用与 boot 相同的装配把三条消费通道各跑一轮，然后关掉存储——因此它跑的是**同一套** worker、
+ * 用与 boot 相同的装配把五条通道各跑一轮，然后关掉存储——因此它跑的是**同一套** worker / job、
  * 同一个 run store、同一份 evidence 落点，而不是另写一条「近似」的路径。存在的理由：定时消费的
  * 周期缺省与维护周期一致（1 小时），而「刚跑完一个任务、想立刻看到经验入库」不该只能等。
  *
@@ -730,6 +751,7 @@ export async function drainMemoryDeliveriesOnce(
         path.join(bRuntime.app_state_root, 'b', 'maintenance'),
       ),
       llm: memoryLlm,
+      ...readMemoryJobOptions(env),
     });
     return await consumers.runOnce(options);
   } finally {

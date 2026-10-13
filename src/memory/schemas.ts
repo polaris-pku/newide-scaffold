@@ -376,6 +376,19 @@ export const ExperiencePromotionSchema = z.object({
   outcome: PromotionOutcomeSchema.optional(),
   /** 做出该结论的策略版本；版本变了，同一条经验可以被重新评估 */
   strategy_version: z.string().optional(),
+  /**
+   * 判定所依据的那份输入指纹（经验上参与判定的字段的规范摘要，见
+   * `promotionInputSnapshotHash`）。
+   *
+   * 与 `strategy_version` 一起构成「这条结论还作不作数」的**两个**判据：版本变了、或输入变了，
+   * 才重评；两者都没变就跳过。少了这一个，一条刚提取出来（置信度还低）的经验会在第一次被看到
+   * 的那一轮就被判 `rejected` 并**永久冻结**——之后 Driver 反馈把置信度抬过门槛也不会再有人
+   * 看它一眼。那正是「置信度靠反馈滚雪球、最终过门槛」这条故事的反面。
+   *
+   * 缺席 = 这个字段出现之前判的结论，按「输入变过」处理，重评一次（与「读不懂就重评」同一条
+   * 取舍：多评一次的代价，远小于一条经验永远不再被考虑）。
+   */
+  input_snapshot_hash: z.string().optional(),
   /** 结论产生的时刻 */
   evaluated_at: z.iso.datetime().optional(),
   /** 晋升出的 Skill id；只在 `outcome === 'promoted'` 时有值，且与 Experience.promoted_to 一致 */

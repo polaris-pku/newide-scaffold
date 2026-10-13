@@ -216,6 +216,14 @@ export interface PromotionCompletionRequest {
   outcome: PromotionOutcome;
   /** 做出这个结论的策略版本 */
   strategy_version: string;
+  /**
+   * 判定所依据的输入指纹（见 `promotionInputSnapshotHash`）。
+   *
+   * 与 `strategy_version` 并列而不是可省的：下一次运行要靠它回答「这条结论还作不作数」。
+   * 少了它，一条被判 `rejected` 的经验只要策略版本没变就永远不再被考虑——包括它的置信度后来
+   * 被反馈抬过了门槛。
+   */
+  input_snapshot_hash: string;
   /** 结论的人读理由 */
   reasons?: string[];
   /** 晋升出的 Skill id；`outcome === 'promoted'` 时必填，其余结论**不接受**（传了也不落） */

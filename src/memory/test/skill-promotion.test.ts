@@ -9,6 +9,7 @@ import {
 import {
   comparePromotionCandidates,
   planPromotionCandidate,
+  promotionInputSnapshotHash,
   promotionStateLabel,
   selectPromotionCandidates,
 } from '../services/promotion-candidates';
@@ -802,16 +803,56 @@ describe('候选规则（planPromotionCandidate / selectPromotionCandidates）',
     });
   });
 
-  it('同一策略版本下已拒绝的不重评，换版本后重评', () => {
-    const rejected = makeExperience({ promotion: marker({ outcome: 'rejected' }) });
+  it('同一策略版本下已拒绝的：输入没变不重评，输入变过就重评', () => {
+    const experience = makeExperience({ promotion: marker({ outcome: 'rejected' }) });
+    // 指纹缺席（这一版字段出现之前判下的结论）按「输入变过」处理：重评一次，而不是永远搁着
+    // ——多评一次的代价，远小于一条经验永远不再被考虑
+    expect(planPromotionCandidate(experience, candidateInput()).kind).toBe('reevaluate_then_claim');
 
-    expect(planPromotionCandidate(rejected, candidateInput())).toEqual({
+    // 记下判定当时的输入：同一份输入不再重评。这里必须从**同一条** experience 派生——
+    // 另造一条 `makeExperience()` 会拿到毫秒不同的 `updated_at`，而它也在指纹里，断言于是
+    // 变成「两次 `new Date()` 会不会落在同一毫秒」的掷骰子（CI 上就是这样红的）。
+    const judged = {
+      ...experience,
+      promotion: marker({
+        outcome: 'rejected',
+        input_snapshot_hash: promotionInputSnapshotHash(experience),
+      }),
+    };
+    expect(planPromotionCandidate(judged, candidateInput())).toEqual({
       kind: 'skip',
       reason: 'evaluated_under_current_strategy',
     });
 
     const newer = candidateInput({ strategy_version: 'promotion-threshold.v2' });
-    expect(planPromotionCandidate(rejected, newer).kind).toBe('reevaluate_then_claim');
+    expect(planPromotionCandidate(judged, newer).kind).toBe('reevaluate_then_claim');
+  });
+
+  it('判完之后置信度被反馈抬上来，这条 rejected 会被重评——判据是输入内容，不是轮次', () => {
+    const before = makeExperience({ confidence: 0.5 });
+    const promotion = marker({
+      outcome: 'rejected',
+      input_snapshot_hash: promotionInputSnapshotHash(before),
+    });
+
+    // 同一份输入：不重评
+    expect(planPromotionCandidate({ ...before, promotion }, candidateInput())).toEqual({
+      kind: 'skip',
+      reason: 'evaluated_under_current_strategy',
+    });
+
+    // 同一个 id、同一版策略，只有置信度与 updated_at 变了 —— 这正是反馈回写的形状。
+    // 少了这一条重评，晋升通道就变成「一次定终身」：第一次看到时置信度还低的经验永远翻不了身。
+    const afterFeedback = {
+      ...before,
+      confidence: 0.98,
+      referenced_count: 1,
+      updated_at: new Date(Date.parse(before.updated_at) + 1_000).toISOString(),
+      promotion,
+    };
+    expect(planPromotionCandidate(afterFeedback, candidateInput()).kind).toBe(
+      'reevaluate_then_claim',
+    );
   });
 
   it('判为待审核的经验：人工审核模式下不再重评，转自动批准后重评', () => {
@@ -946,6 +987,7 @@ describe('人工审核模式不写 Skill', () => {
       claim_token: claimed!.claim_token,
       outcome: 'pending_review',
       strategy_version: decision.strategy_version,
+      input_snapshot_hash: promotionInputSnapshotHash(experience),
       reasons: decision.reasons,
       now: EVAL_NOW,
     });

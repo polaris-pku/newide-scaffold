@@ -47,6 +47,14 @@ import type { ExperienceRecord } from '../schemas';
 const NOW = '2026-10-10T12:00:00.000Z';
 const LEASE_MS = 60_000;
 const STRATEGY_VERSION = DEFAULT_PROMOTION_STRATEGY_VERSION;
+/**
+ * 直接调 `completePromotion` 时要给的输入指纹。
+ *
+ * 这些用例考的是状态机（fencing、条件写、引用校验），不考候选重评，所以给个固定值就够。但它
+ * **不能省**：字段是必填的，而它存在的理由恰恰是「判过的结论在输入变化之后还能不能重开」
+ * （见 promotion-candidates.ts 的 promotionInputSnapshotHash）。要考那条规则请用真实指纹。
+ */
+const INPUT_SNAPSHOT_HASH = 'sha256:test-input-snapshot';
 
 function makeExperience(role_id: string, overrides: Partial<ExperienceRecord> = {}): ExperienceRecord {
   const now = nowTimestamp();
@@ -208,6 +216,7 @@ function runPromotionStateContract(
         experience_id: experience.id,
         claim_token: claimed.claim_token,
         outcome: 'promoted',
+        input_snapshot_hash: INPUT_SNAPSHOT_HASH,
         strategy_version: STRATEGY_VERSION,
         skill_id: skill.id,
         reasons: ['qualifies'],
@@ -273,6 +282,7 @@ function runPromotionStateContract(
             experience_id: experience.id,
             claim_token: claimed.claim_token,
             outcome: 'promoted',
+            input_snapshot_hash: INPUT_SNAPSHOT_HASH,
             strategy_version: STRATEGY_VERSION,
             skill_id,
             reasons: ['qualifies'],
@@ -318,6 +328,7 @@ function runPromotionStateContract(
           experience_id: experience.id,
           claim_token: claimed.claim_token,
           outcome: 'promoted',
+          input_snapshot_hash: INPUT_SNAPSHOT_HASH,
           strategy_version: STRATEGY_VERSION,
           skill_id: skill.id,
           reasons: ['qualifies'],
@@ -346,6 +357,7 @@ function runPromotionStateContract(
           experience_id: experience.id,
           claim_token: claimed.claim_token,
           outcome: 'promoted',
+          input_snapshot_hash: INPUT_SNAPSHOT_HASH,
           strategy_version: STRATEGY_VERSION,
           skill_id: skill.id,
           reasons: ['qualifies'],
@@ -379,6 +391,7 @@ function runPromotionStateContract(
         experience_id: experience.id,
         claim_token: claimed.claim_token,
         outcome: 'promoted',
+        input_snapshot_hash: INPUT_SNAPSHOT_HASH,
         strategy_version: STRATEGY_VERSION,
         skill_id: skill.id,
         reasons: ['qualifies'],
@@ -435,6 +448,7 @@ function runPromotionStateContract(
           experience_id: experience.id,
           claim_token: claimed.claim_token,
           outcome: 'promoted',
+          input_snapshot_hash: INPUT_SNAPSHOT_HASH,
           strategy_version: STRATEGY_VERSION,
           skill_id: foreign.id,
           now: addMilliseconds(NOW, 1_000),
@@ -465,6 +479,7 @@ function runPromotionStateContract(
         experience_id: experience.id,
         claim_token: claimed.claim_token,
         outcome: 'rejected',
+        input_snapshot_hash: INPUT_SNAPSHOT_HASH,
         strategy_version: STRATEGY_VERSION,
         skill_id: skill.id,
         reasons: ['below_confidence_threshold'],
@@ -486,6 +501,7 @@ function runPromotionStateContract(
           experience_id: claimed.experience.id,
           claim_token: claimed.claim_token,
           outcome: 'promoted',
+          input_snapshot_hash: INPUT_SNAPSHOT_HASH,
           strategy_version: STRATEGY_VERSION,
           now: NOW,
         }),
@@ -502,6 +518,7 @@ function runPromotionStateContract(
           experience_id: claimed.experience.id,
           claim_token: 'claim_someone_else',
           outcome: 'rejected',
+          input_snapshot_hash: INPUT_SNAPSHOT_HASH,
           strategy_version: STRATEGY_VERSION,
           now: NOW,
         }),
@@ -634,6 +651,7 @@ function runPromotionStateContract(
           experience_id: claimed.experience.id,
           claim_token: claimed.claim_token,
           outcome: 'rejected',
+          input_snapshot_hash: INPUT_SNAPSHOT_HASH,
           strategy_version: STRATEGY_VERSION,
           now: expiredAt,
         }),

@@ -37,8 +37,9 @@ import {
   type ExperienceExtractor,
   type LlmClient,
   type MemoryDeliveryRepository,
+  type MemoryRepository,
 } from '../../src/memory';
-import type { BufferSnapshot } from '../../src/memory/schemas';
+import type { BufferSnapshot, ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
 import type { CandidateExperience, ExtractionOutput } from '../../src/memory/types';
 
 const ROLE = 'role_consumers';
@@ -58,12 +59,14 @@ async function tempRoot(): Promise<string> {
   return root;
 }
 
-/** 提取器替身：这一层不考提取质量，只要「产出几条经验」可控 */
-function scriptedExtractor(count = 1): ExperienceExtractor {
+/** 提取器替身：这一层不考提取质量，只要「产出几条经验」与它们的置信度可控 */
+function scriptedExtractor(count = 1, confidence = 0.6): ExperienceExtractor {
   return {
     extract(): Promise<ExtractionOutput> {
       return Promise.resolve({
-        experiences: Array.from({ length: count }, (_unused, index) => candidateExperience(index)),
+        experiences: Array.from({ length: count }, (_unused, index) =>
+          candidateExperience(index, confidence),
+        ),
         result: {
           experiences_created: count,
           experiences_updated: 0,
@@ -75,15 +78,53 @@ function scriptedExtractor(count = 1): ExperienceExtractor {
   };
 }
 
-function candidateExperience(index: number): CandidateExperience {
+function candidateExperience(index: number, confidence = 0.6): CandidateExperience {
   return {
     id: randomUUID(),
     description: `experience ${String(index)}`,
     description_embedding: [0.1, 0.2, 0.3],
     content: `content ${String(index)}`,
-    confidence: 0.6,
+    confidence,
     tags: ['delivery-consumer'],
     confidence_history: [],
+    referenced_count: 0,
+    source_task_id: TASK_ID,
+    source_driver: 'acp-external',
+    type: 'positive',
+    created_at: START,
+    updated_at: START,
+  };
+}
+
+/** 一条已批准、可作演化输入的 Skill（`promoted_from` 缺席：它不指向任何经验） */
+function approvedSkill(): SkillRecord {
+  return {
+    id: randomUUID(),
+    description: 'Prefer explicit contracts over implicit conventions.',
+    description_embedding: [0.1, 0.2, 0.3],
+    content: 'full skill content body',
+    version: '1.0.0',
+    review_status: 'approved',
+    tags: ['delivery-consumer'],
+    promoted_at: START,
+    agent_id: ROLE,
+    market_status: 'available',
+    created_at: START,
+    updated_at: START,
+  };
+}
+
+/** 一条直接落库的经验（绕开提取，用来给晋升 / 演化摆好输入） */
+function seededExperience(confidence: number): ExperienceRecord {
+  return {
+    id: randomUUID(),
+    description: 'seeded experience',
+    description_embedding: [0.1, 0.2, 0.3],
+    content: 'seeded content',
+    confidence,
+    tags: ['delivery-consumer'],
+    agent_id: ROLE,
+    confidence_history: [{ value: confidence, updated_at: START, reason: 'seed' }],
     referenced_count: 0,
     source_task_id: TASK_ID,
     source_driver: 'acp-external',
@@ -111,6 +152,10 @@ interface Harness {
   consumers(overrides?: {
     extractor?: ExperienceExtractor;
     delivery?: MemoryDeliveryRepository;
+    /** 换一个读不动的仓储，用来考一条通道失败时的隔离 */
+    repository?: MemoryRepository;
+    promotion?: { min_confidence?: number; auto_approve?: boolean };
+    personaEvolution?: { auto_approve?: boolean };
     schedule?: (handler: () => void, ms: number) => ReturnType<typeof setInterval>;
     cancel?: (timer: ReturnType<typeof setInterval>) => void;
   }): MemoryDeliveryConsumers;
@@ -179,13 +224,19 @@ async function harness(): Promise<Harness> {
     },
     consumers(overrides = {}) {
       return new MemoryDeliveryConsumers({
-        repository,
+        repository: overrides.repository ?? repository,
         bufferRepository: buffer,
         deliveryRepository: overrides.delivery ?? delivery,
         runStore,
         evidenceStore,
         llm: unusedLlm,
         extractor: overrides.extractor ?? scriptedExtractor(1),
+        // 两条 job 通道的审核模式缺省是手动——夹具里不显式打开时，缺省就是「只记结论」，
+        // 那正是要被测到的行为之一，因此这里不做任何「测试一律自动批准」的偷懒默认。
+        ...(overrides.promotion !== undefined ? { promotion: overrides.promotion } : {}),
+        ...(overrides.personaEvolution !== undefined
+          ? { personaEvolution: overrides.personaEvolution }
+          : {}),
         // 刻意**不**注入假时钟：交付项的 `next_attempt_at` 是 runner 登记时按真实时间写的，
         // 拿一个更早的参考时刻去 claim 会永远读不到「到期」，测出来的是夹具的时钟差，
         // 不是消费逻辑。
@@ -401,6 +452,146 @@ describe('MemoryDeliveryConsumers — 提取器不给经验时的 evidence', () 
     expect((await h.repository.listExperiences(ROLE)).map((item) => item.id).sort()).toEqual(
       [stableExperienceId(ROLE, 1, 0), stableExperienceId(ROLE, 2, 0)].sort(),
     );
+  });
+});
+
+describe('MemoryDeliveryConsumers — 晋升通道（Phase 3）', () => {
+  it('同一轮里反馈先把置信度抬过门槛，晋升随即命中（通道顺序是承重的）', async () => {
+    const h = await harness();
+    const seq = await h.schedule();
+    // 提取出来的经验只有 0.88：单看它不合格——判据是**严格大于** 0.95。这正是「经验刚被提取
+    // 出来」的样子，置信度还没被任何反馈抬过。
+    const consumers = h.consumers({
+      extractor: scriptedExtractor(1, 0.88),
+      promotion: { auto_approve: true },
+    });
+    const [feedback] = buildDriverUsageFeedbackRecords({
+      role_id: ROLE,
+      task_id: TASK_ID,
+      observed_at: START,
+      references: [
+        {
+          experience_id: stableExperienceId(ROLE, seq, 0),
+          applied: true,
+          effectiveness: 'fully_effective',
+          note: 'reused it successfully',
+        },
+      ],
+    });
+    await h.delivery.submitDriverFeedback(feedback!);
+
+    const report = await consumers.runOnce();
+
+    expect(report.channels.driver_feedback.status).toBe('completed');
+    expect(report.channels.skill_promotion.status).toBe('completed');
+    expect(report.channels.skill_promotion.approval).toBe('auto_approve');
+
+    // 反馈先落：0.88 + 0.1 → 0.98（封顶）
+    const experiences = await h.repository.listExperiences(ROLE);
+    expect(experiences[0]!.confidence).toBeCloseTo(0.98, 6);
+
+    // 晋升后落：同一轮里它看到的就是抬过之后的置信度。把这条排到 `driver_feedback` 前面，
+    // 它看到的会是 0.88 并判不合格，这条断言随即失败——顺序保的就是这件事。
+    const skills = await h.repository.listSkills(ROLE);
+    expect(skills).toHaveLength(1);
+    expect(experiences[0]!.promoted_to).toBe(skills[0]!.id);
+    expect(experiences[0]!.promotion?.outcome).toBe('promoted');
+  });
+
+  it('缺省手动：只记待审结论、不写 Skill；开关打开后下一轮把它接起来', async () => {
+    const h = await harness();
+    await h.schedule();
+    const consumers = h.consumers({ extractor: scriptedExtractor(1, 0.99) });
+
+    const first = await consumers.runOnce();
+
+    expect(first.channels.skill_promotion.status).toBe('completed');
+    // 报告必须带 `approval`：`completed_count` 把 promoted 与 pending_review 算在同一格里，
+    // 少了它，「这轮到底产出了没有」从计数上读不出来。
+    expect(first.channels.skill_promotion.approval).toBe('manual_review');
+    expect(await h.repository.listSkills(ROLE)).toEqual([]);
+    const marked = (await h.repository.listExperiences(ROLE))[0]!;
+    expect(marked.promotion?.outcome).toBe('pending_review');
+    expect(marked.promoted_to).toBeUndefined();
+
+    // 放宽成自动批准：这是人工放行的**唯一**一条路——`listPendingReviews` 认的是 Skill 上的
+    // `review_status`，而手动模式下根本不写 Skill，那条队列里不会有它。
+    const loosened = h.consumers({
+      extractor: scriptedExtractor(1, 0.99),
+      promotion: { auto_approve: true },
+    });
+    const second = await loosened.runOnce();
+
+    expect(second.channels.skill_promotion.status).toBe('completed');
+    expect(await h.repository.listSkills(ROLE)).toHaveLength(1);
+  });
+});
+
+describe('MemoryDeliveryConsumers — 人格演化通道（Phase 4）', () => {
+  it('写出新版本并落标记；同一份输入再跑一轮是幂等命中', async () => {
+    const h = await harness();
+    // 演化只吃**已批准**的输入
+    await h.repository.saveSkillIfAbsent(ROLE, approvedSkill());
+    await h.repository.saveExperience(ROLE, seededExperience(0.9));
+
+    const consumers = h.consumers({ personaEvolution: { auto_approve: true } });
+    const before = await h.repository.getPersona(ROLE);
+
+    const report = await consumers.runOnce({ channels: ['persona_evolution'] });
+
+    expect(report.channels.persona_evolution.status).toBe('completed');
+    expect(report.channels.persona_evolution.approval).toBe('auto_approve');
+    expect(report.channels.persona_evolution.strategy_version).toBeDefined();
+
+    const after = await h.repository.getPersona(ROLE);
+    expect(after.version).toBe(before.version + 1);
+    const marker = await h.repository.getPersonaEvolutionMarker(ROLE);
+    expect(marker?.outcome).toBe('evolved');
+    expect(marker?.source_run_id).toBe(report.channels.persona_evolution.run_id);
+
+    // 同一份输入、同一版策略：没有活，版本不动
+    const again = await consumers.runOnce({ channels: ['persona_evolution'] });
+    expect(again.channels.persona_evolution.status).toBe('no_work');
+    expect((await h.repository.getPersona(ROLE)).version).toBe(after.version);
+  });
+});
+
+describe('MemoryDeliveryConsumers — 新通道的失败隔离与演练', () => {
+  it('一条 job 通道读不动存储只让它自己 failed，另外四条照常跑完', async () => {
+    const h = await harness();
+    await h.schedule();
+
+    const broken = Object.create(h.repository) as MemoryRepository;
+    broken.claimNextPromotionCandidate = async () => {
+      throw new Error('promotion store is unreadable');
+    };
+
+    const report = await h.consumers({ repository: broken }).runOnce();
+
+    expect(report.channels.skill_promotion.status).toBe('failed');
+    expect(report.channels.skill_promotion.error?.message).toContain('unreadable');
+    // 失败隔离：它自己 failed，而另外四条不是 failed，也不是没接线
+    expect(report.channels.context_delivery.status).toBe('completed');
+    expect(report.channels.driver_feedback.status).toBe('no_work');
+    expect(report.channels.persona_evolution.status).not.toBe('failed');
+  });
+
+  it('--dry-run 点名了不可演练的通道就整轮拒绝，一条都不跑', async () => {
+    const h = await harness();
+    await h.schedule();
+
+    await expect(h.consumers().runOnce({ dry_run: true })).rejects.toThrow(/dry_run/);
+    // 拒绝发生在任何通道开跑之前：队列一条都没被消费
+    expect(await h.buffer.listPendingBufferSeqs(ROLE)).toEqual([1]);
+
+    const report = await h.consumers().runOnce({
+      dry_run: true,
+      channels: ['persona_evolution'],
+    });
+    expect(report.channels.persona_evolution.dry_run).toBe(true);
+    expect(report.channels.persona_evolution.status).toBe('no_work');
+    expect(report.channels.context_delivery.status).toBe('not_run');
+    expect(await h.buffer.listPendingBufferSeqs(ROLE)).toEqual([1]);
   });
 });
 
