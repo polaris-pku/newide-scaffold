@@ -13,6 +13,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { nowTimestamp } from '../../core';
 import { DEFAULT_PROMOTION_STRATEGY_VERSION } from '../adapters/default-promotion-strategy';
+import { promotionInputSnapshotHash } from '../services/promotion-candidates';
 import { HashEmbeddingProvider } from '../adapters/hash-embedding-provider';
 import { PgMemoryRepository } from '../adapters/pg-memory-repository';
 import { ensurePgMemorySchema } from '../adapters/pg-memory-schema';
@@ -870,6 +871,7 @@ describe('PgMemoryRepository on embedded PGlite', () => {
       claim_token: claimed.claim_token,
       outcome: 'promoted',
       strategy_version: DEFAULT_PROMOTION_STRATEGY_VERSION,
+      input_snapshot_hash: promotionInputSnapshotHash(experience),
       skill_id: skill.id,
       reasons: ['qualifies'],
       now: '2026-10-10T12:00:01.000Z',

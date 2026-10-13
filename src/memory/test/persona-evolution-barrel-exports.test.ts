@@ -22,7 +22,8 @@
  * - **共享规则模块是允许的**：`delivery-lifecycle`（状态机）与 `delivery-error-classification`
  *   （失败码）是四条通道共用的那套规则，演化复用它们正是「没有第二套状态机」的落点，因此
  *   不在禁止名单里；被禁的是两条**消费者**、晋升通道、Buffer / 交付 outbox 与在线装配。
- * - Phase 5 把演化接进调度器时，这条绊线**应该**要改（改的是它，不是把 import 藏起来）。
+ * - 这条绊线**已经改过一次**：Phase 5 的调度接线落地时，`src/app` 那条从「一个都不许有」
+ *   改成了「只许有离线装配模块一个」（见下面那条断言）。改的是断言本身，不是把 import 藏起来。
  */
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -502,7 +503,7 @@ describe('Persona 演化与在线流程的耦合边界', () => {
     expect(violations).toEqual([]);
   });
 
-  it('组合根（src/app）里没有演化 job 的任何影子：调度接线属于 Phase 5', async () => {
+  it('演化 job 在 src/app 里只有一个落点：离线装配模块', async () => {
     const root = fileURLToPath(new URL('../../app/', import.meta.url));
     const entries = await readdir(root, { recursive: true });
     const hits: string[] = [];
@@ -511,9 +512,13 @@ describe('Persona 演化与在线流程的耦合边界', () => {
       const text = await readFile(join(root, entry), 'utf8');
       if (/persona-evolution|DefaultPersonaEvolutionJob/.test(text)) hits.push(entry);
     }
-    // 一旦有人把它接进在线装配，这里先红——那时要改的是这条断言（有意识地接线），
-    // 而不是把接线藏进动态 import
-    expect(hits).toEqual([]);
+    // Phase 5 的调度接线已经落地：演化 job 由**离线装配模块**构造并挂在同一条时间线上。
+    // 于是这条断言从「一个都不许有」收紧成「只许有它一个」——名单写死是有意的：多出第二个
+    // 位置就说明有人绕开装配另起了一条路径，而那正是这条绊线要拦的事。真要再加一个落点，
+    // 改的是这份名单（有意识地接线），而不是把 import 藏进动态 import。
+    expect(hits.map((entry) => entry.split(/[\\/]/).pop()).sort()).toEqual([
+      'b-memory-delivery-consumers.ts',
+    ]);
 
     // 扫描器本身是活的：拿一个**确实**含这个名字的目录（本模块自己）跑同一段判据，
     // 它必须报出来。否则上面那条空数组可能只是「什么都没扫到」

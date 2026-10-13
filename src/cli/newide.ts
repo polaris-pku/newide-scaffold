@@ -10,7 +10,10 @@ import {
   materializeRuntimeEnv,
   runBackendRpcMain,
 } from '../app/backend-rpc-stdio';
-import type { MemoryDeliveryChannel } from '../app/b-memory-delivery-consumers';
+import {
+  DRY_RUNNABLE_CHANNELS,
+  type MemoryDeliveryChannel,
+} from '../app/b-memory-delivery-consumers';
 import type { NewideBackendService } from '../app/newide-backend-service';
 import type { RunSnapshot } from '../protocol/run-snapshot';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
@@ -64,10 +67,18 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
  * PGlite 单写者，后端开着时这里打不开库。
  */
 async function runMemoryDrainCli(args: string[]): Promise<number> {
+  // `--help` 必须在这里被拦住：不拦的话它会落到下面「按缺省跑一轮」上——一个问用法的人
+  // 顺手把队列真消费掉了。这与 `--dry-run` 那条「不许静默跑真格」是同一条理由。
+  if (args.includes('--help') || args.includes('-h')) {
+    writeUsage();
+    return 0;
+  }
   try {
     const stateRoot = readOptionalFlag(args, '--state-root') ?? path.join(process.cwd(), '.newide');
     const roleId = readOptionalFlag(args, '--role');
-    const channels = parseChannelSelection(readRepeatedFlag(args, '--channel'));
+    const dryRun = args.includes('--dry-run');
+    const requested = parseChannelSelection(readRepeatedFlag(args, '--channel'));
+    const channels = dryRun ? resolveDryRunChannels(requested) : requested;
     const batchSizeRaw = readOptionalFlag(args, '--batch-size');
     const batchSize = batchSizeRaw ? parsePositiveInteger(batchSizeRaw, '--batch-size') : undefined;
 
@@ -78,6 +89,7 @@ async function runMemoryDrainCli(args: string[]): Promise<number> {
       ...(roleId !== undefined ? { role_id: roleId } : {}),
       ...(channels !== undefined ? { channels } : {}),
       ...(batchSize !== undefined ? { batch_size: batchSize } : {}),
+      ...(dryRun ? { dry_run: true } : {}),
     });
     process.stdout.write(
       `${JSON.stringify({ contract_version: MEMORY_DRAIN_CLI_CONTRACT, ...report }, null, 2)}\n`,
@@ -98,10 +110,10 @@ async function runMemoryDrainCli(args: string[]): Promise<number> {
 /**
  * 解析 `--channel` 的选择：接受通道全名、日常简写，以及 `all`。
  *
- * 简写存在的理由：`context` / `feedback` / `pending` 是运维嘴里说的三个名字，而
- * `context_delivery` / `driver_feedback` / `feedback_reconcile` 是 run 记录里的 `job_type`。
- * 两个都收，避免「记得住名字才用得了」。非法值当场报错而不是静默忽略——打错一个通道名却
- * 以为跑过了，比跑不起来更贵。
+ * 简写存在的理由：`context` / `feedback` / `pending` / `promotion` / `evolution` 是运维嘴里说的
+ * 名字，而 `context_delivery` / `driver_feedback` / `feedback_reconcile` / `skill_promotion` /
+ * `persona_evolution` 是 run 记录里的 `job_type`。两个都收，避免「记得住名字才用得了」。
+ * 非法值当场报错而不是静默忽略——打错一个通道名却以为跑过了，比跑不起来更贵。
  */
 function parseChannelSelection(values: readonly string[]): MemoryDeliveryChannel[] | undefined {
   if (values.length === 0) return undefined;
@@ -113,6 +125,12 @@ function parseChannelSelection(values: readonly string[]): MemoryDeliveryChannel
     pending: 'feedback_reconcile',
     pending_feedback: 'feedback_reconcile',
     feedback_reconcile: 'feedback_reconcile',
+    promotion: 'skill_promotion',
+    skill: 'skill_promotion',
+    skill_promotion: 'skill_promotion',
+    evolution: 'persona_evolution',
+    persona: 'persona_evolution',
+    persona_evolution: 'persona_evolution',
   };
   const selected = new Set<MemoryDeliveryChannel>();
   for (const raw of values.flatMap((value) => value.split(','))) {
@@ -122,12 +140,31 @@ function parseChannelSelection(values: readonly string[]): MemoryDeliveryChannel
     const channel = aliases[token];
     if (!channel) {
       throw new Error(
-        `Unknown --channel "${token}"; expected one of context, feedback, pending, all`,
+        `Unknown --channel "${token}"; expected one of context, feedback, pending, promotion, evolution, all`,
       );
     }
     selected.add(channel);
   }
   return selected.size > 0 ? [...selected] : undefined;
+}
+
+/**
+ * `--dry-run` 只对两条 job 通道成立（它们有「照常判定但不落地」这个模式）。
+ *
+ * 没指定 `--channel` 时默认跑那两条，并在 stderr 上说清这一次跑的是哪几条——**不能**默认成
+ * 「五条一起演练」：另外三条没有演练模式，跑真格就等于把队列消费掉，而那正是想演练的人要避开的
+ * 事。显式点名了不可演练的通道时交给库去拒绝（判据只有那一个地方），CLI 不替它过滤——静默丢掉
+ * 一条通道的选择，比报错贵得多。
+ */
+function resolveDryRunChannels(
+  requested: MemoryDeliveryChannel[] | undefined,
+): MemoryDeliveryChannel[] | undefined {
+  if (requested !== undefined) return requested;
+  const channels: MemoryDeliveryChannel[] = [...DRY_RUNNABLE_CHANNELS];
+  process.stderr.write(
+    `[newide] --dry-run applies to ${channels.join(', ')}; running only those. Pass --channel to widen, but the outbox channels have no dry-run mode.\n`,
+  );
+  return channels;
 }
 
 /** 收集一个可重复出现的旗标的全部取值（`--channel a --channel b`）；缺省为空数组。 */
@@ -460,12 +497,20 @@ function writeUsage(): void {
       '  newide serve --stdio [--state-root PATH]',
       '  newide council run --request FILE',
       '  newide council run --workspace ABS --prompt TEXT [--state-root PATH] [--allow-degraded]',
-      '  newide memory drain [--state-root PATH] [--role ROLE] [--channel NAME] [--batch-size N]',
+      '  newide memory drain [--state-root PATH] [--role ROLE] [--channel NAME] [--batch-size N] [--dry-run]',
       '',
-      'newide memory drain consumes the memory-maintenance outboxes once (context deliveries,',
-      'driver feedback, pending feedback). --channel accepts context | feedback | pending | all',
-      'and may be repeated or comma-separated. It needs the backend to be stopped (the experience',
-      'store is single-writer).',
+      'newide memory drain runs the memory-maintenance offline half once: consuming the two',
+      'outboxes (context deliveries, driver feedback, pending feedback) and then the two jobs',
+      'that scan derived candidates (skill promotion, persona evolution). --channel accepts',
+      'context | feedback | pending | promotion | evolution | all and may be repeated or',
+      'comma-separated.',
+      '',
+      '--dry-run only applies to the two job channels: it screens and judges candidates without',
+      'claiming, writing a Skill or bumping a Persona version. With no --channel it runs those',
+      'two alone (the outbox channels have no dry-run mode); naming one of them alongside',
+      '--dry-run is an error rather than a silent real run.',
+      '',
+      'It needs the backend to be stopped (the experience store is single-writer).',
       '',
     ].join('\n'),
   );

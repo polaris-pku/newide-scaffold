@@ -916,7 +916,7 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       expect(await repository.listSkills(role_id)).toHaveLength(1);
     });
 
-    it('判定不合格：记 rejected，不写 Skill，同一策略版本下不重评', async () => {
+    it('判定不合格：记 rejected，不写 Skill，同一策略版本 + 同一份输入下不重评', async () => {
       await seedExperiences(repository, role_id, 1, { confidence: 0.5 });
 
       const result = await job().run();
@@ -934,6 +934,40 @@ function runSkillPromotionJobSuite(storeCase: JobStoreCase): void {
       const again = await job().run();
       expect(again.counts.claimed_count).toBe(0);
       expect(again.outcomes).toHaveLength(0);
+    });
+
+    it('判过之后置信度被反馈抬过门槛：这条 rejected 会被重评并晋升', async () => {
+      // 0.88 在门槛之下（判据是**严格大于** 0.95），所以第一次看到它时会判不合格 ——
+      // 这正是「经验刚被提取出来」的样子：置信度还没被任何反馈抬过。
+      const seeded = await seedExperiences(repository, role_id, 1, { confidence: 0.88 });
+      const experience = seeded[0]!;
+
+      const first = await job().run();
+      expect(first.outcomes[0]?.status).toBe('rejected');
+      expect(await repository.listSkills(role_id)).toHaveLength(0);
+
+      // 唯一变的是这条经验自己的输入：一条 fully_effective 的反馈把它抬到 0.98（封顶）
+      const applied = await repository.applyExperienceFeedback(role_id, {
+        feedback_id: 'drvfb_promotion_reevaluation',
+        experience_id: experience.id,
+        applied: true,
+        effectiveness: 'fully_effective',
+        note: 'reused it successfully',
+        observed_at: '2026-10-10T02:00:00.000Z',
+        feedback_source: 'driver_usage',
+      });
+      expect(applied.outcome).toBe('applied');
+
+      // 同一策略版本、同一个 job，**没有任何人显式要求重评** —— 输入变了就该重开。
+      // 少了这条重评，「反馈滚雪球直到跨过门槛」这条故事在按周期扫的通道上就不成立：
+      // 一条经验只会在它置信度还低的那一轮被判死，之后再没人看它一眼。
+      const second = await job().run();
+      expect(second.outcomes.map((item) => item.status)).toEqual(['promoted']);
+      expect(await repository.listSkills(role_id)).toHaveLength(1);
+
+      const promoted = await storedExperience(experience.id);
+      expect(promoted?.promotion?.outcome).toBe('promoted');
+      expect(promoted?.promoted_to).toBeDefined();
     });
 
     it('可重试失败：退避回队列，跨过退避窗口后被重投并晋升', async () => {

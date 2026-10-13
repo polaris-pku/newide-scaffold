@@ -89,6 +89,7 @@ import {
 } from './delivery-error-classification';
 import type { DeliveryRetryPolicy } from './delivery-lifecycle';
 import { isPromotionSkillIntegrityError } from './promotion-integrity';
+import { promotionInputSnapshotHash } from './promotion-candidates';
 import type {
   ClaimedPromotionCandidate,
   MemoryRepository,
@@ -243,6 +244,9 @@ export async function executePromotionCandidate(
       // 结果，但取这一个让「run 记的版本 = 经验记的版本 = 真正判定用的版本」在写入口就是
       // 同一个来源，而不是靠三处各自传递得恰好一致
       strategy_version: deps.strategy.version,
+      // 指纹取**这条候选当时的输入**：下一次运行拿它和当前输入比，才能回答「这条结论还作不作数」。
+      // 不记的话，一条 rejected 会冻结到策略换版为止——包括它的置信度后来被反馈抬过了门槛。
+      input_snapshot_hash: promotionInputSnapshotHash(experience),
       reasons: decision.reasons,
       skill_id: saved.skill.id,
       now,
@@ -716,6 +720,7 @@ async function settleDecision(
       ...(deps.owner !== undefined ? { owner: deps.owner } : {}),
       outcome,
       strategy_version: decision.strategy_version,
+      input_snapshot_hash: promotionInputSnapshotHash(experience),
       reasons: decision.reasons,
       now,
     });

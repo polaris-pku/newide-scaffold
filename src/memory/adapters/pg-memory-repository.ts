@@ -1327,6 +1327,7 @@ export class PgMemoryRepository implements MemoryRepository {
             ...marker,
             outcome: request.outcome,
             strategy_version: request.strategy_version,
+            input_snapshot_hash: request.input_snapshot_hash,
             evaluated_at: request.now,
             skill_id: promotedTo,
             reasons: request.reasons,
