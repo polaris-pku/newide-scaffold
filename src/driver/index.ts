@@ -16,3 +16,4 @@ export * from './adp-invocation-state';
 export * from './adp-status-mapping';
 export * from './adp-retry-policy';
 export * from './adp-driver-endpoint';
+export * from './driver-probe-service';
