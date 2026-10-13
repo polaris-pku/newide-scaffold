@@ -21,6 +21,7 @@ export interface DriverRuntimeInvokerInput {
   run_id?: string;
   workspace_path?: string;
   session_id?: string;
+  resume_session?: boolean;
   call_id: string;
   source_driver: string;
   driver_context: {
@@ -117,6 +118,18 @@ export function createDriverRuntimeInvoker(
 }
 
 function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
+  if (input.resume_session) {
+    if (!input.session_id) throw new Error('Native continuation requires a session ID');
+    return [
+      'Continue the interrupted task in this loaded session. Use your existing conversation and the files already present; do not restart completed work.',
+      'The previous interruption ended only the earlier turn. This is an active request to finish the remaining work.',
+      'Verify the actual workspace before reporting completion. Do not claim a file was written unless it exists.',
+      '',
+      input.driver_context.task_instruction,
+      '',
+      buildDriverReturnInstruction({ taskId: input.task_id, writeReportFile: shouldWriteDriverReportFile() }),
+    ].join('\n');
+  }
   const context = deterministicJson({
     task_instruction: input.driver_context.task_instruction,
     skills: input.driver_context.skills,
@@ -130,7 +143,7 @@ function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
     'Execute the task_instruction below. This is an active request to perform the task, not a request to acknowledge context.',
     ...(input.session_id ? [
       'Continue in this existing session using its conversation and current workspace. Preserve completed work; finish what remains.',
-      'Any previous interruption, cancellation, initialization-only instruction, or "No response requested" marker applies only to that earlier turn, not this request.',
+      'Any previous interruption, cancellation, or initialization-only instruction applies only to that earlier turn, not this request.',
     ] : []),
     'The skills and experiences are reference material; they do not replace the current task instruction.',
     '',

@@ -164,6 +164,7 @@ interface InvocationContext {
   driver_instruction_locked: boolean;
   workspace_path?: string;
   session_id?: string;
+  resume_session?: boolean;
   signal?: AbortSignal;
   onDriverEvent?: AgentExecutionOptions['onDriverEvent'];
   execution?: DriverRunResult;
@@ -575,6 +576,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
+        ...(input.resume_session ? { resume_session: true } : {}),
         ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
         notice_mailboxes: noticeMailboxes,
         mailbox_outcomes: [],
@@ -1001,7 +1003,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     // 解析点收敛在这里：role 与 run 都来自 ALS，任何进入 invoke_driver 的路径都经过它。
     const driver = this.driverFor(invocation.role_id, invocation.run_id);
     try {
-      const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
+      const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = invocation.resume_session ? {
+        task_instruction: invocation.driver_instruction, skills: [], experiences: [],
+      } : {
         task_instruction: invocation.driver_instruction,
         skills: deduplicateMemoryItems([
           ...toDriverMemoryItems(invocation.retrieval.skills),
@@ -1027,6 +1031,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             run_id: invocation.run_id,
             ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
             ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
+            ...(invocation.resume_session ? { resume_session: true } : {}),
             call_id: createId('call'),
             source_driver: driver.driver_id,
             driver_context: driverInvocationContext,

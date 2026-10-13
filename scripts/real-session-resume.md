@@ -15,6 +15,9 @@ Unit tests and `RESUME_PROOF` smoke tasks are not release criteria.
 - A blocked Task has no active execution and can be resumed explicitly.
 - Driver routing is inherited. Unsupported session loading is rejected; a successful
   Driver response with a replacement session ID is rejected too.
+- Interrupted turns carry an explicit native-continuation flag. They reuse the
+  session's own history and receive the current instruction, not another copy of
+  the initial memory package. Initial task turns still receive that package.
 - Council retains selected participants, initial proposal identities, role working
   directories, in-flight session IDs, workspace baselines and completed role results
   in an atomic `recovery.json` outside the role workspaces. Completed roles are reused;
@@ -119,6 +122,13 @@ The committed strict harness subsequently passed single-agent task
 - Real Chrome: a direction key changed the snake's vertical movement, wall collision
   ended the game, and R restarted it; no page script errors.
 - Evidence: `newide-session-reload-JKLb7r/acceptance.json` in the printed temporary root.
+
+A fresh Council run (`task_6908071b-2209-47fb-9186-7f119b4dd46b`) subsequently
+failed after correctly reloading reviewer session `d8f32bb9-8298-4995-95e7-1dd0a65df452`:
+the reviewer reported a nonexistent reviews.json, then returned a no-response marker.
+It was not counted as acceptance. The next revision separates native continuation
+from initial context delivery to avoid replaying the full memory package. Fresh
+single and Council revalidation of that revision is in progress.
 
   Native session reload does not restore an operating-system process or an in-flight
 tool's instruction pointer. Tools with external side effects need their own outcome

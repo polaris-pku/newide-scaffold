@@ -116,6 +116,12 @@ try {
   await stop();
   assert.equal(evidence.terminal.task.status, 'completed');
   evidence.resumed_events = readAudit(resumedRun).filter(e => /turn_started|handler.started/.test(e.type));
+  assert.notEqual(evidence.processes[0], evidence.processes[1], 'Backend process was not replaced');
+  assert.equal(
+    evidence.resumed_events.find(e => e.type === 'handler.started')?.payload.cursor,
+    evidence.original_events.filter(e => e.type === 'handler.started').at(-1)?.payload.cursor,
+    'Resume restarted the stage cursor instead of continuing the interrupted stage',
+  );
   const originalTurns = evidence.original_events.filter(e => e.type === 'driver.turn_started');
   const activeRole = interruptedTool.payload.role_id;
   const interruptedSession = originalTurns.filter(e => e.payload.role_id === activeRole).at(-1)?.payload.session_id;
@@ -139,6 +145,10 @@ try {
   evidence.native_session = { path: nativePath, records_before: beforeIds.size, records_after: after.length,
     links: links.map(m => ({ uuid: m.uuid, parentUuid: m.parentUuid, timestamp: m.timestamp, sessionId: m.sessionId })) };
   if (mode === 'council') {
+    const completedRoles = new Set(readAudit(originalRun)
+      .filter(e => ['agent.execution_completed', 'council.proposal.completed', 'council.review.completed'].includes(e.type))
+      .map(e => e.payload.role_id ?? e.payload.agent_id).filter(role => role && role !== activeRole));
+    assert(!evidence.resumed_events.some(e => e.type === 'driver.turn_started' && completedRoles.has(e.payload.role_id)), 'Council reran an earlier completed role');
     assert.equal(evidence.terminal.council?.result?.role_failure_count, 0, 'Council role failed');
     assert.equal(evidence.terminal.council?.result?.fallback_used, false, 'Council used fallback');
   }

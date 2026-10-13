@@ -10,6 +10,15 @@ import type {
 import { createDriverRuntimeInvoker } from './driver-runtime-invoker';
 
 describe('createDriverRuntimeInvoker', () => {
+  it('continues a loaded native session without replaying the initial memory package', async () => {
+    const driver = new TestDriver(successResult());
+    await createDriverRuntimeInvoker(driver)({ ...invocationInput(), resume_session: true });
+    expect(driver.prompts[0]?.session_id).toBe('session_existing');
+    expect(driver.prompts[0]?.prompt).toContain('Continue the interrupted task');
+    expect(driver.prompts[0]?.prompt).toContain('Implement it');
+    expect(driver.prompts[0]?.prompt).not.toContain('Experience body');
+    expect(driver.prompts[0]?.prompt).not.toContain('Skill body');
+  });
   it('maps B-shaped input to a stable prompt and returns an auditable success', async () => {
     const driver = new TestDriver(successResult());
     const invoke = createDriverRuntimeInvoker(driver);

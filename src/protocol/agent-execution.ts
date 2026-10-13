@@ -34,6 +34,8 @@ export interface AgentExecutionRequest {
   driver_instruction?: string;
   workspace_path?: string;
   session_id?: string;
+  /** Resume an interrupted native turn; do not resend the initial memory/context package. */
+  resume_session?: boolean;
   /** Pending Mailbox Delivery injected into this role's task-scoped turn. */
   mailbox_delivery_id?: string;
   input_artifact_refs: ArtifactId[];

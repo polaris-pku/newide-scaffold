@@ -712,6 +712,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           context_policy: `council_${participant.seat}`,
           schema_version: SCHEMA_VERSION,
           ...(sessionId ? { session_id: sessionId } : {}),
+          ...(sessionId ? { resume_session: true } : {}),
           ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         },
         options?.signal || options?.onDriverEvent
