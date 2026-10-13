@@ -644,7 +644,7 @@ process.stdin.on('end', () => {
   const writeResult = () => process.stdout.write(JSON.stringify({
     driver_run_result_id: 'driver_result_' + suffix,
     response: 'Done.',
-    session_id: 'session_' + suffix,
+    session_id: input.session_id || 'session_' + suffix,
     status: 'succeeded',
     artifacts: [artifact],
     transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript', content: undefined },

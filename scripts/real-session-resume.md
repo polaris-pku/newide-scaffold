@@ -84,3 +84,28 @@ game. The follow-up fix makes the active instruction explicit after load and rej
 an artifact/tool-free no-response marker as `DRIVER_NO_PROGRESS`. Reverification is
 in progress. Council reviewer interruption is also being exercised separately.
 Do not infer release readiness or Council acceptance from the successful first run.
+
+Council task `task_70747161-913c-4b65-ba32-d795cef346df` was interrupted during a
+reviewer tool call. Its first resume was rejected by the old source-workspace-only
+session lookup. After fixing that lookup and in-flight session indexing, the **same
+unchanged persisted Task** resumed through the production `task.resume` RPC:
+
+- Original Run: `run_63000ffe-0c84-4bc3-9d4d-6f53fc3f6df4`.
+- Resumed Run: `run_a031f672-5780-4094-bf8b-eedc0bcd0002`, completed.
+- Reviewer session on both sides: `42bf1c51-cc03-4784-b076-e4c9af4e65dd`.
+- Native resumed message `309c7ce9-2577-4a06-bad9-cfcab63f0393` has pre-restart
+  parent `16840101-67a4-4610-8230-687f126136c4`.
+- Resumed Driver calls: reviewer, then synthesizer (its first invocation). Neither
+  primary nor completed proposer ran again.
+- Council reports zero role failures, no fallback, no warnings and no unmet criteria.
+- Delivered game tests: 19 passed. Real Chrome: start, pause, keyboard input, game
+  over and restart worked; no page script errors. No game files were manually fixed.
+
+This is real recovery-after-upgrade evidence, not a clean final-version acceptance
+run. A fresh final-version Council run and the stricter single-agent rerun remain
+separate checks.
+
+Native session reload does not restore an operating-system process or an in-flight
+tool's instruction pointer. Tools with external side effects need their own outcome
+reconciliation; this Snake/SIGINT acceptance does not certify arbitrary external
+tools, power loss, every Driver, or exact stochastic-output equivalence.
