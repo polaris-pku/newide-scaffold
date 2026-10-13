@@ -288,7 +288,7 @@ export const runSnapshotSchema = z
     run_id: z.string().min(1),
     task_id: z.string().min(1),
     mode: z.enum(['single_agent', 'council']),
-    status: z.enum(['running', 'completed', 'failed', 'cancelled']),
+    status: z.enum(['running', 'completed', 'failed', 'cancelled', 'interrupted']),
     /**
      * 这个 Run **实际**使用的 driver。
      *
@@ -392,7 +392,7 @@ export const runSnapshotSchema = z
     council: z
       .object({
         enabled: z.literal(true),
-        status: z.enum(['running', 'completed', 'failed', 'cancelled']),
+        status: z.enum(['running', 'completed', 'failed', 'cancelled', 'interrupted']),
         council_run_id: z.string().min(1).optional(),
         phase: z
           .enum([

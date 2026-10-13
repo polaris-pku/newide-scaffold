@@ -68,12 +68,14 @@ describe('TaskRpcMethods', () => {
     });
   });
 
-  it('forwards cancel/startCouncil and maps Task errors', async () => {
+  it('forwards cancel/interrupt/startCouncil and maps Task errors', async () => {
     const output: string[] = [];
     const cancelTask = vi.fn(async () => snapshot('task_cancelled', 'cancelled'));
+    const interruptTask = vi.fn(async () => snapshot('task_interrupted', 'blocked'));
     const startCouncil = vi.fn(async () => snapshot('task_council'));
     const service = fakeService({
       cancelTask,
+      interruptTask,
       startCouncil,
       getTask: async (taskId) => {
         throw new TaskNotFoundError(taskId);
@@ -86,6 +88,9 @@ describe('TaskRpcMethods', () => {
     );
     await session.handleLine(
       '{"jsonrpc":"2.0","id":2,"method":"task.startCouncil","params":{"task_id":"task_council"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":7,"method":"task.interrupt","params":{"task_id":"task_interrupted"}}',
     );
     await session.handleLine(
       '{"jsonrpc":"2.0","id":3,"method":"task.get","params":{"task_id":"missing"}}',
@@ -121,12 +126,14 @@ describe('TaskRpcMethods', () => {
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       { id: 1, result: { task: { task_id: 'task_cancelled', status: 'cancelled' } } },
       { id: 2, result: { task: { task_id: 'task_council' } } },
+      { id: 7, result: { task: { task_id: 'task_interrupted', status: 'blocked' } } },
       { id: 3, error: { code: -32006, message: 'Task not found' } },
       { id: 4, error: { code: -32007, message: 'Task already running' } },
       { id: 5, error: { code: -32008, message: 'Task not running' } },
       { id: 6, error: { code: -32009, message: 'Task event cursor not found' } },
     ]);
     expect(cancelTask).toHaveBeenCalledWith('task_cancelled');
+    expect(interruptTask).toHaveBeenCalledWith('task_interrupted');
     expect(startCouncil).toHaveBeenCalledWith('task_council');
   });
 
@@ -243,6 +250,7 @@ function fakeService(overrides: Partial<TaskMethodsService> = {}): TaskMethodsSe
     getTask: async () => snapshot('task_1'),
     listTasks: async () => ({ tasks: [snapshot('task_1')] }),
     cancelTask: async () => snapshot('task_1', 'cancelled'),
+    interruptTask: async () => snapshot('task_1', 'blocked'),
     resumeTask: async () => snapshot('task_1'),
     startCouncil: async () => snapshot('task_1'),
     subscribeTask: async (_taskId, _listener) => ({

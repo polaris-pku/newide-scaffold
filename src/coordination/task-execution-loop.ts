@@ -13,6 +13,7 @@ import type {
 } from '../persistence';
 import {
   TaskProcessorStageCommitError,
+  TaskInterruptedError,
   type TaskProcessor,
   type TaskRunExecutionState,
   type TaskStageCommitResult,
@@ -468,6 +469,13 @@ export class TaskExecutionLoop {
       }
     } catch (error) {
       if (error instanceof TaskProcessorStageCommitError) throw error;
+      if (isTaskInterrupted(controls.signal?.reason)) {
+        const interrupted = this.processor.interruptRun(state.run_id, {
+          source: controls.signal?.reason.source ?? 'user',
+          reason: controls.signal?.reason.message ?? 'Task interrupted by user',
+        });
+        return { snapshot: interrupted, committed_events: [] };
+      }
       if (controls.signal?.aborted) {
         const cancelled = this.processor.finishRun({
           run_id: state.run_id,
@@ -649,6 +657,10 @@ export class TaskExecutionLoop {
       return undefined;
     }
   }
+}
+
+function isTaskInterrupted(error: unknown): error is TaskInterruptedError {
+  return error instanceof TaskInterruptedError;
 }
 
 function assertRunTaskIdentity(state: TaskRunExecutionState, taskId: string): void {

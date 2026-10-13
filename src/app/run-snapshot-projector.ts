@@ -26,7 +26,9 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
   const runStarted = input.events.find((event) => event.type === 'run.started');
   const terminalEvent = [...input.events]
     .reverse()
-    .find((event) => ['run.completed', 'run.failed', 'run.cancelled'].includes(event.type));
+    .find((event) =>
+      ['run.completed', 'run.failed', 'run.cancelled', 'run.interrupted'].includes(event.type),
+    );
 
   return {
     ...(task ? { contract_version: 'frontend-workflow.v0.1' as const } : {}),
@@ -154,7 +156,7 @@ function projectCouncil(
 function terminalStatus(
   status: AppRunSnapshot['status'],
 ): 'completed' | 'failed' | 'cancelled' | undefined {
-  return status === 'running' ? undefined : status;
+  return status === 'running' || status === 'interrupted' ? undefined : status;
 }
 
 function artifactIds(artifacts: Record<string, unknown>[]): string[] {

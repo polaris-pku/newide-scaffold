@@ -69,6 +69,7 @@ import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task
 import {
   TaskProcessorRunNotFoundError,
   TaskProcessorTaskNotFoundError,
+  TaskInterruptedError,
   type AapMailboxBridge,
   type BeginTaskRunIntent,
   type ParticipantSessionProvisioner,
@@ -856,6 +857,22 @@ export class NewideBackendService {
     return this.getTask(taskId);
   }
 
+  async interruptTask(taskId: string): Promise<TaskSnapshot> {
+    await this.getTask(taskId);
+    if (!this.taskProcessor) {
+      throw new Error('Task interruption requires the persistent Task processor');
+    }
+    const current = this.registry
+      .listSnapshots()
+      .find((run) => run.task_id === taskId && run.status === 'running');
+    if (!current) throw new TaskNotRunningError(taskId);
+    await this.interruptRun(current.run_id, {
+      code: 'TASK_INTERRUPTED',
+      message: 'Task interrupted by user',
+    });
+    return this.getTask(taskId);
+  }
+
   async startCouncil(taskId: string): Promise<TaskSnapshot> {
     const task = await this.getTask(taskId);
     if (task.current_run) {
@@ -1133,6 +1150,10 @@ export class NewideBackendService {
       }
       await this.requestStore.save({
         ...identity,
+        recovery_parent_run_id:
+          lineage?.run_intent?.type === 'checkpoint_resume' || lineage?.run_intent?.type === 'mailbox_continuation'
+            ? lineage.restarted_from_run_id ?? null
+            : null,
         ...(driverConfig ? { driver_config: driverConfig } : {}),
         prompt: params.prompt,
         workspace_path: workspacePath,
@@ -1315,6 +1336,14 @@ export class NewideBackendService {
       }
       if (taskSnapshot.task.status === 'completed') {
         this.registry.complete(input.identity.run_id);
+      } else if (taskSnapshot.task.status === 'blocked') {
+        for (const event of processor.listTaskEvents(input.identity.task_id)) {
+          if (event.run_id === input.identity.run_id) this.mirrorTaskAuthorityEvent(event);
+        }
+        this.registry.interrupt(input.identity.run_id, {
+          code: 'TASK_INTERRUPTED',
+          message: 'Task interrupted before the current stage reached a terminal result',
+        });
       } else if (taskSnapshot.task.status === 'cancelled') {
         this.registry.cancel(input.identity.run_id);
       } else {
@@ -1331,21 +1360,31 @@ export class NewideBackendService {
       await this.auditWriter.flush(input.identity.run_id).catch(() => undefined);
     } catch (error) {
       const normalized = toError(error);
+      const interruptReason = input.controller.signal.reason instanceof TaskInterruptedError
+        ? input.controller.signal.reason
+        : undefined;
       try {
         const current = processor.getTaskSnapshot(input.identity.task_id);
         if (current.current_run?.run_id === input.identity.run_id) {
-          processor.finishRun({
-            run_id: input.identity.run_id,
-            status: input.controller.signal.aborted ? 'cancelled' : 'failed',
-            ...(input.controller.signal.aborted
-              ? {}
-              : {
-                  error: {
-                    code: 'TASK_LOOP_FAILED',
-                    message: normalized.message,
-                  },
-                }),
-          });
+          if (interruptReason) {
+            processor.interruptRun(input.identity.run_id, {
+              source: interruptReason.source,
+              reason: interruptReason.message,
+            });
+          } else {
+            processor.finishRun({
+              run_id: input.identity.run_id,
+              status: input.controller.signal.aborted ? 'cancelled' : 'failed',
+              ...(input.controller.signal.aborted
+                ? {}
+                : {
+                    error: {
+                      code: 'TASK_LOOP_FAILED',
+                      message: normalized.message,
+                    },
+                  }),
+            });
+          }
         }
         for (const event of processor.listTaskEvents(input.identity.task_id)) {
           if (event.run_id === input.identity.run_id) this.mirrorTaskAuthorityEvent(event);
@@ -1353,7 +1392,12 @@ export class NewideBackendService {
       } catch {
         // The persistent terminal transition is best-effort after a commit failure.
       }
-      if (input.controller.signal.aborted) {
+      if (interruptReason) {
+        this.registry.interrupt(input.identity.run_id, {
+          code: 'TASK_INTERRUPTED',
+          message: interruptReason.message,
+        });
+      } else if (input.controller.signal.aborted) {
         this.registry.cancel(input.identity.run_id);
       } else {
         this.registry.fail(input.identity.run_id, 'TASK_LOOP_FAILED', normalized.message);
@@ -1819,7 +1863,17 @@ export class NewideBackendService {
       this.registry
         .listSnapshots()
         .filter((run) => run.status === 'running')
-        .map((run) => this.cancelRun(run.run_id)),
+        .map((run) =>
+          this.taskProcessor
+            ? this.interruptRun(run.run_id, {
+                code: 'BACKEND_SHUTDOWN',
+                message: 'Backend service is shutting down',
+              })
+            : this.cancelRun(run.run_id, {
+                code: 'BACKEND_SHUTDOWN',
+                message: 'Backend service is shutting down',
+              }),
+        ),
     );
     await Promise.allSettled(pendingStarts.map((pendingStart) => pendingStart.settled));
     await Promise.allSettled([...this.terminalRuns.values()]);
@@ -2005,6 +2059,26 @@ export class NewideBackendService {
       throw new Error(snapshot.error?.message ?? `Run ${runId} already reached ${snapshot.status}`);
     }
     return { cancelled: true };
+  }
+
+  async interruptRun(
+    runId: string,
+    reason: RunCancellationReason,
+  ): Promise<{ interrupted: true }> {
+    this.registry.requestAbort(
+      runId,
+      new TaskInterruptedError(
+        reason.code === 'BACKEND_SHUTDOWN' ? 'shutdown' : 'user',
+        reason.message,
+      ),
+    );
+    const terminal = this.terminalRuns.get(runId);
+    if (terminal) await terminal;
+    const snapshot = this.registry.getSnapshot(runId);
+    if (snapshot.status !== 'interrupted') {
+      throw new Error(snapshot.error?.message ?? `Run ${runId} did not reach interrupted state`);
+    }
+    return { interrupted: true };
   }
 
   /**
@@ -2447,7 +2521,9 @@ function toDomainEvent(event: AppRunEvent): Event {
 }
 
 function terminalStatus(status: AppRunSnapshot['status']): 'completed' | 'failed' | 'cancelled' {
-  if (status === 'running') throw new Error('Cannot persist a running snapshot as terminal');
+  if (status === 'running' || status === 'interrupted') {
+    throw new Error('Cannot persist an interrupted snapshot as terminal output');
+  }
   return status;
 }
 

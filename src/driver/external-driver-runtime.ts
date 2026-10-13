@@ -52,12 +52,14 @@ export class ExternalDriverRuntime implements DriverRuntimeHandle {
   }
 
   async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
-    const effectiveInput =
-      !this.capabilities.supports_session_load && input.session_id
-        ? withoutSessionId(input)
-        : input;
-    const result = await this.invokeTransport(effectiveInput);
+    if (input.session_id && !this.capabilities.supports_session_load) {
+      throw new Error(`DRIVER_SESSION_LOAD_UNSUPPORTED: ${this.driver_id} cannot load ${input.session_id}; refusing a fresh session`);
+    }
+    const result = await this.invokeTransport(input);
     assertDriverRunResult(result);
+    if (input.session_id && result.status === 'succeeded' && result.session_id !== input.session_id) {
+      throw new Error(`DRIVER_SESSION_MISMATCH: requested ${input.session_id}, received ${result.session_id}`);
+    }
     this.latestTranscriptRef = result.transcript_ref;
     return result;
   }
@@ -95,12 +97,6 @@ export class ExternalDriverRuntime implements DriverRuntimeHandle {
   subscribeToEvents(listener: DriverStreamEventListener): () => void {
     return this.transport.subscribeToEvents?.(listener) ?? (() => undefined);
   }
-}
-
-function withoutSessionId(input: DriverPrompt): DriverPrompt {
-  const copy = { ...input };
-  delete copy.session_id;
-  return copy;
 }
 
 export function assertDriverRunResult(

@@ -240,6 +240,8 @@ export interface CouncilLifecycleEvent {
 }
 
 export interface CouncilExecutionOptions {
+  /** Stable execution lineage, retained across backend restarts. */
+  recovery_key?: string;
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
   onLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
