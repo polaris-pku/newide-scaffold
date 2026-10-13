@@ -30,7 +30,7 @@ export interface ResumePackage {
   artifact_refs: string[];
   message_thread: PersistedCheckpointMessage[];
   mailbox: ResumePackageMailbox;
-  participant_sessions: Array<{ role_id: string; session_id: string }>;
+  participant_sessions: Array<{ role_id: string; session_id: string; workspace_path?: string }>;
   council_state_ref?: string;
   file_anchor: FileAnchor;
   interrupt_state?: Record<string, unknown>;
@@ -81,12 +81,20 @@ export function buildResumePackage(input: BuildResumePackageInput): ResumePackag
   const cursorInput = resolveResumeCursorInput(aggregate, checkpoint);
   const participantSessions = [...(checkpoint.participant_sessions ?? [])];
   for (const participant of participantSessions) {
+    const legacyBindings = !participant.workspace_path
+      ? input.participantSessions?.listForTask?.(aggregate.task.task_id).filter(binding => binding.role_id === participant.role_id && binding.session_id === participant.session_id)
+      : undefined;
+    const workspacePath = participant.workspace_path ?? (legacyBindings?.length === 1 ? legacyBindings[0]!.workspace_path : aggregate.task.workspace_path);
     const bound = input.participantSessions?.get(
       aggregate.task.task_id,
-      aggregate.task.workspace_path,
+      workspacePath,
       participant.role_id,
     );
-    if (input.participantSessions && bound !== participant.session_id) {
+    // The checkpoint is the durable reference, while this registry is an index.
+    // Older interrupted turns may not have populated that index yet. A missing
+    // entry cannot establish loss of the native session; load it through the
+    // Driver (which must fail closed), never replace it with a new session.
+    if (bound !== undefined && bound !== participant.session_id) {
       throw new ResumePackageError(
         `Participant Session ${participant.role_id}/${participant.session_id} is not recoverable`,
       );

@@ -76,6 +76,11 @@ Real single-agent Snake task `task_2dda0090-fb94-4dc3-ae34-e5eac0161936`:
 - Real headless Chrome: pause, keyboard input, game over and restart checked; no
   page script errors. This used the delivered files, without editing the game.
 
-This run used the earlier manual production-process harness. The committed harness
-and Council reviewer interruption are being exercised separately. Do not infer
-release readiness or Council acceptance from the single-agent result.
+This run used the earlier manual production-process harness. A subsequent committed
+harness run (`task_3ccca2bb-7104-40da-87a6-6273bcaee241`) **failed**: native session
+reload succeeded, but the model returned `No response requested.` and no files;
+the backend incorrectly reported completion. The strict harness caught the missing
+game. The follow-up fix makes the active instruction explicit after load and rejects
+an artifact/tool-free no-response marker as `DRIVER_NO_PROGRESS`. Reverification is
+in progress. Council reviewer interruption is also being exercised separately.
+Do not infer release readiness or Council acceptance from the successful first run.

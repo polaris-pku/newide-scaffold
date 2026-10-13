@@ -2145,7 +2145,9 @@ function request(taskId: string, roleId: string, workspacePath?: string) {
 }
 
 function parseDriverContext(prompt: string): unknown {
-  return JSON.parse(prompt.split('\n\n---\n', 1)[0]!);
+  const context = prompt.split('\n').find(line => line.startsWith('{"experiences":'));
+  if (!context) throw new Error('Missing structured Driver context');
+  return JSON.parse(context);
 }
 
 class CapturingDriver implements DriverRuntimeHandle {

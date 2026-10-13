@@ -417,12 +417,17 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       await validate?.(saved.execution.result);
       return saved.execution;
     }
+    if (saved?.prepared && !saved.session_id) {
+      throw new Error('Interrupted Council role has no durable native session ID; refusing a fresh session');
+    }
     let sessionId: string | undefined = saved?.session_id;
+    let recoveryError: unknown;
     let recoveryReason: string | undefined;
     let workspaceBefore: WorkspaceFileSnapshot | undefined = saved ? new Map(saved.workspace_before) : undefined;
     const originalOptions = options;
     if (recovery) {
       options = { ...options, onDriverEvent: (event) => {
+        try {
         if (event.event_type === 'driver.turn_started' && event.session_id) {
           const role = recovery.state.roles[recoveryId];
           if (role) {
@@ -433,6 +438,9 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
             sessionId = event.session_id;
             recovery.save();
           }
+        }
+        } catch (error) {
+          recoveryError = error;
         }
         originalOptions?.onDriverEvent?.(event);
       } };
@@ -485,6 +493,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           attempt > 1 || saved ? workspaceBefore : undefined,
           attempt,
         );
+        if (recoveryError) throw recoveryError;
         await validate?.(execution.result);
         if (recovery) {
           recovery.state.roles[recoveryId]!.execution = { result: execution.result, phase_id: phaseId };
@@ -495,6 +504,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         }
         return { result: execution.result, phase_id: phaseId };
       } catch (error) {
+        if (recoveryError) throw recoveryError;
         if (options?.signal?.aborted) throw error;
         const retry = attempt < maxAttempts && isRecoverableRoleFailure(error);
         const failure = await this.toRoleFailure(

@@ -113,6 +113,19 @@ describe('ExternalDriverRuntime', () => {
     );
   });
 
+  it('does not report a native no-response marker as task completion', async () => {
+    const runtime = new ExternalDriverRuntime({
+      driver_id: 'external-acp-driver',
+      capabilities: { supports_session_load: true },
+      transport: { invoke: async () => ({
+        ...driverRunResult(), response: 'No response requested.', artifacts: [], tool_events: [],
+      }) },
+    });
+    const result = await runtime.sendPrompt({ ...PROMPT, session_id: 'external-session' });
+    expect(result).toMatchObject({ status: 'failed', session_id: 'external-session',
+      error: { code: 'DRIVER_NO_PROGRESS', retryable: false } });
+  });
+
   it('delegates interrupt and shutdown to the transport when supported', async () => {
     const interrupt = vi.fn(async (_reason: string) => undefined);
     const shutdown = vi.fn(async () => undefined);

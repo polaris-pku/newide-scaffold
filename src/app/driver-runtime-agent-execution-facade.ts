@@ -582,12 +582,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         driver_attempts: 0,
         abortObserved: false,
         ...(options?.signal ? { signal: options.signal } : {}),
-        ...(options?.onDriverEvent
-          ? {
-              onDriverEvent: (event: DriverStreamEvent) =>
-                options.onDriverEvent?.({ ...event, role_id: input.role_id }),
-            }
-          : {}),
+        onDriverEvent: (event: DriverStreamEvent) => {
+          if (event.event_type === 'driver.turn_started' && event.session_id && input.workspace_path && this.driverFor(runtimeRoleId, input.run_id).capabilities.supports_session_load) {
+            this.options.mailbox?.sessionRegistry?.register({
+              task_id: input.task_id, workspace_path: input.workspace_path,
+              role_id: input.role_id, session_id: event.session_id,
+            });
+          }
+          options?.onDriverEvent?.({ ...event, role_id: input.role_id });
+        },
       };
       const workspaceBefore = input.workspace_path
         ? await snapshotWorkspaceFiles(input.workspace_path)

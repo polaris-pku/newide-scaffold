@@ -28,6 +28,9 @@ describe('createDriverRuntimeInvoker', () => {
       '{"experiences":[{"content":"Experience body","description":"Experience","id":"exp_1"}],"skills":[{"content":"Skill body","description":"Skill","id":"skill_1"}],"task_instruction":"Implement it"}',
     );
     expect(driver.prompts[0]?.prompt).toContain('<<<DRIVER_RETURN>>>');
+    expect(driver.prompts[0]?.prompt).toMatch(/^Execute the task_instruction/);
+    expect(driver.prompts[0]?.prompt).toContain('Continue in this existing session');
+    expect(driver.prompts[0]?.prompt).toContain('applies only to that earlier turn');
     expect(driver.prompts[0]?.prompt).toContain('referenced_experiences');
     expect(output.execution).toEqual(successResult());
     expect(output.report).toEqual({

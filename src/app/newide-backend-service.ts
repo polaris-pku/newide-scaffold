@@ -1363,6 +1363,7 @@ export class NewideBackendService {
       const interruptReason = input.controller.signal.reason instanceof TaskInterruptedError
         ? input.controller.signal.reason
         : undefined;
+      let interruptionPersistenceError: Error | undefined;
       try {
         const current = processor.getTaskSnapshot(input.identity.task_id);
         if (current.current_run?.run_id === input.identity.run_id) {
@@ -1389,10 +1390,12 @@ export class NewideBackendService {
         for (const event of processor.listTaskEvents(input.identity.task_id)) {
           if (event.run_id === input.identity.run_id) this.mirrorTaskAuthorityEvent(event);
         }
-      } catch {
-        // The persistent terminal transition is best-effort after a commit failure.
+      } catch (persistenceError) {
+        if (interruptReason) interruptionPersistenceError = toError(persistenceError);
       }
-      if (interruptReason) {
+      if (interruptionPersistenceError) {
+        this.registry.fail(input.identity.run_id, 'INTERRUPT_PERSIST_FAILED', interruptionPersistenceError.message);
+      } else if (interruptReason) {
         this.registry.interrupt(input.identity.run_id, {
           code: 'TASK_INTERRUPTED',
           message: interruptReason.message,

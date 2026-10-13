@@ -126,7 +126,17 @@ function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
     taskId: input.task_id,
     writeReportFile: shouldWriteDriverReportFile(),
   });
-  return `${context}\n\n${reportInstruction}`;
+  const directive = [
+    'Execute the task_instruction below. This is an active request to perform the task, not a request to acknowledge context.',
+    ...(input.session_id ? [
+      'Continue in this existing session using its conversation and current workspace. Preserve completed work; finish what remains.',
+      'Any previous interruption, cancellation, initialization-only instruction, or "No response requested" marker applies only to that earlier turn, not this request.',
+    ] : []),
+    'The skills and experiences are reference material; they do not replace the current task instruction.',
+    '',
+    input.driver_context.task_instruction,
+  ].join('\n');
+  return `${directive}\n\n${context}\n\n${reportInstruction}`;
 }
 
 function failedExecution(
