@@ -65,7 +65,40 @@ parent links crossing the process restart, actual game files, and the generated
 game tests. Council must have zero role failures and no fallback. A timeout is a
 failure, not a reason to weaken assertions. Browser playability is checked separately.
 
-## Observed on 2026-10-13
+## Final real acceptance on 2026-10-13
+
+Both modes passed on source commit `458adcf8dd1935164e9b2a2e2d2f6522564a6cdd`,
+including main `649521035bc0b4f4074bd9d630250b344d3b3247`. These runs used the
+production backend, Claude Code + MiniMax-M3, persistent native sessions, real Git
+workspaces, SQLite coordination and the supported hash embedding configuration.
+
+| Check | single_agent | council |
+| --- | --- | --- |
+| Task | `task_c858f3f9-4e2e-46f9-90fb-6a7aa123ca15` | `task_10c18556-a416-483e-bf3b-3d2b5c71ed6f` |
+| Backend PID before / after SIGINT | 93027 / 93557 | 93143 / 97794 |
+| Preserved cursor | `execute_agent` | `council` / reviewer |
+| Interrupted native session, same before / after | `554ff746-b242-441e-91fd-43ec80e4ded6` | `2fb030d6-f4b4-4924-ba16-cbe13fa30bb8` |
+| Final Task state | completed | completed |
+| Delivered game tests | 18 passed, 0 failed | 24 passed, 0 failed |
+| Actual Chrome interactions | pause, keyboard, game over, restart | start, keyboard, game over, restart |
+
+Native Claude JSONL parent links cross both restarts. In Council, primary and
+completed proposer Driver calls did not repeat: reviewer resumed its existing
+session, followed by the synthesizer's first invocation. The final Council result
+has zero role failures, no fallback, no warnings and no unmet criteria.
+
+Neither product files nor Task/checkpoint/session records were manually repaired.
+The original Run remains interrupted for audit; the new Run continues the same
+Task and native Driver conversation. See
+[machine-readable evidence](acceptance-evidence/native-session-resume-2026-10-13.json)
+for exact Run IDs, native message links, Driver calls, product and audit hashes.
+Raw evidence directories `newide-session-reload-SMG8Cw` and
+`newide-session-reload-Tlz1VJ` are preserved in the printed temporary root.
+
+The subsequent event-coverage test correction changes tests only; the tested
+application source above is unchanged. CI verification is tracked separately in PR #200.
+
+## Earlier diagnostic runs
 
 Real single-agent Snake task `task_2dda0090-fb94-4dc3-ae34-e5eac0161936`:
 
@@ -84,9 +117,8 @@ harness run (`task_3ccca2bb-7104-40da-87a6-6273bcaee241`) **failed**: native ses
 reload succeeded, but the model returned `No response requested.` and no files;
 the backend incorrectly reported completion. The strict harness caught the missing
 game. The follow-up fix makes the active instruction explicit after load and rejects
-an artifact/tool-free no-response marker as `DRIVER_NO_PROGRESS`. Reverification is
-in progress. Council reviewer interruption is also being exercised separately.
-Do not infer release readiness or Council acceptance from the successful first run.
+an artifact/tool-free no-response marker as `DRIVER_NO_PROGRESS`. The final runs
+above include this fix. This earlier successful run alone was insufficient acceptance.
 
 Council task `task_70747161-913c-4b65-ba32-d795cef346df` was interrupted during a
 reviewer tool call. Its first resume was rejected by the old source-workspace-only
@@ -104,8 +136,8 @@ unchanged persisted Task** resumed through the production `task.resume` RPC:
 - Delivered game tests: 19 passed. Real Chrome: start, pause, keyboard input, game
   over and restart worked; no page script errors. No game files were manually fixed.
 
-This is real recovery-after-upgrade evidence, not a clean final-version Council
-acceptance run. A fresh final-version Council run remains a separate check.
+This was recovery-after-upgrade evidence. The final acceptance above subsequently
+validated a fresh final-version Council Task.
 
 The committed strict harness subsequently passed single-agent task
 `task_6dc0bc6a-70b8-4998-86e6-6a290478a3b5` with no manual task/workspace edits:
@@ -127,10 +159,10 @@ A fresh Council run (`task_6908071b-2209-47fb-9186-7f119b4dd46b`) subsequently
 failed after correctly reloading reviewer session `d8f32bb9-8298-4995-95e7-1dd0a65df452`:
 the reviewer reported a nonexistent reviews.json, then returned a no-response marker.
 It was not counted as acceptance. The next revision separates native continuation
-from initial context delivery to avoid replaying the full memory package. Fresh
-single and Council revalidation of that revision is in progress.
+from initial context delivery to avoid replaying the full memory package. The final
+single and Council runs above validated that behavior on the latest main.
 
-  Native session reload does not restore an operating-system process or an in-flight
+Native session reload does not restore an operating-system process or an in-flight
 tool's instruction pointer. Tools with external side effects need their own outcome
 reconciliation; this Snake/SIGINT acceptance does not certify arbitrary external
 tools, power loss, every Driver, or exact stochastic-output equivalence.
