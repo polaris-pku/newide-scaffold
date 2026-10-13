@@ -87,6 +87,7 @@ import type {
 } from '../mailbox';
 import type { DriverStreamEvent } from '../driver/contract';
 import type { DriverRoutingPort } from '../driver';
+import type { DriverProbeService } from '../driver';
 import type { PersistedDriverConfig } from '../driver';
 import type {
   AgentBoardAgentView,
@@ -327,6 +328,8 @@ export class NewideBackendService {
    * 缺省（测试与历史装配）时不做冻结，行为与接线前逐字段一致。
    */
   readonly driverRouting: DriverRoutingPort | undefined;
+  /** ACP-owned local driver probe exposed through the frontend RPC surface. */
+  readonly driverProbe: DriverProbeService | undefined;
   private closing = false;
   private closePromise?: Promise<void>;
 
@@ -407,8 +410,10 @@ export class NewideBackendService {
      * `driver_config`；执行期的 facade 解析同一份，于是「保存只影响新 Run」有据可依。
      */
     driverRouting?: DriverRoutingPort,
+    driverProbe?: DriverProbeService,
   ) {
     this.driverRouting = driverRouting;
+    this.driverProbe = driverProbe;
   }
 
   /**

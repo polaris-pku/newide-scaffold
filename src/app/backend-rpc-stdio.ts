@@ -16,7 +16,12 @@ import {
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
-import { createDriverRegistry, DriverRoutingService, loadDriverConfig } from '../driver';
+import {
+  AcpDriverProbeService,
+  createDriverRegistry,
+  DriverRoutingService,
+  loadDriverConfig,
+} from '../driver';
 import {
   LlmContextCleaner,
   LiteLLMToolCallingClient,
@@ -628,6 +633,9 @@ export async function createProductionBackendService(
         DEFAULT_DRIVER_BILLED_SOURCE,
       // Run 创建时冻结 routing 快照；`startBackendRpcServer` 也从 service 上取它注册 driver.* 方法。
       driverRoutingService,
+      // ACP owns adapter metadata and the initialize handshake. Keep the probe
+      // behind the same service so the frontend can call it through JSON-RPC.
+      new AcpDriverProbeService({ runnerDir }),
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();
@@ -798,7 +806,10 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   // driver 读写 RPC 只在组装点注入了 routing service 时注册：测试里的裸 service 不会凭空
   // 多出三个方法，生产装配则自动带上（`system.*` 的只读语义不受影响）。
   if (service.driverRouting) {
-    const driverMethods = new DriverRpcMethods(createDriverMethodsService(service.driverRouting));
+    const driverMethods = new DriverRpcMethods(
+      createDriverMethodsService(service.driverRouting),
+      service.driverProbe,
+    );
     driverMethods.register(dispatcher);
   }
 

@@ -21,6 +21,12 @@ import {
   DriverRoutingError,
   type DriverRoutingErrorCode,
 } from '../driver/driver-routing-service';
+import {
+  DriverProbeFailedError,
+  DriverProbeUnavailableError,
+  type DriverProbeOptions,
+  type DriverProbeResult,
+} from '../driver/driver-probe-service';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 import { JsonRpcMethodError, type JsonRpcDispatcher } from './json-rpc-dispatcher';
 
@@ -34,6 +40,10 @@ export interface DriverMethodsService {
   getDriverConfig(): Promise<DriverRoutingSnapshot>;
   updateDriverRouting(input: UpdateDriverRoutingInput): Promise<DriverRoutingSnapshot>;
   resetDriverRouting(expectedRevision: string): Promise<DriverRoutingSnapshot>;
+}
+
+export interface DriverProbeMethodsService {
+  probe(options?: DriverProbeOptions): Promise<DriverProbeResult>;
 }
 
 /**
@@ -54,6 +64,14 @@ export function createDriverMethodsService(routing: {
 }
 
 const emptyParamsSchema = z.object({}).strict();
+const probeParamsSchema = z
+  .object({
+    agent_ids: z.array(z.string().trim().min(1)).min(1).optional(),
+    timeout_ms: z.number().int().positive().max(120_000).optional(),
+    concurrency: z.number().int().positive().max(32).optional(),
+    force: z.boolean().optional(),
+  })
+  .strict();
 
 /** 领域错误码 → JSON-RPC 业务错误码；一一对应，没有兜底的「其他」。 */
 const DRIVER_ROUTING_RPC_CODES: Readonly<Record<DriverRoutingErrorCode, number>> = {
@@ -66,7 +84,10 @@ const DRIVER_ROUTING_RPC_CODES: Readonly<Record<DriverRoutingErrorCode, number>>
 };
 
 export class DriverRpcMethods {
-  constructor(private readonly service: DriverMethodsService) {}
+  constructor(
+    private readonly service: DriverMethodsService,
+    private readonly probeService?: DriverProbeMethodsService,
+  ) {}
 
   register(dispatcher: JsonRpcDispatcher): void {
     dispatcher.register('driver.getConfig', async (params) => {
@@ -83,6 +104,19 @@ export class DriverRpcMethods {
       const input = parseParams(resetDriverRoutingInputSchema, params ?? {});
       return this.invoke(() => this.service.resetDriverRouting(input.expected_revision));
     });
+
+    if (this.probeService) {
+      dispatcher.register('driver.list', async (params) => {
+        const input = parseParams(probeParamsSchema, params ?? {});
+        return this.invokeProbe(() => this.probeService!.probe(toProbeOptions(input)));
+      });
+      // `driver.probe` is an explicit alias for clients that prefer an action
+      // name; both methods share exactly the same validated contract.
+      dispatcher.register('driver.probe', async (params) => {
+        const input = parseParams(probeParamsSchema, params ?? {});
+        return this.invokeProbe(() => this.probeService!.probe(toProbeOptions(input)));
+      });
+    }
   }
 
   private async invoke<T>(operation: () => Promise<T>): Promise<T> {
@@ -99,6 +133,42 @@ export class DriverRpcMethods {
       throw error;
     }
   }
+
+  private async invokeProbe<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof DriverProbeUnavailableError) {
+        throw new JsonRpcMethodError(
+          JSON_RPC_ERROR_CODES.DRIVER_PROBE_UNAVAILABLE,
+          error.message,
+          { reason: 'DRIVER_PROBE_UNAVAILABLE' },
+        );
+      }
+      if (error instanceof DriverProbeFailedError) {
+        throw new JsonRpcMethodError(
+          JSON_RPC_ERROR_CODES.DRIVER_PROBE_FAILED,
+          'ACP driver probe failed',
+          { reason: 'DRIVER_PROBE_FAILED' },
+        );
+      }
+      throw error;
+    }
+  }
+}
+
+function toProbeOptions(input: {
+  agent_ids?: string[] | undefined;
+  timeout_ms?: number | undefined;
+  concurrency?: number | undefined;
+  force?: boolean | undefined;
+}): DriverProbeOptions {
+  return {
+    ...(input.agent_ids ? { agentIds: input.agent_ids } : {}),
+    ...(input.timeout_ms === undefined ? {} : { timeoutMs: input.timeout_ms }),
+    ...(input.concurrency === undefined ? {} : { concurrency: input.concurrency }),
+    ...(input.force === undefined ? {} : { force: input.force }),
+  };
 }
 
 function parseParams<T>(schema: z.ZodType<T>, params: unknown): T {
