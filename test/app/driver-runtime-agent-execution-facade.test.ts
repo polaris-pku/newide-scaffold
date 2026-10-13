@@ -46,6 +46,42 @@ import {
 import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
+  it('persists a Council native session before its first Driver turn finishes', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-inflight-session-'));
+    const driver = new CapturingDriver('succeeded');
+    driver.capabilities.supports_session_load = true;
+    let listener: DriverStreamEventListener | undefined;
+    let finish!: (result: DriverRunResult) => void;
+    vi.spyOn(driver, 'subscribeToEvents').mockImplementation(callback => {
+      listener = callback;
+      return () => { listener = undefined; };
+    });
+    vi.spyOn(driver, 'sendPrompt').mockImplementation(input => {
+      listener?.({ schema_version: 'driver-event.v1', event_type: 'driver.turn_started',
+        task_id: input.task_id, run_id: input.run_id, session_id: 'native_inflight' });
+      return new Promise(resolve => { finish = resolve; });
+    });
+    const sessions = new InMemoryParticipantSessionRegistry();
+    const store = new SqliteCoordinationStore(':memory:');
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver, repository: new InMemoryRepository(), bufferRepository: new InMemoryBufferRepository(), llm: invokeDriverLlm(),
+      mailbox: { service: new PersistentMailboxService(store), allowedRoleIds: ['reviewer'], sessionRegistry: sessions },
+    });
+    const controller = new AbortController();
+    const { session_id: _unused, ...input } = request('task_inflight', 'reviewer', workspace);
+    const pending = facade.runAgent({ ...input, context_policy: 'council_reviewer' }, { signal: controller.signal }).catch(error => error);
+    try {
+      await vi.waitFor(() => expect(sessions.get(input.task_id, workspace, 'reviewer')).toBe('native_inflight'));
+      controller.abort(new Error('interrupt before result'));
+      await pending;
+      expect(sessions.get(input.task_id, workspace, 'reviewer')).toBe('native_inflight');
+    } finally {
+      finish?.(driverResult(driver, 'cancelled', 'native_inflight'));
+      store.close();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('cancels a pending Session initialization and releases its provisioning slot', async () => {
     const driver = new CapturingDriver('succeeded');
     let finish!: (result: DriverRunResult) => void;

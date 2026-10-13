@@ -101,11 +101,26 @@ unchanged persisted Task** resumed through the production `task.resume` RPC:
 - Delivered game tests: 19 passed. Real Chrome: start, pause, keyboard input, game
   over and restart worked; no page script errors. No game files were manually fixed.
 
-This is real recovery-after-upgrade evidence, not a clean final-version acceptance
-run. A fresh final-version Council run and the stricter single-agent rerun remain
-separate checks.
+This is real recovery-after-upgrade evidence, not a clean final-version Council
+acceptance run. A fresh final-version Council run remains a separate check.
 
-Native session reload does not restore an operating-system process or an in-flight
+The committed strict harness subsequently passed single-agent task
+`task_6dc0bc6a-70b8-4998-86e6-6a290478a3b5` with no manual task/workspace edits:
+
+- Backend PIDs: 45525 before SIGINT, 46040 after restart.
+- Runs: `run_7b2aa72b-8187-4bdd-ad09-94723c484898` interrupted,
+  `run_5e329bc5-2c97-4fbe-b847-51a425fc0063` completed.
+- Native session: `d3e2beff-3d1c-468c-bace-8d55757f0b29` throughout.
+- Native parent link: `181adcd4-6df0-4d62-ab47-3ea58c1d255e` →
+  `cc53523f-9058-4ecd-95e9-62cc230d362b`; 5 pre-restart records, 86 after.
+- Delivered Snake tests: 14 passed. The Driver encountered failing tests during
+  execution and corrected its own code/tests before completion; the acceptance
+  harness did not repair or substitute the product.
+- Real Chrome: a direction key changed the snake's vertical movement, wall collision
+  ended the game, and R restarted it; no page script errors.
+- Evidence: `newide-session-reload-JKLb7r/acceptance.json` in the printed temporary root.
+
+  Native session reload does not restore an operating-system process or an in-flight
 tool's instruction pointer. Tools with external side effects need their own outcome
 reconciliation; this Snake/SIGINT acceptance does not certify arbitrary external
 tools, power loss, every Driver, or exact stochastic-output equivalence.
