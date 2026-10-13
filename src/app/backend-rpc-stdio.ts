@@ -66,6 +66,12 @@ import {
   BMemoryMaintenanceRunner,
   FileBMemoryMaintenanceEvidenceStore,
 } from './b-memory-maintenance-runner';
+import {
+  MemoryDeliveryConsumers,
+  type MemoryDeliveryDrainOptions,
+  type MemoryDeliveryDrainReport,
+} from './b-memory-delivery-consumers';
+import { FileMaintenanceRunStore } from '../memory';
 import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities, createLedgerRoleTokenUsage } from './b-public-capabilities';
 import { createAgentCatalogProvider } from './agent-catalog';
@@ -232,12 +238,17 @@ export async function createProductionBackendService(
   let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
   let coordinationStore: SqliteCoordinationStore | undefined;
   let maintenanceScheduler: AgentMaintenanceScheduler | undefined;
+  let memoryDeliveryConsumers: MemoryDeliveryConsumers | undefined;
   const closeRuntime = onceAsync(async () => {
     const failures: unknown[] = [];
+    // 两个定时器先停，再等在途的那一轮跑完，最后才关存储：反过来的话，在途的维护轮次会写到
+    // 已经关掉的存储上。
     for (const close of [
       () => maintenanceScheduler?.stop(),
+      () => memoryDeliveryConsumers?.stop(),
       () => driverRegistry.shutdown(),
       () => memoryMaintenance?.waitForIdle(),
+      () => memoryDeliveryConsumers?.waitForIdle(),
       () => bRuntime?.close(),
       () => coordinationStore?.close(),
     ]) {
@@ -279,6 +290,12 @@ export async function createProductionBackendService(
       store: coordinationStore,
       sessionRegistry: participantSessions,
     });
+    // 维护 evidence 的落点由 runner 与消费端共用：交付时写下的那条 `scheduled` evidence，
+    // 要由消费端就地改写成 `experience_extraction / completed`（见消费端模块的文件头），
+    // 两边指向同一个目录才谈得上「就地」。
+    const maintenanceEvidenceStore = new FileBMemoryMaintenanceEvidenceStore(
+      path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
+    );
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
@@ -286,9 +303,7 @@ export async function createProductionBackendService(
         bufferRepository: bRuntime.bufferRepository,
         deliveryRepository: bRuntime.deliveryRepository,
         llm: memoryLlm,
-        evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
-          path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
-        ),
+        evidenceStore: maintenanceEvidenceStore,
         runsRoot,
         // dependencies.memoryMaintenance 覆盖路径会绕过留档（测试缝，接受）
         callJournal: protocolCallJournal,
@@ -300,6 +315,21 @@ export async function createProductionBackendService(
           autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
         },
       });
+    // 消费端（Phase 1 + Phase 2）：把在线登记的两条 outbox 真的消费成 Experience 与置信度
+    // 回写。构造在这里、启动在维护定时器旁边（见下面的 start），因此关停仍是一条路径。
+    memoryDeliveryConsumers = new MemoryDeliveryConsumers({
+      repository: bRuntime.repository,
+      bufferRepository: bRuntime.bufferRepository,
+      deliveryRepository: bRuntime.deliveryRepository,
+      runStore: new FileMaintenanceRunStore({
+        root: path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance-runs'),
+      }),
+      evidenceStore: maintenanceEvidenceStore,
+      llm: memoryLlm,
+      logger: (message) => {
+        process.stderr.write(`[newide] ${message}\n`);
+      },
+    });
     try {
       await memoryMaintenance.replayPending();
     } catch {
@@ -505,6 +535,17 @@ export async function createProductionBackendService(
       },
     );
     maintenanceScheduler.start(readIntEnv(env.NEWIDE_MAINTENANCE_INTERVAL_MS, 3600_000));
+    // 消费端的定时器与维护定时器共用同一条关停路径（见 closeRuntime），但周期是独立的一个开关：
+    // 「多久扫一次退休/自学习」与「多久把 outbox 抽干一次」是两件事，缺省取维护周期只是为了让
+    // 部署里只配一个值也能跑。新开关必须是正整数——0 会让 start() 安静地什么都不做，配置错误
+    // 不该长得像「已经配好了」。
+    memoryDeliveryConsumers.start(
+      readPositiveIntEnv(
+        'NEWIDE_B_DELIVERY_DRAIN_INTERVAL_MS',
+        env.NEWIDE_B_DELIVERY_DRAIN_INTERVAL_MS,
+        readIntEnv(env.NEWIDE_MAINTENANCE_INTERVAL_MS, 3600_000),
+      ),
+    );
 
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
@@ -646,6 +687,56 @@ export async function createProductionBackendService(
   }
 }
 
+/**
+ * 手动补跑口（CLI：`newide memory drain`）。
+ *
+ * 用与 boot 相同的装配把三条消费通道各跑一轮，然后关掉存储——因此它跑的是**同一套** worker、
+ * 同一个 run store、同一份 evidence 落点，而不是另写一条「近似」的路径。存在的理由：定时消费的
+ * 周期缺省与维护周期一致（1 小时），而「刚跑完一个任务、想立刻看到经验入库」不该只能等。
+ *
+ * 与一个正在运行的后端互斥：经验那条腿是 PGlite（单写者），后端开着时这里打不开库。补跑的
+ * 正确用法是后端已停，或本就没起。缺省没配 LLM 也不会白跑——提取器调用失败会自己降级到规则版。
+ */
+export async function drainMemoryDeliveriesOnce(
+  env: NodeJS.ProcessEnv = process.env,
+  options: MemoryDeliveryDrainOptions = {},
+): Promise<MemoryDeliveryDrainReport> {
+  const repoRoot = process.cwd();
+  const stateRoot = path.resolve(env.NEWIDE_STATE_ROOT?.trim() || path.join(repoRoot, '.newide'));
+  // 与 boot 同源：B 侧文本 LLM 复用 ACP runner 的模型档案。这里**不**检查 runner 目录存不存在
+  // ——补跑不该因为「driver runner 没构建」而起不来，缺配置时 LLM 腿失败了照样有规则版兜底。
+  const runnerDir = path.resolve(
+    env.ACP_DRIVER_RUNNER_DIR ?? path.join(repoRoot, '..', 'acp-client-prototype'),
+  );
+  const driverEnv = loadEnvFile(
+    env.ACP_DRIVER_ENV_FILE
+      ? path.resolve(repoRoot, env.ACP_DRIVER_ENV_FILE)
+      : path.join(runnerDir, '.env'),
+  );
+  const memoryLlm = new ProductionTextLlmAdapter(
+    createProductionToolCallingClient(resolveProductionLlmRuntime(env, driverEnv), env),
+  );
+  let bRuntime: BackendBRuntime | undefined;
+  try {
+    bRuntime = await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot });
+    const consumers = new MemoryDeliveryConsumers({
+      repository: bRuntime.repository,
+      bufferRepository: bRuntime.bufferRepository,
+      deliveryRepository: bRuntime.deliveryRepository,
+      runStore: new FileMaintenanceRunStore({
+        root: path.join(bRuntime.app_state_root, 'b', 'maintenance-runs'),
+      }),
+      evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
+        path.join(bRuntime.app_state_root, 'b', 'maintenance'),
+      ),
+      llm: memoryLlm,
+    });
+    return await consumers.runOnce(options);
+  } finally {
+    await bRuntime?.close().catch(() => undefined);
+  }
+}
+
 const MODEL_OVERRIDE_ENV = [
   'ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
@@ -743,6 +834,27 @@ function readIntEnv(value: string | undefined, fallback: number): number {
     throw new Error(`Invalid integer env value: ${value}`);
   }
   return Number(value.trim());
+}
+
+/**
+ * 读取必须为正整数的环境变量：未设置（或只有空白）用缺省，其余（含 `0`、负数、非整数串）
+ * 一律抛错，错误信息点名变量。
+ *
+ * 刻意不并进 `readIntEnv`——那个允许 `0`（`NEWIDE_B_LEARN_MAX_PER_CYCLE=0` 是合法配置）。
+ * 但「周期」这类配置的 `0` 是另一回事：调用方会把它当成「不启动」，于是运维看到的是
+ * 「配了但什么都不干」。这类值必须在启动时就把人拦住，而不是安静地退化成关闭。
+ */
+export function readPositiveIntEnv(
+  name: string,
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) === 0) {
+    throw new Error(`${name} must be a positive integer (>= 1); got "${value}"`);
+  }
+  return Number(trimmed);
 }
 
 function readJson(filePath: string): unknown {
