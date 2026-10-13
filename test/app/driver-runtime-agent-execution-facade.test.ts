@@ -898,6 +898,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
 
     expect(events).toEqual([
+      expect.objectContaining({ event_type: 'driver.prompt_dispatching', role_id: 'reviewer' }),
       expect.objectContaining({ event_type: 'agent_message_chunk', role_id: 'reviewer' }),
     ]);
   });

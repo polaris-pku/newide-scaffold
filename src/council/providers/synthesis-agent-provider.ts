@@ -417,7 +417,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       await validate?.(saved.execution.result);
       return saved.execution;
     }
-    if (saved?.prepared && !saved.session_id) {
+    if (saved?.prepared && saved.driver_dispatched !== false && !saved.session_id) {
       throw new Error('Interrupted Council role has no durable native session ID; refusing a fresh session');
     }
     let sessionId: string | undefined = saved?.session_id;
@@ -428,6 +428,13 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     if (recovery) {
       options = { ...options, onDriverEvent: (event) => {
         try {
+        if (event.event_type === 'driver.prompt_dispatching') {
+          const role = recovery.state.roles[recoveryId];
+          if (role) {
+            role.driver_dispatched = true;
+            recovery.save();
+          }
+        }
         if (event.event_type === 'driver.turn_started' && event.session_id) {
           const role = recovery.state.roles[recoveryId];
           if (role) {
@@ -435,12 +442,16 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
               throw new Error('Council Driver returned a different session while resuming');
             }
             role.session_id = event.session_id;
+            role.driver_dispatched = true;
             sessionId = event.session_id;
             recovery.save();
           }
         }
         } catch (error) {
           recoveryError = error;
+          // This callback is invoked synchronously before transport launch.
+          // A failed durable dispatch record must prevent that launch.
+          if (event.event_type === 'driver.prompt_dispatching') throw error;
         }
         originalOptions?.onDriverEvent?.(event);
       } };
@@ -471,7 +482,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           await prepare?.();
           workspaceBefore = await snapshotWorkspaceFiles(workspacePath);
           if (recovery) {
-            recovery.state.roles[recoveryId] = { prepared: true, workspace_before: [...workspaceBefore] };
+            recovery.state.roles[recoveryId] = { prepared: true, driver_dispatched: false, workspace_before: [...workspaceBefore] };
             recovery.save();
           }
         }

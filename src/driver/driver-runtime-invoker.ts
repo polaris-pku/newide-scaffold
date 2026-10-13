@@ -94,9 +94,19 @@ export function createDriverRuntimeInvoker(
         },
         options?.signal,
         options?.onDriverEvent,
-        options?.onDispatch || options?.onLateResult
+        options?.onDriverEvent || options?.onDispatch || options?.onLateResult
           ? {
-              ...(options.onDispatch ? { onDispatch: options.onDispatch } : {}),
+              onDispatch: () => {
+                options.onDriverEvent?.({
+                  schema_version: 'driver-event.v1',
+                  event_type: 'driver.prompt_dispatching',
+                  task_id: input.task_id,
+                  run_id: runId,
+                  ...(input.session_id ? { session_id: input.session_id } : {}),
+                  created_at: nowTimestamp(),
+                });
+                options.onDispatch?.();
+              },
               ...(options.onLateResult ? { onLateResult: options.onLateResult } : {}),
             }
           : undefined,

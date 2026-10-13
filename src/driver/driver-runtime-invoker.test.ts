@@ -172,6 +172,11 @@ describe('createDriverRuntimeInvoker', () => {
 
     expect(events).toEqual([
       expect.objectContaining({
+        event_type: 'driver.prompt_dispatching',
+        task_id: 'task_1',
+        run_id: 'run_1',
+      }),
+      expect.objectContaining({
         event_type: 'agent_message_chunk',
         task_id: 'task_1',
         run_id: 'run_1',

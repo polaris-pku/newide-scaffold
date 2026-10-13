@@ -7,6 +7,8 @@ import type { Proposal } from './contract';
 
 export interface CouncilRoleRecovery {
   prepared: boolean;
+  /** False proves interruption happened before the first Driver dispatch. */
+  driver_dispatched?: boolean;
   workspace_before: Array<[string, string]>;
   session_id?: string;
   execution?: { result: AgentExecutionResult; phase_id: string };

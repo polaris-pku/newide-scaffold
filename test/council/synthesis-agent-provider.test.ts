@@ -14,6 +14,53 @@ import { SapTaskBridge } from '../../src/coordination';
 import { SqliteCoordinationStore, type CoordinationStateCommit } from '../../src/persistence';
 
 describe('SynthesisAgentCouncilProvider', () => {
+  it.each([false, true])('handles interruption before a session ID exists (dispatched=%s)', async (dispatched) => {
+    const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-before-session-'));
+    const controller = new AbortController();
+    let workspace: string | undefined;
+    const first = new SynthesisAgentCouncilProvider({ councilRoot, agentExecutionFacade: {
+      async runAgent(input, options) {
+        if (input.council_seat === 'reviewer') {
+          workspace = input.workspace_path;
+          await fs.writeFile(path.join(workspace!, 'prepared.txt'), 'keep');
+          if (dispatched) options?.onDriverEvent?.({
+            schema_version: 'driver-event.v1', event_type: 'driver.prompt_dispatching',
+            task_id: input.task_id, run_id: input.run_id,
+          });
+          controller.abort(new Error('backend stopped before session ID'));
+          throw controller.signal.reason;
+        }
+        return completedExecution(input);
+      },
+    } });
+    const resumed: AgentExecutionRequest[] = [];
+    const second = new SynthesisAgentCouncilProvider({ councilRoot, agentExecutionFacade: {
+      async runAgent(input) {
+        resumed.push(input);
+        expect(input.session_id).toBeUndefined();
+        if (input.council_seat === 'reviewer') {
+          expect(input.workspace_path).toBe(workspace);
+          expect(await fs.readFile(path.join(workspace!, 'prepared.txt'), 'utf8')).toBe('keep');
+        }
+        return completedExecution(input);
+      },
+    } });
+    try {
+      await expect(first.runCouncilRound(baseInput(), { recovery_key: 'original', signal: controller.signal }))
+        .rejects.toThrow('backend stopped before session ID');
+      const resume = second.runCouncilRound({ ...baseInput(), run_id: 'resumed' }, { recovery_key: 'original' });
+      if (dispatched) {
+        await expect(resume).rejects.toThrow('no durable native session ID');
+        expect(resumed).toEqual([]);
+      } else {
+        await expect(resume).resolves.toMatchObject({ decision: { verdict: 'select' } });
+        expect(resumed.map(r => r.council_seat)).toEqual(['reviewer', 'synthesizer']);
+      }
+    } finally {
+      await fs.rm(councilRoot, { recursive: true, force: true });
+    }
+  });
+
   it.each(['reviewer', 'synthesizer'] as const)('reloads interrupted %s without rerunning completed roles', async (seat) => {
     const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-reload-'));
     const controller = new AbortController();
