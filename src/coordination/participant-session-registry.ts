@@ -32,7 +32,10 @@ export interface ParticipantSessionProvisionRequest {
   task_id: string;
   workspace_path: string;
   role_id: string;
+  /** 执行身份；council 席位是 `${任务run_id}_${phaseId}`。 */
   run_id: string;
+  /** 本次执行归属的**任务 run**（冻结 routing 快照按它存）；缺省时等于 `run_id`。 */
+  activity_run_id?: string;
 }
 
 export type ParticipantSessionProvisioner = (

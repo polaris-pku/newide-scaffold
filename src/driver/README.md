@@ -75,6 +75,37 @@ converter),以及 **ADP(Agent-Driver Protocol)v1 的 System 内代理 endpoint**
 - 历史的「artifact-free retryable 重试」(按 `error.retryable` 启发式)只保留在
   非 ADP 路径;ADP 路径的重试语义完全由 `auto_retry[side_effect]` 支配。
 
+## Driver 档案、自动发现与路由
+
+「有哪些 driver、每个 driver 是什么、哪个 role 用哪个」这一半由下面几个文件承担，与上面的
+ADP 调用链是两条独立的关注点：
+
+| 文件 | 职责 |
+| --- | --- |
+| `profile.ts` | 档案与配置的模型（zod 单一来源），`resolveRoleDriver` 是「role → driver」的唯一取值入口 |
+| `profile-loader.ts` | 分层加载：内置 → 用户级 → 用户本地 → 项目级 → 项目本地 → **自动发现层** → UI routing 层，最后叠 env 覆盖（env 永远赢） |
+| `driver-discovery-catalog.ts` | 探测事实的唯一出口：稳定身份、合并规则、stale 判定、runtime 注册结果 |
+| `driver-discovery-file-store.ts` | 自动 profile 与 discovery state 的原子落盘（`.agent` 锁 + 临时文件 + fsync + rename） |
+| `driver-discovery-service.ts` | 编排「探测 → 合并 → 落盘 → 注册」，并对并发刷新去重 |
+| `driver-registry.ts` | 档案 → runtime 句柄；手工档案 fail-fast，自动发现走可捕获失败的动态注册 |
+| `driver-routing-service.ts` | 有效映射、revision/CAS、Run 冻结快照、可选择性投影 |
+| `agent-dir-lock.ts` / `atomic-file-write.ts` | 上面两个存储层共用的 `.agent` 目录锁与原子写 |
+
+边界（改动前先读这几条）：
+
+- **`src/app` 之外不碰文件系统以外的装配**：模块只提供纯逻辑与存储适配，`backend-rpc-stdio.ts`
+  负责顺序——探测 → 落盘 → `loadDriverConfig` → registry → routing → system status。顺序反了
+  会让 registry 与 routing 各执一份真相。
+- **配置事实与探测事实分权**：`loadManualDriverConfig()` 给出「用户配了什么」（自动发现层与
+  UI routing 层都不算），catalog 给出「本机探测到了什么」，registry 给出「执行事实」。任何一处
+  都不许拿另一处的结论冒充自己的。它是一份**残缺层集**的投影，因此只做形状校验：UI 里选中的
+  `discovered:` driver 由被排除的那一层提供，对它做全量引用校验会把「用户存下的选择」误判成
+  配置错误。
+- **两类 driver 的失败语义不同**：手工档案装配失败 = 启动失败（用户要立刻知道）；自动发现的
+  失败 = 那个 driver 不可选择（记录原因码）。共用同一套装配代码，差别只在失败的处理方式。
+- **敏感信息不出模块**：`DriverProbe.launch`（启动命令、参数）只用于探测诊断，不写进自动 profile、
+  不进 routing 快照、不进 discovery state。前端能看到的是 driver_id / agent / 可选择性 / 原因码。
+
 ## 测试映射
 
 | 文件 | 场景 |

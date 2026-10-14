@@ -2,12 +2,12 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createProductionBackendService,
   parseDriverEnv,
@@ -1078,3 +1078,232 @@ function maintenanceLlm(): LlmClient {
     },
   };
 }
+
+/** ACP 探针模块桩：写进 runner 检出里，让真实 `AcpDriverProbeService` 有东西可跑。 */
+function writeAcpProbeModule(runnerDir: string, agentIds: readonly string[]): void {
+  const moduleDir = path.join(runnerDir, 'dist', 'src', 'driver-adapter');
+  mkdirSync(moduleDir, { recursive: true });
+  const rows = agentIds.map((agentId) =>
+    [
+      '{',
+      `  agentId: ${JSON.stringify(agentId)},`,
+      `  displayName: ${JSON.stringify(`${agentId} CLI`)},`,
+      // 启动命令与参数刻意塞进假凭据与绝对路径：它们绝不能出现在 RPC 响应里
+      "  launch: { command: 'npx', args: ['-y', 'some-agent', '--token=sk-should-not-leak'] },",
+      "  provenance: 'npx-on-demand',",
+      "  connectionType: 'acp',",
+      "  initialize: { protocolVersion: 1, authMethods: 0 },",
+      "  probedAt: '2026-10-14T00:00:00.000Z',",
+      '}',
+    ].join('\n'),
+  );
+  writeFileSync(
+    path.join(moduleDir, 'probe.js'),
+    `export async function probeAgents() { return [\n${rows.join(',\n')}\n]; }\n` +
+      `export async function probeAgent(id) { return (await probeAgents()).find((row) => row.agentId === id) ?? null; }\n`,
+  );
+}
+
+/**
+ * 自动发现在**真实装配**里的样子。
+ *
+ * 这一层最需要端到端验证，因为它的错误形态是「装好了但列表里没有」或「列表里有但一执行就炸」，
+ * 单看模块测试看不出来。这里用假的 ACP 探针模块跑真实 `AcpDriverProbeService`（真实 spawn），
+ * 于是「探测成功 → 自动 profile 落盘 → registry 注册 → 出现在 driver.getConfig 与
+ * system.capabilities」整条链路都被覆盖。
+ *
+ * 每个用例把 cwd 换成一个临时项目根：生产的 projectRoot 就是 cwd，不换的话自动 profile 会写进
+ * 本仓检出（`.agent/`），污染后续测试。
+ */
+describe('driver auto-discovery in the production assembly', () => {
+  const originalCwd = process.cwd();
+  const roots: string[] = [];
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
+  });
+
+  function makeProjectRoot(): string {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'newide-discovery-root-'));
+    roots.push(root);
+    writeFileSync(path.join(root, 'package.json'), '{"name":"newide-bcd","version":"0.1.0"}');
+    return root;
+  }
+
+  function makeRunnerDir(withProbe: boolean, agentIds: readonly string[] = ['gemini']): string {
+    const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-discovery-runner-'));
+    roots.push(runnerDir);
+    writeFileSync(
+      path.join(runnerDir, 'package.json'),
+      JSON.stringify({ name: 'acp-external-runner', version: '9.9.9', scripts: { 'driver:run': 'exit 0' } }),
+    );
+    writeFakeAcpRunnerBuild(runnerDir);
+    if (withProbe) writeAcpProbeModule(runnerDir, agentIds);
+    return runnerDir;
+  }
+
+  async function startBackend(root: string, runnerDir: string): Promise<NewideBackendService> {
+    process.chdir(root);
+    return createProductionBackendService(
+      {
+        ACP_DRIVER_RUNNER_DIR: runnerDir,
+        NEWIDE_STATE_ROOT: path.join(root, '.newide'),
+        NEWIDE_COORDINATION_DB: ':memory:',
+      },
+      { bRuntime: createInMemoryBRuntime() },
+    );
+  }
+
+  it('adds a probe-reachable agent to getConfig and system.capabilities', async () => {
+    const root = makeProjectRoot();
+    const runnerDir = makeRunnerDir(true);
+    const service = await startBackend(root, runnerDir);
+
+    try {
+      const snapshot = await service.driverRouting!.getSnapshot();
+      const discovered = snapshot.drivers.filter((driver) =>
+        driver.driver_id.startsWith('discovered:'),
+      );
+
+      expect(discovered).toHaveLength(1);
+      expect(discovered[0]).toMatchObject({
+        agent: 'gemini',
+        display_name: 'gemini CLI',
+        selectable: true,
+        status: 'degraded',
+      });
+      // 探测到的 driver 与手工那个（内置 acp-external）并列，默认 driver 不变
+      expect(snapshot.default_driver).toBe('acp-external');
+
+      // system.capabilities 与 driver.getConfig 同源：同一个 driver 在两边都出现
+      const statuses = service.getSystemReadiness().components.map((item) => item.component_id);
+      expect(statuses).toContain(`driver:${discovered[0]!.driver_id}`);
+      const limitations = service
+        .getSystemCapabilities()
+        .capabilities.find((item) => item.capability_id === 'driver.execute')?.limitations;
+      expect(limitations?.some((line) => line.includes('ACP 探测通过'))).toBe(true);
+
+      // 探测细节不穿过 RPC 边界：启动命令、参数、凭据值、runner 绝对路径都不出现
+      const serialized = JSON.stringify([snapshot, service.getSystemReadiness(), service.getSystemCapabilities()]);
+      expect(serialized).not.toContain('npx');
+      expect(serialized).not.toContain('sk-should-not-leak');
+      expect(serialized).not.toContain(runnerDir);
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('lets the discovered driver be chosen as a role driver', async () => {
+    const root = makeProjectRoot();
+    const service = await startBackend(root, makeRunnerDir(true));
+
+    try {
+      const before = await service.driverRouting!.getSnapshot();
+      const discoveredId = before.drivers.find((driver) =>
+        driver.driver_id.startsWith('discovered:'),
+      )!.driver_id;
+
+      const after = await service.driverRouting!.updateRouting({
+        expected_revision: before.revision,
+        default_driver: before.default_driver,
+        roles: { role_ts_engineer: discoveredId },
+      });
+
+      expect(after.roles.find((role) => role.role_id === 'role_ts_engineer')?.driver_id).toBe(
+        discoveredId,
+      );
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('starts and keeps serving when the ACP probe is unavailable', async () => {
+    const root = makeProjectRoot();
+    // runner 没有构建探针模块：探测整体不可用，但后端必须照常起来
+    const service = await startBackend(root, makeRunnerDir(false));
+
+    try {
+      const snapshot = await service.driverRouting!.getSnapshot();
+
+      expect(snapshot.drivers.map((driver) => driver.driver_id)).toEqual(['acp-external']);
+      expect(snapshot.drivers[0]?.selectable).toBe(true);
+      // 什么都没发现时不在项目里留下一个空文件
+      expect(existsSync(path.join(root, '.agent', 'drivers.detected.local.yaml'))).toBe(false);
+      // 探测失败的结论仍然落在 state 里，便于归因
+      expect(
+        JSON.parse(readFileSync(path.join(root, '.newide', 'driver-discovery.json'), 'utf8'))
+          .probe_status,
+      ).toBe('unavailable');
+    } finally {
+      await service.close();
+    }
+  });
+
+  it('remembers a discovered driver across a restart without re-probing', async () => {
+    const root = makeProjectRoot();
+    const runnerDir = makeRunnerDir(true);
+    const first = await startBackend(root, runnerDir);
+    const discoveredId = (await first.driverRouting!.getSnapshot()).drivers.find((driver) =>
+      driver.driver_id.startsWith('discovered:'),
+    )!.driver_id;
+    await first.close();
+
+    // 重启：同一个项目根，但 runner 侧已经拿不到探针了
+    const second = await startBackend(root, makeRunnerDir(false));
+
+    try {
+      const snapshot = await second.driverRouting!.getSnapshot();
+      // 上一轮的发现结果从 profile 文件里读回来，因而仍在列表里（本轮未再发现 → 不可选择）
+      expect(snapshot.drivers.map((driver) => driver.driver_id)).toContain(discoveredId);
+      expect(
+        snapshot.drivers.find((driver) => driver.driver_id === discoveredId),
+      ).toMatchObject({ selectable: false, reason_code: 'DRIVER_DISCOVERY_STALE' });
+    } finally {
+      await second.close();
+    }
+  });
+
+  it('keeps routing to a discovered driver usable across a restart', async () => {
+    const root = makeProjectRoot();
+    const runnerDir = makeRunnerDir(true, ['codex', 'gemini']);
+    const first = await startBackend(root, runnerDir);
+    const before = await first.driverRouting!.getSnapshot();
+    const [primary, secondary] = before.drivers
+      .filter((driver) => driver.driver_id.startsWith('discovered:'))
+      .map((driver) => driver.driver_id);
+    // 默认 driver 与一条 role 都指向自动发现的 driver——UI 里选择它们之后就会写进 UI 层
+    await first.driverRouting!.updateRouting({
+      expected_revision: before.revision,
+      default_driver: primary!,
+      roles: { role_ts_engineer: secondary! },
+    });
+    await first.close();
+
+    const second = await startBackend(root, runnerDir);
+
+    try {
+      const snapshot = await second.driverRouting!.getSnapshot();
+
+      expect(snapshot.default_driver).toBe(primary);
+      expect(
+        snapshot.roles.find((role) => role.role_id === 'role_ts_engineer')?.driver_id,
+      ).toBe(secondary);
+      // 这一轮探测照常成功：UI 层引用了 discovered: 不该把整轮探测判成失败
+      expect(snapshot.drivers.find((driver) => driver.driver_id === primary)).toMatchObject({
+        selectable: true,
+        status: 'degraded',
+      });
+      expect(snapshot.drivers.find((driver) => driver.driver_id === secondary)).toMatchObject({
+        selectable: true,
+        status: 'degraded',
+      });
+      expect(
+        JSON.parse(readFileSync(path.join(root, '.newide', 'driver-discovery.json'), 'utf8'))
+          .probe_status,
+      ).toBe('ready');
+    } finally {
+      await second.close();
+    }
+  });
+});

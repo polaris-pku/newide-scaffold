@@ -154,9 +154,20 @@ export class DriverConfigError extends Error {
 
 /** 把一份**完整**配置解析为 {@link DriverConfig}，并做跨字段校验。 */
 export function parseDriverConfig(raw: unknown, sourcePath?: string): DriverConfig {
-  const config = parseWith(driverConfigSchema, raw, sourcePath);
+  const config = parseDriverConfigShape(raw, sourcePath);
   assertReferencesResolve(config, sourcePath);
   return config;
+}
+
+/**
+ * 只做形状校验，不校验 `default_driver` / `roles` 是否引用得到档案。
+ *
+ * 给**部分层投影**用：那种投影按定义不是一份完整文档（例如「只看手工层」的投影里，
+ * 被 UI 层引用的 `discovered:` driver 由自动发现层提供），拿全量判据去校验必然误报。
+ * 每层自己的形状仍然严格——YAML 坏了、字段越界了照样抛。
+ */
+export function parseDriverConfigShape(raw: unknown, sourcePath?: string): DriverConfig {
+  return parseWith(driverConfigSchema, raw, sourcePath);
 }
 
 /** 把一层配置文件解析为 {@link DriverConfigLayer}；不做跨字段校验（合并后再做）。 */

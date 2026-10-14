@@ -18,9 +18,11 @@ import {
 } from '../council';
 import {
   AcpDriverProbeService,
+  createDriverDiscoveryRuntime,
   createDriverRegistry,
   DriverRoutingService,
   loadDriverConfig,
+  loadManualDriverConfig,
 } from '../driver';
 import {
   LlmContextCleaner,
@@ -84,7 +86,7 @@ import {
 import { SystemRpcMethods } from '../rpc/system-methods';
 import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { DriverRpcMethods, createDriverMethodsService } from '../rpc/driver-methods';
-import { createProductionSystemStatusService } from './system-status-service';
+import { createProductionSystemStatusService, systemStatusDriverStatus } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
 import { FileRunPayloadReader } from './run-payload-reader';
@@ -167,9 +169,35 @@ export async function createProductionBackendService(
   // driver 可配置化：可用 driver 是一份数据体（默认 <repoRoot>/.agent/drivers.yaml），
   // 每个档案各建一个 runtime。基础环境里**不含** ACP_AGENT_ID——它由档案的 agent 决定，
   // 于是「换 driver」就是换 spawn 时的 agent，A 侧无需改动（进程本就是每次调用一次性）。
+  //
+  // 自动发现（driver 自动发现）插在这里：先探测、把结果落成一层配置，再 loadDriverConfig，
+  // 这样「探测到的 driver」与「手工配的 driver」在同一份配置里合并，registry 与 routing 都
+  // 只看这一份。顺序不能反——先建 registry 再改 config 会让 registry 与 routing 各执一份真相。
+  const driverProbeService = new AcpDriverProbeService({ runnerDir });
+  // 「配置事实」只取手工层：自动发现层是后端自己写的，拿它当配置事实会让 stale 判定永远不成立。
+  const configuredDriverProfiles = () =>
+    Object.entries(loadManualDriverConfig({ projectRoot: repoRoot, env }).drivers).map(
+      ([driverId, profile]) => ({ driver_id: driverId, agent: profile.agent }),
+    );
+  const driverDiscoveryRuntime = createDriverDiscoveryRuntime({
+    projectRoot: repoRoot,
+    stateRoot,
+    probe: driverProbeService,
+    configuredProfiles: configuredDriverProfiles,
+  });
+  const discoveryCatalog = driverDiscoveryRuntime.service.catalog();
+  // 启动探测失败不阻塞后端：服务内部只记原因码、保留历史 driver（降级为 stale）。
+  await driverDiscoveryRuntime.service.startup();
+
   const driverConfig = loadDriverConfig({ projectRoot: repoRoot, env });
+  // 只有**探测生成**的那些才走动态注册：它们的装配失败不该拦住启动（见 registry 文件头）。
+  const discoveredDriverIds = Object.keys(driverConfig.drivers).filter(
+    (driverId) => discoveryCatalog.recordOf(driverId)?.source === 'discovered',
+  );
   const driverRegistry = createDriverRegistry({
     config: driverConfig,
+    discoveredDriverIds,
+    connectionTypeOf: (driverId) => discoveryCatalog.recordOf(driverId)?.connection_type,
     runnerDir,
     defaultEntryRelative: DRIVER_RUNNER_ENTRY_RELATIVE,
     baseEnv: {
@@ -232,6 +260,10 @@ export async function createProductionBackendService(
       env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
     ),
   });
+  // registry 就绪后把自动发现的 runtime 补注册进去。放在这里而不是 startup() 里面，是因为
+  // registry 需要先读到「含自动 profile 的配置」，而那一步在探测落盘之后。
+  driverDiscoveryRuntime.service.attachRegistry(driverRegistry);
+  driverDiscoveryRuntime.service.syncRuntimes();
   // 未配置任何 driver 档案时，这里拿到的是唯一那个 acp-external，与历史装配一致。
   const driver = driverRegistry.get(driverConfig.default_driver);
   let bRuntime: BackendBRuntime | undefined;
@@ -358,6 +390,11 @@ export async function createProductionBackendService(
       registry: driverRegistry,
       // 可协作 role 用同一条动态目录：运行时新增/退休的 Agent 立即反映在路由快照里。
       knownRoleIds: agentCatalogProvider,
+      // 探测事实与刷新入口：`driver.getConfig` 的 drivers[] 与 `system.capabilities` 共用这份投影。
+      catalog: discoveryCatalog,
+      discovery: {
+        refresh: (probeOptions) => driverDiscoveryRuntime.service.refresh(probeOptions),
+      },
     });
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
@@ -602,12 +639,24 @@ export async function createProductionBackendService(
       coordination_durable: databasePath !== ':memory:',
       driver_provider_id: runnerPackageIdentity.name,
       driver_provider_version: runnerPackageIdentity.version,
-      // 「有哪些 driver 可用」的对外出口：逐档案带上 agent 与档案自报的限制。
-      driver_profiles: Object.entries(driverConfig.drivers).map(([driverId, profile]) => ({
-        driver_id: driverId,
-        agent: profile.agent,
-        ...(profile.limitations ? { limitations: profile.limitations } : {}),
-      })),
+      // 「有哪些 driver 可用」的对外出口：与 `driver.getConfig.drivers[]` **同一份投影**。
+      // 每次查询重新取（函数而不是数组）：刷新后新增的 driver 必须立刻出现在能力里，
+      // 否则前端会把「探测到了但 system.capabilities 里没有」读成不可用。
+      driver_status: () =>
+        driverRoutingService.driverProjection().map((entry) => {
+          const record = discoveryCatalog.recordOf(entry.driver_id);
+          return systemStatusDriverStatus({
+            driver_id: entry.driver_id,
+            agent: entry.agent,
+            selectable: entry.selectable,
+            status: entry.status,
+            ...(entry.reason_code ? { reason_code: entry.reason_code } : {}),
+            ...(entry.limitations ? { limitations: entry.limitations } : {}),
+            ...(entry.display_name ? { display_name: entry.display_name } : {}),
+            source: record?.source ?? 'configured',
+            probe_verified: record?.status === 'ready',
+          });
+        }),
       b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
       b_embedding: bRuntime.embedding_info ?? {
         provider: 'host-managed repository',
@@ -676,9 +725,10 @@ export async function createProductionBackendService(
         DEFAULT_DRIVER_BILLED_SOURCE,
       // Run 创建时冻结 routing 快照；`startBackendRpcServer` 也从 service 上取它注册 driver.* 方法。
       driverRoutingService,
-      // ACP owns adapter metadata and the initialize handshake. Keep the probe
-      // behind the same service so the frontend can call it through JSON-RPC.
-      new AcpDriverProbeService({ runnerDir }),
+      // ACP owns adapter metadata and the initialize handshake. Keep the probe behind the same
+      // service so the frontend can call it through JSON-RPC (`driver.list` / `driver.probe`),
+      // and the same instance the startup probe used (`driver.refresh`)。
+      driverProbeService,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();
@@ -940,9 +990,14 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   // driver 读写 RPC 只在组装点注入了 routing service 时注册：测试里的裸 service 不会凭空
   // 多出三个方法，生产装配则自动带上（`system.*` 的只读语义不受影响）。
   if (service.driverRouting) {
+    const routing = service.driverRouting;
     const driverMethods = new DriverRpcMethods(
-      createDriverMethodsService(service.driverRouting),
+      createDriverMethodsService(routing),
       service.driverProbe,
+      // `driver.refresh` 只在 routing 端口真的支持重新探测时注册：桩实现不该凭空多出这个方法。
+      typeof routing.refreshDriverDiscovery === 'function'
+        ? { refresh: (options) => routing.refreshDriverDiscovery(options) }
+        : undefined,
     );
     driverMethods.register(dispatcher);
   }
