@@ -26,6 +26,7 @@ export interface TaskMethodsService {
   getTask(taskId: string): Promise<TaskSnapshot>;
   listTasks(): Promise<TaskListResult>;
   cancelTask(taskId: string): Promise<TaskSnapshot>;
+  interruptTask(taskId: string): Promise<TaskSnapshot>;
   resumeTask(taskId: string): Promise<TaskSnapshot>;
   startCouncil(taskId: string): Promise<TaskSnapshot>;
   subscribeTask(
@@ -95,6 +96,10 @@ export class TaskRpcMethods {
     dispatcher.register('task.cancel', (params) => {
       const { task_id } = parseParams(taskIdParamsSchema, params);
       return this.callWithTaskError(() => this.service.cancelTask(task_id));
+    });
+    dispatcher.register('task.interrupt', (params) => {
+      const { task_id } = parseParams(taskIdParamsSchema, params);
+      return this.callWithTaskError(() => this.service.interruptTask(task_id));
     });
     dispatcher.register('task.resume', (params) => {
       const { task_id } = parseParams(taskIdParamsSchema, params);

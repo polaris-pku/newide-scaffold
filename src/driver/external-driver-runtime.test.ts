@@ -56,7 +56,7 @@ describe('ExternalDriverRuntime', () => {
     );
   });
 
-  it('starts a fresh session when session loading is unsupported', async () => {
+  it('refuses a fresh session when session loading is unsupported', async () => {
     let receivedPrompt: DriverPrompt | undefined;
     const runtime = new ExternalDriverRuntime({
       driver_id: 'external-acp-driver',
@@ -69,9 +69,19 @@ describe('ExternalDriverRuntime', () => {
       },
     });
 
-    await runtime.sendPrompt({ ...PROMPT, session_id: 'stale-process-local-session' });
+    await expect(runtime.sendPrompt({ ...PROMPT, session_id: 'stale-process-local-session' }))
+      .rejects.toThrow('DRIVER_SESSION_LOAD_UNSUPPORTED');
+    expect(receivedPrompt).toBeUndefined();
+  });
 
-    expect(receivedPrompt?.session_id).toBeUndefined();
+  it('rejects a successful response from a different session', async () => {
+    const runtime = new ExternalDriverRuntime({
+      driver_id: 'external-acp-driver',
+      capabilities: { supports_session_load: true },
+      transport: { invoke: async () => driverRunResult() },
+    });
+    await expect(runtime.sendPrompt({ ...PROMPT, session_id: 'original-session' }))
+      .rejects.toThrow('DRIVER_SESSION_MISMATCH');
   });
 
   it('returns a failed DriverRunResult when the transport throws', async () => {
@@ -101,6 +111,19 @@ describe('ExternalDriverRuntime', () => {
     expect(result.diagnostics.notes).toContain(
       'transport_error=Command driver timed out after 1000ms',
     );
+  });
+
+  it('does not report a native no-response marker as task completion', async () => {
+    const runtime = new ExternalDriverRuntime({
+      driver_id: 'external-acp-driver',
+      capabilities: { supports_session_load: true },
+      transport: { invoke: async () => ({
+        ...driverRunResult(), response: 'No response requested.', artifacts: [], tool_events: [],
+      }) },
+    });
+    const result = await runtime.sendPrompt({ ...PROMPT, session_id: 'external-session' });
+    expect(result).toMatchObject({ status: 'failed', session_id: 'external-session',
+      error: { code: 'DRIVER_NO_PROGRESS', retryable: false } });
   });
 
   it('delegates interrupt and shutdown to the transport when supported', async () => {

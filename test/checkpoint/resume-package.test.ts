@@ -14,8 +14,24 @@ import { TaskProcessor } from '../../src/coordination';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { InMemoryParticipantSessionRegistry } from '../../src/coordination/participant-session-registry';
 
 describe('ResumePackage', () => {
+  it('resolves legacy Council sessions in their isolated workspaces and keeps missing indexes as native load references', () => {
+    const aggregate = fakeAggregate({ resume_cursor: 'select_agent', artifact_refs: [] });
+    const checkpoint = fakeCheckpoint({ resume_cursor: 'select_agent', artifact_refs: [] });
+    checkpoint.participant_sessions = [
+      { role_id: 'primary', session_id: 'native_primary' },
+      { role_id: 'reviewer', session_id: 'native_review' },
+    ];
+    const sessions = new InMemoryParticipantSessionRegistry();
+    sessions.register({ task_id: aggregate.task.task_id, role_id: 'primary', session_id: 'native_primary', workspace_path: '/isolated/primary' });
+    const result = buildResumePackage({ aggregate, checkpoint, participantSessions: sessions });
+    expect(result.participant_sessions).toEqual(checkpoint.participant_sessions);
+    checkpoint.participant_sessions = [{ role_id: 'primary', session_id: 'wrong_session', workspace_path: '/isolated/primary' }];
+    expect(() => buildResumePackage({ aggregate, checkpoint, participantSessions: sessions })).toThrow(ResumePackageError);
+  });
+
   it('builds a package with cursor/session/workspace/artifact/mailbox/file_anchor', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-resume-pkg-'));
     const store = new SqliteCoordinationStore(path.join(root, 'coordination.sqlite'));

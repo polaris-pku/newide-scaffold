@@ -17,7 +17,7 @@ import {
 } from './run-stage-mapping';
 
 export type AppRunMode = 'single_agent' | 'council';
-export type AppRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type AppRunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export type { AppRunStage };
 
 export type AppRunEvent = RunEvent;
@@ -131,6 +131,7 @@ const EVENT_NODE_CODES: Readonly<Record<string, string>> = {
   'checkpoint.saved': 'N16',
   'run.completed': 'N18',
   'run.failed': 'N18',
+  'run.interrupted': 'N16',
 };
 
 /**
@@ -395,6 +396,33 @@ export class InMemoryRunRegistry {
     });
     if (!staged) return this.clone(record);
     return this.commitTerminal(runId, staged);
+  }
+
+  /** Abort the active execution without turning it into a terminal cancellation. */
+  requestAbort(runId: string, reason: Error): AppRunSnapshot {
+    const record = this.require(runId);
+    if (record.status === 'running') record.controller?.abort(reason);
+    return this.clone(record);
+  }
+
+  /** Mark a run interrupted after its execution loop persisted the durable checkpoint. */
+  interrupt(runId: string, reason: RunCancellationReason): AppRunSnapshot {
+    const record = this.require(runId);
+    if (record.status !== 'running') return this.clone(record);
+    record.status = 'interrupted';
+    record.current = {
+      stage: 'intervention',
+      active_node_code: 'N16',
+      ...(record.current.cursor ? { cursor: record.current.cursor } : {}),
+    };
+    record.error = { ...reason };
+    this.appendEventOnce(runId, 'run.interrupted', {
+      status: 'interrupted',
+      code: reason.code,
+      message: reason.message,
+      ...(reason.details ? { details: reason.details } : {}),
+    });
+    return this.clone(record);
   }
 
   /**

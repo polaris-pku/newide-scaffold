@@ -1,0 +1,217 @@
+{
+  "schema_version": "native-session-resume-acceptance.v1",
+  "date": "2026-10-13",
+  "tested_source_commit": "458adcf8dd1935164e9b2a2e2d2f6522564a6cdd",
+  "included_main_commit": "649521035bc0b4f4074bd9d630250b344d3b3247",
+  "runtime": {
+    "backend": "production stdio RPC",
+    "driver_agent": "claude",
+    "configured_model": "MiniMax-M3",
+    "ephemeral_sessions": false,
+    "embedding_provider": "hash"
+  },
+  "cases": [
+    {
+      "mode": "single_agent",
+      "status": "passed",
+      "raw_evidence_directory": "newide-session-reload-SMG8Cw",
+      "task_id": "task_c858f3f9-4e2e-46f9-90fb-6a7aa123ca15",
+      "backend_process_ids": [
+        93027,
+        93557
+      ],
+      "interrupt_signal": "SIGINT",
+      "interrupted_role": "role_ts_engineer",
+      "original_run_id": "run_b3d47ce1-b932-4d77-99dd-137590fa8872",
+      "resumed_run_id": "run_ded256b0-1a80-416a-a2b5-273ce2331f0e",
+      "cursor_before": "execute_agent",
+      "cursor_after": "execute_agent",
+      "native_session_id": "554ff746-b242-441e-91fd-43ec80e4ded6",
+      "native_history": {
+        "records_before": 5,
+        "records_after": 21,
+        "cross_restart_parent_links": [
+          {
+            "uuid": "7b63537f-dc2d-4ed5-b5c2-187c904782f2",
+            "parentUuid": "10918b80-7efb-4f0a-b741-b9035a52f96e",
+            "timestamp": "2026-10-13T05:25:12.095Z",
+            "sessionId": "554ff746-b242-441e-91fd-43ec80e4ded6"
+          }
+        ],
+        "transcript_sha256": "be8a5996804307fe4125d01d6191711c604ab10c5785a37547a2d26809dc0c25"
+      },
+      "driver_turns_before": [
+        {
+          "role_id": "role_ts_engineer",
+          "session_id": "554ff746-b242-441e-91fd-43ec80e4ded6",
+          "prompt_length": 314,
+          "at": "2026-10-13T05:23:12.288Z"
+        },
+        {
+          "role_id": "role_ts_engineer",
+          "session_id": "554ff746-b242-441e-91fd-43ec80e4ded6",
+          "prompt_length": 24916,
+          "at": "2026-10-13T05:23:44.658Z"
+        }
+      ],
+      "driver_turns_after": [
+        {
+          "role_id": "role_ts_engineer",
+          "session_id": "554ff746-b242-441e-91fd-43ec80e4ded6",
+          "prompt_length": 2478,
+          "at": "2026-10-13T05:25:12.116Z"
+        }
+      ],
+      "completed_roles_not_rerun": [],
+      "task_status": "completed",
+      "product_tests": {
+        "passed": 18,
+        "failed": 0
+      },
+      "browser_checks": {
+        "browser": "Chrome",
+        "keyboard": true,
+        "gameover": true,
+        "restart": true,
+        "page_errors": [],
+        "pause": true
+      },
+      "product_files": [
+        {
+          "path": "index.html",
+          "sha256": "293f8f549726159ea2009b8b7225c12ddefdb1b80d4d4db31bb4e91559dfc18c"
+        },
+        {
+          "path": "snake.mjs",
+          "sha256": "a98910996f0b5ffd6af7a30f1ecb35781d0cb6a74b6db73671471f65e99d4bbc"
+        },
+        {
+          "path": "snake.test.mjs",
+          "sha256": "3b82846a4aeed63c92919c2c7d1c61e1718b054af15d8489ebb8d093f23c8870"
+        }
+      ],
+      "audit_sha256": {
+        "original": "ed8576976ffb32eb2e068cb83ccce9bebb203e7884656707968cca89a816b410",
+        "resumed": "ff6f32d9b6ffaf1288088d894a32306940028c4652b642a08184e2c6091d3c80"
+      }
+    },
+    {
+      "mode": "council",
+      "status": "passed",
+      "raw_evidence_directory": "newide-session-reload-Tlz1VJ",
+      "task_id": "task_10c18556-a416-483e-bf3b-3d2b5c71ed6f",
+      "backend_process_ids": [
+        93143,
+        97794
+      ],
+      "interrupt_signal": "SIGINT",
+      "interrupted_role": "role_code_reviewer",
+      "original_run_id": "run_7f55fd02-bb15-4b36-ba09-76ecaca59cd7",
+      "resumed_run_id": "run_d19a21f9-ca1b-4640-adb8-90a8002a5f7a",
+      "cursor_before": "council",
+      "cursor_after": "council",
+      "native_session_id": "2fb030d6-f4b4-4924-ba16-cbe13fa30bb8",
+      "native_history": {
+        "records_before": 4,
+        "records_after": 77,
+        "cross_restart_parent_links": [
+          {
+            "uuid": "a257bfc7-3cc0-4d2f-9aba-6c2adcfa1d90",
+            "parentUuid": "85de3391-3c35-4b80-80e2-5b7baccc39ca",
+            "timestamp": "2026-10-13T05:32:53.586Z",
+            "sessionId": "2fb030d6-f4b4-4924-ba16-cbe13fa30bb8"
+          }
+        ],
+        "transcript_sha256": "ad3f118d7c2a7c15158f2bb483c8a9b3aa157717d28b1172afe94884024d24cd"
+      },
+      "driver_turns_before": [
+        {
+          "role_id": "role_ts_engineer",
+          "session_id": "36bb1655-eff4-4b19-80d6-34bdfc89a209",
+          "prompt_length": 314,
+          "at": "2026-10-13T05:23:14.226Z"
+        },
+        {
+          "role_id": "role_ts_engineer",
+          "session_id": "36bb1655-eff4-4b19-80d6-34bdfc89a209",
+          "prompt_length": 25530,
+          "at": "2026-10-13T05:23:56.325Z"
+        },
+        {
+          "role_id": "role_fullstack_engineer",
+          "session_id": "609cbea6-1904-40e4-b78c-16a553c6857d",
+          "prompt_length": 43919,
+          "at": "2026-10-13T05:29:55.920Z"
+        },
+        {
+          "role_id": "role_code_reviewer",
+          "session_id": "2fb030d6-f4b4-4924-ba16-cbe13fa30bb8",
+          "prompt_length": 31768,
+          "at": "2026-10-13T05:32:33.562Z"
+        }
+      ],
+      "driver_turns_after": [
+        {
+          "role_id": "role_code_reviewer",
+          "session_id": "2fb030d6-f4b4-4924-ba16-cbe13fa30bb8",
+          "prompt_length": 3338,
+          "at": "2026-10-13T05:32:53.612Z"
+        },
+        {
+          "role_id": "role_synthesis_engineer",
+          "session_id": "46080bd2-7039-48c9-b8b8-737d24d260d6",
+          "prompt_length": 47793,
+          "at": "2026-10-13T05:34:39.000Z"
+        }
+      ],
+      "completed_roles_not_rerun": [
+        "role_ts_engineer",
+        "role_fullstack_engineer"
+      ],
+      "task_status": "completed",
+      "council_result": {
+        "role_failure_count": 0,
+        "fallback_used": false,
+        "quality": "verified",
+        "final_artifact_ref": "artifact_a51aaa5c-cb25-49a6-8069-583f61483295",
+        "final_artifact_sha256": "6aed55a8968288ebc780abdcf5bc192923430bee5b39e7ace855d635e64fd204",
+        "warnings": [],
+        "unmet_criteria": [],
+        "verification_refs": [
+          "review_e23e3e30-d8b5-4b63-b598-b67a22a9f6e4",
+          "review_69f8d708-c5c0-4ebf-9e87-ee3c8ec2be15"
+        ],
+        "decision_record_ref": "council_decision_4f3221ec-ef53-44ac-b18b-2c13f36b5fc3"
+      },
+      "product_tests": {
+        "passed": 24,
+        "failed": 0
+      },
+      "browser_checks": {
+        "browser": "Chrome",
+        "keyboard": true,
+        "gameover": true,
+        "restart": true,
+        "page_errors": []
+      },
+      "product_files": [
+        {
+          "path": "index.html",
+          "sha256": "969b7a17d212d7ff08d27bd50c70fe1b37e9feac84b3f673a90f3d349869c35a"
+        },
+        {
+          "path": "snake.mjs",
+          "sha256": "30a1bd08728302b44570b0e9494fff28b68bda47e0f404cb9fcdb601f71e343a"
+        },
+        {
+          "path": "snake.test.mjs",
+          "sha256": "b464d3c37e95f8d3070ec81ade296022c85ab76d10c50153f875fe72b34f12ce"
+        }
+      ],
+      "audit_sha256": {
+        "original": "98bacad633e9e731dddff5bb7183961fdd2eea5ccaa5258de1b6e3038e24b5ea",
+        "resumed": "effa8c6a4485a23467855efe56b28c2af27add09fe3485f2d73f16617b0ff961"
+      }
+    }
+  ]
+}

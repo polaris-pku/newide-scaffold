@@ -10,6 +10,7 @@ export interface ParticipantSessionRegistry {
   get(taskId: string, workspacePath: string, roleId: string): string | undefined;
   clear(taskId: string, workspacePath: string, roleId: string): void;
   list?(taskId: string, workspacePath: string): ParticipantSessionBinding[];
+  listForTask?(taskId: string): ParticipantSessionBinding[];
 }
 
 export interface ParticipantSessionPersistence {
@@ -17,6 +18,7 @@ export interface ParticipantSessionPersistence {
   findParticipantSession(taskId: string, workspacePath: string, roleId: string): string | undefined;
   deleteParticipantSession(taskId: string, workspacePath: string, roleId: string): void;
   listParticipantSessions?(taskId: string, workspacePath: string): ParticipantSessionBinding[];
+  listParticipantSessionsForTask?(taskId: string): ParticipantSessionBinding[];
 }
 
 export interface ParticipantSessionBinding {
@@ -74,6 +76,14 @@ export class InMemoryParticipantSessionRegistry implements ParticipantSessionReg
         session_id,
       }));
   }
+
+  listForTask(taskId: string): ParticipantSessionBinding[] {
+    return [...this.sessions.entries()].flatMap(([key, session_id]) => {
+      const [task_id, workspace_path, role_id] = key.split('\u0000');
+      return task_id === taskId && workspace_path && role_id
+        ? [{ task_id, workspace_path, role_id, session_id }] : [];
+    });
+  }
 }
 
 /** Durable registry adapter used by the production SQLite composition. */
@@ -114,6 +124,10 @@ export class PersistentParticipantSessionRegistry implements ParticipantSessionR
       ) => ParticipantSessionBinding[];
     };
     return persistence.listParticipantSessions?.(taskId, workspacePath) ?? [];
+  }
+
+  listForTask(taskId: string): ParticipantSessionBinding[] {
+    return this.persistence.listParticipantSessionsForTask?.(taskId) ?? [];
   }
 }
 

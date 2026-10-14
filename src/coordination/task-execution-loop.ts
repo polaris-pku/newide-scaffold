@@ -13,6 +13,7 @@ import type {
 } from '../persistence';
 import {
   TaskProcessorStageCommitError,
+  TaskInterruptedError,
   type TaskProcessor,
   type TaskRunExecutionState,
   type TaskStageCommitResult,
@@ -69,6 +70,7 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
    * 续跑 run 需要据此回溯读取上一 run 已完成 stage 的产物。
    */
   restarted_from_run_id?: string;
+  native_task_prompt_dispatched?: boolean;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
   on_event?: (event: Event) => void;
@@ -468,6 +470,13 @@ export class TaskExecutionLoop {
       }
     } catch (error) {
       if (error instanceof TaskProcessorStageCommitError) throw error;
+      if (isTaskInterrupted(controls.signal?.reason)) {
+        const interrupted = this.processor.interruptRun(state.run_id, {
+          source: controls.signal?.reason.source ?? 'user',
+          reason: controls.signal?.reason.message ?? 'Task interrupted by user',
+        });
+        return { snapshot: interrupted, committed_events: [] };
+      }
       if (controls.signal?.aborted) {
         const cancelled = this.processor.finishRun({
           run_id: state.run_id,
@@ -651,6 +660,10 @@ export class TaskExecutionLoop {
   }
 }
 
+function isTaskInterrupted(error: unknown): error is TaskInterruptedError {
+  return error instanceof TaskInterruptedError;
+}
+
 function assertRunTaskIdentity(state: TaskRunExecutionState, taskId: string): void {
   if (state.task_id !== taskId) {
     throw new Error(`Run ${state.run_id} does not belong to Task ${taskId}`);
@@ -705,6 +718,9 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     cursor_input: cursorInput,
     ...(state.restarted_from_run_id
       ? { restarted_from_run_id: state.restarted_from_run_id }
+      : {}),
+    ...(state.native_task_prompt_dispatched !== undefined
+      ? { native_task_prompt_dispatched: state.native_task_prompt_dispatched }
       : {}),
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),

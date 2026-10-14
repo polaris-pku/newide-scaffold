@@ -42,6 +42,7 @@ import {
 import { proposalReportFields } from '../proposal-adapter';
 import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles, type WorkspaceFileSnapshot } from '../../coordinator/workspace-change-detector';
 import { PLAN_STEP_LIST_REQUIREMENT } from '../../coordinator/plan-check';
+import { CouncilRecovery } from '../council-recovery';
 import type { SapTaskBridge } from '../../coordination/sap-task-bridge';
 
 export type CouncilRoleFailureCode =
@@ -147,8 +148,18 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
     const executionRunId = input.run_id ?? createId('run');
-    const councilRunId = createId('council_run');
-    const participants = await this.resolveParticipants(input, executionRunId, options);
+    const councilDir = councilRunWorkspaceRoot(this.councilRoot, options?.recovery_key ?? executionRunId);
+    const recoveryFile = path.join(councilDir, 'recovery.json');
+    let recovery = options?.recovery_key ? CouncilRecovery.read(recoveryFile, input.task_id) : undefined;
+    const councilRunId = recovery?.state.council_run_id ?? createId('council_run');
+    const participants = recovery?.state.participants ?? await this.resolveParticipants(input, executionRunId, options);
+    if (options?.recovery_key && !recovery) {
+      recovery = CouncilRecovery.create(recoveryFile, {
+        task_id: input.task_id, council_run_id: councilRunId, participants,
+        initial_proposals: input.proposals, proposals: {}, roles: {},
+      });
+    }
+    if (recovery) input = { ...input, proposals: recovery.state.initial_proposals };
     await emitLifecycle(options, {
       type: 'council.participants.selected',
       payload: {
@@ -164,7 +175,6 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       .sort((left, right) => left.seat_index - right.seat_index);
     const reviewerParticipant = requireSeat(participants, 'reviewer');
     const synthesizerParticipant = requireSeat(participants, 'synthesizer');
-    const councilDir = councilRunWorkspaceRoot(this.councilRoot, executionRunId);
     const generatedResults: AgentExecutionResult[] = [];
     const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];
@@ -200,6 +210,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           diagnosticRefs,
           2,
           () => prepareCouncilWorkspace(input.workspace_path, workspace),
+          undefined,
+          recovery,
         );
         return execution ? { execution, participant } : undefined;
       }),
@@ -210,7 +222,11 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       const result = execution?.result;
       if (!result) continue;
       generatedResults.push(result);
-      const proposal = buildProposal(input, participant, result);
+      const proposal = recovery?.state.proposals[participant.participant_id] ?? buildProposal(input, participant, result);
+      if (recovery) {
+        recovery.state.proposals[participant.participant_id] = proposal;
+        recovery.save();
+      }
       generatedProposals.push(proposal);
       await emitLifecycle(
         options,
@@ -264,6 +280,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           );
         }
       },
+      recovery,
     );
     const reviewer = reviewerExecution?.result;
     if (reviewer) generatedResults.push(reviewer);
@@ -323,6 +340,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           'utf-8',
         );
       },
+      undefined,
+      recovery,
     );
     const synthesizer = synthesisExecution?.result;
     const synthesisPhaseId = synthesisExecution?.phase_id;
@@ -389,10 +408,54 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     maxAttempts: number,
     prepare?: () => Promise<void>,
     validate?: (result: AgentExecutionResult) => Promise<void>,
+    recovery?: CouncilRecovery,
   ): Promise<CouncilRoleExecution | undefined> {
-    let sessionId: string | undefined;
+    const recoveryId = `${participant.participant_id}:${phase}`;
+    const saved = recovery?.state.roles[recoveryId];
+    if (saved?.prepared) await fs.access(workspacePath);
+    if (saved?.execution) {
+      await validate?.(saved.execution.result);
+      return saved.execution;
+    }
+    if (saved?.prepared && saved.driver_dispatched !== false && !saved.session_id) {
+      throw new Error('Interrupted Council role has no durable native session ID; refusing a fresh session');
+    }
+    let sessionId: string | undefined = saved?.session_id;
+    let recoveryError: unknown;
     let recoveryReason: string | undefined;
-    let workspaceBefore: WorkspaceFileSnapshot | undefined;
+    let workspaceBefore: WorkspaceFileSnapshot | undefined = saved ? new Map(saved.workspace_before) : undefined;
+    const originalOptions = options;
+    if (recovery) {
+      options = { ...options, onDriverEvent: (event) => {
+        try {
+        if (event.event_type === 'driver.prompt_dispatching') {
+          const role = recovery.state.roles[recoveryId];
+          if (role) {
+            role.driver_dispatched = true;
+            recovery.save();
+          }
+        }
+        if (event.event_type === 'driver.turn_started' && event.session_id) {
+          const role = recovery.state.roles[recoveryId];
+          if (role) {
+            if (role.session_id && role.session_id !== event.session_id) {
+              throw new Error('Council Driver returned a different session while resuming');
+            }
+            role.session_id = event.session_id;
+            role.driver_dispatched = true;
+            sessionId = event.session_id;
+            recovery.save();
+          }
+        }
+        } catch (error) {
+          recoveryError = error;
+          // This callback is invoked synchronously before transport launch.
+          // A failed durable dispatch record must prevent that launch.
+          if (event.event_type === 'driver.prompt_dispatching') throw error;
+        }
+        originalOptions?.onDriverEvent?.(event);
+      } };
+    }
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       options?.signal?.throwIfAborted();
       const phaseId = createId('council_phase');
@@ -415,9 +478,13 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         },
       });
       try {
-        if (attempt === 1) {
+        if (attempt === 1 && !saved?.prepared) {
           await prepare?.();
           workspaceBefore = await snapshotWorkspaceFiles(workspacePath);
+          if (recovery) {
+            recovery.state.roles[recoveryId] = { prepared: true, driver_dispatched: false, workspace_before: [...workspaceBefore] };
+            recovery.save();
+          }
         }
         const execution = await this.runRoleWithInactivitySteering(
           input,
@@ -434,15 +501,21 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           phaseId,
           this.roleInactivityTimeoutMs,
           sessionId,
-          attempt > 1 ? workspaceBefore : undefined,
+          attempt > 1 || saved ? workspaceBefore : undefined,
           attempt,
         );
+        if (recoveryError) throw recoveryError;
         await validate?.(execution.result);
+        if (recovery) {
+          recovery.state.roles[recoveryId]!.execution = { result: execution.result, phase_id: phaseId };
+          recovery.save();
+        }
         for (const warning of (execution.result.diagnostics.council_warnings as string[]) ?? []) {
           diagnosticRefs.push(`${participant.participant_id}:${warning}`);
         }
         return { result: execution.result, phase_id: phaseId };
       } catch (error) {
+        if (recoveryError) throw recoveryError;
         if (options?.signal?.aborted) throw error;
         const retry = attempt < maxAttempts && isRecoverableRoleFailure(error);
         const failure = await this.toRoleFailure(
@@ -650,6 +723,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           context_policy: `council_${participant.seat}`,
           schema_version: SCHEMA_VERSION,
           ...(sessionId ? { session_id: sessionId } : {}),
+          ...(sessionId ? { resume_session: true } : {}),
           ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         },
         options?.signal || options?.onDriverEvent

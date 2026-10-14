@@ -348,7 +348,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     const firstClient = new RpcChildClient(
       spawnBackend(runnerDir, {
         HOME: homeDir,
-        NEWIDE_EPHEMERAL_ACP_SESSIONS: '1',
+        NEWIDE_EPHEMERAL_ACP_SESSIONS: '0',
       }),
     );
     let resumedClient: RpcChildClient | undefined;
@@ -370,7 +370,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       resumedClient = new RpcChildClient(
         spawnBackend(runnerDir, {
           HOME: homeDir,
-          NEWIDE_EPHEMERAL_ACP_SESSIONS: '1',
+          NEWIDE_EPHEMERAL_ACP_SESSIONS: '0',
         }),
       );
       await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
@@ -415,6 +415,134 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       }
     }
   }, 20_000);
+
+  it('interrupts an active Driver turn, restarts the backend, and resumes the same Task', async () => {
+    const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-task-interrupt-runner-'));
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-task-interrupt-workspace-'));
+    const holdPath = path.join(runnerDir, 'hold-first-invocation');
+    const enteredPath = path.join(runnerDir, 'first-invocation-entered');
+    const runIds = new Set<string>();
+    const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
+    writeInterruptibleFakeDriver(runnerDir);
+    writeFileSync(holdPath, 'hold');
+    const firstClient = new RpcChildClient(
+      spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+    );
+    let resumedClient: RpcChildClient | undefined;
+
+    try {
+      const created = await firstClient.call<TaskSnapshot>('task.create', {
+        spec: 'Interrupt this active task and resume it after backend restart',
+        completion_criteria: ['The Task completes after task.interrupt and task.resume'],
+        workspace_path: workspace,
+      });
+      collectEvidence(created, runIds, marketDirectories);
+      await waitForFile(enteredPath);
+
+      const interrupted = await firstClient.call<TaskSnapshot>('task.interrupt', {
+        task_id: created.task.task_id,
+      });
+      collectEvidence(interrupted, runIds, marketDirectories);
+      expect(interrupted.task.status).toBe('blocked');
+      expect(interrupted.run_history[0]).toMatchObject({ status: 'interrupted' });
+
+      await firstClient.close();
+      rmSync(holdPath, { force: true });
+      resumedClient = new RpcChildClient(
+        spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+      );
+      await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
+      const afterRestart = await resumedClient.call<TaskSnapshot>('task.get', {
+        task_id: created.task.task_id,
+      });
+      expect(afterRestart.task.status).toBe('blocked');
+      collectEvidence(afterRestart, runIds, marketDirectories);
+
+      const resumed = await resumedClient.call<TaskSnapshot>('task.resume', {
+        task_id: created.task.task_id,
+      });
+      collectEvidence(resumed, runIds, marketDirectories);
+      const terminal = await waitForTerminalTask(resumedClient, created.task.task_id);
+      collectEvidence(terminal, runIds, marketDirectories);
+      expect(terminal.task.status).toBe('completed');
+      expect(terminal.run_history[0]).toMatchObject({ status: 'completed' });
+      expect(terminal.run_history[1]).toMatchObject({ status: 'interrupted' });
+      expect(terminal.run_history[0]?.run_id).not.toBe(terminal.run_history[1]?.run_id);
+    } finally {
+      await firstClient.close();
+      await resumedClient?.close();
+      rmSync(runnerDir, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+      for (const runId of runIds) {
+        rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+      }
+      for (const directory of marketDirectories) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  }, 20_000);
+
+  it('interrupts a Council Task and resumes it through the Council stages', async () => {
+    const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-council-interrupt-runner-'));
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-council-interrupt-workspace-'));
+    const holdPath = path.join(runnerDir, 'hold-first-invocation');
+    const enteredPath = path.join(runnerDir, 'first-invocation-entered');
+    const runIds = new Set<string>();
+    const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
+    writeInterruptibleFakeDriver(runnerDir);
+    writeFileSync(holdPath, 'hold');
+    const firstClient = new RpcChildClient(
+      spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+    );
+    let resumedClient: RpcChildClient | undefined;
+
+    try {
+      const created = await firstClient.call<TaskSnapshot>('task.create', {
+        spec: 'Create a small snake game and validate it with Council',
+        completion_criteria: ['Council completes and delivers a final artifact'],
+        workspace_path: workspace,
+        mode: 'council',
+      });
+      collectEvidence(created, runIds, marketDirectories);
+      await waitForFile(enteredPath);
+
+      const interrupted = await firstClient.call<TaskSnapshot>('task.interrupt', {
+        task_id: created.task.task_id,
+      });
+      expect(interrupted.task.status).toBe('blocked');
+      collectEvidence(interrupted, runIds, marketDirectories);
+
+      await firstClient.close();
+      rmSync(holdPath, { force: true });
+      resumedClient = new RpcChildClient(
+        spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+      );
+      await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
+      await expect(
+        resumedClient.call<TaskSnapshot>('task.resume', { task_id: created.task.task_id }),
+      ).resolves.toMatchObject({ task: { status: 'running' } });
+      const terminal = await waitForTerminalTask(resumedClient, created.task.task_id);
+      collectEvidence(terminal, runIds, marketDirectories);
+      expect(terminal.task.status).toBe('completed');
+      expect(terminal.council).toMatchObject({ status: 'completed' });
+      expect(terminal.run_history[0]).toMatchObject({ status: 'completed' });
+      expect(terminal.run_history[1]).toMatchObject({ status: 'interrupted' });
+    } finally {
+      await firstClient.close();
+      await resumedClient?.close();
+      rmSync(runnerDir, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+      for (const runId of runIds) {
+        rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+        rmSync(path.join('.newide', 'council', runId), { recursive: true, force: true });
+      }
+      for (const directory of marketDirectories) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
 
   it('replays a scoped pending Mailbox delivery across restarts', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-mailbox-rpc-runner-'));
@@ -690,17 +818,24 @@ function writeInterruptibleFakeDriver(runnerDir: string): void {
     path.join(runnerDir, 'fake.mjs'),
     `import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 let body='';
 process.stdin.on('data', chunk => body += chunk);
 process.stdin.on('end', () => {
   const input = JSON.parse(body);
   appendFileSync(new URL('./sessions.log', import.meta.url), String(input.session_id || '') + '\\n');
   appendFileSync(new URL('./drivers.log', import.meta.url), String(process.env.ACP_AGENT_ID || '') + '\\n');
+  const councilRole = String(input.workspace_path || '').replaceAll('\\\\', '/').includes('.newide/council');
+  const reviewPrompt = input.prompt.includes('Review the isolated proposal inputs');
   const complete = () => {
     const created_at = new Date().toISOString();
     const suffix = createHash('sha256').update(JSON.stringify([input.task_id, input.prompt, input.session_id])).digest('hex').slice(0, 16);
-    const artifact = { artifact_id: 'artifact_' + suffix, type: 'driver_result', uri: 'artifact://fake/resumed', producer_id: 'fake-acp', task_id: input.task_id, created_at, schema_version: input.schema_version };
-    process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: input.session_id || 'session_ephemeral', status: 'succeeded', response: 'Resumed fake ACP completed.', artifacts: [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
+    const artifact = { artifact_id: 'artifact_' + suffix, type: councilRole ? 'diff' : 'driver_result', uri: 'artifact://fake/resumed', producer_id: 'fake-acp', task_id: input.task_id, ...(councilRole ? { content: { kind: 'text', content_ref: 'data:text/plain,COUNCIL_FINAL%0A', target_path: 'council-output.txt', media_type: 'text/plain' } } : {}), created_at, schema_version: input.schema_version };
+    if (reviewPrompt && input.workspace_path) {
+      writeFileSync(join(input.workspace_path, 'reviews.json'), JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }));
+    }
+    const response = reviewPrompt ? 'Review written to reviews.json.' : 'Resumed fake ACP completed.';
+    process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: input.session_id || 'session_ephemeral', status: 'succeeded', response, artifacts: [artifact, ...(reviewPrompt ? [{ artifact_id: 'reviews_' + suffix, type: 'file', uri: 'artifact://fake/reviews', producer_id: 'fake-acp', task_id: input.task_id, content: { kind: 'text', content_ref: 'data:text/plain,%7B%22reviews%22%3A%5B%5D%7D', target_path: 'reviews.json' }, created_at, schema_version: input.schema_version }] : [])], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
   };
   const hold = new URL('./hold-first-invocation', import.meta.url);
   if (!existsSync(hold)) return complete();

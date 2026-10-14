@@ -10,6 +10,15 @@ import type {
 import { createDriverRuntimeInvoker } from './driver-runtime-invoker';
 
 describe('createDriverRuntimeInvoker', () => {
+  it('continues a loaded native session without replaying the initial memory package', async () => {
+    const driver = new TestDriver(successResult());
+    await createDriverRuntimeInvoker(driver)({ ...invocationInput(), resume_session: true });
+    expect(driver.prompts[0]?.session_id).toBe('session_existing');
+    expect(driver.prompts[0]?.prompt).toContain('Continue the interrupted task');
+    expect(driver.prompts[0]?.prompt).toContain('Implement it');
+    expect(driver.prompts[0]?.prompt).not.toContain('Experience body');
+    expect(driver.prompts[0]?.prompt).not.toContain('Skill body');
+  });
   it('maps B-shaped input to a stable prompt and returns an auditable success', async () => {
     const driver = new TestDriver(successResult());
     const invoke = createDriverRuntimeInvoker(driver);
@@ -28,6 +37,9 @@ describe('createDriverRuntimeInvoker', () => {
       '{"experiences":[{"content":"Experience body","description":"Experience","id":"exp_1"}],"skills":[{"content":"Skill body","description":"Skill","id":"skill_1"}],"task_instruction":"Implement it"}',
     );
     expect(driver.prompts[0]?.prompt).toContain('<<<DRIVER_RETURN>>>');
+    expect(driver.prompts[0]?.prompt).toMatch(/^Execute the task_instruction/);
+    expect(driver.prompts[0]?.prompt).toContain('Continue in this existing session');
+    expect(driver.prompts[0]?.prompt).toContain('applies only to that earlier turn');
     expect(driver.prompts[0]?.prompt).toContain('referenced_experiences');
     expect(output.execution).toEqual(successResult());
     expect(output.report).toEqual({
@@ -159,6 +171,11 @@ describe('createDriverRuntimeInvoker', () => {
     });
 
     expect(events).toEqual([
+      expect.objectContaining({
+        event_type: 'driver.prompt_dispatching',
+        task_id: 'task_1',
+        run_id: 'run_1',
+      }),
       expect.objectContaining({
         event_type: 'agent_message_chunk',
         task_id: 'task_1',

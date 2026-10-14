@@ -164,6 +164,7 @@ interface InvocationContext {
   driver_instruction_locked: boolean;
   workspace_path?: string;
   session_id?: string;
+  resume_session?: boolean;
   signal?: AbortSignal;
   onDriverEvent?: AgentExecutionOptions['onDriverEvent'];
   execution?: DriverRunResult;
@@ -324,6 +325,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const onDriverEvent: DriverStreamEventListener | undefined = options?.onDriverEvent
       ? (event) => options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
       : undefined;
+    onDriverEvent?.({
+      schema_version: 'driver-event.v1',
+      event_type: 'driver.session_initializing',
+      task_id: input.task_id,
+      run_id: input.run_id,
+      created_at: nowTimestamp(),
+    });
     let result = await runDriverPromptWithSignal(
       driver, prompt, options?.signal, onDriverEvent,
     );
@@ -575,6 +583,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
+        ...(input.resume_session ? { resume_session: true } : {}),
         ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
         notice_mailboxes: noticeMailboxes,
         mailbox_outcomes: [],
@@ -582,12 +591,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         driver_attempts: 0,
         abortObserved: false,
         ...(options?.signal ? { signal: options.signal } : {}),
-        ...(options?.onDriverEvent
-          ? {
-              onDriverEvent: (event: DriverStreamEvent) =>
-                options.onDriverEvent?.({ ...event, role_id: input.role_id }),
-            }
-          : {}),
+        onDriverEvent: (event: DriverStreamEvent) => {
+          if (event.event_type === 'driver.turn_started' && event.session_id && input.workspace_path && this.driverFor(runtimeRoleId, input.run_id).capabilities.supports_session_load) {
+            this.options.mailbox?.sessionRegistry?.register({
+              task_id: input.task_id, workspace_path: input.workspace_path,
+              role_id: input.role_id, session_id: event.session_id,
+            });
+          }
+          options?.onDriverEvent?.({ ...event, role_id: input.role_id });
+        },
       };
       const workspaceBefore = input.workspace_path
         ? await snapshotWorkspaceFiles(input.workspace_path)
@@ -998,7 +1010,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     // 解析点收敛在这里：role 与 run 都来自 ALS，任何进入 invoke_driver 的路径都经过它。
     const driver = this.driverFor(invocation.role_id, invocation.run_id);
     try {
-      const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
+      const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = invocation.resume_session ? {
+        task_instruction: invocation.driver_instruction, skills: [], experiences: [],
+      } : {
         task_instruction: invocation.driver_instruction,
         skills: deduplicateMemoryItems([
           ...toDriverMemoryItems(invocation.retrieval.skills),
@@ -1024,6 +1038,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             run_id: invocation.run_id,
             ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
             ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
+            ...(invocation.resume_session ? { resume_session: true } : {}),
             call_id: createId('call'),
             source_driver: driver.driver_id,
             driver_context: driverInvocationContext,

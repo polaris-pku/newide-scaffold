@@ -238,7 +238,7 @@ export function createProductionStageExecutors(
           ? path.join(
               councilRunWorkspaceRoot(
                 dependencies.councilRoot,
-                context.restarted_from_run_id ?? context.run_id,
+                await stateStore.workspaceRunId(context.run_id, context.restarted_from_run_id),
               ),
               'primary',
             )
@@ -272,6 +272,8 @@ export function createProductionStageExecutors(
             schema_version: SCHEMA_VERSION,
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
+            ...(sessionId && context.restarted_from_run_id && context.native_task_prompt_dispatched !== false
+              ? { resume_session: true } : {}),
             ...(context.cursor_input.mailbox_delivery_id
               ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
               : {}),
@@ -551,6 +553,7 @@ export function createProductionStageExecutors(
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
           },
           {
+            recovery_key: await stateStore.workspaceRunId(context.run_id, context.restarted_from_run_id),
             ...(context.signal ? { signal: context.signal } : {}),
             ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
             ...(context.on_sap_dispatch ? { onSapDispatch: context.on_sap_dispatch } : {}),
@@ -926,7 +929,7 @@ async function executeFinalCouncilPlan(input: {
   const workspace = path.join(
     councilRunWorkspaceRoot(
       input.dependencies.councilRoot,
-      input.context.restarted_from_run_id ?? input.context.run_id,
+      await new ProductionStageStateStore(input.dependencies.runsRoot).workspaceRunId(input.context.run_id, input.context.restarted_from_run_id),
     ),
     'primary',
   );
@@ -999,6 +1002,8 @@ async function executeFinalCouncilPlan(input: {
         role_id: input.primary.role_id,
         instruction: retryInstruction,
         driver_instruction: retryInstruction,
+        ...(input.context.restarted_from_run_id && input.context.native_task_prompt_dispatched !== false
+          ? { resume_session: true } : {}),
         workspace_path: workspace,
         session_id: input.primary.session_id,
         input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
@@ -1328,19 +1333,48 @@ function emitCouncilFailure<TCursor extends TaskResumeCursor>(
 class ProductionStageStateStore {
   constructor(private readonly runsRoot: string) {}
 
+  async workspaceRunId(runId: string, inheritedFromRunId?: string): Promise<string> {
+    const lineage = await this.lineage(runId, inheritedFromRunId);
+    return lineage[lineage.length - 1]!;
+  }
+
+  private async lineage(runId: string, parent?: string): Promise<string[]> {
+    const lineage = [runId];
+    parent = await this.readRecoveryParent(runId, parent);
+    while (parent) {
+      if (!/^[A-Za-z0-9_-]+$/.test(parent) || lineage.includes(parent)) {
+        throw new Error('Invalid Run recovery lineage');
+      }
+      lineage.push(parent);
+      parent = await this.readRecoveryParent(parent);
+    }
+    return lineage;
+  }
+
+  private async readRecoveryParent(runId: string, fallback?: string): Promise<string | undefined> {
+    if (!/^[A-Za-z0-9_-]+$/.test(runId)) throw new Error('Invalid Run recovery lineage');
+    try {
+      const request = JSON.parse(await fs.readFile(path.join(this.runsRoot, runId, 'request.json'), 'utf8'));
+      return 'recovery_parent_run_id' in request
+        ? request.recovery_parent_run_id ?? undefined
+        : request.restarted_from_run_id ?? fallback;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return fallback;
+    }
+  }
+
   /**
    * 读取 stage 中间产物。resume 会新建 run_id，已完成 stage 的产物落在被中断 run 的
-   * 目录下，所以允许沿 restarted_from_run_id 回溯一层，否则续跑的 deliver 会因为
+   * 目录下，所以沿持久化恢复链回溯，否则连续中断后的 deliver 会因为
    * "no production stage state" 直接失败。
    *
    * 只回溯读、不回溯写：update 始终写当前 run 的文件，保持每个 run 的证据自洽。
    */
   async require(runId: string, inheritedFromRunId?: string): Promise<ProductionStageState> {
-    const state = await this.read(runId);
-    if (state) return state;
-    if (inheritedFromRunId) {
-      const inherited = await this.read(inheritedFromRunId);
-      if (inherited) return inherited;
+    for (const id of await this.lineage(runId, inheritedFromRunId)) {
+      const state = await this.read(id);
+      if (state) return state;
     }
     throw new Error(`Run ${runId} has no production stage state`);
   }
@@ -1352,7 +1386,11 @@ class ProductionStageStateStore {
     inheritedFromRunId?: string,
   ): Promise<void> {
     // 续跑 run 的首次写入必须以被中断 run 的状态为底，否则会把前序 stage 的产物写没。
-    const inherited = inheritedFromRunId ? await this.read(inheritedFromRunId) : undefined;
+    let inherited: ProductionStageState | undefined;
+    for (const id of (await this.lineage(runId, inheritedFromRunId)).slice(1)) {
+      inherited = await this.read(id);
+      if (inherited) break;
+    }
     const current =
       (await this.read(runId)) ??
       ({

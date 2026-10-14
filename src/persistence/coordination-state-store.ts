@@ -254,6 +254,7 @@ export interface PersistedCheckpointMessage {
 export interface PersistedCheckpointParticipantSession {
   role_id: string;
   session_id: string;
+  workspace_path?: string;
 }
 
 export interface PersistedCheckpointMailboxState {
