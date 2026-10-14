@@ -303,3 +303,99 @@ describe('construct-time failures are attributable', () => {
     expect(message).toContain('CODEX_API_KEY');
   });
 });
+
+/**
+ * 自动发现 driver 的注册：**失败不是启动失败**。
+ *
+ * 手工配置的档案写错了必须当场炸（用户要立刻知道），但探测生成的档案不行——本机没装 runner、
+ * 缺凭据，都只该让这一个 driver 不可选择，而不是让后端起不来。两者共用同一套装配代码，差别
+ * 只在失败的处理方式上。
+ */
+describe('dynamically registered discovered drivers', () => {
+  const discoveredConfig = parseDriverConfig({
+    default_driver: 'discovered:gemini-8a12f40e',
+    drivers: {
+      'discovered:gemini-8a12f40e': { agent: 'gemini' },
+    },
+  });
+
+  it('keeps a broken discovered profile from failing the whole startup', () => {
+    const { registry } = buildRegistry(discoveredConfig, makeRunnerDir(false), {
+      discoveredDriverIds: ['discovered:gemini-8a12f40e'],
+    });
+
+    expect(registry.listDriverIds()).toEqual([]);
+    expect(registry.hasRuntime('discovered:gemini-8a12f40e')).toBe(false);
+    expect(registry.failureOf('discovered:gemini-8a12f40e')?.reason_code).toBe(
+      'DRIVER_RUNNER_ENTRY_MISSING',
+    );
+  });
+
+  it('still fails fast for a configured profile next to a broken discovered one', () => {
+    const config = parseDriverConfig({
+      default_driver: 'codex',
+      drivers: { codex: { agent: 'codex' }, 'discovered:x-12345678': { agent: 'x' } },
+    });
+
+    expect(() =>
+      buildRegistry(config, makeRunnerDir(false), {
+        discoveredDriverIds: ['discovered:x-12345678'],
+      }),
+    ).toThrow(/Driver "codex" runner entry missing/);
+  });
+
+  it('registers a discovered profile and attributes its credential failures', () => {
+    const config = parseDriverConfig({
+      default_driver: 'discovered:gemini-8a12f40e',
+      drivers: {
+        'discovered:gemini-8a12f40e': {
+          agent: 'gemini',
+          credentials: { env: ['GEMINI_API_KEY'] },
+        },
+      },
+    });
+    const { registry } = buildRegistry(config, makeRunnerDir(), {
+      discoveredDriverIds: ['discovered:gemini-8a12f40e'],
+      parentEnv: {},
+    });
+
+    expect(registry.failureOf('discovered:gemini-8a12f40e')).toMatchObject({
+      reason_code: 'DRIVER_REQUIRED_CREDENTIAL_MISSING',
+    });
+    expect(registry.failureOf('discovered:gemini-8a12f40e')?.message).toContain('GEMINI_API_KEY');
+  });
+
+  it('refuses a pty driver this build cannot execute', () => {
+    const { registry, captured } = buildRegistry(discoveredConfig, makeRunnerDir(), {
+      discoveredDriverIds: ['discovered:gemini-8a12f40e'],
+    });
+
+    const result = registry.registerDiscovered(
+      'discovered:pty-12345678',
+      { agent: 'pty-agent' },
+      { connection_type: 'pty' },
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason_code: 'DRIVER_CONNECTION_TYPE_UNSUPPORTED',
+    });
+    expect(captured.transports).toHaveLength(1);
+  });
+
+  it('is idempotent: re-registering does not leak a second transport', async () => {
+    const { registry, captured } = buildRegistry(discoveredConfig, makeRunnerDir(), {
+      discoveredDriverIds: ['discovered:gemini-8a12f40e'],
+    });
+    const first = registry.get('discovered:gemini-8a12f40e');
+
+    const again = registry.registerDiscovered('discovered:gemini-8a12f40e', { agent: 'gemini' });
+
+    expect(again).toMatchObject({ ok: true });
+    expect(registry.get('discovered:gemini-8a12f40e')).toBe(first);
+    expect(captured.transports).toHaveLength(1);
+
+    await registry.shutdown();
+    expect(captured.shutDown).toBe(1);
+  });
+});

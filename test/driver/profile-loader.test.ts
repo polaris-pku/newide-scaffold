@@ -16,11 +16,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_AGENT_ID,
+  DETECTED_DRIVER_PROFILES_FILE_NAME,
   DriverConfigError,
   LEGACY_DRIVER_ID,
   UI_DRIVER_ROUTING_FILE_NAME,
   defaultDriverConfigLayers,
   loadDriverConfig,
+  loadManualDriverConfig,
   mergeDriverConfigLayers,
   parseDriverConfig,
   parseDriverConfigLayer,
@@ -410,5 +412,127 @@ describe('shipped example config', () => {
 
     expect(config.default_driver).toBe(LEGACY_DRIVER_ID);
     expect(Object.keys(config.drivers)).toEqual([LEGACY_DRIVER_ID]);
+  });
+});
+
+/**
+ * 自动发现层（`drivers.detected.local.yaml`）。
+ *
+ * 这一层的字段限制不是靠约定，而是靠层来源：它由后端生成、可随时重建，所以**只能补 drivers**，
+ * 且同 id 恒输给手工配置。写错了（多一个顶层键、YAML 坏了）只退化成「没有自动 profile」，
+ * 绝不阻塞启动——但原因必须交给告警出口，否则「自动 driver 怎么不见了」无法归因。
+ */
+describe('the auto-discovered layer', () => {
+  const DISCOVERED = 'discovered:gemini-8a12f40e';
+  const DETECTED_YAML = [
+    'version: 1',
+    'drivers:',
+    `  ${DISCOVERED}:`,
+    '    agent: gemini',
+    '    description: Gemini CLI',
+    '',
+  ].join('\n');
+
+  function writeDetected(projectRoot: string, content: string): void {
+    mkdirSync(join(projectRoot, '.agent'), { recursive: true });
+    writeFileSync(
+      join(projectRoot, '.agent', DETECTED_DRIVER_PROFILES_FILE_NAME),
+      content,
+      'utf-8',
+    );
+  }
+
+  it('adds probed drivers without touching the default driver', () => {
+    const projectRoot = makeTempDir();
+    writeDetected(projectRoot, DETECTED_YAML);
+
+    const config = loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+
+    expect(config.default_driver).toBe(LEGACY_DRIVER_ID);
+    expect(Object.keys(config.drivers).sort()).toEqual([DISCOVERED, LEGACY_DRIVER_ID].sort());
+    expect(config.drivers[DISCOVERED]).toEqual({ agent: 'gemini', description: 'Gemini CLI' });
+  });
+
+  it('loses to a hand-written profile with the same id', () => {
+    const projectRoot = makeTempDir();
+    writeYaml(
+      projectRoot,
+      join('.agent', 'drivers.local.yaml'),
+      ['version: 1', 'drivers:', `  ${DISCOVERED}:`, '    agent: gemini-cli-pinned', '    runtime:', '      runner_dir: /opt/pinned', ''].join('\n'),
+    );
+    writeDetected(projectRoot, DETECTED_YAML);
+
+    const config = loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+
+    // 整档案替换的方向是「手工赢」：用户写的启动方式不该被一份可重建的自动文件抹掉
+    expect(config.drivers[DISCOVERED]?.agent).toBe('gemini-cli-pinned');
+    expect(config.drivers[DISCOVERED]?.runtime?.runner_dir).toBe('/opt/pinned');
+  });
+
+  it('ignores a default_driver or roles written into the auto file', () => {
+    const projectRoot = makeTempDir();
+    const warnings: string[] = [];
+    writeDetected(
+      projectRoot,
+      [
+        'version: 1',
+        `default_driver: ${DISCOVERED}`,
+        'drivers:',
+        `  ${DISCOVERED}:`,
+        '    agent: gemini',
+        'roles:',
+        '  reviewer: acp-external',
+        '',
+      ].join('\n'),
+    );
+
+    const config = loadDriverConfig({
+      projectRoot,
+      homeDir: makeTempDir(),
+      env: {},
+      onWarning: (message) => warnings.push(message),
+    });
+
+    expect(config.default_driver).toBe(LEGACY_DRIVER_ID);
+    expect(Object.keys(config.drivers)).toEqual([LEGACY_DRIVER_ID]);
+    expect(warnings.join('\n')).toContain(DETECTED_DRIVER_PROFILES_FILE_NAME);
+  });
+
+  it('degrades to no auto profiles when the YAML is broken', () => {
+    const projectRoot = makeTempDir();
+    const warnings: string[] = [];
+    writeDetected(projectRoot, 'drivers: [unclosed\n');
+
+    const config = loadDriverConfig({
+      projectRoot,
+      homeDir: makeTempDir(),
+      env: {},
+      onWarning: (message) => warnings.push(message),
+    });
+
+    expect(Object.keys(config.drivers)).toEqual([LEGACY_DRIVER_ID]);
+    expect(warnings.join('\n')).toContain('ignoring auto-discovered driver profiles');
+  });
+
+  it('refuses to carry launch parameters or credentials', () => {
+    const projectRoot = makeTempDir();
+    writeDetected(
+      projectRoot,
+      ['version: 1', 'drivers:', `  ${DISCOVERED}:`, '    agent: gemini', '    credentials:', '      env:', '        - GEMINI_API_KEY', ''].join('\n'),
+    );
+
+    const config = loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+
+    expect(config.drivers[DISCOVERED]).toBeUndefined();
+  });
+
+  it('is not part of the manual (configured) projection', () => {
+    const projectRoot = makeTempDir();
+    writeDetected(projectRoot, DETECTED_YAML);
+
+    const manual = loadManualDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+
+    // 「配置事实」必须排除自动层，否则一个 driver 被发现过一次就再也不会变成 stale
+    expect(Object.keys(manual.drivers)).toEqual([LEGACY_DRIVER_ID]);
   });
 });
