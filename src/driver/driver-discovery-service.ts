@@ -204,6 +204,12 @@ export function createDriverDiscoveryService(
       if (result.ok) options.catalog.recordRuntimeRegistered(driverId);
       else options.catalog.recordRuntimeFailure(driverId, result.reason_code);
     }
+    // 配置 driver 的 runtime 由 registry 自己装配，这里只把那一格事实**记真**：state 里的
+    // `runtime_registered` 若对手工 driver 恒为 false，就是一条与进程现状相反的记录。
+    for (const { driver_id: driverId } of options.configuredProfiles()) {
+      if (options.catalog.recordOf(driverId)?.source !== 'configured') continue;
+      if (registry.hasRuntime(driverId)) options.catalog.recordRuntimeRegistered(driverId);
+    }
   }
 
   async function run(round: {

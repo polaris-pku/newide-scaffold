@@ -1263,4 +1263,47 @@ describe('driver auto-discovery in the production assembly', () => {
       await second.close();
     }
   });
+
+  it('keeps routing to a discovered driver usable across a restart', async () => {
+    const root = makeProjectRoot();
+    const runnerDir = makeRunnerDir(true, ['codex', 'gemini']);
+    const first = await startBackend(root, runnerDir);
+    const before = await first.driverRouting!.getSnapshot();
+    const [primary, secondary] = before.drivers
+      .filter((driver) => driver.driver_id.startsWith('discovered:'))
+      .map((driver) => driver.driver_id);
+    // 默认 driver 与一条 role 都指向自动发现的 driver——UI 里选择它们之后就会写进 UI 层
+    await first.driverRouting!.updateRouting({
+      expected_revision: before.revision,
+      default_driver: primary!,
+      roles: { role_ts_engineer: secondary! },
+    });
+    await first.close();
+
+    const second = await startBackend(root, runnerDir);
+
+    try {
+      const snapshot = await second.driverRouting!.getSnapshot();
+
+      expect(snapshot.default_driver).toBe(primary);
+      expect(
+        snapshot.roles.find((role) => role.role_id === 'role_ts_engineer')?.driver_id,
+      ).toBe(secondary);
+      // 这一轮探测照常成功：UI 层引用了 discovered: 不该把整轮探测判成失败
+      expect(snapshot.drivers.find((driver) => driver.driver_id === primary)).toMatchObject({
+        selectable: true,
+        status: 'degraded',
+      });
+      expect(snapshot.drivers.find((driver) => driver.driver_id === secondary)).toMatchObject({
+        selectable: true,
+        status: 'degraded',
+      });
+      expect(
+        JSON.parse(readFileSync(path.join(root, '.newide', 'driver-discovery.json'), 'utf8'))
+          .probe_status,
+      ).toBe('ready');
+    } finally {
+      await second.close();
+    }
+  });
 });

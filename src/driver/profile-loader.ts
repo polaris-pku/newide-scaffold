@@ -25,6 +25,7 @@ import {
   LEGACY_DRIVER_ID,
   parseDriverConfig,
   parseDriverConfigLayer,
+  parseDriverConfigShape,
   type DriverConfig,
   type DriverConfigLayer,
 } from './profile';
@@ -51,12 +52,14 @@ export interface DriverConfigLayerSource {
    * 该层的权威来源。
    *
    * - `manual`（缺省）：用户/部署手写的配置，字段全量参与合并；
-   * - `discovered`：后端自动生成的那一层，**只能补 drivers**，且同 id 输给手工配置。
+   * - `discovered`：后端自动生成的那一层，**只能补 drivers**，且同 id 输给手工配置；
+   * - `ui-routing`：后端按 `driver.updateRouting` 写的 UI 覆盖层，它持有整张 `roles` 表；
+   *   标注它的意义是让「哪些层算配置事实」在代码里可判——它不是用户手写的档案层。
    *
    * 明确标注来源，是为了让「自动文件被当成用户配置」在类型与代码路径上都不可达——它的字段
    * 限制不是靠约定，而是靠这条 origin 上的分支。
    */
-  origin?: 'manual' | 'discovered';
+  origin?: 'manual' | 'discovered' | 'ui-routing';
 }
 
 export interface LoadDriverConfigOptions {
@@ -82,6 +85,14 @@ export interface LoadDriverConfigOptions {
    * 可诊断的——但又不值得让后端起不来。
    */
   onWarning?: (message: string) => void;
+  /**
+   * 允许 `default_driver` / `roles` 引用到没有档案的 driver（只做形状校验）。
+   *
+   * 给**只加载部分层的投影**用（见 {@link loadManualDriverConfig}）：投影按定义不是完整
+   * 文档，它引用的 `discovered:` driver 正是被排除的那一层提供的，全量校验必然误报。
+   * 真实装配路径（缺省）依旧严格。
+   */
+  allowUnresolvedReferences?: boolean;
 }
 
 /**
@@ -113,6 +124,7 @@ export function defaultDriverConfigLayers(
     {
       path: join(projectRoot, '.agent', UI_DRIVER_ROUTING_FILE_NAME),
       rolesMode: 'replace',
+      origin: 'ui-routing',
     },
   ];
 }
@@ -153,7 +165,10 @@ export function loadDriverConfig(options: LoadDriverConfigOptions = {}): DriverC
     merged = mergeLayer(merged, readDriverConfigLayer(layer.path), layer);
   }
 
-  return parseDriverConfig(applyEnvOverlay(merged, env));
+  const synthesized = applyEnvOverlay(merged, env);
+  return options.allowUnresolvedReferences
+    ? parseDriverConfigShape(synthesized)
+    : parseDriverConfig(synthesized);
 }
 
 /** 按层的来源选合并方式：自动发现层只能补，手工层照旧后层覆盖。 */
@@ -228,6 +243,15 @@ function warnToStderr(message: string): void {
  * 用于「配置事实」的投影：自动发现层是后端自己生成的，不能拿它当「用户配了什么」——否则一个
  * agent 只要被发现过一次，下一轮合并就会把它算成配置 driver，`stale` 判定永远不成立，
  * `discovered:` 前缀也再不会出现。
+ *
+ * 同理排除 UI routing 层：那一层是 `driver.updateRouting` 写的路由表，不是档案层（它只带
+ * `default_driver` 与 `roles`，从不声明 driver）。把它算进来不但无益，还会把「用户通过 UI
+ * 选了自动发现的 driver」变成一次跨字段校验失败——被选中的 `discovered:` 档案恰好由被排除的
+ * 那一层提供。
+ *
+ * 也因为它是一份**残缺层集**的合成结果，这里只做形状校验，不做「引用必须解析得到」的全量
+ * 校验（{@link LoadDriverConfigOptions.allowUnresolvedReferences}）。真正的装配路径
+ * {@link loadDriverConfig} 仍严格校验：手工层写错引用照样在启动时炸出来。
  */
 export function loadManualDriverConfig(options: LoadDriverConfigOptions = {}): DriverConfig {
   const projectRoot = options.projectRoot ?? process.cwd();
@@ -236,10 +260,11 @@ export function loadManualDriverConfig(options: LoadDriverConfigOptions = {}): D
     ...options,
     projectRoot,
     homeDir: home,
+    allowUnresolvedReferences: true,
     layers:
       options.layers ??
       defaultDriverConfigLayers(projectRoot, home).filter(
-        (layer) => layer.origin !== 'discovered',
+        (layer) => layer.origin !== 'discovered' && layer.origin !== 'ui-routing',
       ),
   });
 }

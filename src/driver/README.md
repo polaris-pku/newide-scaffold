@@ -96,9 +96,11 @@ ADP 调用链是两条独立的关注点：
 - **`src/app` 之外不碰文件系统以外的装配**：模块只提供纯逻辑与存储适配，`backend-rpc-stdio.ts`
   负责顺序——探测 → 落盘 → `loadDriverConfig` → registry → routing → system status。顺序反了
   会让 registry 与 routing 各执一份真相。
-- **配置事实与探测事实分权**：`loadManualDriverConfig()` 给出「用户配了什么」（自动发现层不算），
-  catalog 给出「本机探测到了什么」，registry 给出「执行事实」。任何一处都不许拿另一处的结论
-  冒充自己的。
+- **配置事实与探测事实分权**：`loadManualDriverConfig()` 给出「用户配了什么」（自动发现层与
+  UI routing 层都不算），catalog 给出「本机探测到了什么」，registry 给出「执行事实」。任何一处
+  都不许拿另一处的结论冒充自己的。它是一份**残缺层集**的投影，因此只做形状校验：UI 里选中的
+  `discovered:` driver 由被排除的那一层提供，对它做全量引用校验会把「用户存下的选择」误判成
+  配置错误。
 - **两类 driver 的失败语义不同**：手工档案装配失败 = 启动失败（用户要立刻知道）；自动发现的
   失败 = 那个 driver 不可选择（记录原因码）。共用同一套装配代码，差别只在失败的处理方式。
 - **敏感信息不出模块**：`DriverProbe.launch`（启动命令、参数）只用于探测诊断，不写进自动 profile、

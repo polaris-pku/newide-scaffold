@@ -71,8 +71,11 @@ function makeRuntime(options: {
 /** 只满足发现服务需要的注册表桩。 */
 function stubRegistry(
   outcomes: Record<string, { ok: true } | { ok: false; reason_code: string }> = {},
+  alreadyRegistered: readonly string[] = [],
 ) {
-  const registered = new Map<string, { agent: string }>();
+  const registered = new Map<string, { agent: string }>(
+    alreadyRegistered.map((driverId) => [driverId, { agent: driverId }]),
+  );
   const failures = new Map<string, { reason_code: string; message: string }>();
   const registry: DriverDiscoveryRegistryPort & {
     registered: Map<string, { agent: string }>;
@@ -196,6 +199,28 @@ describe('explicit refresh', () => {
       reason_code: 'DRIVER_RUNNER_ENTRY_MISSING',
       runtime_registered: false,
     });
+    // 装成功的那个 driver 记的是「已注册」——同一轮里两种执行事实互不串台
+    const ready = service.snapshot().drivers.find((driver) => driver.status === 'ready');
+    expect(ready?.runtime_registered).toBe(true);
+  });
+
+  it('records the registration fact for a configured driver without inventing it', async () => {
+    const { service } = makeRuntime({
+      // 配置 driver 的 agent 也在探测结果里：catalog 只给「探测到过」的档案留记录
+      probe: async () => probeResult(['gemini', 'claude']),
+      configuredProfiles: [{ driver_id: 'acp-external', agent: 'claude' }],
+    });
+    await service.startup();
+    const configuredRecord = (): { runtime_registered?: boolean } | undefined =>
+      service.snapshot().drivers.find((driver) => driver.driver_id === 'acp-external');
+    // 还没有 registry：不得凭空写一条「已注册」
+    expect(configuredRecord()?.runtime_registered).toBe(false);
+
+    // registry 自己装了配置 driver 的 runtime，这一格事实要跟着变真
+    service.attachRegistry(stubRegistry({}, ['acp-external']));
+    service.syncRuntimes();
+
+    expect(configuredRecord()?.runtime_registered).toBe(true);
   });
 });
 

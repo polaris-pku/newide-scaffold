@@ -180,6 +180,7 @@ describe('UI routing overlay layer', () => {
     expect(layers.at(-1)).toEqual({
       path: join('/project', '.agent', UI_DRIVER_ROUTING_FILE_NAME),
       rolesMode: 'replace',
+      origin: 'ui-routing',
     });
   });
 
@@ -534,5 +535,59 @@ describe('the auto-discovered layer', () => {
 
     // 「配置事实」必须排除自动层，否则一个 driver 被发现过一次就再也不会变成 stale
     expect(Object.keys(manual.drivers)).toEqual([LEGACY_DRIVER_ID]);
+  });
+
+  it('keeps the manual projection loadable when UI routing picked a discovered driver', () => {
+    const projectRoot = makeTempDir();
+    writeDetected(projectRoot, DETECTED_YAML);
+    writeYaml(
+      projectRoot,
+      join('.agent', UI_DRIVER_ROUTING_FILE_NAME),
+      ['version: 1', `default_driver: ${DISCOVERED}`, 'roles:', `  reviewer: ${DISCOVERED}`, ''].join(
+        '\n',
+      ),
+    );
+
+    // 投影引用的档案由被排除的那一层提供：这是残缺层集，不能拿全量判据去校验它
+    const manual = loadManualDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+    expect(Object.keys(manual.drivers)).toEqual([LEGACY_DRIVER_ID]);
+    // UI 层是后端写的路由表，同样不算「用户配了什么」
+    expect(manual.default_driver).toBe(LEGACY_DRIVER_ID);
+
+    // 完整装配照旧解析得到它，路由也确实落在自动发现的 driver 上
+    const config = loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} });
+    expect(config.default_driver).toBe(DISCOVERED);
+    expect(resolveRoleDriver(config, 'reviewer').driver_id).toBe(DISCOVERED);
+  });
+
+  it('tolerates a hand-written layer that points at a discovered driver', () => {
+    const projectRoot = makeTempDir();
+    writeDetected(projectRoot, DETECTED_YAML);
+    writeYaml(
+      projectRoot,
+      join('.agent', 'drivers.local.yaml'),
+      ['version: 1', `default_driver: ${DISCOVERED}`, ''].join('\n'),
+    );
+
+    expect(() =>
+      loadManualDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} }),
+    ).not.toThrow();
+    expect(loadDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} }).default_driver).toBe(
+      DISCOVERED,
+    );
+  });
+
+  it('still rejects a malformed manual layer in the projection', () => {
+    const projectRoot = makeTempDir();
+    writeYaml(
+      projectRoot,
+      join('.agent', 'drivers.yaml'),
+      ['version: 1', 'drivers:', '  codex:', '    agent: [not-a-string]', ''].join('\n'),
+    );
+
+    // 放宽的只是「引用必须解析得到」，形状错误照旧在启动前炸出来
+    expect(() =>
+      loadManualDriverConfig({ projectRoot, homeDir: makeTempDir(), env: {} }),
+    ).toThrow(DriverConfigError);
   });
 });
