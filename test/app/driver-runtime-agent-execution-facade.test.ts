@@ -124,6 +124,70 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
     expect(events).toContainEqual(expect.objectContaining({ run_id: 'run_parent', role_id: 'primary' }));
   });
+
+  it('resolves every driver lookup by the task run id, not the council phase run id', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-routing-runid-'));
+    try {
+      const repository = new InMemoryRepository();
+      await repository.initializeAgent({ role_id: 'proposer_a', name: 'Proposer A' });
+      const driver = new CapturingDriver('succeeded');
+      const resolveDriver = vi.fn(() => driver);
+      const facade = new DriverRuntimeAgentExecutionFacade({
+        driver,
+        resolveDriver,
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+      });
+      const { session_id: _unused, ...input } = request('task_phase', 'proposer_a', workspace);
+
+      const result = await facade.runAgent({
+        ...input,
+        run_id: 'run_task_phase_council_p1',
+        activity_run_id: 'run_task',
+        context_policy: 'council_proposer',
+      });
+
+      expect(result.status).toBe('completed');
+      expect(driver.prompts.length).toBeGreaterThan(0);
+      // 相位执行身份查不到该 Run 冻结的 routing 快照，会静默回落到当前全局配置——所以
+      // 会话归属、留档 source_driver、invoke_driver、结果归属这几处都必须用任务 run id。
+      expect(resolveDriver.mock.calls.length).toBeGreaterThan(0);
+      expect(resolveDriver.mock.calls.map((call) => call[1])).toEqual(
+        resolveDriver.mock.calls.map(() => 'run_task'),
+      );
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('hands the task run id to Session provisioning', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const original = driver.sendPrompt.bind(driver);
+    vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({
+      ...(await original(input)),
+      session_id: 'session_provisioned',
+      response: 'SESSION_READY',
+    }));
+    const resolveDriver = vi.fn(() => driver);
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      resolveDriver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+    });
+
+    await facade.provisionParticipantSession({
+      task_id: 'task_provision',
+      run_id: 'run_task_phase_council_p1',
+      activity_run_id: 'run_task',
+      role_id: 'proposer_a',
+      workspace_path: os.tmpdir(),
+    });
+
+    expect(resolveDriver.mock.calls.map((call) => call[1])).toEqual(['run_task']);
+  });
   it('lets one real B Agent tool turn send and another role reply through Mailbox', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-mailbox-agent-'));
     const repository = new InMemoryRepository();

@@ -106,8 +106,10 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
    * 投递都从同一个入口进，所以解析点只需收敛在这里一处，调用方不必各自叠一层。
    * driver 是 per-role 的无状态工具：换 driver 不影响 B 侧记忆（它绑在 role_id 上）。
    *
-   * `runId` 是 Run 隔离的关键：同一个 Run 的每个席位都必须解析到同一份 routing 快照，
-   * 否则会出现「第一个席位用旧映射、第二个席位用刚保存的新映射」。
+   * `runId` 必须是**任务 run id**（{@link routingRunId}）：同一个 Run 的每个席位都必须解析
+   * 到同一份 routing 快照，否则会出现「第一个席位用旧映射、第二个席位用刚保存的新映射」。
+   * council 席位执行身份是 `${run_id}_${phaseId}`，拿它来查会查不到冻结快照、静默回落到
+   * 当前全局配置——所以这里一律经过 `routingRunId`，调用方不要直接传执行身份。
    */
   resolveDriver?: (roleId: string, runId?: string) => DriverRuntimeHandle;
   repository: MemoryRepository;
@@ -156,7 +158,10 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
 
 interface InvocationContext {
   task_id: string;
+  /** 执行身份：council 席位是 `${任务run_id}_${phaseId}`。 */
   run_id: string;
+  /** 本次执行归属的**任务 run**（冻结快照与在飞状态的键）；单 agent 路径与 `run_id` 同值。 */
+  activity_run_id?: string;
   role_id: string;
   context_policy: string;
   instruction: string;
@@ -239,6 +244,18 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.manager;
   }
 
+  /**
+   * Run 作用域查询（冻结 routing、会话归属、留档外键）用的键：**任务 run id**。
+   *
+   * council 每次席位执行的身份是 `${run_id}_${phaseId}`（相位隔离需要），而冻结快照是按任务
+   * run id 存的——拿相位 id 去查必然落空，于是席位会静默回落到「当前全局配置」，让「运行中的
+   * Run 不受保存影响」在议会阶段失效。`activity_run_id` 表示的就是「本次执行属于哪个 Run」，
+   * `src/memory/runtime/agent.ts` 的在飞状态点已经在用同一条 `activity_run_id ?? run_id`。
+   */
+  private routingRunId(runId: string, activityRunId?: string): string {
+    return activityRunId ?? runId;
+  }
+
   /** 取（并按 driver_id 缓存）某个 driver 的 invoker。 */
   private invokerFor(driver: DriverRuntimeHandle) {
     const existing = this.driverInvokers.get(driver.driver_id);
@@ -308,7 +325,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.ensureRole(input.role_id);
     throwIfAborted(options?.signal);
     // 会话 provisioning 也必须按 role + Run 快照选 driver：否则会把某个 agent 的会话发给另一个。
-    const driver = this.driverFor(input.role_id, input.run_id);
+    const driver = this.driverFor(
+      input.role_id,
+      this.routingRunId(input.run_id, input.activity_run_id),
+    );
     const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
@@ -456,6 +476,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           workspace_path: normalizedInput.workspace_path,
           role_id: normalizedInput.role_id,
           run_id: normalizedInput.run_id,
+          ...(normalizedInput.activity_run_id
+            ? { activity_run_id: normalizedInput.activity_run_id }
+            : {}),
         },
         options,
       );
@@ -537,7 +560,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       call_id: createId('call'),
       // 归属到本 role 实际会用的 driver（按本 Run 冻结的 routing 解析），与真正下发的那一个保持一致。
-      source_driver: this.driverFor(runtimeRoleId, input.run_id).driver_id,
+      source_driver: this.driverFor(
+        runtimeRoleId,
+        this.routingRunId(input.run_id, input.activity_run_id),
+      ).driver_id,
     };
     const inboundMailbox = input.mailbox_delivery_id
       ? this.requireInboundMailbox(input)
@@ -575,6 +601,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const invocation: InvocationContext = {
         task_id: input.task_id,
         run_id: input.run_id,
+        ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
         role_id: runtimeRoleId,
         context_policy: input.context_policy,
         instruction: input.instruction,
@@ -592,7 +619,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         abortObserved: false,
         ...(options?.signal ? { signal: options.signal } : {}),
         onDriverEvent: (event: DriverStreamEvent) => {
-          if (event.event_type === 'driver.turn_started' && event.session_id && input.workspace_path && this.driverFor(runtimeRoleId, input.run_id).capabilities.supports_session_load) {
+          if (event.event_type === 'driver.turn_started' && event.session_id && input.workspace_path && this.driverFor(runtimeRoleId, this.routingRunId(input.run_id, input.activity_run_id)).capabilities.supports_session_load) {
             this.options.mailbox?.sessionRegistry?.register({
               task_id: input.task_id, workspace_path: input.workspace_path,
               role_id: input.role_id, session_id: event.session_id,
@@ -1008,7 +1035,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     }
     throwIfAborted(invocation.signal);
     // 解析点收敛在这里：role 与 run 都来自 ALS，任何进入 invoke_driver 的路径都经过它。
-    const driver = this.driverFor(invocation.role_id, invocation.run_id);
+    const driver = this.driverFor(
+      invocation.role_id,
+      this.routingRunId(invocation.run_id, invocation.activity_run_id),
+    );
     try {
       const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = invocation.resume_session ? {
         task_instruction: invocation.driver_instruction, skills: [], experiences: [],
@@ -1216,7 +1246,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
-    const driver = this.driverFor(input.role_id, input.run_id);
+    const driver = this.driverFor(
+      input.role_id,
+      this.routingRunId(input.run_id, input.activity_run_id),
+    );
     const mailboxWait = mailboxOutcomes.find(
       (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
     );
