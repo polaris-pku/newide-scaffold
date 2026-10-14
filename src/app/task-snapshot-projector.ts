@@ -96,7 +96,10 @@ function projectCouncil(
   const council = snapshot?.council;
   const parsedResult = councilResultEvidenceSchema.safeParse(council?.result);
   return {
-    status: council?.status ?? projectCouncilStatus(latest?.status),
+    status:
+      council?.status === 'interrupted'
+        ? 'failed'
+        : (council?.status ?? projectCouncilStatus(latest?.status)),
     ...(council?.decision_id ? { decision_id: council.decision_id } : {}),
     ...(isCouncilVerdict(council?.verdict) ? { verdict: council.verdict } : {}),
     ...(parsedResult.success ? { result: parsedResult.data } : {}),

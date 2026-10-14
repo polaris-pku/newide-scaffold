@@ -130,6 +130,8 @@ export interface TaskRunExecutionState {
    * 拿不到 gate/execute 阶段的产物。
    */
   restarted_from_run_id?: string;
+  /** False means the saved session only reached initialization, not its task prompt. */
+  native_task_prompt_dispatched?: boolean;
 }
 
 export interface FinishTaskRunInput {
@@ -164,6 +166,22 @@ export interface TaskMailboxWaitContext extends TaskLaunchContext {
   sender_role_id: string;
   delivery_ids: string[];
   waiting_reason: string;
+}
+
+export interface TaskInterruptRequest {
+  reason: string;
+  source: 'user' | 'shutdown';
+}
+
+/** Abort reason carried from the application interrupt API into the stage loop. */
+export class TaskInterruptedError extends Error {
+  constructor(
+    readonly source: TaskInterruptRequest['source'],
+    reason: string,
+  ) {
+    super(reason);
+    this.name = 'TaskInterruptedError';
+  }
 }
 
 export class TaskProcessorTaskNotFoundError extends Error {
@@ -837,6 +855,23 @@ export class TaskProcessor {
   getRunExecutionState(runId: string): TaskRunExecutionState {
     const aggregate = this.requireAggregateForRun(runId);
     const run = requireRun(aggregate, runId);
+    const lineage = new Set<string>();
+    let ancestor: PersistedRunState | undefined = run;
+    while (ancestor && !lineage.has(ancestor.run_id)) {
+      lineage.add(ancestor.run_id);
+      ancestor = ancestor.restarted_from_run_id
+        ? aggregate.runs.find(candidate => candidate.run_id === ancestor?.restarted_from_run_id)
+        : undefined;
+    }
+    const primaryRole = aggregate.runtime_state.cursor_input?.cursor === 'execute_agent'
+      ? aggregate.runtime_state.cursor_input.winner_agent_id
+      : aggregate.task.owner_agent_id ?? aggregate.task.role_id;
+    const nativeEvents = aggregate.events.filter(event =>
+      event.run_id && lineage.has(event.run_id) &&
+      (!primaryRole || event.payload.role_id === primaryRole),
+    );
+    const taskPromptDispatched = nativeEvents.some(event => event.event_type === 'driver.prompt_dispatching');
+    const sessionInitializing = nativeEvents.some(event => event.event_type === 'driver.session_initializing');
     const memoryAblation = readMemoryAblation(
       aggregate.runtime_state.diagnostics.memory_ablation,
     );
@@ -844,6 +879,9 @@ export class TaskProcessor {
       task_id: aggregate.task.task_id,
       run_id: runId,
       mode: run.mode,
+      ...(taskPromptDispatched || sessionInitializing
+        ? { native_task_prompt_dispatched: taskPromptDispatched }
+        : {}),
       ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
       task_request: {
         spec: aggregate.task.spec,
@@ -1231,6 +1269,28 @@ export class TaskProcessor {
       .map((aggregate) => this.recoverInterruptedTask(aggregate));
   }
 
+  /**
+   * Persist a user/shutdown interruption at the current stage boundary.
+   *
+   * The active stage is intentionally left as the resume cursor: a driver turn
+   * may have produced partial workspace changes, and resume must re-enter that
+   * stage with the captured workspace rather than silently restarting the Task.
+   */
+  interruptRun(runId: string, input: TaskInterruptRequest): TaskSnapshot {
+    const aggregate = this.requireAggregateForRun(runId);
+    const run = requireRun(aggregate, runId);
+    if (!isActiveRun(run)) return this.getTaskSnapshot(aggregate.task.task_id);
+    return this.commitInterruptedRun(aggregate, run, {
+      trigger: input.source === 'shutdown' ? 'shutdown' : 'manual',
+      interrupt_state: {
+        type: 'user_interrupted',
+        source: input.source,
+        reason: input.reason,
+        interrupted_run_id: run.run_id,
+      },
+    });
+  }
+
   finishRun(input: FinishTaskRunInput): TaskSnapshot {
     const aggregate = this.requireAggregateForRun(input.run_id);
     const run = requireRun(aggregate, input.run_id);
@@ -1584,35 +1644,43 @@ export class TaskProcessor {
   private recoverInterruptedTask(aggregate: PersistedTaskAggregate): TaskSnapshot {
     const run = aggregate.runs.find((candidate) => isActiveRun(candidate));
     if (!run) return projectAggregate(aggregate, this.runsRoot);
+    return this.commitInterruptedRun(aggregate, run, {
+      trigger: 'blocked',
+      inherit_mechanical_snapshot: true,
+      interrupt_state: {
+        type: 'process_interrupted',
+        reason: 'The backend process ended before the active run reached a terminal state.',
+        interrupted_run_id: run.run_id,
+      },
+    });
+  }
+
+  private commitInterruptedRun(
+    aggregate: PersistedTaskAggregate,
+    run: PersistedRunState,
+    input: {
+      trigger: PersistedFullCheckpoint['trigger'];
+      interrupt_state: Record<string, unknown>;
+      inherit_mechanical_snapshot?: boolean;
+    },
+  ): TaskSnapshot {
     assertTaskStatusTransition(aggregate.task.status, 'blocked');
 
     const timestamp = this.now();
-    const reason = 'The backend process ended before the active run reached a terminal state.';
-    const interruptState = {
-      type: 'process_interrupted',
-      reason,
-      interrupted_run_id: run.run_id,
-    };
     const latestCheckpoint = this.store.getLatestCheckpoint(aggregate.task.task_id);
-    // Built through buildSafepointCheckpoint so the interrupt captures a real workspace
-    // anchor. This path used to hardcode base_commit 'unknown' with no snapshot, which
-    // made every recovery checkpoint undeployable for content restore.
     const checkpoint = buildSafepointCheckpoint({
       aggregate,
       run_id: run.run_id,
-      trigger: 'blocked',
-      ...(latestCheckpoint
+      trigger: input.trigger,
+      ...(input.inherit_mechanical_snapshot && latestCheckpoint
         ? {
             parent_checkpoint_id: latestCheckpoint.checkpoint_id,
-            // Recovery happens after the crash, so the disk is no longer authoritative.
-            // Carry the last safepoint's snapshot forward instead of pinning this
-            // checkpoint to whatever the crash (or anything since) left behind.
             inherit_mechanical_snapshot: latestCheckpoint.mechanical_snapshot,
           }
         : {}),
       ...(this.mailboxStore ? { mailboxStore: this.mailboxStore } : {}),
       ...(this.participantSessions ? { participantSessions: this.participantSessions } : {}),
-      interrupt_state: interruptState,
+      interrupt_state: input.interrupt_state,
       now: timestamp,
     });
     const checkpointId = checkpoint.checkpoint_id;
@@ -1621,21 +1689,31 @@ export class TaskProcessor {
       run.run_id,
       aggregate.task.task_id,
       run.run_id,
-      { reason, resume_cursor: aggregate.runtime_state.resume_cursor },
+      {
+        reason: String(input.interrupt_state.reason ?? 'Task interrupted'),
+        resume_cursor: aggregate.runtime_state.resume_cursor,
+      },
     );
     const taskBlocked = this.createEvent(
       'task.blocked',
       aggregate.task.task_id,
       aggregate.task.task_id,
       run.run_id,
-      { reason, interrupted_run_id: run.run_id },
+      {
+        reason: String(input.interrupt_state.reason ?? 'Task interrupted'),
+        interrupted_run_id: run.run_id,
+      },
     );
     const checkpointSaved = this.createEvent(
       'checkpoint.saved',
       checkpointId,
       aggregate.task.task_id,
       run.run_id,
-      { checkpoint_id: checkpointId, resume_cursor: aggregate.runtime_state.resume_cursor },
+      {
+        checkpoint_id: checkpointId,
+        resume_cursor: aggregate.runtime_state.resume_cursor,
+        trigger: input.trigger,
+      },
     );
     const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
 
@@ -1657,7 +1735,7 @@ export class TaskProcessor {
       runtime_state: {
         ...runtimeWithoutCurrentRun,
         ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
-        interrupt_state: interruptState,
+        interrupt_state: input.interrupt_state,
         diagnostics: {
           ...aggregate.runtime_state.diagnostics,
           interrupted_run_id: run.run_id,

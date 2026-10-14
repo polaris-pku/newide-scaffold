@@ -73,6 +73,7 @@ export interface ArtifactSelectionInput {
 }
 
 export interface ArtifactSelectionExecutionOptions {
+  recovery_key?: string;
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
   onCouncilLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
@@ -181,6 +182,7 @@ export class ArtifactSelector {
       };
     const councilOptions = execution
         ? {
+            ...(execution.recovery_key ? { recovery_key: execution.recovery_key } : {}),
             ...(execution.signal ? { signal: execution.signal } : {}),
             ...(execution.onDriverEvent ? { onDriverEvent: execution.onDriverEvent } : {}),
             ...(execution.onCouncilLifecycleEvent

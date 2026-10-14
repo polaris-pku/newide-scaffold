@@ -64,6 +64,8 @@ export type DriverStreamChannel = 'coordination' | 'stream_only';
  */
 export const DRIVER_STREAM_CHANNELS: Readonly<Record<string, DriverStreamChannel>> = Object.freeze({
   // ── turn / 会话生命周期：状态转移，低频 ──
+  'driver.prompt_dispatching': 'coordination',
+  'driver.session_initializing': 'coordination',
   'driver.turn_started': 'coordination',
   'driver.turn_completed': 'coordination',
   'driver.turn_failed': 'coordination',

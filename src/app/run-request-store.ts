@@ -38,6 +38,8 @@ export interface PersistedRunRequest {
   client_task_id?: string;
   title?: string;
   restarted_from_run_id?: string;
+  /** Null starts a new execution lineage; only resume/continuation may inherit role state. */
+  recovery_parent_run_id?: string | null;
   created_at: Timestamp;
 }
 
@@ -186,7 +188,7 @@ export class FileRunRequestStore implements RunRequestStore {
 
   private async readTerminalState(runId: string): Promise<
     | {
-        status: 'completed' | 'failed' | 'cancelled';
+        status: 'completed' | 'failed' | 'cancelled' | 'interrupted';
         task_id?: string;
         mode?: AppRunMode;
         session_id?: string;
@@ -205,7 +207,7 @@ export class FileRunRequestStore implements RunRequestStore {
 
 function extractTerminalState(value: Record<string, unknown>):
   | {
-      status: 'completed' | 'failed' | 'cancelled';
+      status: 'completed' | 'failed' | 'cancelled' | 'interrupted';
       task_id?: string;
       mode?: AppRunMode;
       session_id?: string;
@@ -284,8 +286,12 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }
 
-function asTerminalStatus(value: unknown): 'completed' | 'failed' | 'cancelled' | undefined {
-  return value === 'completed' || value === 'failed' || value === 'cancelled' ? value : undefined;
+function asTerminalStatus(
+  value: unknown,
+): 'completed' | 'failed' | 'cancelled' | 'interrupted' | undefined {
+  return value === 'completed' || value === 'failed' || value === 'cancelled' || value === 'interrupted'
+    ? value
+    : undefined;
 }
 
 function asRunMode(value: unknown): AppRunMode | undefined {

@@ -680,6 +680,15 @@ export class SqliteCoordinationStore
     this.database.close();
   }
 
+  listParticipantSessionsForTask(taskId: string): ParticipantSessionBinding[] {
+    return this.database.prepare(
+      'SELECT task_id, workspace_path, role_id, session_id FROM participant_sessions WHERE task_id = ? ORDER BY workspace_path, role_id',
+    ).all(taskId).map((row) => ({
+      task_id: readString(row, 'task_id'), workspace_path: readString(row, 'workspace_path'),
+      role_id: readString(row, 'role_id'), session_id: readString(row, 'session_id'),
+    }));
+  }
+
   private configure(): void {
     this.database.exec(`
       PRAGMA foreign_keys = ON;

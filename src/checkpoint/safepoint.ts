@@ -89,13 +89,13 @@ export function buildSafepointCheckpoint(
       ? [...aggregate.runtime_state.cursor_input.delivery_ids]
       : [];
   const participantSessions = [
-    ...collectParticipantSessions(aggregate),
-    ...(input.participantSessions?.list?.(
+    ...(input.participantSessions?.listForTask?.(aggregate.task.task_id) ?? input.participantSessions?.list?.(
       aggregate.task.task_id,
       aggregate.task.workspace_path,
-    ) ?? []).map(({ role_id, session_id }) => ({ role_id, session_id })),
+    ) ?? []).map(({ role_id, session_id, workspace_path }) => ({ role_id, session_id, workspace_path })),
+    ...collectParticipantSessions(aggregate),
   ].filter((value, index, values) =>
-    values.findIndex((candidate) => candidate.role_id === value.role_id) === index,
+    values.findIndex((candidate) => candidate.role_id === value.role_id && candidate.session_id === value.session_id) === index,
   );
 
   return {
