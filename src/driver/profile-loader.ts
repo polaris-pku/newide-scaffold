@@ -222,6 +222,28 @@ function warnToStderr(message: string): void {
   process.stderr.write(`${message}\n`);
 }
 
+/**
+ * 只按**手工层**加载配置。
+ *
+ * 用于「配置事实」的投影：自动发现层是后端自己生成的，不能拿它当「用户配了什么」——否则一个
+ * agent 只要被发现过一次，下一轮合并就会把它算成配置 driver，`stale` 判定永远不成立，
+ * `discovered:` 前缀也再不会出现。
+ */
+export function loadManualDriverConfig(options: LoadDriverConfigOptions = {}): DriverConfig {
+  const projectRoot = options.projectRoot ?? process.cwd();
+  const home = options.homeDir ?? homedir();
+  return loadDriverConfig({
+    ...options,
+    projectRoot,
+    homeDir: home,
+    layers:
+      options.layers ??
+      defaultDriverConfigLayers(projectRoot, home).filter(
+        (layer) => layer.origin !== 'discovered',
+      ),
+  });
+}
+
 /** 合并两层配置：后者覆盖前者。 */
 export function mergeDriverConfigLayers(
   base: DriverConfigLayer,

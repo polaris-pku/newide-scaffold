@@ -72,6 +72,13 @@ export interface DriverDiscoveryService {
   refresh(options?: DriverProbeOptions): Promise<DriverDiscoverySnapshot>;
   snapshot(): DriverDiscoverySnapshot;
   catalog(): DriverDiscoveryCatalog;
+  /**
+   * 把当前自动发现 profile 注册进已接入的 registry（幂等）。
+   *
+   * 装配时必须单独调一次：registry 只能在「自动 profile 已落盘」之后才建得起来，而
+   * `startup()` 发生在它之前。重复调用不会多造 runtime（registry 的注册本身幂等）。
+   */
+  syncRuntimes(): void;
   /** 自动发现 profile（最小档案）；组装点据此决定哪些 driver 走动态注册。 */
   discoveredProfiles(): Record<string, DriverProfile>;
 }
@@ -160,10 +167,15 @@ export function createDriverDiscoveryService(
   async function persist(snapshot: DriverDiscoverySnapshot): Promise<void> {
     const lock = await options.store.acquireLock();
     try {
-      options.store.writeProfiles({
-        version: DETECTED_DRIVER_PROFILES_VERSION,
-        drivers: options.catalog.discoveredProfiles(),
-      });
+      const profiles = options.catalog.discoveredProfiles();
+      // 一个自动 profile 都没有、文件也不存在时就不建这个文件：`.agent` 目录是用户可见的，
+      // 「什么都没发现」不该在别人的检出里留下一个空文件。
+      if (Object.keys(profiles).length > 0 || options.store.exists()) {
+        options.store.writeProfiles({
+          version: DETECTED_DRIVER_PROFILES_VERSION,
+          drivers: profiles,
+        });
+      }
       const state: DriverDiscoveryStateDocument = {
         schema_version: snapshot.schema_version,
         generated_at: snapshot.generated_at,
@@ -252,6 +264,7 @@ export function createDriverDiscoveryService(
 
     snapshot: () => options.catalog.current(),
     catalog: () => options.catalog,
+    syncRuntimes: registerRuntimes,
     discoveredProfiles: () => options.catalog.discoveredProfiles(),
     attachRegistry: (next: DriverDiscoveryRegistryPort) => {
       registry = next;

@@ -19,11 +19,22 @@
  * - **部署锁定**：`NEWIDE_DRIVER` 是部署级锁定的 default driver。请求想改成别的 driver 一律
  *   在写文件前拒绝（`default_driver_locked`），因为写了也不会生效——loader 的 env 覆盖层
  *   永远赢。成功返回的 snapshot 一定来自「写完文件后重新 load 的」有效配置；
+ * - **自动发现的 driver 走同一份投影**：探测事实（catalog）是「是否可选」的前置判据，执行
+ *   事实（registry 注册结果）紧跟其后，注入的 `availabilityOf` 是最后一关。前端只看
+ *   `selectable`，不从 `status` 或 `limitations` 推断；
  * - 更新失败不改变内存配置、不影响在飞 Run。
  */
 import path from 'node:path';
 
 import type { DriverRuntimeHandle } from './contract';
+import {
+  DRIVER_CONNECTION_TYPE_UNSUPPORTED,
+  DRIVER_DISCOVERY_STALE,
+  DRIVER_RUNTIME_REGISTRATION_FAILED,
+  type DriverDiscoveryCatalog,
+  type DriverDiscoveryRecord,
+} from './driver-discovery-catalog';
+import type { DriverProbeOptions } from './driver-probe-service';
 import {
   projectDriverConfigForRun,
   resolveRoleDriver,
@@ -60,6 +71,39 @@ export const AGENT_CLI_READINESS_NOT_VERIFIABLE = 'AGENT_CLI_READINESS_NOT_VERIF
 
 /** 配置里有这个 driver 档案，但进程内没有它的 runtime 句柄（理论不可达，仍如实标注）。 */
 export const DRIVER_RUNTIME_NOT_CONFIGURED = 'DRIVER_RUNTIME_NOT_CONFIGURED';
+
+/**
+ * 探测通过的诚实措辞。
+ *
+ * 探测验证的是「ACP 能解析出启动方式并完成 initialize」，不是「这个 agent 能跑完我们的一次
+ * Run」——两者的链路并不相同（我们的执行走 runner 的 `${AGENT_ID}_CLI_COMMAND` / adapter
+ * 默认值，provenance 为 `npx-on-demand` 时本机甚至没有这个 CLI）。所以状态仍是 `degraded`，
+ * 只把证据补上，不改成可用。
+ */
+export const DRIVER_DISCOVERED_PROBE_PASSED =
+  'ACP 探测通过；未验证它能否跑完一次 Run';
+
+/** 本轮探测没再发现它：profile 与 id 仍然保留，但不可选择。 */
+export const DRIVER_DISCOVERY_STALE_WORDING = '本轮 ACP 探测未再次发现它';
+
+/** 探测到了，但连接类型不在当前执行链支持范围内（如 `pty`）。 */
+export const DRIVER_CONNECTION_TYPE_UNSUPPORTED_WORDING =
+  '连接类型不在当前执行链支持范围内';
+
+/** 一个 driver 的探测证据行；格式与其它 driver 文案一致，前端按同一份常量取。 */
+export function driverProbeEvidence(record: DriverDiscoveryRecord): string {
+  const label = `driver "${record.driver_id}"（agent: ${record.agent_id}）`;
+  switch (record.status) {
+    case 'ready':
+      return `${label}: ${DRIVER_DISCOVERED_PROBE_PASSED}${record.probed_at ? `（探测于 ${record.probed_at}）` : ''}`;
+    case 'stale':
+      return `${label}: ${DRIVER_DISCOVERY_STALE_WORDING}`;
+    case 'unsupported':
+      return `${label}: ${DRIVER_CONNECTION_TYPE_UNSUPPORTED_WORDING}（${record.connection_type}）`;
+    case 'failed':
+      return `${label}: runtime 注册失败（${record.reason_code ?? DRIVER_RUNTIME_REGISTRATION_FAILED}）`;
+  }
+}
 
 /** 一个 driver 的可选择性投影；测试可注入以构造「不可选择」场景。 */
 export interface DriverRoutingDriverAvailability {
@@ -116,6 +160,10 @@ export class DriverRoutingError extends Error {
 export interface DriverRuntimeRegistry {
   listDriverIds(): string[];
   get(driverId: string): DriverRuntimeHandle;
+  /** 进程内是否已注册该 driver 的 runtime；缺省按 `listDriverIds()` 判。 */
+  hasRuntime?(driverId: string): boolean;
+  /** 该 driver 上次动态注册失败的原因；缺省表示「没有失败记录」。 */
+  failureOf?(driverId: string): { reason_code: string; message: string } | undefined;
 }
 
 export interface DriverRoutingServiceOptions {
@@ -133,8 +181,17 @@ export interface DriverRoutingServiceOptions {
    * 后端不维护静态 role 白名单；缺省时目录视为查不到，所有显式 role 都落 orphan_roles。
    */
   knownRoleIds?: () => Promise<readonly string[]>;
-  /** 覆盖默认的可选择性投影（测试缝）。 */
+  /** 覆盖默认的可选择性投影（测试缝）。自动发现的硬约束（stale / unsupported / 注册失败）先于它生效。 */
   availabilityOf?: (driverId: string, profile: DriverProfile) => DriverRoutingDriverAvailability;
+  /**
+   * 自动发现的事实来源。
+   *
+   * 缺省时行为与接线前逐字段一致（只看配置 + runtime + `availabilityOf`），这样既有的装配与
+   * 测试不需要跟着改。
+   */
+  catalog?: DriverDiscoveryCatalog;
+  /** 重新探测的入口（`driver.refresh`）；缺省表示本进程不做刷新。 */
+  discovery?: { refresh(options?: DriverProbeOptions): Promise<unknown> };
   /**
    * 跨进程写锁的等待参数；缺省 5s 超时 / 25ms 重试 / 30s stale。
    *
@@ -158,8 +215,17 @@ export interface RunDriverRoutingPort {
  */
 export interface DriverRoutingPort extends RunDriverRoutingPort {
   getSnapshot(): Promise<DriverRoutingSnapshot>;
+  /**
+   * 同步的 driver 投影（`driver.getConfig.drivers[]`）。
+   *
+   * 与 `getSnapshot()` 同一份来源，只是不查 role 目录。`system.capabilities` 需要按调用时刻
+   * 反映最新的 driver（刷新后新增的也要在），而它是同步接口，所以这两条投影必须共用这一处。
+   */
+  driverProjection(): DriverRoutingDriver[];
   updateRouting(input: UpdateDriverRoutingInput): Promise<DriverRoutingSnapshot>;
   resetRouting(expectedRevision: string): Promise<DriverRoutingSnapshot>;
+  /** 重新探测 driver 并把结果同步到有效 driver 列表；不改 UI routing mapping。 */
+  refreshDriverDiscovery(options?: DriverProbeOptions): Promise<DriverRoutingSnapshot>;
 }
 
 export class DriverRoutingService implements DriverRoutingPort {
@@ -173,6 +239,8 @@ export class DriverRoutingService implements DriverRoutingPort {
     driverId: string,
     profile: DriverProfile,
   ) => DriverRoutingDriverAvailability;
+  private readonly catalog: DriverDiscoveryCatalog | undefined;
+  private readonly discovery: { refresh(options?: DriverProbeOptions): Promise<unknown> } | undefined;
   private readonly lockOptions: DriverRoutingLockOptions;
   /** 当前有效配置（含 UI 覆盖层）；每次成功写入或 reset 后整体替换。 */
   private currentConfig: DriverConfig;
@@ -188,7 +256,13 @@ export class DriverRoutingService implements DriverRoutingPort {
     this.env = options.env;
     this.homeDir = options.homeDir;
     this.knownRoleIds = options.knownRoleIds;
-    this.availabilityOf = options.availabilityOf ?? defaultDriverAvailability;
+    this.catalog = options.catalog;
+    this.discovery = options.discovery;
+    // 默认投影要读 catalog：探测通过时，说明「CLI 是否就绪未验证」这句话已经不准确了，
+    // 改用探测证据（但状态仍是 degraded——探测通过不等于能跑完一次 Run）。
+    this.availabilityOf =
+      options.availabilityOf ??
+      ((driverId, profile) => defaultDriverAvailability(driverId, profile, this.catalog?.recordOf(driverId)));
     this.lockOptions = options.lock ?? {};
     this.currentConfig = this.loadConfig();
   }
@@ -207,14 +281,23 @@ export class DriverRoutingService implements DriverRoutingPort {
       revision: revisionOf(config),
       scope: 'project',
       default_driver: config.default_driver,
-      drivers: Object.keys(config.drivers)
-        .sort(compareCodeUnits)
-        .map((driverId) => this.projectDriver(config, driverId)),
+      drivers: this.projectDrivers(config),
       roles,
       orphan_roles,
     };
     // 出口再走一次 strict schema：任何多余的敏感字段都不可能从这里漏出去。
     return driverRoutingSnapshotSchema.parse(snapshot);
+  }
+
+  /**
+   * 同步的 driver 投影。
+   *
+   * `getSnapshot()` 的 `drivers[]` 就是它——两处共用一处实现，`system.capabilities` 才能和
+   * `driver.getConfig` 说同一件事（§11：不允许各算各的）。
+   */
+  driverProjection(): DriverRoutingDriver[] {
+    this.refreshConfigFromDisk();
+    return this.projectDrivers(this.currentConfig);
   }
 
   /** 当前 revision；下一次 update/reset 的 `expected_revision` 必须等于它。 */
@@ -414,6 +497,27 @@ export class DriverRoutingService implements DriverRoutingPort {
     });
   }
 
+  /**
+   * 重新探测 driver（`driver.refresh`）。
+   *
+   * 顺序与理由：
+   * 1. 走 update 锁串行化——刷新会**重写自动 profile 文件**，而 `updateRouting` 的临界区也
+   *    依赖「磁盘即真相」，两者交错会读到半新半旧的配置；
+   * 2. 先探测、合并、落盘、注册（都由 discovery 服务完成）；
+   * 3. 再**强制重读配置**：revision 只看 `{version, default_driver, roles}`，新增 driver 不会
+   *    改 revision，所以 `refreshConfigFromDisk` 的「revision 不同才换」在这里会漏掉新 driver；
+   * 4. 最后返回最新快照（**不改 UI routing mapping**，`revision` 因此保持不变）。
+   *
+   * 已冻结的 Run 不受影响：它们的投影在创建时就复制好了，刷新只动 `currentConfig`。
+   */
+  async refreshDriverDiscovery(options?: DriverProbeOptions): Promise<DriverRoutingSnapshot> {
+    return this.withUpdateLock(async () => {
+      if (this.discovery) await this.discovery.refresh(options);
+      this.reloadConfigFromDisk();
+      return this.getSnapshot();
+    });
+  }
+
   private assertRevision(
     expectedRevision: string,
     config: DriverConfig = this.currentConfig,
@@ -429,13 +533,13 @@ export class DriverRoutingService implements DriverRoutingPort {
 
   private assertSelectable(field: string, driverId: string, profile: DriverProfile): void {
     const availability = this.projectAvailability(driverId, profile);
-    const hasRuntime = this.registry.listDriverIds().includes(driverId);
+    const hasRuntime = this.hasRuntime(driverId);
     // 与 `projectDriver` 同一判据：投影说「不可选择」的 driver，update 也必须拒绝，
     // 否则会出现「前端看到不可选、却保存成功、执行时才炸」的分叉。
     if (hasRuntime && availability.selectable) return;
     const reasonCode = hasRuntime
       ? availability.reason_code
-      : DRIVER_RUNTIME_NOT_CONFIGURED;
+      : (this.registryFailureOf(driverId)?.reason_code ?? DRIVER_RUNTIME_NOT_CONFIGURED);
     throw new DriverRoutingError(
       'driver_not_selectable',
       `Driver "${driverId}" is not selectable`,
@@ -526,6 +630,21 @@ export class DriverRoutingService implements DriverRoutingPort {
     }
   }
 
+  /**
+   * 无条件重读磁盘配置。
+   *
+   * 与 {@link refreshConfigFromDisk} 的区别就是这一点：那个只在 revision 变化时才换内存配置，
+   * 而自动发现新增的 driver **不改 revision**（revision 只看 default_driver 与 roles），
+   * 刷新后必须强制读一遍，否则新 driver 永远不会出现在列表里。
+   */
+  private reloadConfigFromDisk(): void {
+    try {
+      this.currentConfig = this.loadConfig();
+    } catch (error) {
+      throw this.writeFailed(error);
+    }
+  }
+
   /** loader 真正会读的那份 env；服务缺省 `process.env`，与 loader 的缺省一致。 */
   private routingEnv(): NodeJS.ProcessEnv {
     return this.env ?? process.env;
@@ -580,6 +699,13 @@ export class DriverRoutingService implements DriverRoutingPort {
     );
   }
 
+  /** 全部 driver 的投影（按 driver_id 排序，输出稳定）。 */
+  private projectDrivers(config: DriverConfig): DriverRoutingDriver[] {
+    return Object.keys(config.drivers)
+      .sort(compareCodeUnits)
+      .map((driverId) => this.projectDriver(config, driverId));
+  }
+
   private projectDriver(config: DriverConfig, driverId: string): DriverRoutingDriver {
     const profile = config.drivers[driverId];
     if (!profile) {
@@ -588,12 +714,15 @@ export class DriverRoutingService implements DriverRoutingPort {
         driver_id: driverId,
       });
     }
-    const hasRuntime = this.registry.listDriverIds().includes(driverId);
+    const record = this.catalog?.recordOf(driverId);
+    const hasRuntime = this.hasRuntime(driverId);
     const availability = this.projectAvailability(driverId, profile);
     const selectable = hasRuntime && availability.selectable;
     const capabilities = {
       driver_id: driverId,
       agent: profile.agent,
+      // 探测拿到的显示名优先于档案描述：前者来自 A 侧 adapter 的标注，后者可能缺省。
+      ...(record?.display_name ? { display_name: record.display_name } : {}),
       ...(profile.description ? { description: profile.description } : {}),
     };
     if (!hasRuntime) {
@@ -601,7 +730,8 @@ export class DriverRoutingService implements DriverRoutingPort {
         ...capabilities,
         selectable: false,
         status: 'unavailable',
-        reason_code: DRIVER_RUNTIME_NOT_CONFIGURED,
+        // 有明确的注册失败原因就用它——「不可选择」要能区分「没配 runtime」与「配了但起不来」。
+        reason_code: this.registryFailureOf(driverId)?.reason_code ?? DRIVER_RUNTIME_NOT_CONFIGURED,
         ...(availability.limitations ? { limitations: [...availability.limitations] } : {}),
       };
     }
@@ -614,11 +744,61 @@ export class DriverRoutingService implements DriverRoutingPort {
     };
   }
 
+  /**
+   * 可选择性投影。
+   *
+   * 自动发现的**硬约束**先于注入的闸门生效：一个本轮没再探测到、连接类型不支持或 runtime
+   * 起不来的 driver，不能因为某个 `availabilityOf` 说「可以」就变成可选。反过来，闸门仍然
+   * 是判断「可选不可选」的最后一关（职责分离：发现事实由 catalog 说，策略由注入方说）。
+   */
   private projectAvailability(
     driverId: string,
     profile: DriverProfile,
   ): DriverRoutingDriverAvailability {
+    const constraint = this.discoveryConstraint(driverId);
+    if (constraint) return constraint;
     return this.availabilityOf(driverId, profile);
+  }
+
+  /** 探测/执行事实给出的硬约束；没有则返回 undefined（交给闸门）。 */
+  private discoveryConstraint(driverId: string): DriverRoutingDriverAvailability | undefined {
+    const record = this.catalog?.recordOf(driverId);
+    if (!record) return undefined;
+    const evidence = [driverProbeEvidence(record)];
+    switch (record.status) {
+      case 'ready':
+        return undefined;
+      case 'stale':
+        return {
+          selectable: false,
+          status: 'unavailable',
+          reason_code: DRIVER_DISCOVERY_STALE,
+          limitations: evidence,
+        };
+      case 'unsupported':
+        return {
+          selectable: false,
+          status: 'unavailable',
+          reason_code: DRIVER_CONNECTION_TYPE_UNSUPPORTED,
+          limitations: evidence,
+        };
+      case 'failed':
+        return {
+          selectable: false,
+          status: 'unavailable',
+          reason_code: record.reason_code ?? DRIVER_RUNTIME_REGISTRATION_FAILED,
+          limitations: evidence,
+        };
+    }
+  }
+
+  private hasRuntime(driverId: string): boolean {
+    if (this.registry.hasRuntime) return this.registry.hasRuntime(driverId);
+    return this.registry.listDriverIds().includes(driverId);
+  }
+
+  private registryFailureOf(driverId: string): { reason_code: string; message: string } | undefined {
+    return this.registry.failureOf?.(driverId);
   }
 
   private async projectRoles(config: DriverConfig): Promise<{
@@ -671,17 +851,32 @@ function revisionOf(config: DriverConfig): string {
   return computeUiRoutingRevision(effectiveUiRoutingDocument(config));
 }
 
-/** 默认投影：档案已配置且 runtime 已构造 → 可选择，但 CLI 就绪情况本仓验证不了。 */
+/**
+ * 默认投影。
+ *
+ * 有探测记录且探测通过时，把「CLI 是否就绪未验证」补成**具体证据**——这句话在探测之后已经
+ * 不准确了（探测真的把 A 侧拉起来并完成过 initialize）。但状态仍是 `degraded`：探测通过不等于
+ * 它能跑完我们的一次 Run，而且 provenance 为 `npx-on-demand` 时本机根本没有这个 CLI。
+ */
 function defaultDriverAvailability(
   _driverId: string,
   profile: DriverProfile,
+  record?: DriverDiscoveryRecord,
 ): DriverRoutingDriverAvailability {
-  const limitations = profile.limitations ? [...profile.limitations] : undefined;
+  const declared = profile.limitations ? [...profile.limitations] : [];
+  if (record?.status === 'ready') {
+    return {
+      selectable: true,
+      status: 'degraded',
+      reason_code: AGENT_CLI_READINESS_NOT_VERIFIABLE,
+      limitations: [driverProbeEvidence(record), ...declared],
+    };
+  }
   return {
     selectable: true,
     status: 'degraded',
     reason_code: AGENT_CLI_READINESS_NOT_VERIFIABLE,
-    ...(limitations ? { limitations } : {}),
+    ...(declared.length > 0 ? { limitations: declared } : {}),
   };
 }
 
