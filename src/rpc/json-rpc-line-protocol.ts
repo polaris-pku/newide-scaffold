@@ -64,6 +64,10 @@ export const JSON_RPC_ERROR_CODES = {
   DRIVER_CONFIG_BUSY: -32026,
   DRIVER_PROBE_UNAVAILABLE: -32027,
   DRIVER_PROBE_FAILED: -32028,
+  /** driver 自动发现的持久化失败：自动 profile / state 写不进去（响应里不含路径与 secret）。 */
+  DRIVER_DISCOVERY_PERSIST_FAILED: -32029,
+  /** 另一个 backend 实例正在写自动发现文件：可重试。 */
+  DRIVER_DISCOVERY_LOCK_BUSY: -32030,
 } as const;
 
 const requestSchema = z
