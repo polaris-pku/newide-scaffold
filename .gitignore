@@ -24,6 +24,11 @@ my-session.json
 *.tar.gz
 *.log
 
+# driver 自动发现的产物：由后端探测生成、可随时重建，且随本机装了什么 agent 而变。
+# 想固定某个 driver 的启动方式或凭据，请写 .agent/drivers.yaml / drivers.local.yaml。
+.agent/drivers.detected.local.yaml
+.agent/drivers.detected.local.yaml.lock/
+
 # 本地评测/复现产物，不入仓
 evalResult/
 
