@@ -67,6 +67,55 @@ describe('SqliteCoordinationStore', () => {
     database.close();
   });
 
+  it('deletes a task together with its cascaded runs, runtime state, and events', () => {
+    const { databasePath, store } = createStore();
+    store.commitState(initialCommit());
+
+    expect(store.getTaskAggregate('task_sqlite')).toBeDefined();
+    store.close();
+
+    // 换一条独立连接直查：证明是真删了行，不是聚合读取时被过滤掉。
+    const raw = new DatabaseSync(databasePath);
+    const counts = {
+      tasks: raw.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number },
+      runs: raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as { n: number },
+      events: raw.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number },
+      runtime: raw.prepare('SELECT COUNT(*) AS n FROM task_runtime_states').get() as { n: number },
+    };
+    raw.close();
+    expect(counts).toEqual({
+      tasks: { n: 1 },
+      runs: { n: 1 },
+      events: { n: 1 },
+      runtime: { n: 1 },
+    });
+
+    const reopened = new SqliteCoordinationStore(databasePath);
+    reopened.deleteTask('task_sqlite');
+
+    const after = new DatabaseSync(databasePath);
+    const remaining = {
+      tasks: after.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number },
+      runs: after.prepare('SELECT COUNT(*) AS n FROM runs').get() as { n: number },
+      events: after.prepare('SELECT COUNT(*) AS n FROM events').get() as { n: number },
+      runtime: after.prepare('SELECT COUNT(*) AS n FROM task_runtime_states').get() as { n: number },
+    };
+    after.close();
+
+    expect(remaining).toEqual({ tasks: { n: 0 }, runs: { n: 0 }, events: { n: 0 }, runtime: { n: 0 } });
+    expect(reopened.getTaskAggregate('task_sqlite')).toBeUndefined();
+    expect(reopened.listTaskAggregates()).toEqual([]);
+    reopened.close();
+  });
+
+  it('ignores deleting an unknown task', () => {
+    const { store } = createStore();
+    store.commitState(initialCommit());
+    expect(() => store.deleteTask('task_missing')).not.toThrow();
+    expect(store.getTaskAggregate('task_sqlite')).toBeDefined();
+    store.close();
+  });
+
   it('atomically persists task, run, runtime state, and ordered events', () => {
     const { store } = createStore();
     const commit = initialCommit();

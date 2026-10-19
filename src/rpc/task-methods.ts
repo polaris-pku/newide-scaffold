@@ -26,6 +26,7 @@ export interface TaskMethodsService {
   getTask(taskId: string): Promise<TaskSnapshot>;
   listTasks(): Promise<TaskListResult>;
   cancelTask(taskId: string): Promise<TaskSnapshot>;
+  deleteTask(taskId: string): Promise<{ deleted: true }>;
   interruptTask(taskId: string): Promise<TaskSnapshot>;
   resumeTask(taskId: string): Promise<TaskSnapshot>;
   startCouncil(taskId: string): Promise<TaskSnapshot>;
@@ -96,6 +97,17 @@ export class TaskRpcMethods {
     dispatcher.register('task.cancel', (params) => {
       const { task_id } = parseParams(taskIdParamsSchema, params);
       return this.callWithTaskError(() => this.service.cancelTask(task_id));
+    });
+    dispatcher.register('task.delete', (params) => {
+      const { task_id } = parseParams(taskIdParamsSchema, params);
+      return this.callWithTaskError(async () => {
+        const result = await this.service.deleteTask(task_id);
+        // 任务都没了，这个 task 的推送订阅没有任何存在理由 —— 留着只会在内存里
+        // 一直挂着一个再也收不到事件的 listener。
+        this.subscriptions.get(task_id)?.();
+        this.subscriptions.delete(task_id);
+        return result;
+      });
     });
     dispatcher.register('task.interrupt', (params) => {
       const { task_id } = parseParams(taskIdParamsSchema, params);

@@ -852,6 +852,40 @@ export class NewideBackendService {
     return { tasks: await this.collectTaskSnapshots() };
   }
 
+  /**
+   * 永久删除一个任务，使它不再出现在任何一次 `collectTaskSnapshots` 里。
+   *
+   * 运行中的任务一律拒绝（抛 `TaskAlreadyRunningError`）：删掉一条还在跑的 run 会把它
+   * 已经产生的产出丢在半个状态里，而调用方拿不到任何错误线索。终态任务直接删。
+   *
+   * 三处状态必须一起清，缺一处任务就会复活：
+   * - coordination 库（聚合/事件/检查点/消息），经 `taskProcessor.deleteTask`；
+   * - `.newide/runs/<run_id>/` 磁盘目录，经 `requestStore.removeRun` —— 否则 `listHistory`
+   *   会把 request.json 重新读出来，历史分支又把这个 task_id 拼回快照；
+   * - 内存里的 registry 订阅与 listener。
+   *
+   * 删完返回 `{ deleted: true }` 而不是快照：快照已经不存在了，没有东西可返回。
+   */
+  async deleteTask(taskId: string): Promise<{ deleted: true }> {
+    const task = await this.getTask(taskId);
+    const running = this.registry
+      .listSnapshots()
+      .find((run) => run.task_id === taskId && run.status === 'running');
+    if (running) throw new TaskAlreadyRunningError(taskId);
+
+    const runIds = [
+      ...new Set([
+        ...task.run_history.map((run) => run.run_id),
+        ...(task.current_run ? [task.current_run.run_id] : []),
+      ]),
+    ];
+
+    this.taskListeners.delete(taskId);
+    await Promise.all(runIds.map((runId) => this.requestStore.removeRun(runId)));
+    this.taskProcessor?.deleteTask(taskId);
+    return { deleted: true };
+  }
+
   async cancelTask(taskId: string): Promise<TaskSnapshot> {
     await this.getTask(taskId);
     const current = this.registry

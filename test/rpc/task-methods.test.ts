@@ -103,6 +103,11 @@ describe('TaskRpcMethods', () => {
       cancelTask: async (taskId) => {
         throw new TaskNotRunningError(taskId);
       },
+      // 运行中的任务必须拒绝删除：复用与 startCouncil 相同的错误码，前端才能
+      // 把「删不掉」和「不能转合议」当成同一件事来提示。
+      deleteTask: async (taskId) => {
+        throw new TaskAlreadyRunningError(taskId);
+      },
     });
     const runningSession = sessionWith(runningService, output);
     await runningSession.handleLine(
@@ -110,6 +115,9 @@ describe('TaskRpcMethods', () => {
     );
     await runningSession.handleLine(
       '{"jsonrpc":"2.0","id":5,"method":"task.cancel","params":{"task_id":"task_done"}}',
+    );
+    await runningSession.handleLine(
+      '{"jsonrpc":"2.0","id":8,"method":"task.delete","params":{"task_id":"task_busy"}}',
     );
     const cursorSession = sessionWith(
       fakeService({
@@ -130,6 +138,7 @@ describe('TaskRpcMethods', () => {
       { id: 3, error: { code: -32006, message: 'Task not found' } },
       { id: 4, error: { code: -32007, message: 'Task already running' } },
       { id: 5, error: { code: -32008, message: 'Task not running' } },
+      { id: 8, error: { code: -32007, message: 'Task already running' } },
       { id: 6, error: { code: -32009, message: 'Task event cursor not found' } },
     ]);
     expect(cancelTask).toHaveBeenCalledWith('task_cancelled');
@@ -162,6 +171,37 @@ describe('TaskRpcMethods', () => {
       { id: 2, error: { code: -32010, message: 'Task not blocked' } },
     ]);
     expect(resumeTask).toHaveBeenCalledWith('task_resumed');
+  });
+
+  it('deletes a Task and drops its event subscription', async () => {
+    const output: string[] = [];
+    const unsubscribe = vi.fn();
+    const deleteTask = vi.fn(async () => ({ deleted: true as const }));
+    const session = sessionWith(
+      fakeService({
+        deleteTask,
+        subscribeTask: async () => ({
+          snapshot: snapshot('task_gone'),
+          replay_events: [],
+          unsubscribe,
+        }),
+      }),
+      output,
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":1,"method":"task.subscribe","params":{"task_id":"task_gone"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":2,"method":"task.delete","params":{"task_id":"task_gone"}}',
+    );
+
+    expect(output.map((line) => JSON.parse(line))).toMatchObject([
+      { id: 1, result: { subscribed: true } },
+      { id: 2, result: { deleted: true } },
+    ]);
+    expect(deleteTask).toHaveBeenCalledWith('task_gone');
+    // 任务没了，订阅必须一起退掉，否则 listener 会一直挂着一个收不到事件的任务。
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   it('subscribes to Task events and returns the current snapshot', async () => {
@@ -250,6 +290,7 @@ function fakeService(overrides: Partial<TaskMethodsService> = {}): TaskMethodsSe
     getTask: async () => snapshot('task_1'),
     listTasks: async () => ({ tasks: [snapshot('task_1')] }),
     cancelTask: async () => snapshot('task_1', 'cancelled'),
+    deleteTask: async () => ({ deleted: true }),
     interruptTask: async () => snapshot('task_1', 'blocked'),
     resumeTask: async () => snapshot('task_1'),
     startCouncil: async () => snapshot('task_1'),

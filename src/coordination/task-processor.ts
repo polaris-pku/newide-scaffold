@@ -1407,6 +1407,20 @@ export class TaskProcessor {
       .map((aggregate) => projectAggregate(aggregate, this.runsRoot));
   }
 
+  /**
+   * 永久删除一个任务。
+   *
+   * 存在的语义是「这个 task_id 之后不再存在」：聚合、事件、检查点、消息全部清掉，
+   * 随后的 `listTaskSnapshots` / `getTaskSnapshot` 一律当成没建过。
+   *
+   * 调用方负责先挡住运行中的任务 —— 这里不兜底取消，删一条还在跑的 run 等于把它的
+   * 产出丢在半个状态里，那种情况必须让调用方带着错误提示停下来。
+   */
+  deleteTask(taskId: string): void {
+    if (!this.store.getTaskAggregate(taskId)) throw new TaskProcessorTaskNotFoundError(taskId);
+    this.store.deleteTask(taskId);
+  }
+
   listTaskEvents(taskId: string, afterEventId?: string): AppRunEvent[] {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
