@@ -325,6 +325,8 @@ export interface CoordinationStateStore {
   commitState(input: CoordinationStateCommit): PersistedCoordinationEvent[];
   getTaskAggregate(taskId: string): PersistedTaskAggregate | undefined;
   listTaskAggregates(): PersistedTaskAggregate[];
+  /** 彻底删除任务及其派生数据；任务不存在时安静返回。 */
+  deleteTask(taskId: string): void;
   listEvents(taskId: string, afterSequence?: number): PersistedCoordinationEvent[];
   getLatestCheckpoint(taskId: string): PersistedFullCheckpoint | undefined;
   close(): void;

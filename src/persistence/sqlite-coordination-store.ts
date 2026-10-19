@@ -262,6 +262,28 @@ export class SqliteCoordinationStore
       .filter((aggregate): aggregate is PersistedTaskAggregate => aggregate !== undefined);
   }
 
+  /**
+   * 彻底删除一个任务及其全部派生数据。
+   *
+   * `runs` / `events` / `checkpoints` / `task_runtime_states` 都带 `ON DELETE CASCADE`，
+   * 删 `tasks` 一行即可连带清掉；`messages` / `participant_sessions` 没有外键，必须显式删。
+   * `deliveries` 由 message 的 CASCADE 带走。
+   *
+   * 用量账本（token_usage）**刻意保留**：它不挂 task 外键，累计用量必须活过任务清理。
+   */
+  deleteTask(taskId: string): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database.prepare('DELETE FROM messages WHERE task_id = ?').run(taskId);
+      this.database.prepare('DELETE FROM participant_sessions WHERE task_id = ?').run(taskId);
+      this.database.prepare('DELETE FROM tasks WHERE task_id = ?').run(taskId);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   listEvents(taskId: string, afterSequence = 0): PersistedCoordinationEvent[] {
     return this.database
       .prepare('SELECT * FROM events WHERE task_id = ? AND sequence > ? ORDER BY sequence ASC')

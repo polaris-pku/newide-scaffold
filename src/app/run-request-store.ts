@@ -74,6 +74,14 @@ export interface RunRequestStore {
   listHistory(): Promise<RunHistoryEntry[]>;
   readTerminalSessionId(runId: string): Promise<string | undefined>;
   loadRunSnapshot(runId: string): Promise<RunSnapshot | undefined>;
+  /**
+   * 丢弃一个 run 的整个磁盘目录，使它不再出现在 `listHistory()` 里。
+   *
+   * 任务删除必须走到这里：只清 coordination 库不够 —— `.newide/runs/<run_id>/` 里的
+   * request.json 与 frontend-snapshot.json 仍会被 `listHistory` 扫出来，把已删任务
+   * 重新拼回 `collectTaskSnapshots` 的历史分支。目录不存在时安静返回。
+   */
+  removeRun(runId: string): Promise<void>;
 }
 
 export class FileRunRequestStore implements RunRequestStore {
@@ -147,6 +155,10 @@ export class FileRunRequestStore implements RunRequestStore {
     if (!value) return undefined;
     const parsed = runSnapshotSchema.safeParse(value);
     return parsed.success ? parsed.data : undefined;
+  }
+
+  async removeRun(runId: string): Promise<void> {
+    await fs.rm(path.join(this.runsRoot, runId), { recursive: true, force: true });
   }
 
   private async readHistoryEntry(runId: string): Promise<RunHistoryEntry | undefined> {

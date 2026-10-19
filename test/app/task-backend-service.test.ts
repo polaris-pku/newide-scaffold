@@ -92,6 +92,89 @@ describe('NewideBackendService Task-first view', () => {
     }
   });
 
+  it('deletes a terminal task so it never comes back from run history', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-delete-'));
+    const requestStore = new FileRunRequestStore(runsRoot);
+    await requestStore.save({
+      run_id: 'run_gone',
+      task_id: 'task_gone',
+      prompt: 'Delete me',
+      workspace_path: process.cwd(),
+      mode: 'single_agent',
+      task_request: { spec: 'Delete me', completion_criteria: ['Gone stays gone'] },
+    });
+    await writeFile(
+      path.join(runsRoot, 'run_gone', 'frontend-snapshot.json'),
+      JSON.stringify({
+        schema_version: 'v0',
+        run_id: 'run_gone',
+        task_id: 'task_gone',
+        mode: 'single_agent',
+        status: 'failed',
+        current: { stage: 'delivery', active_node_code: 'N18' },
+        run: {
+          run_id: 'run_gone',
+          task_id: 'task_gone',
+          status: 'failed',
+          mode: 'single_agent',
+          event_ids: [],
+          started_at: '2026-07-19T01:00:00.000Z',
+          completed_at: '2026-07-19T01:01:00.000Z',
+        },
+        timeline: [],
+        agent_runs: [],
+        artifacts: [],
+        gates: [],
+        errors: [{ code: 'AGENT_FAILED', message: 'boom' }],
+      }),
+      'utf-8',
+    );
+    const service = serviceWith(requestStore, new InMemoryRunRegistry(), async () => {
+      throw new Error('the deleted task must not be started again');
+    });
+
+    try {
+      await expect(service.getTask('task_gone')).resolves.toMatchObject({
+        task: { task_id: 'task_gone', status: 'failed' },
+      });
+
+      await expect(service.deleteTask('task_gone')).resolves.toEqual({ deleted: true });
+
+      // 磁盘目录与历史列表都要真的空掉：request.json 残留就会把任务重新拼回来。
+      await expect(requestStore.listHistory()).resolves.toEqual([]);
+      await expect(service.listTasks()).resolves.toEqual({ tasks: [] });
+      await expect(service.getTask('task_gone')).rejects.toBeInstanceOf(TaskNotFoundError);
+      await expect(service.deleteTask('task_gone')).rejects.toBeInstanceOf(TaskNotFoundError);
+    } finally {
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to delete a task whose run is still running', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-delete-running-'));
+    const requestStore = new FileRunRequestStore(runsRoot);
+    const service = serviceWith(requestStore, new InMemoryRunRegistry(), async (request) => {
+      request.onRunCreated?.({ run_id: 'run_busy', task_id: 'task_busy' });
+      return new Promise<IntegrationV0Result>(() => undefined);
+    });
+
+    try {
+      await service.createTask({
+        spec: 'Still running',
+        completion_criteria: ['Must not be deleted mid-flight'],
+        workspace_path: process.cwd(),
+      });
+
+      await expect(service.deleteTask('task_busy')).rejects.toBeInstanceOf(TaskAlreadyRunningError);
+      // 拒绝之后任务必须毫发无损，仍然可读。
+      await expect(service.getTask('task_busy')).resolves.toMatchObject({
+        task: { task_id: 'task_busy', status: 'running' },
+      });
+    } finally {
+      await rm(runsRoot, { recursive: true, force: true });
+    }
+  });
+
   it('cancels the current run through the Task boundary', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-cancel-'));
     const requestStore = new FileRunRequestStore(runsRoot);
