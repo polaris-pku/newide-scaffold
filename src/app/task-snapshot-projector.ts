@@ -51,6 +51,9 @@ export function projectTaskSnapshot(input: ProjectTaskSnapshotInput): TaskSnapsh
       completion_criteria: [...input.task_request.completion_criteria],
       affected_paths: [...(input.task_request.affected_paths ?? [])],
       ...(input.task_request.budget ? { budget: { ...input.task_request.budget } } : {}),
+      ...(input.task_request.allow_agent_council
+        ? { allow_agent_council: true }
+        : {}),
       created_at: input.created_at,
       updated_at: updatedAt,
       schema_version: SCHEMA_VERSION,

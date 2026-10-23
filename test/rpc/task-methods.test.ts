@@ -25,6 +25,7 @@ describe('TaskRpcMethods', () => {
         method: 'task.create',
         params: {
           spec: 'Build Task RPC',
+          allow_agent_council: true,
           role_id: 'role_backend_engineer',
           risk_level: 'medium',
           affected_paths: ['src/rpc/**'],
@@ -59,6 +60,7 @@ describe('TaskRpcMethods', () => {
     ]);
     expect(createTask).toHaveBeenCalledWith({
       spec: 'Build Task RPC',
+      allow_agent_council: true,
       role_id: 'role_backend_engineer',
       risk_level: 'medium',
       affected_paths: ['src/rpc/**'],

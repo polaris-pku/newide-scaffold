@@ -70,6 +70,8 @@ export interface ArtifactSelectionInput {
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   /** Persisted Agent that produced the initial Driver proposal. */
   proposal_agent_id?: string;
+  /** A Solo escalation supplies evidence, not a completed Council proposal. */
+  reuse_primary_proposal?: boolean;
 }
 
 export interface ArtifactSelectionExecutionOptions {
@@ -176,7 +178,7 @@ export class ArtifactSelector {
         ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         ...(input.proposal_agent_id ? { primary_agent_id: input.proposal_agent_id } : {}),
         candidate_artifacts: [...input.driver_result.artifacts],
-        proposals: [proposal],
+        proposals: input.reuse_primary_proposal === false ? [] : [proposal],
         evidence_pack: input.evidence_pack,
         schema_version: SCHEMA_VERSION,
       };

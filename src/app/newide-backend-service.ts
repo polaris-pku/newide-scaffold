@@ -209,6 +209,7 @@ export interface RunCreateParams {
   title?: string;
   /** F-eval memory ablation B0–B3; recorded on summary for --backend-summary. */
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
+  allow_agent_council?: boolean;
   /** Optional override for materializer base / eval worktree root. */
   worktree_path?: string;
 }
@@ -1149,7 +1150,12 @@ export class NewideBackendService {
     const loop = this.taskExecutionLoop!;
     const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
-    const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
+    const taskRequest = {
+      ...(params.task_request ?? createDefaultTaskRequest(params.prompt)),
+      ...(params.allow_agent_council !== undefined
+        ? { allow_agent_council: params.allow_agent_council }
+        : {}),
+    };
     const identity = {
       task_id: params.task_id ?? createId('task'),
       run_id: createId('run'),
@@ -1660,7 +1666,12 @@ export class NewideBackendService {
     }
     const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
-    const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
+    const taskRequest = {
+      ...(params.task_request ?? createDefaultTaskRequest(params.prompt)),
+      ...(params.allow_agent_council !== undefined
+        ? { allow_agent_council: params.allow_agent_council }
+        : {}),
+    };
     const controller = new AbortController();
     let resolvePendingStart!: () => void;
     const pendingStart: PendingRunStart = {
@@ -2452,6 +2463,7 @@ export class NewideBackendService {
 function toTaskCreateRequest(params: TaskCreateParams): TaskCreateRequest {
   return {
     spec: params.spec,
+    ...(params.allow_agent_council === true ? { allow_agent_council: true } : {}),
     ...(params.role_id ? { role_id: params.role_id } : {}),
     ...(params.parent_task_id ? { parent_task_id: params.parent_task_id } : {}),
     ...(params.deps ? { deps: [...params.deps] } : {}),

@@ -78,6 +78,7 @@ describe('NewideBackendService SQLite lifecycle', () => {
     try {
       const created = await service.createTask({
         spec: 'Persist the backend lifecycle',
+        allow_agent_council: true,
         completion_criteria: ['A restarted backend returns the same TaskSnapshot'],
         workspace_path: root,
       });
@@ -98,7 +99,7 @@ describe('NewideBackendService SQLite lifecycle', () => {
             sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
           },
         },
-        runtime_state: { resume_cursor: 'done' },
+        runtime_state: { resume_cursor: 'done', diagnostics: { allow_agent_council: true } },
       });
       expect(persisted?.runtime_state).not.toHaveProperty('current_run_id');
       firstStore.close();

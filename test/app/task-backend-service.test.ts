@@ -47,6 +47,7 @@ describe('NewideBackendService Task-first view', () => {
     try {
       const created = await service.createTask({
         spec: 'Implement task.get',
+        allow_agent_council: true,
         role_id: 'role_backend_engineer',
         risk_level: 'medium',
         affected_paths: ['src/app/**'],
@@ -61,6 +62,7 @@ describe('NewideBackendService Task-first view', () => {
           task_id: 'task_live',
           status: 'running',
           spec: 'Implement task.get',
+          allow_agent_council: true,
           role_id: 'role_backend_engineer',
           risk_level: 'medium',
           affected_paths: ['src/app/**'],
@@ -71,6 +73,7 @@ describe('NewideBackendService Task-first view', () => {
       });
       expect(received?.task_request).toEqual({
         spec: 'Implement task.get',
+        allow_agent_council: true,
         role_id: 'role_backend_engineer',
         risk_level: 'medium',
         affected_paths: ['src/app/**'],

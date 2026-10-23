@@ -270,6 +270,9 @@ export function createProductionStageExecutors(
             input_artifact_refs: [],
             context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
             schema_version: SCHEMA_VERSION,
+            ...(context.mode === 'single_agent' && context.task_request.allow_agent_council
+              ? { allow_agent_council: true }
+              : {}),
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
             ...(sessionId && context.restarted_from_run_id && context.native_task_prompt_dispatched !== false
@@ -284,6 +287,9 @@ export function createProductionStageExecutors(
           },
         );
       let result = await executePrimary(primaryInstruction);
+      if (result.council_request && !(context.mode === 'single_agent' && context.task_request.allow_agent_council === true)) {
+        throw new Error('Agent Council escalation is disabled for this run');
+      }
       let mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
       if (planFirst && result.status === 'completed' && !mailboxWait) {
         try {
@@ -344,6 +350,9 @@ export function createProductionStageExecutors(
             context_pack_ref: result.context_pack_ref,
             memory_buffer_ref: result.memory_buffer_ref,
             mailbox_wait: mailboxWait,
+            ...(result.council_request
+              ? { council_request: { ...result.council_request } }
+              : {}),
           },
           artifact_refs: [
             result.transcript_ref.artifact_id,
@@ -467,7 +476,7 @@ export function createProductionStageExecutors(
         driver_run_result_id: result.driver_run_result_id,
         diagnostics: result.diagnostics,
       });
-      if (context.mode === 'single_agent') {
+      if (context.mode === 'single_agent' && !result.council_request) {
         emit(context, 'artifact.selected', selection.manifest_ref, {
           mode: 'single_agent',
           selected_artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
@@ -477,7 +486,15 @@ export function createProductionStageExecutors(
         changeset_ref: selection.manifest_ref,
         expected_sha256: selection.expected_sha256,
         agent_id: result.agent_id ?? result.role_id,
-        session_id: result.session_id,
+        ...(result.diagnostics.driver_status === 'not_invoked' ? {} : { session_id: result.session_id }),
+        ...(result.council_request
+          ? {
+              escalation_request: {
+                type: 'request_council' as const,
+                ...result.council_request,
+              },
+            }
+          : {}),
         evidence: {
           status: result.status,
           agent_id: result.agent_id ?? result.role_id,
@@ -486,6 +503,9 @@ export function createProductionStageExecutors(
           context_pack_ref: result.context_pack_ref,
           memory_buffer_ref: result.memory_buffer_ref,
           driver_run_result_id: result.driver_run_result_id,
+          ...(result.council_request
+            ? { council_request: { ...result.council_request } }
+            : {}),
           artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
           changeset_ref: selection.manifest_ref,
           expected_sha256: selection.expected_sha256,
@@ -524,6 +544,7 @@ export function createProductionStageExecutors(
       ).strategyName;
       emit(context, 'council.started', context.run_id, {
         trigger: context.cursor_input.trigger,
+        ...(primary.council_request ? { council_request: { ...primary.council_request } } : {}),
         subject: context.task_request.spec,
         decision_mode: 'advisory',
         artifact_mode: strategyName === 'plan_first' ? 'plan' : 'implementation',
@@ -550,6 +571,7 @@ export function createProductionStageExecutors(
             question: context.task_request.spec,
             workspace_path: context.workspace_path,
             proposal_agent_id: primary.agent_id ?? primary.role_id,
+            ...(primary.council_request ? { reuse_primary_proposal: false } : {}),
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
           },
           {
@@ -593,6 +615,7 @@ export function createProductionStageExecutors(
         primary.agent_id ??
         primary.role_id;
       let response = councilRunResult.decision.reason || primary.response;
+      let selectedSessionId = primary.session_id;
       if (strategyName === 'plan_first') {
         try {
           const finalPlans = assertCouncilPlanArtifacts(selectedArtifacts, 'final synthesis');
@@ -618,6 +641,7 @@ export function createProductionStageExecutors(
           selectedArtifacts = implementation.artifact_refs;
           producerAgentId = primary.agent_id ?? primary.role_id;
           response = implementation.result.response;
+          selectedSessionId = implementation.result.session_id;
           councilRunResult = await attachPlanExecution(
             councilRunResult,
             finalPlans,
@@ -636,7 +660,7 @@ export function createProductionStageExecutors(
         artifacts: selectedArtifacts,
         producerAgentId,
         response,
-        sessionId: primary.session_id,
+        sessionId: selectedSessionId,
         driverId: String(primary.diagnostics.driver_id ?? primary.role_id),
         runsRoot: dependencies.runsRoot,
         councilRunResult,
@@ -707,14 +731,14 @@ export function createProductionStageExecutors(
       const gateResult = await dependencies.gateExecutor.execute({
         run_id: context.run_id,
         task_id: context.task_id,
-        phase: context.mode === 'council' ? 'post_council' : 'pre_selection',
+        phase: selection.mode === 'council' ? 'post_council' : 'pre_selection',
         workspace_path: context.workspace_path,
         completion_criteria: context.task_request.completion_criteria,
         artifact_refs: selection.selected_artifacts.map((artifact) => artifact.artifact_id),
       });
       for (const result of gateResult.gate_results) {
         emit(context, 'gate.result', result.gate_result_id, {
-          phase: context.mode === 'council' ? 'post_council' : 'pre_selection',
+          phase: selection.mode === 'council' ? 'post_council' : 'pre_selection',
           ...result,
         });
       }
@@ -735,7 +759,7 @@ export function createProductionStageExecutors(
         delivery_receipt_path: buildRunOutputPaths(context.run_id, dependencies.runsRoot)
           .delivery_receipt_path,
         user_workspace_path: context.workspace_path,
-        ...(context.mode === 'council'
+        ...(selection.mode === 'council'
           ? {
               council_workspace_path: councilRunWorkspaceRoot(
                 dependencies.councilRoot,
@@ -1005,7 +1029,9 @@ async function executeFinalCouncilPlan(input: {
         ...(input.context.restarted_from_run_id && input.context.native_task_prompt_dispatched !== false
           ? { resume_session: true } : {}),
         workspace_path: workspace,
-        session_id: input.primary.session_id,
+        ...(input.primary.diagnostics.driver_status === 'not_invoked'
+          ? (input.context.session_id ? { session_id: input.context.session_id } : {})
+          : { session_id: input.primary.session_id }),
         input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
         context_policy: 'council_plan_execution',
         schema_version: SCHEMA_VERSION,

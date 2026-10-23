@@ -51,6 +51,8 @@ export interface AgentExecutionRequest {
   activity_run_id?: RunId;
   /** RFC §1.2 memory ablation; applied by production Agent execution facade. */
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
+  /** Per-run capability gate for the top-level Agent's Council request tool. */
+  allow_agent_council?: boolean;
   schema_version: SchemaVersion;
 }
 
@@ -68,6 +70,8 @@ export interface AgentExecutionResult {
   diagnostics: AgentExecutionDiagnostics;
   status: AgentExecutionStatus;
   memory_buffer_ref?: string;
+  /** Set when the top-level Agent explicitly requested Council escalation. */
+  council_request?: { reason?: string };
   created_at: Timestamp;
   schema_version: SchemaVersion;
 }

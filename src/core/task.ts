@@ -38,6 +38,8 @@ export interface TaskCreateRequest {
   affected_paths?: string[];
   completion_criteria: string[];
   budget?: TaskBudget;
+  /** Whether the primary Agent may escalate this run into Council. */
+  allow_agent_council?: boolean;
 }
 
 export interface Task {
