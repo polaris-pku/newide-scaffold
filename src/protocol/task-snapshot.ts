@@ -69,6 +69,7 @@ const taskSchema = z
       })
       .strict()
       .optional(),
+    allow_agent_council: z.boolean().optional(),
     created_at: z.string().min(1),
     updated_at: z.string().min(1),
     schema_version: z.string().min(1),

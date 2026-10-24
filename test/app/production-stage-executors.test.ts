@@ -252,7 +252,7 @@ describe('production stage executors', () => {
     expect(await readFile(path.join(workspace, 'src/result.ts'), 'utf8')).toBe('export {};');
   });
 
-  it('enables plan_first end to end: fixed seats propose, synthesize a plan, primary implements it', async () => {
+  it.each([false, true])('enables plan_first end to end, including Solo escalation=%s', async (escalate) => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-plan-first-e2e-'));
     const workspace = path.join(root, 'workspace');
     await mkdir(workspace, { recursive: true });
@@ -261,6 +261,11 @@ describe('production stage executors', () => {
     const agentExecutionFacade: AgentExecutionFacade = {
       async runAgent(input) {
         requests.push(input);
+        if (input.context_policy === 'production_task_loop') {
+          expect(input.allow_agent_council).toBe(true);
+          return { ...planFirstScriptedResponse(input), artifact_refs: [], council_request: { reason: 'Independent plans needed' }, diagnostics: { driver_status: 'not_invoked' } };
+        }
+        expect(input.allow_agent_council).toBeUndefined();
         return planFirstScriptedResponse(input);
       },
     };
@@ -339,8 +344,8 @@ describe('production stage executors', () => {
     const common = {
       task_id: 'task_plan_e2e',
       run_id: 'run_plan_e2e',
-      mode: 'council' as const,
-      task_request: { spec: 'implement result.ts', completion_criteria: [] },
+      mode: escalate ? 'single_agent' as const : 'council' as const,
+      task_request: { spec: 'implement result.ts', completion_criteria: [], ...(escalate ? { allow_agent_council: true } : {}) },
       workspace_path: workspace,
       memory_ablation: 'B0' as const,
     };
@@ -358,7 +363,7 @@ describe('production stage executors', () => {
       session_id: executed.session_id,
       cursor_input: {
         cursor: 'council',
-        trigger: 'explicit_mode',
+        trigger: escalate ? 'agent_request' : 'explicit_mode',
         candidate_manifest_ref: executed.changeset_ref,
       },
     });
@@ -366,12 +371,13 @@ describe('production stage executors', () => {
     // Plan mode is enabled: primary first writes a Plan artifact, then implements it.
     expect(requests[0]).toMatchObject({
       role_id: 'role_primary',
-      context_policy: 'council_primary_plan',
+      context_policy: escalate ? 'production_task_loop' : 'council_primary_plan',
       memory_ablation: 'B0',
     });
-    expect(requests[0]?.instruction).toContain('council-plan.md');
+    if (!escalate) expect(requests[0]?.instruction).toContain('council-plan.md');
+    if (escalate) expect(executed.escalation_request).toEqual({ type: 'request_council', reason: 'Independent plans needed' });
     expect(requests.map((request) => request.context_policy)).toEqual([
-      'council_primary_plan',
+      ...(escalate ? ['production_task_loop', 'council_proposer'] : ['council_primary_plan']),
       'council_proposer',
       'council_reviewer',
       'council_synthesizer',
@@ -414,9 +420,9 @@ describe('production stage executors', () => {
     );
     expect(implementation).toMatchObject({
       role_id: 'role_primary',
-      session_id: 'session_primary',
       input_artifact_refs: councilResult.synthesis?.artifact_refs,
     });
+    expect(implementation?.session_id).toBe(escalate ? undefined : 'session_primary');
     expect(implementation?.driver_instruction).toContain('Implement the approved final Council Plan');
     // 指令点名 staged 落点，执行者不必再自己 Glob 猜文件名（落点与落盘同源）。
     expect(implementation?.driver_instruction).toContain(
@@ -429,6 +435,16 @@ describe('production stage executors', () => {
       final_plan_artifact_refs: councilResult.synthesis?.artifact_refs,
       implementation_artifact_refs: councilResult.selected_artifact_refs,
     });
+    const gated = await executors.gate.execute({
+      ...common,
+      cursor_input: { cursor: 'gate', subject_ref: council.changeset_ref, phase: 'post_council', changeset_ref: council.changeset_ref, expected_sha256: council.expected_sha256 },
+    });
+    expect(gated.status).toBe('allowed');
+    await executors.deliver.execute({
+      ...common,
+      cursor_input: { cursor: 'deliver', changeset_ref: council.changeset_ref, expected_sha256: council.expected_sha256 },
+    });
+    expect(await readFile(path.join(workspace, 'src/result.ts'), 'utf8')).toBe('output for role_primary\n');
   });
 
   it('archives the executor Plan self-check without judging it', async () => {

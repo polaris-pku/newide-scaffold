@@ -46,6 +46,67 @@ import {
 import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
+  it.each([undefined, false, true])('gates Council per invocation (%s) and permits escalation without Driver execution', async (allowed) => {
+    const driver = new CapturingDriver('succeeded');
+    const seen: string[][] = [];
+    let calls = 0;
+    const llm: ToolCallingClient = {
+      async completeWithTools(input) {
+        seen.push(input.tools.map(tool => tool.function.name));
+        if (calls++ === 0) return {
+          content: null,
+          tool_calls: [{ id: 'council_request', type: 'function', function: {
+            name: 'invoke_council', arguments: JSON.stringify({ reason: '  Independent review needed  ' }),
+          } }],
+        };
+        return { content: 'Finished. [done]', tool_calls: undefined };
+      },
+    };
+    const { facade } = createFacade(driver, undefined, llm);
+    const result = await facade.runAgent({
+      ...request('task_council_gate', 'primary'), context_policy: 'production_task_loop',
+      ...(allowed !== undefined ? { allow_agent_council: allowed } : {}),
+    });
+    expect(seen[0]?.includes('invoke_council')).toBe(allowed === true);
+    expect(driver.prompts).toHaveLength(0);
+    if (allowed) {
+      expect(result).toMatchObject({ status: 'completed', council_request: { reason: 'Independent review needed' }, diagnostics: { driver_status: 'not_invoked' } });
+      expect(calls).toBe(1);
+    } else {
+      expect(result.council_request).toBeUndefined();
+      expect(result.status).toBe('failed');
+    }
+  });
+
+  it('does not expose Council recursively even if a participant receives the flag', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const llm: ToolCallingClient = {
+      async completeWithTools(input) {
+        expect(input.tools.map(tool => tool.function.name)).not.toContain('invoke_council');
+        return { content: 'Finished. [done]', tool_calls: undefined };
+      },
+    };
+    const { facade } = createFacade(driver, undefined, llm);
+    const result = await facade.runAgent({ ...request('task_recursive', 'reviewer'), context_policy: 'council_reviewer', allow_agent_council: true });
+    expect(result.council_request).toBeUndefined();
+  });
+
+  it.each(['succeeded', 'failed'] as const)('allows Council after Driver evidence with status %s', async (status) => {
+    const driver = new CapturingDriver(status);
+    let calls = 0;
+    const llm: ToolCallingClient = {
+      async completeWithTools() {
+        if (calls++ === 0) return driverToolCalls('driver_first');
+        return { content: null, tool_calls: [{ id: 'escalate', type: 'function', function: { name: 'invoke_council', arguments: '{"reason":"Driver evidence needs review"}' } }] };
+      },
+    };
+    const { facade } = createFacade(driver, undefined, llm);
+    const result = await facade.runAgent({ ...request('task_post_driver', 'primary'), context_policy: 'production_task_loop', allow_agent_council: true });
+    expect(driver.prompts).toHaveLength(1);
+    expect(result.council_request?.reason).toBe('Driver evidence needs review');
+    expect(result.status).toBe('completed');
+  });
+
   it('persists a Council native session before its first Driver turn finishes', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-inflight-session-'));
     const driver = new CapturingDriver('succeeded');

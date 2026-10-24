@@ -55,6 +55,10 @@ import {
   type PersistedMailboxEnvelope,
   type PersistentMailboxService,
 } from '../mailbox';
+import {
+  RequestCouncilTool,
+  type RequestCouncilInput,
+} from '../memory/runtime/tools/request-council-tool';
 import type {
   AgentExecutionFacade,
   AgentExecutionOptions,
@@ -183,6 +187,8 @@ interface InvocationContext {
   collaboration_brief?: string;
   driver_attempts: number;
   abortObserved: boolean;
+  allow_agent_council: boolean;
+  council_request?: { reason?: string };
 }
 
 /** Driver 使用反馈的提交结果；`error` 只进诊断，不影响任务状态。 */
@@ -268,6 +274,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private createManager(): Promise<AgentManager> {
     const tools = [
       new InvokeDriverTool((task) => this.invokeDriver(task)),
+      new RequestCouncilTool((input) => this.requestCouncil(input)),
       ...(this.options.mailbox
         ? [new MailboxSendTool((input) => this.sendMailbox(input))]
         : []),
@@ -617,6 +624,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         mailbox_sequence: 0,
         driver_attempts: 0,
         abortObserved: false,
+        allow_agent_council: input.allow_agent_council === true && input.context_policy === 'production_task_loop',
         ...(options?.signal ? { signal: options.signal } : {}),
         onDriverEvent: (event: DriverStreamEvent) => {
           if (event.event_type === 'driver.turn_started' && event.session_id && input.workspace_path && this.driverFor(runtimeRoleId, this.routingRunId(input.run_id, input.activity_run_id)).capabilities.supports_session_load) {
@@ -657,6 +665,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         invocation.driver_invocation_context,
         invocation.agent_system_prompt_sha256,
         invocation.mailbox_outcomes,
+        invocation.council_request,
       );
       if (inboundMailbox && result.status === 'completed') {
         this.finishInboundMailbox(
@@ -728,8 +737,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           tool_calls: undefined,
         };
       }
+      if (invocation.council_request) {
+        return {
+          content: `Council escalation requested${invocation.council_request.reason ? `: ${invocation.council_request.reason}` : ''}. [done]`,
+          tool_calls: undefined,
+        };
+      }
       if (
         shouldFinalizeAfterSuccessfulDriver(invocation.context_policy) &&
+        !invocation.allow_agent_council &&
         invocation.execution?.status === 'succeeded'
       ) {
         // Council and single-agent production persist their result through the Driver.
@@ -743,9 +759,17 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         };
       }
       invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
+      const tools = invocation.allow_agent_council
+        ? input.tools
+        : input.tools.filter((tool) => tool.function.name !== 'invoke_council');
       return await withAbort(
         this.options.llm.completeWithTools(
-          withTopLevelExecutionContext(input, invocation.collaboration_brief),
+          withTopLevelExecutionContext({ ...input, tools }, [
+            invocation.collaboration_brief,
+            ...(invocation.allow_agent_council ? [
+              'This run permits invoke_council. Call it when independent proposals or review are needed, before or after invoke_driver. Include the reason. Calling it hands control to the Coordinator and ends this Solo phase; Council uses the existing review and delivery gates. Otherwise complete the task with invoke_driver.',
+            ] : []),
+          ].join('\n\n')),
         ),
         invocation.signal,
       );
@@ -1030,6 +1054,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (!invocation) {
       throw new Error('B invoke_driver was called outside an AgentExecutionFacade invocation');
     }
+    if (invocation.council_request) {
+      throw new Error('Council escalation already requested; Solo execution has ended');
+    }
     if (invocation.execution) {
       throw new Error('A C role execution can invoke the driver only once');
     }
@@ -1127,6 +1154,30 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     }
   }
 
+  private async requestCouncil(input: RequestCouncilInput) {
+    const invocation = this.invocationContext.getStore();
+    if (!invocation) {
+      throw new Error('invoke_council was called outside a configured Agent invocation');
+    }
+    if (!invocation.allow_agent_council) {
+      throw new Error('Council escalation is disabled for this run');
+    }
+    throwIfAborted(invocation.signal);
+    if (input.reason !== undefined && typeof input.reason !== 'string') {
+      throw new Error('Council reason must be a string');
+    }
+    if (invocation.context_policy.startsWith('council_')) {
+      throw new Error('Council participants cannot recursively invoke Council');
+    }
+    invocation.council_request = {
+      ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
+    };
+    return {
+      requested: true as const,
+      ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
+    };
+  }
+
   private async buildResult(
     input: AgentExecutionRequest,
     dispatched: DispatchTaskResult,
@@ -1137,6 +1188,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
     agentSystemPromptSha256: string | undefined,
     mailboxOutcomes: readonly MailboxToolOutcome[],
+    councilRequest?: { reason?: string },
   ): Promise<AgentExecutionResult> {
     const memoryMaintenance = await this.processMemoryMaintenance(
       input,
@@ -1162,6 +1214,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         memoryMaintenance,
         mailboxOutcomes,
         driverFeedback,
+        councilRequest,
       );
     }
 
@@ -1226,7 +1279,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             ? { driver_error: dispatchError, driver_error_code: dispatchError.code }
             : {}),
       },
-      status: mapStatus(dispatched.status, execution.status),
+      status: councilRequest && dispatched.status === 'completed'
+        ? 'completed'
+        : mapStatus(dispatched.status, execution.status),
+      ...(councilRequest ? { council_request: { ...councilRequest } } : {}),
       memory_buffer_ref: contextEvidence.memory_buffer_ref,
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
@@ -1243,6 +1299,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
     mailboxOutcomes: readonly MailboxToolOutcome[],
     driverFeedback: DriverFeedbackOutcome,
+    councilRequest?: { reason?: string },
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
@@ -1283,15 +1340,15 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       artifact_refs: [...workspaceArtifacts],
       transcript_ref: transcript,
       session_id: input.session_id ?? driver.session_id,
-      response: mailboxWait
+      response: councilRequest ? `Council requested: ${councilRequest.reason ?? ''}` : mailboxWait
         ? `Waiting for Mailbox reply from ${mailboxWait.to_role_id}.`
         : '',
       tool_events: [],
       diagnostics: {
         driver_id: driver.driver_id,
-        driver_status: mailboxWait ? 'not_invoked' : 'failed',
+        driver_status: mailboxWait || councilRequest ? 'not_invoked' : 'failed',
         dispatch_status: dispatched.status,
-        ...(mailboxWait
+        ...(mailboxWait || councilRequest
           ? { mailbox_wait: true }
           : {
               driver_error_code: errorCode,
@@ -1318,11 +1375,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
       },
-      status: mailboxWait
+      status: mailboxWait || (councilRequest && dispatched.status !== 'cancelled')
         ? 'completed'
         : dispatched.status === 'cancelled'
           ? 'cancelled'
           : 'failed',
+      ...(councilRequest ? { council_request: { ...councilRequest } } : {}),
       memory_buffer_ref: contextEvidence.memory_buffer_ref,
       created_at,
       schema_version: SCHEMA_VERSION,

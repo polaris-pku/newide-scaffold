@@ -359,6 +359,9 @@ export class TaskProcessor {
         diagnostics: {
           mode: input.mode,
           run_intent: runIntent.type,
+          ...(input.task_request.allow_agent_council
+            ? { allow_agent_council: true }
+            : {}),
           ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
           ...(runIntent.type === 'checkpoint_resume'
             ? { resume_strategy: runIntent.strategy }
@@ -891,6 +894,9 @@ export class TaskProcessor {
         affected_paths: [...aggregate.task.affected_paths],
         completion_criteria: [...aggregate.task.completion_criteria],
         ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
+        ...(aggregate.runtime_state.diagnostics.allow_agent_council === true
+          ? { allow_agent_council: true }
+          : {}),
       },
       workspace_path: run.workspace_path,
       resume_cursor: aggregate.runtime_state.resume_cursor,
@@ -1131,6 +1137,9 @@ export class TaskProcessor {
           affected_paths: [...aggregate.task.affected_paths],
           completion_criteria: [...aggregate.task.completion_criteria],
           ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
+          ...(aggregate.runtime_state.diagnostics.allow_agent_council === true
+            ? { allow_agent_council: true }
+            : {}),
         },
         workspace_path: aggregate.task.workspace_path,
         ...(run.session_id ? { session_id: run.session_id } : {}),
@@ -1471,6 +1480,9 @@ export class TaskProcessor {
         affected_paths: [...aggregate.task.affected_paths],
         completion_criteria: [...aggregate.task.completion_criteria],
         ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
+        ...(aggregate.runtime_state.diagnostics.allow_agent_council === true
+          ? { allow_agent_council: true }
+          : {}),
       },
       workspace_path: aggregate.task.workspace_path,
       ...(latestSession ? { session_id: latestSession } : {}),
@@ -1497,6 +1509,9 @@ export class TaskProcessor {
         completion_criteria: [...resumePackage.task_request.completion_criteria],
         ...(resumePackage.task_request.budget
           ? { budget: { ...resumePackage.task_request.budget } }
+          : {}),
+        ...(this.store.getTaskAggregate(taskId)?.runtime_state.diagnostics.allow_agent_council === true
+          ? { allow_agent_council: true }
           : {}),
       },
       workspace_path: resumePackage.workspace_path,
@@ -1793,6 +1808,9 @@ function projectAggregate(aggregate: PersistedTaskAggregate, runsRoot: string): 
       risk_level: aggregate.task.risk_level,
       affected_paths: [...aggregate.task.affected_paths],
       completion_criteria: [...aggregate.task.completion_criteria],
+      ...(aggregate.runtime_state.diagnostics.allow_agent_council === true
+        ? { allow_agent_council: true }
+        : {}),
       ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
     },
     created_at: aggregate.task.created_at,
