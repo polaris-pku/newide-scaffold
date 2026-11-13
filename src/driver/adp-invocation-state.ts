@@ -25,6 +25,12 @@ export interface AdpInvocationEvidence {
   cancel_requested: boolean;
   /** transport 层给出的阶段证据(spawn 失败 = 明确未执行等) */
   transport_evidence?: DriverExecutionEvidence;
+  /**
+   * 旧持久化数据缺少「是否收到 DriverRunResult」事实时的显式缺失标记
+   * (兼容字段;新数据由 driver.invocation_evidence 调用行持久化)。
+   * 只作恢复/对账用,不改变 unknown 的副作用不确定语义。
+   */
+  result_received_missing?: boolean;
 }
 
 export class AdpInvocationState {

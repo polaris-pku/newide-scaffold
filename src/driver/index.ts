@@ -1,4 +1,7 @@
 export * from './contract';
+export * from './execution-contract';
+export * from './dispatch-attempt';
+export * from './adp-receipt-reconciler';
 export * from './profile';
 export * from './profile-loader';
 export * from './driver-registry';

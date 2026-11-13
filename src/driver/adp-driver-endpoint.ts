@@ -14,7 +14,14 @@
  * - 结局经 adp-status-mapping 证据化映射为 succeeded/failed/cancelled/unknown;
  *   unknown 永不自动重跑,failed 的自动重跑只看部署级 auto_retry[side_effect]
  *   (adp-retry-policy),部署配置不进入帧;
- * - 回执经宿主内回调(onReceipt)交还 Agent;迟到结果只对账入档,不改已发回执。
+ * - 回执经宿主内回调(onReceipt)交还 Agent;每次 invoke 还可以注册 per-invoke 回执回调
+ *   (request.onReceipt,通知语义,同步 fire-and-forget)与对账型回调
+ *   (request.onReceiptReconciled,写屏障语义:invoke 必须 await 它,失败以
+ *   AdpReceiptReconciliationError 从 invoke 抛出)。判重重放/崩溃恢复收束时也把既有
+ *   receipt 交付一次(不重执行),两条路径遵守同一完成条件;
+ * - 迟到结果只对账入档,不改已发回执;可选 lateResultObserver 在调用行落账成功后
+ *   把迟到结果交给上层对账器(不改变协议调用行、不回执、不重执行)。观察器允许异步,
+ *   异步失败不产生未处理 rejection,由 flushLateResultObservers 观察并重抛。
  *
  * 调用意图(§7.5 host.intent)单独留档、causation 为空;invoke 的 causation 指向
  * 外层 SAP execute(无则 null)。driver.cancel 不单独发回执帧:目标 invoke 的
@@ -42,6 +49,96 @@ import { createAdpRetryPolicy, type AdpRetryPolicy } from './adp-retry-policy';
 export type AdpInvokeFrame = Extract<AdpFrame, { command: 'driver.invoke' }>;
 export type AdpCancelFrame = Extract<AdpFrame, { command: 'driver.cancel' }>;
 export type AdpReceiptFrame = Extract<AdpFrame, { result: string }>;
+
+/**
+ * P1 调用行:持久化单次 exchange 的阶段证据(result_received / transport_evidence 等)。
+ * 重启回放必须读取该事实,不能从 receipt.status 反推「是否收到 DriverRunResult」。
+ */
+const INVOCATION_EVIDENCE_EVENT = 'driver.invocation_evidence';
+const INVOCATION_EVIDENCE_SCHEMA_VERSION = 'newide.adp_invocation_evidence.v1';
+
+function invocationEvidenceCallId(exchangeId: string): string {
+  return `${exchangeId}:evidence`;
+}
+
+/** 把 AdpInvocationEvidence 序列化进 P1 调用行 summary(结构化 JSON,字段白名单)。 */
+function serializeInvocationEvidence(evidence: Readonly<AdpInvocationEvidence>): string {
+  return JSON.stringify({
+    schema_version: INVOCATION_EVIDENCE_SCHEMA_VERSION,
+    dispatched: evidence.dispatched,
+    effects_observed: evidence.effects_observed,
+    result_received: evidence.result_received,
+    cancel_requested: evidence.cancel_requested,
+    ...(evidence.transport_evidence !== undefined
+      ? { transport_evidence: evidence.transport_evidence }
+      : {}),
+    ...(evidence.result_received_missing === true ? { result_received_missing: true } : {}),
+  });
+}
+
+/** 解析持久化证据行;形状不合法/旧数据缺字段时返回 undefined(走保守回退)。 */
+function parseInvocationEvidenceSummary(summary: string): AdpInvocationEvidence | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(summary);
+  } catch {
+    return undefined;
+  }
+  if (raw === null || typeof raw !== 'object') return undefined;
+  const record = raw as Record<string, unknown>;
+  if (record.schema_version !== INVOCATION_EVIDENCE_SCHEMA_VERSION) return undefined;
+  const flag = (key: string): boolean | undefined =>
+    typeof record[key] === 'boolean' ? (record[key] as boolean) : undefined;
+  const dispatched = flag('dispatched');
+  const effects = flag('effects_observed');
+  const resultReceived = flag('result_received');
+  const cancelRequested = flag('cancel_requested');
+  if (
+    dispatched === undefined ||
+    effects === undefined ||
+    resultReceived === undefined ||
+    cancelRequested === undefined
+  ) {
+    return undefined;
+  }
+  const transport = record.transport_evidence;
+  const transportEvidence =
+    transport === 'not_executed' || transport === 'execution_unconfirmed' ? transport : undefined;
+  if (transport !== undefined && transportEvidence === undefined) return undefined;
+  const missing = record.result_received_missing;
+  if (missing !== undefined && typeof missing !== 'boolean') return undefined;
+  if (missing === true && resultReceived) return undefined;
+  return {
+    dispatched,
+    effects_observed: effects,
+    result_received: resultReceived,
+    cancel_requested: cancelRequested,
+    ...(transportEvidence !== undefined ? { transport_evidence: transportEvidence } : {}),
+    ...(missing === true ? { result_received_missing: true } : {}),
+  };
+}
+
+/**
+ * 旧数据回退(没有 driver.invocation_evidence 调用行):只能按回执内容做有依据的保守推断。
+ * - 启动失败(DRIVER_START_FAILED)= 明确未执行 → not_executed + result_received=false;
+ * - succeeded/failed(非启动)/interrupted 回执必然来自 DriverRunResult → result_received=true;
+ * - unknown/cancelled 可能来自「收到结果但结局不明」或「没有结果」→ 明确标记 missing,
+ *   不凭空声称收到或未收到。
+ */
+function legacyReplayInvocationEvidence(receipt: AdpReceiptFrame): AdpInvocationEvidence {
+  const startFailure = receipt.error?.code === 'DRIVER_START_FAILED';
+  const ambiguous = !startFailure && (receipt.status === 'unknown' || receipt.status === 'cancelled');
+  const resultReceived =
+    !startFailure && (receipt.status === 'succeeded' || receipt.status === 'failed');
+  return {
+    dispatched: !startFailure,
+    effects_observed: receipt.status !== 'succeeded' && receipt.status !== 'cancelled',
+    result_received: resultReceived,
+    cancel_requested: false,
+    ...(startFailure ? { transport_evidence: 'not_executed' as const } : {}),
+    ...(ambiguous ? { result_received_missing: true } : {}),
+  };
+}
 
 export interface AdpDriverExecutionInput {
   call_id: string;
@@ -75,6 +172,21 @@ export interface AdpInvokeRequest {
   deadline_at?: string;
   execute: AdpDriverExecutor;
   onEvent?: DriverStreamEventListener;
+  /**
+   * 本次 invoke 的 per-invoke 回执回调:settle 后触发;判重返回既有 settled 结果、
+   * 或崩溃恢复收束出结果时也会把既有 receipt 交付一次(绝不重新执行)。
+   * 与 options.onReceipt 并存,两者都调用、互不替代。
+   * **通知语义**:同步 fire-and-forget,invoke 不等待其返回。
+   */
+  onReceipt?: (delivery: AdpReceiptDelivery) => void;
+  /**
+   * 本次 invoke 的回执对账回调(写屏障):在通知类回调之后调用,invoke **await** 它,
+   * 直到对账完成才 resolve;它抛错/拒绝时 invoke 抛
+   * {@link AdpReceiptReconciliationError}(fail closed,不返回成功)。
+   * 首次 settle 与「已 settled 判重重放/崩溃恢复」两条路径遵守同一完成条件;
+   * 重放路径绝不重新执行 executor。
+   */
+  onReceiptReconciled?: (delivery: AdpReceiptDelivery) => void | Promise<void>;
 }
 
 export interface AdpSettledOutcome {
@@ -93,6 +205,25 @@ export interface AdpSettledOutcome {
   /** 执行体抛出的原始错误(abort 等),供上层原样重抛 */
   thrown?: unknown;
   mapped: AdpMappedOutcome;
+}
+
+/**
+ * 回执对账失败(写屏障):invoke 已收束(receipt 已发出),但 `onReceiptReconciled`
+ * 这条对账型回调抛错/拒绝。调用方不得把该 exchange 当成功继续流程;`cause` 保留
+ * 原始失败(如 journal 写失败),便于上层按 fail-closed 处理。
+ */
+export class AdpReceiptReconciliationError extends Error {
+  constructor(
+    readonly exchange_id: string,
+    cause?: unknown,
+  ) {
+    super(
+      `ADP receipt reconciliation failed for exchange ${exchange_id}` +
+        (cause instanceof Error && cause.message.length > 0 ? `: ${cause.message}` : ''),
+      { cause },
+    );
+    this.name = 'AdpReceiptReconciliationError';
+  }
 }
 
 export type AdpInvokeOutcome =
@@ -118,6 +249,12 @@ export interface AdpReceiptDelivery {
   outcome: AdpSettledOutcome;
 }
 
+/** 迟到结果观察(对账器入口):只表达「哪个 exchange 迟到了什么结果」。 */
+export interface AdpLateResultDelivery {
+  exchange_id: string;
+  execution: DriverRunResult;
+}
+
 export interface AdpDriverEndpointOptions {
   store: ProtocolDeliveryStore;
   /** 应用装配声明的副作用分级;单次 invoke 可覆盖 */
@@ -132,6 +269,14 @@ export interface AdpDriverEndpointOptions {
   now?: () => string;
   /** 宿主内回调:回执交还 Agent */
   onReceipt?: (delivery: AdpReceiptDelivery) => void;
+  /**
+   * 迟到结果观察:仅在 reconcileLateResult 成功记录
+   * driver.invocation_late_result 调用行之后触发。
+   * 不改变协议调用行、不重发回执、不重执行——只供上层对账入档。
+   * 允许返回 Promise(invoke 不等待);异步失败不产生未处理 rejection,
+   * 由 {@link AdpDriverEndpoint.flushLateResultObservers} 观察并重抛。
+   */
+  lateResultObserver?: (delivery: AdpLateResultDelivery) => void | Promise<void>;
   owner?: string;
 }
 
@@ -156,6 +301,10 @@ export class AdpDriverEndpoint {
   private readonly now: () => string;
   private readonly owner: string;
   private readonly live = new Map<string, LiveInvocation>();
+  /** 迟到结果观察的在飞 Promise(只用于 flush/错误观察,invoke 不等待)。 */
+  private readonly pendingLateResultObservers = new Set<Promise<void>>();
+  /** 首个未被 flush 观察到的迟到观察失败;单独用布尔标记以区分 undefined 错误值。 */
+  private lateResultObserverFailure: { captured: boolean; error?: unknown } = { captured: false };
 
   constructor(private readonly options: AdpDriverEndpointOptions) {
     this.store = options.store;
@@ -171,7 +320,16 @@ export class AdpDriverEndpoint {
   async invoke(request: AdpInvokeRequest): Promise<AdpInvokeOutcome> {
     const exchange_id = request.exchange_id ?? createId('ex_adp');
     const existing = this.lookupExisting(exchange_id);
-    if (existing) return existing;
+    if (existing) {
+      // 判重重放 / 崩溃恢复收束:既有 receipt 也交给 per-invoke 回调(不重新执行)。
+      if (existing.state === 'settled') {
+        const delivery = this.receiptDelivery(existing);
+        // 通知类回调先触发(fire-and-forget),再 await 对账型回调。
+        request.onReceipt?.(delivery);
+        await this.awaitReceiptReconciliation(request, delivery);
+      }
+      return existing;
+    }
 
     const side_effect = request.side_effect ?? this.options.side_effect;
     const created_at = this.now();
@@ -261,7 +419,31 @@ export class AdpDriverEndpoint {
     }
 
     const outcome = await this.executeAttempts(live, request, side_effect);
-    return this.settleExchange(live, outcome);
+    const settled = this.settleExchange(live, outcome);
+    const delivery = this.receiptDelivery(settled);
+    // 通知类回调先触发(fire-and-forget),再 await 对账型回调(写屏障)。
+    request.onReceipt?.(delivery);
+    await this.awaitReceiptReconciliation(request, delivery);
+    return settled;
+  }
+
+  /**
+   * 回执对账完成条件:invoke 在 `onReceiptReconciled` 完成前不 resolve。
+   * 首次 settle 与已 settled 重放/恢复路径共用;失败包成
+   * {@link AdpReceiptReconciliationError} 从 invoke 抛出(fail closed)。
+   */
+  private async awaitReceiptReconciliation(
+    request: AdpInvokeRequest,
+    delivery: AdpReceiptDelivery,
+  ): Promise<void> {
+    const reconcile = request.onReceiptReconciled;
+    if (!reconcile) return;
+    try {
+      await reconcile(delivery);
+    } catch (error) {
+      if (error instanceof AdpReceiptReconciliationError) throw error;
+      throw new AdpReceiptReconciliationError(delivery.exchange_id, error);
+    }
   }
 
   /**
@@ -372,8 +554,54 @@ export class AdpDriverEndpoint {
         }),
       );
     } catch {
-      // 对账留档绝不打断业务路径(best-effort)。
+      // 对账留档绝不打断业务路径(best-effort);没留下调用行时不向观察者报“已记录”。
+      return;
     }
+    // 调用行已成功落账,才把迟到结果交给上层对账器(不重执行、不改已发回执)。
+    this.observeLateResult({ exchange_id, execution });
+  }
+
+  /**
+   * 等待并观察所有迟到结果观察器(invoke 本身不等待它们)。
+   *
+   * 异步观察器抛出的第一个错误在这里重抛;等待完成后错误被清空(再次 flush 不会重复抛)。
+   * 观察器返回的 Promise 始终挂有 rejection 处理器,不会产生未处理 rejection。
+   */
+  async flushLateResultObservers(): Promise<void> {
+    while (this.pendingLateResultObservers.size > 0) {
+      await Promise.all([...this.pendingLateResultObservers]);
+    }
+    const failure = this.lateResultObserverFailure;
+    this.lateResultObserverFailure = { captured: false };
+    if (failure.captured) throw failure.error;
+  }
+
+  /** 跟踪迟到结果观察器的返回值:同步抛错/异步拒绝都只捕获第一个错误。 */
+  private observeLateResult(delivery: AdpLateResultDelivery): void {
+    const observer = this.options.lateResultObserver;
+    if (!observer) return;
+    let returned: void | Promise<void>;
+    try {
+      returned = observer(delivery);
+    } catch (error) {
+      this.captureLateResultObserverFailure(error);
+      return;
+    }
+    const pending = Promise.resolve(returned).then(
+      () => {
+        this.pendingLateResultObservers.delete(pending);
+      },
+      (error) => {
+        this.pendingLateResultObservers.delete(pending);
+        this.captureLateResultObserverFailure(error);
+      },
+    );
+    this.pendingLateResultObservers.add(pending);
+  }
+
+  private captureLateResultObserverFailure(error: unknown): void {
+    if (this.lateResultObserverFailure.captured) return;
+    this.lateResultObserverFailure = { captured: true, error };
   }
 
   // ── 内部:执行 + 策略重试 ─────────────────────────────────────
@@ -488,7 +716,20 @@ export class AdpDriverEndpoint {
     this.bookkeep(live, () => {
       const driver_key = this.driverInboxKey(live.exchange_id);
       const driver_lease = this.ensureInboxLease(driver_key, completed_at);
-      this.store.withProtocolTransaction((tx) =>
+      // 同时把本次 exchange 的阶段证据(result_received 等)作为独立调用行持久化:
+      // 重启回放时据此恢复真实事实,而不是从 receipt.status 反推。
+      const evidence = live.state.evidence;
+      this.store.withProtocolTransaction((tx) => {
+        tx.appendCall({
+          task_id: live.task_id,
+          run_id: live.run_id,
+          call_id: invocationEvidenceCallId(live.exchange_id),
+          role_id: null,
+          event: INVOCATION_EVIDENCE_EVENT,
+          status: outcome.mapped.status,
+          summary: serializeInvocationEvidence(evidence),
+          completed_at,
+        });
         tx.completeInbox({
           key: driver_key,
           lease_owner: this.owner,
@@ -499,8 +740,8 @@ export class AdpDriverEndpoint {
             destination: this.agentConsumer(),
             frame: receipt,
           },
-        }),
-      );
+        });
+      });
     });
 
     // 回执投递 A 侧:receiveInbox 会按 causation 收束原 invoke outbox。
@@ -564,6 +805,32 @@ export class AdpDriverEndpoint {
     return settled;
   }
 
+  /**
+   * 把已收束的结局包装成宿主内回执交付(per-invoke 回调复用)。
+   * causation_id 取本次 invoke 的 causation(外层 SAP execute);判重重放/崩溃恢复时
+   * 用已落账的 invoke 帧补回;取不到才退回 receipt 的 causation。
+   */
+  private receiptDelivery(outcome: AdpSettledOutcome): AdpReceiptDelivery {
+    const causation = this.invokeCausation(outcome.exchange_id);
+    return {
+      exchange_id: outcome.exchange_id,
+      // 找到 invoke 帧就沿用它的 causation(根调用为 null);找不到才退回 receipt 的 causation。
+      causation_id: causation === undefined ? outcome.receipt.causation_id : causation,
+      receipt: outcome.receipt,
+      outcome,
+    };
+  }
+
+  private invokeCausation(exchange_id: string): string | null | undefined {
+    const live = this.live.get(exchange_id);
+    if (live) return live.invoke_frame.causation_id;
+    const frame = this.store.getInbox(this.driverInboxKey(exchange_id))?.frame;
+    if (frame && 'command' in frame && frame.command === 'driver.invoke') {
+      return frame.causation_id;
+    }
+    return undefined;
+  }
+
   // ── 内部:判重与崩溃后对账 ───────────────────────────────────
 
   private lookupExisting(exchange_id: string): AdpInvokeOutcome | undefined {
@@ -598,6 +865,9 @@ export class AdpDriverEndpoint {
   }
 
   private replayFromReceipt(exchange_id: string, receipt: AdpReceiptFrame): AdpSettledOutcome {
+    // 重启回放:优先读取本 exchange 持久化的阶段证据(收到 result 与否是事实,不能从
+    // receipt.status 反推);旧数据没有该行时走保守回退并显式标记 missing。
+    const evidence = this.recoverInvocationEvidence(receipt, exchange_id);
     return {
       state: 'settled',
       exchange_id,
@@ -605,12 +875,7 @@ export class AdpDriverEndpoint {
       receipt,
       attempts: 1,
       replayed: true,
-      evidence: {
-        dispatched: true,
-        effects_observed: receipt.status !== 'succeeded' && receipt.status !== 'cancelled',
-        result_received: true,
-        cancel_requested: false,
-      },
+      evidence,
       journal_degraded: false,
       mapped: {
         status: receipt.status,
@@ -619,6 +884,38 @@ export class AdpDriverEndpoint {
         notes: ['replayed from settled exchange (idempotent)'],
       },
     };
+  }
+
+  /** 回放证据:持久化事实优先,缺失时用有依据的保守回退(不伪造 received 事实)。 */
+  private recoverInvocationEvidence(
+    receipt: AdpReceiptFrame,
+    exchange_id: string,
+  ): AdpInvocationEvidence {
+    const persisted = this.readPersistedInvocationEvidence(
+      receipt.task_id,
+      receipt.run_id,
+      exchange_id,
+    );
+    return persisted ?? legacyReplayInvocationEvidence(receipt);
+  }
+
+  /** 从 P1 调用行读回本 exchange 的阶段证据;不存在/损坏 → undefined。 */
+  private readPersistedInvocationEvidence(
+    task_id: string,
+    run_id: string,
+    exchange_id: string,
+  ): AdpInvocationEvidence | undefined {
+    const callId = invocationEvidenceCallId(exchange_id);
+    try {
+      for (const row of this.store.listJournal(task_id, run_id)) {
+        if (row.event !== INVOCATION_EVIDENCE_EVENT || row.id !== callId) continue;
+        const parsed = parseInvocationEvidenceSummary(row.summary);
+        if (parsed !== undefined) return parsed;
+      }
+    } catch {
+      // P1 读不可用 → 按旧数据缺失处理,不影响回放本身。
+    }
+    return undefined;
   }
 
   /** 崩溃恢复:按 P1 状态把死掉的 exchange 对账收束(不启动任何副作用)。 */
