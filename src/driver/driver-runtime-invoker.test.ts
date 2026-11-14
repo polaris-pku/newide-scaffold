@@ -76,7 +76,7 @@ describe('createDriverRuntimeInvoker', () => {
 
     const output = await createDriverRuntimeInvoker(new TestDriver(result))(invocationInput());
 
-    expect(output.report.artifacts[0]?.summary).toBe('patch artifact artifact_1');
+    expect(output.report?.artifacts[0]?.summary).toBe('patch artifact artifact_1');
   });
 
   it('serializes nested context deterministically regardless of property insertion order', async () => {
@@ -115,7 +115,7 @@ describe('createDriverRuntimeInvoker', () => {
       const output = await createDriverRuntimeInvoker(new TestDriver(result))(invocationInput());
 
       expect(output.execution).toBe(result);
-      expect(output.report.blockers).toEqual(
+      expect(output.report?.blockers).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             blocker: 'Driver stopped',
@@ -125,7 +125,7 @@ describe('createDriverRuntimeInvoker', () => {
           }),
         ]),
       );
-      expect(output.report.referenced_experiences).toEqual([]);
+      expect(output.report?.referenced_experiences).toEqual([]);
     },
   );
 
@@ -144,7 +144,7 @@ describe('createDriverRuntimeInvoker', () => {
         retryable: false,
       },
     });
-    expect(output.report.blockers[0]).toMatchObject({
+    expect(output.report?.blockers[0]).toMatchObject({
       blocker: 'socket closed',
       resolved: false,
     });
@@ -207,7 +207,7 @@ describe('createDriverRuntimeInvoker', () => {
     type Expected = (
       input: ReturnType<typeof invocationInput>,
       options?: { signal?: AbortSignal; onDriverEvent?: DriverStreamEventListener },
-    ) => Promise<{ report: BReport; execution: DriverRunResult }>;
+    ) => Promise<{ report?: BReport; execution: DriverRunResult }>;
     const expected: Expected = createDriverRuntimeInvoker(new TestDriver(successResult()));
 
     expect(expected).toBeTypeOf('function');

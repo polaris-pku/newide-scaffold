@@ -4,14 +4,19 @@
  * 定义 Agent 任务后 buffer 队列的读写契约：pending 写入、游标、
  * processed / dead_letter 迁移等。生产实现为文件存储（pending/ 等目录）。
  */
-import type { BufferMeta, BufferSnapshot, AgentContextSnapshot, UserRating } from '../schemas';
+import type {
+  BufferMeta,
+  BufferSnapshotLike,
+  AgentContextSnapshot,
+  UserRating,
+} from '../schemas';
 
 /** saveBufferSnapshot 的返回值 */
 export interface SaveBufferResult {
   /** 分配的缓冲区序号（单调递增） */
   seq: number;
-  /** 写入的缓冲区快照副本 */
-  snapshot: BufferSnapshot;
+  /** 写入的缓冲区快照副本（v1 或 v2） */
+  snapshot: BufferSnapshotLike;
   /** 若同时写入了 AgentContextSnapshot，则附带 */
   agent_context_snapshot?: AgentContextSnapshot;
 }
@@ -49,7 +54,7 @@ export type AgentContextReadStatus = 'present' | 'absent' | 'unreadable';
 
 /** 读一条 Buffer 的结果：快照 + 配对上下文的读取结果（含失败原因） */
 export interface PendingBufferRead {
-  snapshot: BufferSnapshot;
+  snapshot: BufferSnapshotLike;
   agentContext?: AgentContextSnapshot;
   /** 见 AgentContextReadStatus；`unreadable` 才说明上下文真的出了问题 */
   agentContextStatus: AgentContextReadStatus;
@@ -110,7 +115,7 @@ export interface BufferRepository {
    */
   saveBufferSnapshot(
     role_id: string,
-    snapshot: BufferSnapshot,
+    snapshot: BufferSnapshotLike,
     agentContext?: AgentContextSnapshot,
   ): Promise<SaveBufferResult>;
 

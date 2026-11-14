@@ -142,12 +142,21 @@ export {
   buildDriverUsageFeedbackRecords,
   contextDeliveryId,
   contextDeliveryKey,
+  contextDeliverySourceFields,
   driverFeedbackId,
   driverFeedbackKey,
   type ContextDeliveryInput,
   type DriverFeedbackInput,
   type DriverReferencedExperience,
 } from './services/context-delivery';
+export {
+  dispatchHasHostObservedPass,
+  gradeLearningInput,
+  negativeConfidenceCap,
+  sourceDriversLabel,
+  type LearningInputGrade,
+  type LearningInputSourceLevel,
+} from './services/learning-input-grade';
 export {
   computeMemoryOverview,
   type MemoryOverview,
@@ -241,6 +250,20 @@ export type {
 export { MARKET_POOL_ROLE_ID } from './schemas';
 /** 某个字符串能不能命名一条经验（引用准入判据，见 schemas.canNameExperience） */
 export { canNameExperience } from './schemas';
+// Buffer 版本判别与解析是跨模块读取入口（app 组合根 / 维护 runner 都要按版本分支）
+export {
+  BUFFER_SNAPSHOT_V2_SCHEMA_VERSION,
+  isBufferSnapshotV2,
+  parseBufferSnapshot,
+  type BufferDispatchSummary,
+  type BufferJournalRef,
+  type BufferMemoryUsedEntry,
+  type BufferRoleReflection,
+  type BufferRoleStatus,
+  type BufferRoleVerification,
+  type BufferSnapshotLike,
+  type BufferSnapshotV2,
+} from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  8.7 三重门控退休检测（week3 RFC §8.2 触发机制）
@@ -562,6 +585,11 @@ export {
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';
+export type {
+  LearningEvidenceVerifier,
+  LearningInputEvidenceStatus,
+  LearningInputEvidenceVerification,
+} from './ports/learning-evidence-verifier';
 export type { EmbeddingProvider } from './ports/embedding-provider';
 export type { LlmClient, LlmMessage } from './ports/llm-client';
 export type { AgentContextCleaner, AgentContextCleanInput } from './ports/agent-context-cleaner';

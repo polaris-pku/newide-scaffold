@@ -56,12 +56,14 @@ import {
   type DeliveryRepositoryPolicy,
   contextDeliveryId,
   contextDeliveryKey,
+  isBufferSnapshotV2,
 } from '../memory';
 import type {
   AgentContextSnapshot,
   AgentStatus,
   BufferMeta,
   BufferSnapshot,
+  BufferSnapshotV2,
   ContextDeliveryItem,
   DeliveryStatus,
   DriverFeedbackRecord,
@@ -191,7 +193,18 @@ export interface ContextDeliveryPayload {
    *   此时 `driver_return` 仍会给出——DriverReturn 单独可读，缺的是另一半。
    */
   payload_warning?: string;
+  /** v1 学习输入：Driver 六字段报告（v2 没有这个字段） */
   driver_return?: BufferSnapshot['driver_return'];
+  /** Buffer 契约版本：v1（或缺席）或 2（v2 学习输入） */
+  buffer_version?: number;
+  /** v2 学习输入：Role 反思 + 记忆使用 */
+  role_reflection?: BufferSnapshotV2['role_reflection'];
+  /** v2 学习输入：派工摘要 */
+  dispatches?: BufferSnapshotV2['dispatches'];
+  /** v2 学习输入：Journal 前缀引用与 hash */
+  journal_ref?: BufferSnapshotV2['journal_ref'];
+  /** v2 来源 Driver 集合（零派工为 [] 或 null） */
+  source_drivers?: string[] | null;
   agent_context?: AgentContextSnapshot;
 }
 
@@ -948,7 +961,18 @@ export class BMemoryBackendService {
       if (!stored) {
         return { delivery, payload_available: false };
       }
-      // 声明过引用却读不出来：DriverReturn 仍可单独读取，但「完整 payload 可用」是假的
+      const snapshot = stored.snapshot;
+      const learningPayload = isBufferSnapshotV2(snapshot)
+        ? {
+            buffer_version: 2,
+            role_reflection: snapshot.role_reflection,
+            dispatches: snapshot.dispatches,
+            journal_ref: snapshot.journal_ref,
+            source_drivers: snapshot.source_drivers,
+          }
+        : { buffer_version: 1, driver_return: snapshot.driver_return };
+      // 声明过引用却读不出来：DriverReturn（v1）/ 执行事实（v2）仍可单独读取，
+      // 但「完整 payload 可用」是假的。
       if (stored.agentContextStatus === 'unreadable') {
         return {
           delivery,
@@ -956,13 +980,13 @@ export class BMemoryBackendService {
           payload_warning:
             stored.agentContextError ??
             'The AgentContextSnapshot paired with this delivery could not be read.',
-          driver_return: stored.snapshot.driver_return,
+          ...learningPayload,
         };
       }
       return {
         delivery,
         payload_available: true,
-        driver_return: stored.snapshot.driver_return,
+        ...learningPayload,
         ...(stored.agentContext ? { agent_context: stored.agentContext } : {}),
       };
     } catch (error) {

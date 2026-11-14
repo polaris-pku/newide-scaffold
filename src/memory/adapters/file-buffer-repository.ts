@@ -11,10 +11,10 @@ import { dirname, join } from 'node:path';
 import {
   AgentContextSnapshotSchema,
   BufferMetaSchema,
-  BufferSnapshotSchema,
+  parseBufferSnapshot,
   type AgentContextSnapshot,
   type BufferMeta,
-  type BufferSnapshot,
+  type BufferSnapshotLike,
   type UserRating,
 } from '../schemas';
 import type {
@@ -165,7 +165,7 @@ export class FileBufferRepository implements BufferRepository {
 
   async saveBufferSnapshot(
     role_id: string,
-    snapshot: BufferSnapshot,
+    snapshot: BufferSnapshotLike,
     agentContext?: AgentContextSnapshot,
   ): Promise<SaveBufferResult> {
     // 同一 role 的写入串行：序号分配是读-改-写，并发会撞出同一个 seq（见 serialQueues）
@@ -195,7 +195,7 @@ export class FileBufferRepository implements BufferRepository {
    */
   private async writeBufferSnapshot(
     role_id: string,
-    snapshot: BufferSnapshot,
+    snapshot: BufferSnapshotLike,
     agentContext?: AgentContextSnapshot,
   ): Promise<SaveBufferResult> {
     const bufferRoot = this.requireBufferRoot(role_id);
@@ -204,7 +204,7 @@ export class FileBufferRepository implements BufferRepository {
     const scan = await this.scanStore(bufferRoot);
     const seq = Math.max(meta.cursor, scan.highest_seq) + 1;
 
-    const storedSnapshot: BufferSnapshot = agentContext
+    const storedSnapshot: BufferSnapshotLike = agentContext
       ? { ...snapshot, context_snapshot_ref: String(seq) }
       : snapshot;
 
@@ -218,7 +218,7 @@ export class FileBufferRepository implements BufferRepository {
         }
       : undefined;
 
-    BufferSnapshotSchema.parse(storedSnapshot);
+    parseBufferSnapshot(storedSnapshot);
 
     const contextPath = join(bufferRoot, PENDING_DIR, contextFileName(seq));
     if (storedAgentContext) {
@@ -355,7 +355,7 @@ export class FileBufferRepository implements BufferRepository {
     } catch {
       throw new Error(`Pending buffer not found: seq=${seq}`);
     }
-    const snapshot = BufferSnapshotSchema.parse(JSON.parse(rawReport));
+    const snapshot = parseBufferSnapshot(JSON.parse(rawReport));
     snapshot.user_rating = rating;
     await writeJsonAtomic(reportPath, snapshot);
   }
@@ -409,7 +409,7 @@ export class FileBufferRepository implements BufferRepository {
       }
       // 直接读原始 JSON（不经 schema parse）：task_id 必在快照内，
       // reason / failed_at 是 markBufferDeadLetter 附加的死信字段。
-      const parsed = JSON.parse(rawReport) as BufferSnapshot & {
+      const parsed = JSON.parse(rawReport) as BufferSnapshotLike & {
         dead_letter_reason?: string;
         dead_letter_at?: string;
       };
@@ -437,7 +437,7 @@ export class FileBufferRepository implements BufferRepository {
       throw new Error(`Dead-letter buffer not found: seq=${seq}`);
     }
 
-    const snapshot = BufferSnapshotSchema.parse(JSON.parse(rawReport));
+    const snapshot = parseBufferSnapshot(JSON.parse(rawReport));
     snapshot.extraction_status = 'pending';
     // dead_letter → pending（写回时一并更新提取状态）。
     // 与 markBuffer 同一套配对规则：context 先回、report 后回。report 是存在标记，
@@ -695,7 +695,7 @@ export class FileBufferRepository implements BufferRepository {
       throw new Error(`Pending buffer not found: seq=${seq}`);
     }
 
-    const snapshot = BufferSnapshotSchema.parse(JSON.parse(rawReport));
+    const snapshot = parseBufferSnapshot(JSON.parse(rawReport));
     snapshot.extraction_status = targetStatus;
 
     const targetDir = targetStatus === 'processed' ? PROCESSED_DIR : DEAD_LETTER_DIR;
@@ -777,7 +777,7 @@ async function readEntriesIfPresent(dir: string): Promise<Dirent[]> {
  * 而启动恢复恰恰需要把这一条报出来。错误消息带上路径（含 role 与 seq），
  * 才够定位到是哪条 Buffer 坏了。
  */
-async function readSnapshotIfPresent(filePath: string): Promise<BufferSnapshot | undefined> {
+async function readSnapshotIfPresent(filePath: string): Promise<BufferSnapshotLike | undefined> {
   let rawReport: string;
   try {
     rawReport = await readFile(filePath, 'utf8');
@@ -786,7 +786,7 @@ async function readSnapshotIfPresent(filePath: string): Promise<BufferSnapshot |
     throw new Error(`Unreadable buffer report at ${filePath}: ${errorMessage(error)}`);
   }
   try {
-    return BufferSnapshotSchema.parse(JSON.parse(rawReport));
+    return parseBufferSnapshot(JSON.parse(rawReport));
   } catch (error) {
     throw new Error(`Unreadable buffer report at ${filePath}: ${errorMessage(error)}`);
   }
@@ -817,7 +817,7 @@ interface AgentContextRead {
  * 而不是连报告一起拿不到。
  */
 async function readAgentContextIfPresent(
-  snapshot: BufferSnapshot,
+  snapshot: BufferSnapshotLike,
   seq: number,
   filePath: string,
 ): Promise<AgentContextRead> {
@@ -858,7 +858,7 @@ async function readAgentContextIfPresent(
 }
 
 function withAgentContext(
-  snapshot: BufferSnapshot,
+  snapshot: BufferSnapshotLike,
   read: AgentContextRead,
 ): PendingBufferRead {
   return { snapshot, ...read };

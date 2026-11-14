@@ -22,10 +22,13 @@ import { RunDispatchJournal, type DispatchJournalReadResult } from '../persisten
 import type { PersistedRunMode, TaskCursorInput } from '../persistence';
 import {
   buildRoleFreezeInitInput,
+  DEFAULT_ROLE_AUTONOMY_SWITCHES,
+  isRoleAutonomySwitchCombinationValid,
   ROLE_AUTONOMY_ENGINE,
   resolveRolePolicyBudget,
   roleFrozenPolicyFromJournalInit,
   type ExecutionEngine,
+  type RoleAutonomySwitches,
   type RoleBudgetLimits,
   type RoleBudgetOverrides,
   type RoleFreezeInitInput,
@@ -41,6 +44,8 @@ export interface RoleAutonomySelectionConfig {
   enabled: boolean;
   /** 组合根是否装配了 role-loop 引擎。 */
   wired: boolean;
+  /** 阶段 3 开关（`NEWIDE_DRIVER_EVIDENCE_ONLY` / `NEWIDE_BUFFER_V2`），默认都关。 */
+  switches?: RoleAutonomySwitches;
   /** 部署级预算覆盖（只能收紧宿主上限）。 */
   budget_overrides?: RoleBudgetOverrides;
   /** 任务请求预算（TaskBudget.max_tokens / max_wall_clock_seconds / max_tool_calls）。 */
@@ -150,7 +155,7 @@ export async function selectRoleExecutionEngine(
           code: 'role_freeze_invalid',
           message:
             'frozen role_autonomy init row is missing engine version/tool authorization/budgets ' +
-            'or enables an unimplemented switch',
+            'or carries an unsupported switch combination',
         };
       }
       if (!config.wired) {
@@ -206,6 +211,18 @@ export async function selectRoleExecutionEngine(
     return { engine: 'legacy', reason: 'started_run_without_frozen_engine' };
   }
   if (!config.enabled) {
+    // 阶段 3 开关依赖 role 自主循环：只开 EVIDENCE_ONLY/BUFFER_V2 而不开 ROLE_AUTONOMY
+    // 是非法组合（启动配置构造处已拒绝，这里再做一次防御性拒绝，不静默降级到 legacy）。
+    const switches = config.switches ?? DEFAULT_ROLE_AUTONOMY_SWITCHES;
+    if (switches.evidence_only || switches.buffer_v2) {
+      return {
+        engine: 'rejected',
+        reason: 'stage3_switch_without_role_autonomy',
+        code: 'role_switch_invalid',
+        message:
+          'NEWIDE_DRIVER_EVIDENCE_ONLY / NEWIDE_BUFFER_V2 require NEWIDE_ROLE_AUTONOMY=1',
+      };
+    }
     return { engine: 'legacy', reason: 'role_autonomy_disabled' };
   }
   if (!config.wired) {
@@ -215,6 +232,15 @@ export async function selectRoleExecutionEngine(
       code: 'role_loop_not_wired',
       message:
         'NEWIDE_ROLE_AUTONOMY is enabled but the composition root has no role-loop engine wired',
+    };
+  }
+  const switches = config.switches ?? DEFAULT_ROLE_AUTONOMY_SWITCHES;
+  if (!isRoleAutonomySwitchCombinationValid(switches)) {
+    return {
+      engine: 'rejected',
+      reason: 'invalid_switch_combination',
+      code: 'role_switch_invalid',
+      message: 'NEWIDE_BUFFER_V2 requires NEWIDE_DRIVER_EVIDENCE_ONLY=1',
     };
   }
   // 部署覆盖 + TaskBudget 的唯一合并入口：选路与 engine 使用同一份冻结策略。
@@ -243,8 +269,17 @@ export async function selectRoleExecutionEngine(
     frozen_at: frozenAt,
     max_tool_calls: resolved.max_tool_calls,
     routing,
+    evidence_only: switches.evidence_only,
+    buffer_v2: switches.buffer_v2,
   };
-  const freezeInput = buildRoleFreezeInitInput(freezePlan);
+  const freezeInput = buildRoleFreezeInitInput({
+    limits: freezePlan.limits,
+    deadline_at: freezePlan.deadline_at,
+    max_tool_calls: freezePlan.max_tool_calls,
+    routing: freezePlan.routing,
+    evidence_only: freezePlan.evidence_only,
+    buffer_v2: freezePlan.buffer_v2,
+  });
   return {
     engine: ROLE_AUTONOMY_ENGINE,
     reason: 'fresh_role_autonomy',
@@ -252,8 +287,8 @@ export async function selectRoleExecutionEngine(
       engine: ROLE_AUTONOMY_ENGINE,
       engine_version: freezeInput.engine_version,
       tool_allowlist: freezeInput.tool_allowlist,
-      evidence_only: false,
-      buffer_v2: false,
+      evidence_only: switches.evidence_only,
+      buffer_v2: switches.buffer_v2,
       budget: {
         limits: freezePlan.limits,
         deadline_at: freezePlan.deadline_at,

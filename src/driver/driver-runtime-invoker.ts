@@ -24,6 +24,14 @@ export interface DriverRuntimeInvokerInput {
   resume_session?: boolean;
   call_id: string;
   source_driver: string;
+  /**
+   * 报告模式：
+   * - `six_field`（默认，legacy/Council 路径）：prompt 追加六字段报告指令，结果经
+   *   DriverReturnConverter 转成 DriverReturn（含报告文件/transcript/LLM 兜底）。
+   * - `evidence_only`（阶段 3 role 自主循环）：只把本次 Brief 交给 driver，不要求六字段
+   *   报告、不写报告文件、不做转换。执行事实与证据由宿主 Journal 记录。
+   */
+  report_mode?: 'six_field' | 'evidence_only';
   driver_context: {
     task_instruction: string;
     skills: DriverRuntimeInvokerMemoryItem[];
@@ -60,7 +68,11 @@ export interface DriverRuntimeReport {
 }
 
 export interface DriverRuntimeInvocationResult {
-  report: DriverRuntimeReport;
+  /**
+   * 六字段报告：`six_field` 模式必有；`evidence_only` 模式**没有**（不伪造空报告）。
+   * legacy/ADP 消费者必须在缺席时显式失败，而不是拿一份空壳当报告。
+   */
+  report?: DriverRuntimeReport;
   execution: DriverRunResult;
   /**
    * 执行体抛出的原始错误（仅在非 abort 的失败路径）。`execution` 仍是合成的
@@ -83,6 +95,7 @@ export function createDriverRuntimeInvoker(
         `source_driver ${input.source_driver} does not match runtime driver_id ${driver.driver_id}`,
       );
     }
+    const evidenceOnly = input.report_mode === 'evidence_only';
 
     const runId = input.run_id ?? input.call_id;
     let execution: DriverRunResult;
@@ -95,7 +108,7 @@ export function createDriverRuntimeInvoker(
           run_id: runId,
           ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
           ...(input.session_id ? { session_id: input.session_id } : {}),
-          prompt: buildDriverPrompt(input),
+          prompt: buildDriverPrompt(input, evidenceOnly),
           created_at: nowTimestamp(),
           schema_version: SCHEMA_VERSION,
         },
@@ -124,6 +137,11 @@ export function createDriverRuntimeInvoker(
       execution = failedExecution(driver, input, error);
     }
 
+    if (evidenceOnly) {
+      // evidence-only：不等价于「报告为空」，而是本次根本不产出六字段报告。
+      return { execution, ...(thrown !== undefined ? { thrown } : {}) };
+    }
+
     const report = await converter(execution, {
       ...(execution.response ? { transcriptText: execution.response } : {}),
       instruction: input.driver_context.task_instruction,
@@ -135,7 +153,7 @@ export function createDriverRuntimeInvoker(
   };
 }
 
-function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
+function buildDriverPrompt(input: DriverRuntimeInvokerInput, evidenceOnly: boolean): string {
   if (input.resume_session) {
     if (!input.session_id) throw new Error('Native continuation requires a session ID');
     return [
@@ -144,8 +162,31 @@ function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
       'Verify the actual workspace before reporting completion. Do not claim a file was written unless it exists.',
       '',
       input.driver_context.task_instruction,
+      // evidence-only 分支不追加六字段报告/报告文件指令：本次派工只执行 Brief。
+      ...(evidenceOnly
+        ? []
+        : [
+            '',
+            buildDriverReturnInstruction({
+              taskId: input.task_id,
+              writeReportFile: shouldWriteDriverReportFile(),
+            }),
+          ]),
+    ].join('\n');
+  }
+  if (evidenceOnly) {
+    // evidence-only：只给本次 Brief 与必要上下文。长期记忆由 Role 决定是否写进 Brief，
+    // 不再由宿主整批注入（这里连空数组都不渲染，避免 prompt 形状暗示「本该有记忆」）。
+    return [
+      'Execute the task_instruction below. This is an active request to perform the task, not a request to acknowledge context.',
+      ...(input.session_id
+        ? [
+            'Continue in this existing session using its conversation and current workspace. Preserve completed work; finish what remains.',
+            'Any previous interruption, cancellation, or initialization-only instruction applies only to that earlier turn, not this request.',
+          ]
+        : []),
       '',
-      buildDriverReturnInstruction({ taskId: input.task_id, writeReportFile: shouldWriteDriverReportFile() }),
+      input.driver_context.task_instruction,
     ].join('\n');
   }
   const context = deterministicJson({

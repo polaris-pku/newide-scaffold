@@ -15,6 +15,8 @@ import {
   CONTEXT_DELIVERY_SCHEMA_VERSION,
   DRIVER_FEEDBACK_EVENT_VERSION,
   canNameExperience,
+  isBufferSnapshotV2,
+  type BufferSnapshotLike,
   type ContextDeliveryItem,
   type DriverFeedbackRecord,
   type DriverFeedbackSource,
@@ -54,17 +56,37 @@ export interface ContextDeliveryInput {
   role_id: string;
   task_id: string;
   buffer_seq: number;
-  source_driver: string;
+  /** v1 的兼容来源字段；v2 零派工时可以缺席 */
+  source_driver?: string;
+  /** Buffer 契约版本（1 = v1 DriverReturn 快照，2 = v2 学习输入） */
+  buffer_version?: number;
+  /** v2 来源 Driver 集合（零派工为 `[]` 或 `null`） */
+  source_drivers?: string[] | null;
   /** Buffer 快照里的 context_snapshot_ref（有上下文快照时才有） */
   context_snapshot_ref?: string | undefined;
   schema_version?: string;
+}
+
+/** 从 Buffer 快照推导交付项的来源/版本字段（v1 与 v2 的唯一分叉点）。 */
+export function contextDeliverySourceFields(
+  snapshot: BufferSnapshotLike,
+): Pick<ContextDeliveryInput, 'buffer_version' | 'source_driver' | 'source_drivers'> {
+  if (isBufferSnapshotV2(snapshot)) {
+    return {
+      buffer_version: 2,
+      ...(snapshot.source_driver !== undefined ? { source_driver: snapshot.source_driver } : {}),
+      source_drivers: snapshot.source_drivers,
+    };
+  }
+  return { buffer_version: 1, source_driver: snapshot.source_driver };
 }
 
 /**
  * 构造一条上下文交付项。
  *
  * `context_snapshot_ref` 直接沿用 Buffer 快照自己的字段：有就是有，没有就是
- * 没有——交付项不负责猜测上下文是否该存在。
+ * 没有——交付项不负责猜测上下文是否该存在。来源字段同理：v2 零派工任务没有
+ * driver，就不填一个虚构的 `source_driver`（来源权威是 `source_drivers`）。
  */
 export function buildContextDeliveryItem(input: ContextDeliveryInput): ContextDeliveryItem {
   const schema_version = input.schema_version ?? CONTEXT_DELIVERY_SCHEMA_VERSION;
@@ -85,7 +107,9 @@ export function buildContextDeliveryItem(input: ContextDeliveryInput): ContextDe
     ...(input.context_snapshot_ref !== undefined
       ? { context_snapshot_ref: input.context_snapshot_ref }
       : {}),
-    source_driver: input.source_driver,
+    ...(input.buffer_version !== undefined ? { buffer_version: input.buffer_version } : {}),
+    ...(input.source_driver !== undefined ? { source_driver: input.source_driver } : {}),
+    ...(input.source_drivers !== undefined ? { source_drivers: input.source_drivers } : {}),
     status: 'pending',
     // 新记录还没投递过：attempt_count 在每次 claim 时递增（见 delivery-lifecycle）
     attempt_count: 0,

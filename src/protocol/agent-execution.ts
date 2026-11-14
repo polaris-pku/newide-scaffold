@@ -99,6 +99,9 @@ export interface RoleFreezePlanInput {
   frozen_at: string;
   max_tool_calls: number;
   routing: { driver_id?: string; profile_id?: string };
+  /** 阶段 3 开关（默认关闭；与预算一起在 Journal init 行冻结）。 */
+  evidence_only?: boolean;
+  buffer_v2?: boolean;
 }
 
 export interface AgentExecutionOptions {

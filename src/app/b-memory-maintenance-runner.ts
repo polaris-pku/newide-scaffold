@@ -7,18 +7,22 @@ import {
   applyUsageFeedback,
   buildContextDeliveryItem,
   buildDriverUsageFeedbackRecords,
+  contextDeliverySourceFields,
   createAgentMemoryScope,
   contextDeliveryId,
   contextDeliveryKey,
+  isBufferSnapshotV2,
   LlmExperienceExtractor,
   LlmSkillPromotion,
   processPendingBuffer,
   promoteExperiencesForAgent,
   resolveMemoryAblationPolicy,
+  sourceDriversLabel,
   type BufferRepository,
   type CallJournalPort,
   type DriverReferencedExperience,
   type ExperienceExtractor,
+  type LearningEvidenceVerifier,
   type LlmClient,
   type MemoryAblation,
   type MemoryDeliveryRepository,
@@ -171,8 +175,19 @@ export interface BMemoryMaintenanceRunnerOptions {
   mode?: BMemoryMaintenanceMode;
   /** When set, completed maintenance rewrites summary.json token_usage for the run. */
   runsRoot?: string;
-  /** 可选提取器注入（默认 LlmExperienceExtractor + 规则版降级）；测试注入失败提取器用。 */
+  /**
+   * 可选提取器注入（默认 LlmExperienceExtractor + 规则版降级）；测试注入失败提取器用。
+   * 注入覆盖时不再自动携带 evidence 核验：由该 extractor 自行决定（测试缝）。
+   */
   extractor?: ExperienceExtractor;
+  /**
+   * v2 学习输入的受控证据核验端口（Journal/evidence ref 的边界、hash 与计数重建）。
+   *
+   * 生产由组合根注入（知道 runs root 的 `RunJournalLearningEvidenceVerifier`）。缺省 =
+   * 未接线：v2 提取会按「证据未核验」降级并留警告，不会把 Buffer 声称的 host_observed
+   * 计数当成事实——静默信任正是阶段 3 审核复现的缺陷。
+   */
+  learningEvidence?: LearningEvidenceVerifier;
   /** 进程内调用留档（B1）：注入后 extract 收尾写 P1 journal；缺省不留档 */
   callJournal?: CallJournalPort;
   /**
@@ -209,7 +224,14 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
   }
 
   private get extractor(): ExperienceExtractor {
-    this.lazyExtractor ??= this.options.extractor ?? new LlmExperienceExtractor(this.options.llm);
+    this.lazyExtractor ??=
+      this.options.extractor ??
+      new LlmExperienceExtractor(
+        this.options.llm,
+        this.options.learningEvidence !== undefined
+          ? { evidence: this.options.learningEvidence }
+          : {},
+      );
     return this.lazyExtractor;
   }
 
@@ -360,11 +382,12 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
       });
     }
 
+    const source = contextDeliverySourceFields(pending.snapshot);
     const item = buildContextDeliveryItem({
       role_id: input.role_id,
       task_id: input.task_id,
       buffer_seq: input.buffer_seq,
-      source_driver: pending.snapshot.source_driver,
+      ...source,
       context_snapshot_ref: pending.snapshot.context_snapshot_ref,
     });
     const submitted = await outbox.submitContextDelivery(item);
@@ -548,25 +571,37 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     // 引用计数——全自动测评中这是置信度增长的唯一真实信号（无人评分时提取
     // 自评不可靠），使真正被反复使用且有效的经验能滚雪球达到 0.95 晋升门槛。
     // best-effort：失败只记入 warnings，不阻断提取/晋升主流程。
+    //
+    // v2 学习输入没有 DriverReturn，也没有任何独立的「经验被用得怎么样」事实：
+    // `role_reflection.memory_used` 是 Role 自己的声明（dependent），把它当成使用效果
+    // 回写就等于让一句自述提高置信度。因此 v2 在这里不做回写，只留一条 warning。
     const usageWarnings: string[] = [];
     let usageFeedbackDetails: UsageFeedbackEntry[] = [];
-    try {
-      const usage = await applyUsageFeedback(
-        this.options.repository,
-        input.role_id,
-        pending.snapshot.driver_return.referenced_experiences,
-      );
-      usageFeedbackDetails = usage.details;
-      if (usage.updated_experiences > 0) {
+    if (isBufferSnapshotV2(pending.snapshot)) {
+      if (pending.snapshot.role_reflection.memory_used.length > 0) {
         usageWarnings.push(
-          `Usage feedback applied to ${usage.updated_experiences} referenced experience(s)` +
-            ` (${usage.skipped_missing} missing skipped).`,
+          'Role-declared memory usage is dependent input only; confidence was not raised from it.',
         );
       }
-    } catch (error) {
-      usageWarnings.push(
-        `Usage feedback write-back skipped: ${error instanceof Error ? error.message : String(error)}`,
-      );
+    } else {
+      try {
+        const usage = await applyUsageFeedback(
+          this.options.repository,
+          input.role_id,
+          pending.snapshot.driver_return.referenced_experiences,
+        );
+        usageFeedbackDetails = usage.details;
+        if (usage.updated_experiences > 0) {
+          usageWarnings.push(
+            `Usage feedback applied to ${usage.updated_experiences} referenced experience(s)` +
+              ` (${usage.skipped_missing} missing skipped).`,
+          );
+        }
+      } catch (error) {
+        usageWarnings.push(
+          `Usage feedback write-back skipped: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
 
     try {
@@ -586,7 +621,9 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
               run_id: input.run_id,
               ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
               call_id: `maintenance:${input.run_id}:${String(input.buffer_seq)}`,
-              source_driver: pending.snapshot.source_driver,
+              source_driver: isBufferSnapshotV2(pending.snapshot)
+                ? sourceDriversLabel(pending.snapshot)
+                : pending.snapshot.source_driver,
               spec: pending.snapshot.task_description,
             },
             extractor: this.extractor,

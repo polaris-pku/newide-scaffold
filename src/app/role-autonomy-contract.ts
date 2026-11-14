@@ -15,8 +15,9 @@
  * - `RoleTerminationError` 只表达**宿主可识别的终止分支**；role 自己 finish(blocked/failed)
  *   也走同一通道，由 coordination 的 `stageFailure` 映射为 `task.error.code`。
  *
- * 边界：本文件不执行 LLM、不碰文件系统；阶段 3 的 evidence-only、Buffer v2 不在本阶段实现，
- * 对应开关在冻结记录里固定为 false，未实现能力不得伪装为可用。
+ * 边界：本文件不执行 LLM、不碰文件系统；阶段 3 的 `evidence_only` / `buffer_v2` 是**冻结开关**
+ * （默认关闭，与预算一起写入 Journal init 行），其派工/学习输入实现在
+ * `src/app/role-learning-input.ts` 与 `src/driver/driver-runtime-invoker.ts`。
  */
 import { z } from 'zod';
 import type { TaskBudget } from '../core';
@@ -44,7 +45,7 @@ import type {
   RoleRoundAppendInput,
 } from '../persistence';
 import type { ToolCallMessage, ToolCallResult, ToolDefinition } from '../memory';
-import type { AgentExecutionResult } from '../protocol/agent-execution';
+import type { AgentExecutionResult, RoleFreezePlanInput } from '../protocol/agent-execution';
 
 // ─────────────────────────────────────────────────────────────
 // 引擎标记与版本
@@ -57,8 +58,28 @@ export type ExecutionEngine = typeof LEGACY_EXECUTION_ENGINE | typeof ROLE_AUTON
 /** 冻结在 Journal `init` 行里的引擎版本；改变 loop 语义时必须升级。 */
 export const ROLE_AUTONOMY_ENGINE_VERSION = 'role-autonomy-v1' as const;
 
-/** 本阶段显式声明未实现的开关：冻结记录里必须为 false，禁止伪装为可用。 */
-export const ROLE_AUTONOMY_UNIMPLEMENTED_SWITCHES = ['evidence_only', 'buffer_v2'] as const;
+/**
+ * 阶段 3 的两个显式开关（都默认关闭，打开需要 NEWIDE_ROLE_AUTONOMY 同时打开）。
+ *
+ * 合法组合只有三种：都不开；只开 evidence_only；evidence_only + buffer_v2。
+ * `buffer_v2` 依赖 `evidence_only`：v2 学习输入的定义就是「没有六字段报告」，
+ * 要求六字段报告同时写 v2 只会把两份互不一致的事实拼在一起。非法组合由选路配置
+ * 构造处显式拒绝，不在 Run 内静默降级。
+ */
+export interface RoleAutonomySwitches {
+  evidence_only: boolean;
+  buffer_v2: boolean;
+}
+
+export const DEFAULT_ROLE_AUTONOMY_SWITCHES: RoleAutonomySwitches = {
+  evidence_only: false,
+  buffer_v2: false,
+};
+
+/** 开关组合的合法性判定（选路配置与冻结记录读回共用同一规则）。 */
+export function isRoleAutonomySwitchCombinationValid(switches: RoleAutonomySwitches): boolean {
+  return switches.buffer_v2 ? switches.evidence_only : true;
+}
 
 // ─────────────────────────────────────────────────────────────
 // 预算
@@ -728,8 +749,8 @@ export interface RoleFrozenPolicy {
   engine: typeof ROLE_AUTONOMY_ENGINE;
   engine_version: string;
   tool_allowlist: RoleToolName[];
-  evidence_only: false;
-  buffer_v2: false;
+  evidence_only: boolean;
+  buffer_v2: boolean;
   budget: RoleFrozenBudget;
   routing: RoleFrozenRouting;
 }
@@ -747,13 +768,16 @@ export interface RoleFrozenPolicyPlan {
   frozen_at: string;
   max_tool_calls: number;
   routing: RoleFrozenRouting;
+  /** 首次进入 execute_agent 时冻结的 stage 3 开关（恢复时从 init 行读回，不随部署变化）。 */
+  evidence_only: boolean;
+  buffer_v2: boolean;
 }
 
 /** 由选路模块构造、交给 journal.appendInit 的完整冻结参数（身份字段由宿主填）。 */
 export interface RoleFreezeInitInput {
   autonomy: true;
-  evidence_only: false;
-  buffer_v2: false;
+  evidence_only: boolean;
+  buffer_v2: boolean;
   max_dispatches: number;
   max_role_rounds: number;
   role_token_budget: number;
@@ -772,12 +796,14 @@ export function buildRoleFreezeInitInput(input: {
   deadline_at: string;
   max_tool_calls?: number;
   routing?: RoleFrozenRouting;
+  evidence_only?: boolean;
+  buffer_v2?: boolean;
   now?: string;
 }): RoleFreezeInitInput {
   return {
     autonomy: true,
-    evidence_only: false,
-    buffer_v2: false,
+    evidence_only: input.evidence_only ?? false,
+    buffer_v2: input.buffer_v2 ?? false,
     max_dispatches: input.limits.max_dispatches,
     max_role_rounds: input.limits.max_role_rounds,
     role_token_budget: input.limits.role_token_budget,
@@ -794,6 +820,9 @@ export function buildRoleFreezeInitInput(input: {
 /**
  * 从 Journal init 行读回冻结策略。缺失引擎/版本/工具授权/上限的旧行按 legacy 解释，
  * 返回 undefined——不得用部署默认值补一份假的冻结记录。
+ *
+ * 阶段 3 起 `evidence_only` / `buffer_v2` 是**冻结值**而不是「未实现开关」：读回时原样
+ * 继承（即使部署默认值后来变了）。只拒绝永远不合法的组合（buffer_v2 依赖 evidence_only）。
  */
 export function roleFrozenPolicyFromJournalInit(
   init: JournalInitEntry | undefined,
@@ -801,7 +830,14 @@ export function roleFrozenPolicyFromJournalInit(
   if (init === undefined) return undefined;
   if (init.engine !== ROLE_AUTONOMY_ENGINE) return undefined;
   if (init.autonomy !== true) return undefined;
-  if (init.evidence_only || init.buffer_v2) return undefined;
+  if (
+    !isRoleAutonomySwitchCombinationValid({
+      evidence_only: init.evidence_only,
+      buffer_v2: init.buffer_v2,
+    })
+  ) {
+    return undefined;
+  }
   if (!Array.isArray(init.tool_allowlist) || init.tool_allowlist.length === 0) return undefined;
   if (init.dispatch_timeout_ms === undefined) return undefined;
   const limits: RoleBudgetLimits = {
@@ -819,8 +855,9 @@ export function roleFrozenPolicyFromJournalInit(
     engine: ROLE_AUTONOMY_ENGINE,
     engine_version: init.engine_version ?? 'unknown',
     tool_allowlist: init.tool_allowlist as RoleToolName[],
-    evidence_only: false,
-    buffer_v2: false,
+    // 阶段 3：开关从冻结记录读回，恢复不随部署默认值切换（同一 Run 内数据格式解释不变）。
+    evidence_only: init.evidence_only,
+    buffer_v2: init.buffer_v2,
     budget: {
       limits,
       deadline_at: init.deadline_at,
@@ -937,7 +974,7 @@ export interface RoleAutonomyEngineRequest {
   /** 任务请求预算（TaskBudget）；与部署覆盖一起由选路冻结，engine 不再自行推导。 */
   task_budget?: TaskBudget;
   /** stage 选路算出的冻结计划；新 Run 首次执行时原样落 Journal，避免二次合并。 */
-  freeze_plan?: RoleFrozenPolicyPlan;
+  freeze_plan?: RoleFreezePlanInput;
   signal?: AbortSignal;
   on_driver_event?: (event: DriverStreamEvent) => void;
 }

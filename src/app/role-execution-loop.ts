@@ -28,6 +28,7 @@ import type {
   RoleLoopOutcome,
 } from './role-autonomy-contract';
 import {
+  isRoleAutonomySwitchCombinationValid,
   resolveUnresolvedDispatchIds,
   ROLE_TOOL_NAMES,
   RoleTerminationError,
@@ -401,14 +402,21 @@ function uniqueIds(ids: readonly string[]): string[] {
 }
 
 /**
- * 冻结策略自检：引擎标记/未实现开关/工具授权/预算上限非法时按宿主失败终止，
+ * 冻结策略自检：引擎标记/开关组合/工具授权/预算上限非法时按宿主失败终止，
  * 不得用部署默认值补一份假冻结记录（RD-SEL-03/05）。
  */
 function validatePolicy(policy: RoleFrozenPolicy): void {
   const problems: string[] = [];
   if (policy.engine !== 'role_autonomy') problems.push('engine');
-  if (policy.evidence_only !== false) problems.push('evidence_only');
-  if (policy.buffer_v2 !== false) problems.push('buffer_v2');
+  // 阶段 3：两个开关都已实现，但仍只接受合法组合（buffer_v2 依赖 evidence_only）。
+  if (
+    !isRoleAutonomySwitchCombinationValid({
+      evidence_only: policy.evidence_only,
+      buffer_v2: policy.buffer_v2,
+    })
+  ) {
+    problems.push('buffer_v2_without_evidence_only');
+  }
   if (!Array.isArray(policy.tool_allowlist) || policy.tool_allowlist.length === 0) {
     problems.push('tool_allowlist');
   } else {

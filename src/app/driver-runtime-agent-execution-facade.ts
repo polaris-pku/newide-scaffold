@@ -1192,6 +1192,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         result = await invokeRuntime();
       }
       invocation.execution = result.execution;
+      // legacy/Council 路径必须拿到六字段报告；missing 只可能来自被错误标记为
+      // evidence-only 的调用，如实失败而不是伪造一份空报告。
+      if (!result.report) {
+        throw new Error('driver invocation produced no six-field report');
+      }
       return result.report;
     } catch (error) {
       if (invocation.signal?.aborted) invocation.abortObserved = true;

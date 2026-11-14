@@ -16,7 +16,7 @@ import type {
   AgentHandle,
   AgentMetrics,
   BufferMeta,
-  BufferSnapshot,
+  BufferSnapshotLike,
   AgentContextSnapshot,
   ExperienceRecord,
   PersonaDef,
@@ -60,7 +60,7 @@ class ScopedAgentMemory implements AgentMemoryScope {
   }
 
   saveBufferSnapshot(
-    snapshot: BufferSnapshot,
+    snapshot: BufferSnapshotLike,
     agentContext?: AgentContextSnapshot,
   ): Promise<SaveBufferResult> {
     return this.buffer.saveBufferSnapshot(this.role_id, snapshot, agentContext);

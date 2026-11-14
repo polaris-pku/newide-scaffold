@@ -45,7 +45,7 @@ import type { MaintenanceRunStore } from '../ports/maintenance-run-store';
 import type { ExperienceExtractor } from '../ports/experience-extractor';
 import type {
   AgentContextSnapshot,
-  BufferSnapshot,
+  BufferSnapshotLike,
   ContextDeliveryItem,
   DeliveryStatus,
 } from '../schemas';
@@ -143,12 +143,12 @@ async function waitFor(condition: () => boolean, label: string): Promise<void> {
 // ════════════════════════════════════════════════════════
 
 type ExtractHandler = (
-  snapshot: BufferSnapshot,
+  snapshot: BufferSnapshotLike,
   agentContext: AgentContextSnapshot | undefined,
 ) => Promise<ExtractionOutput>;
 
 interface ScriptedExtractor extends ExperienceExtractor {
-  calls: Array<{ snapshot: BufferSnapshot; agentContext: AgentContextSnapshot | undefined }>;
+  calls: Array<{ snapshot: BufferSnapshotLike; agentContext: AgentContextSnapshot | undefined }>;
   /** 换掉这一次的产出（异常也从这里抛） */
   set(handler: ExtractHandler): void;
 }
@@ -336,7 +336,7 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
       let ref = deliverOptions.contextRef;
       if (!deliverOptions.bareDelivery) {
         const memory = createAgentMemoryScope(repository, buffer, role);
-        const snapshot: BufferSnapshot = {
+        const snapshot: BufferSnapshotLike = {
           task_id: taskId,
           task_description: 'Consume context downstream.',
           driver_return: {

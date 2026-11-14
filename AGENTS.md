@@ -191,6 +191,8 @@ Windows 上这些 harness **必须**从 Ubuntu WSL 跑（README 的 "F Eval Real
 | `NEWIDE_MAINTENANCE_INTERVAL_MS` | 退休/技能学习调度周期（默认 1h） |
 | `NEWIDE_B_AUTO_RETIRE` / `NEWIDE_B_AUTO_LEARN` | 该 tick 是真动手还是只出报告（retire 默认关，learn 默认开） |
 | `NEWIDE_B_DELIVERY_DRAIN_INTERVAL_MS` | 离线维护抽干周期（默认同 maintenance 间隔） |
+| `NEWIDE_ROLE_AUTONOMY` | 阶段 2 role 自主循环开关；默认关，只对全新 solo Run 生效（Council/主动 Council/Mailbox/RTL 走旧路） |
+| `NEWIDE_DRIVER_EVIDENCE_ONLY` / `NEWIDE_BUFFER_V2` | 阶段 3：evidence-only 派工（不要求六字段报告）+ Buffer v2 学习输入；都默认关，依赖 `NEWIDE_ROLE_AUTONOMY=1`，且 `BUFFER_V2` 依赖 `EVIDENCE_ONLY`（非法组合启动即拒绝） |
 
 CLI 会把 `process.env` 叠在 `.env.local` 之上，**shell 里已导出的变量优先**。
 
@@ -332,7 +334,7 @@ pnpm vitest run --project default <file>  # 跳过 pg-serial
 | --- | --- |
 | 摸清全局 | `README.md`（对外）→ `docs/architecture/系统架构-模块划分与依赖关系.md`（本地） |
 | 看当前设计方向 | `design/role-driver-rebalance.md`（v3.0 现行设计稿，**未实现**；v2.0 存档同目录；§12 是 2026-11-13 阶段 0 核对记录；`design/` 为本地目录，不入 git） |
-| 实施 role/driver 职责完善 | `docs/plans/role-driver-autonomy-development-plan.md`（2026-11-14，**阶段 0–1 已验收；阶段 2 复审修复链完成 + 第二轮精简/unknown 非成功收束修复 + 最后一轮局部精简完成、待用户审核/验收；阶段 3–5 未开始**；各阶段的目标、交付物与验收门槛，§6 末为 2026-11-14 三轮精简记录）→ 阶段 0 契约 `docs/contracts/role-driver-autonomy.md`（含 §11 阶段 1/2 实现与修复记录；**阶段 2 精简后 `RD-FIN-03` 重写为「Role 语义判断 + 宿主事实校验」**，`RD-IMP-14` 为精简重构的唯一实现入口/退役/保留项与残余风险，`RD-IMP-16` 为最后一轮局部精简：JSON 读写 helper、屏障映射统一、重复回合预算删除、冻结计划直传） + 测试矩阵 `docs/contracts/role-driver-autonomy-test-matrix.md`（含 §13/§14 执行记录，§14.14/§14.15/§14.16 为 2026-11-14 三轮精简回归） + 基线 `docs/reports/role-driver-autonomy-baseline-2026-11-13.md` + 精简依据 `docs/reports/role-driver-phase2-redundancy-review-2026-11-14.md`、`docs/reports/role-driver-phase2-further-simplification-report-2026-11-14.md` 与 `docs/reports/role-driver-phase2-final-simplification-report-2026-11-14.md` |
+| 实施 role/driver 职责完善 | `docs/plans/role-driver-autonomy-development-plan.md`（2026-11-14，**阶段 0–1 已验收；阶段 2 复审/精简完成、待用户审核；阶段 3 审核修复完成、待用户验收；阶段 4–5 未开始**；各阶段的目标、交付物与验收门槛，§6 末为 2026-11-14 三轮精简记录，§7 为阶段 3 目标/开发/审核修复记录）→ 阶段 0 契约 `docs/contracts/role-driver-autonomy.md`（含 §11 阶段 1/2 实现与修复记录、`RD-IMP-17` 阶段 3 evidence-only/Buffer v2 落点、`RD-IMP-18` 阶段 3 审核修复（结束状态 + 离线证据核验）；**阶段 2 精简后 `RD-FIN-03` 重写为「Role 语义判断 + 宿主事实校验」**，`RD-IMP-14` 为精简重构的唯一实现入口/退役/保留项与残余风险，`RD-IMP-16` 为最后一轮局部精简） + 测试矩阵 `docs/contracts/role-driver-autonomy-test-matrix.md`（含 §13/§14 阶段 1/2 执行记录与 §15 阶段 3 记录，§15.4 为审核修复执行记录） + 基线 `docs/reports/role-driver-autonomy-baseline-2026-11-13.md` + 阶段 3 实施报告 `docs/reports/role-driver-phase3-implementation-2026-11-14.md` + 阶段 3 审核报告/修复报告 `docs/reports/role-driver-phase3-review-2026-11-14.md`、`docs/reports/role-driver-phase3-review-fix-2026-11-14.md` + 精简依据 `docs/reports/role-driver-phase2-redundancy-review-2026-11-14.md`、`docs/reports/role-driver-phase2-further-simplification-report-2026-11-14.md` 与 `docs/reports/role-driver-phase2-final-simplification-report-2026-11-14.md` |
 | 查本地文档索引 / 已删材料 | `docs/README.md`（§9 已知问题）+ `.newide/docs-backup-*.zip`（删除前快照） |
 | 改协调/游标 | `src/coordination/README.md` → `src/coordination/task-execution-loop.ts` |
 | 改 Driver | `src/driver/README.md`（含 ADP 状态映射表与未知态语义） |

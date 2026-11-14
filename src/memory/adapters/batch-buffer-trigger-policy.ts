@@ -8,7 +8,7 @@
  *
  * 任一条件满足即触发提取。
  */
-import type { BufferMeta, BufferSnapshot } from '../schemas';
+import { isBufferSnapshotV2, type BufferMeta, type BufferSnapshotLike } from '../schemas';
 import type { BufferTriggerPolicy } from '../ports/buffer-trigger-policy';
 
 export class BatchBufferTriggerPolicy implements BufferTriggerPolicy {
@@ -17,7 +17,7 @@ export class BatchBufferTriggerPolicy implements BufferTriggerPolicy {
     private readonly maxStalenessMs = 6 * 60 * 60 * 1000,
   ) {}
 
-  shouldExtract(meta: BufferMeta, pending: BufferSnapshot[]): boolean {
+  shouldExtract(meta: BufferMeta, pending: BufferSnapshotLike[]): boolean {
     // 1. 容量门控
     if (meta.pending_count >= this.batchSize) {
       return true;
@@ -34,9 +34,11 @@ export class BatchBufferTriggerPolicy implements BufferTriggerPolicy {
       return true;
     }
 
-    // 3. 优先级门控：存在 effectiveness = "ineffective" 的报告
+    // 3. 优先级门控：存在 effectiveness = "ineffective" 的报告（v2 没有六字段报告）
     const hasIneffective = pending.some(
-      (snapshot) => snapshot.driver_return?.effectiveness === 'ineffective',
+      (snapshot) =>
+        !isBufferSnapshotV2(snapshot) &&
+        snapshot.driver_return?.effectiveness === 'ineffective',
     );
     if (hasIneffective) {
       return true;

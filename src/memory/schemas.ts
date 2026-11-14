@@ -226,6 +226,199 @@ export const BufferSnapshotSchema = z.object({
 });
 export type BufferSnapshot = z.infer<typeof BufferSnapshotSchema>;
 
+// ═══════════════════════════════════════════
+//  Buffer v2（阶段 3）：执行事实 + Role 反思的学习输入
+// ═══════════════════════════════════════════
+
+/**
+ * Buffer v2 的契约族标识（沿用「schema 标识以 .v1 结尾」的仓库约定）。
+ *
+ * **版本判别的唯一主键是 `buffer_version`**，不是这个字段：`schema_version` 只说明
+ * 「这是 buffer_snapshot 契约族」，`buffer_version` 才是 v1/v2 的分叉点。
+ * 读取时先看 `buffer_version === 2` 再按 v2 解析、否则按 v1——顺序是正确性要求，
+ * 因为 v1 的 `BufferSnapshotSchema` 是非 strict 的 `z.object`，先按 v1 解析 v2 会把
+ * 未知字段静默 strip 掉而不报错。
+ */
+export const BUFFER_SNAPSHOT_V2_SCHEMA_VERSION = 'newide.buffer_snapshot.v1';
+
+const Sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/i);
+
+/**
+ * 可确定边界的 Journal 前缀引用：`lines` 是参与 hash 的行数（到 finish 行为止），
+ * 后续追加的 reconciled/role_round 行不会改变它，因此已登记的学习输入不会因
+ * Journal 继续追加而失效。`sha256` 是这些解析行的 canonical JSON 行拼接哈希。
+ */
+export const BufferJournalRefSchema = z
+  .object({
+    run_id: z.string().trim().min(1).max(200),
+    /** run 目录内相对路径（当前为 dispatches.jsonl） */
+    path: z.string().trim().min(1).max(1_024),
+    lines: z.number().int().positive(),
+    sha256: Sha256HexSchema,
+  })
+  .strict();
+export type BufferJournalRef = z.infer<typeof BufferJournalRefSchema>;
+
+/** 派工意图（kind 是意图，不能冒充已完成验证）。 */
+export const BufferDispatchKindSchema = z.enum(['investigate', 'execute', 'verify']);
+/** 与 driver 执行契约的 DispatchRecordStatus 同一取值域（unknown 保留为不确定事实）。 */
+export const BufferDispatchStatusSchema = z.enum([
+  'not_executed',
+  'succeeded',
+  'failed',
+  'cancelled',
+  'interrupted',
+  'unknown',
+]);
+export type BufferDispatchStatus = z.infer<typeof BufferDispatchStatusSchema>;
+
+/**
+ * 检查证据的**计数摘要**（不是检查结果本身）。
+ *
+ * `host_observed_passed` 只统计「宿主观察到、数据完整、命令级退出码 0」的检查；
+ * runner 进程退出码从不进入这里，driver 自报的通过也不进入这里。
+ */
+export const BufferDispatchChecksSchema = z
+  .object({
+    host_observed_passed: z.number().int().min(0),
+    host_observed_failed: z.number().int().min(0),
+    driver_reported: z.number().int().min(0),
+    missing: z.number().int().min(0),
+  })
+  .strict();
+
+/** 一次派工的摘要（原始证据仍在 Journal/evidence 侧车，这里只留引用与计数）。 */
+export const BufferDispatchSummarySchema = z
+  .object({
+    dispatch_id: z.string().trim().min(1).max(200),
+    kind: BufferDispatchKindSchema,
+    status: BufferDispatchStatusSchema,
+    /** 该派工实际使用的 driver（多来源时用于还原 source_drivers） */
+    driver_id: z.string().trim().min(1).max(200).optional(),
+    evidence_ref: z.object({ path: z.string().min(1), sha256: Sha256HexSchema }).optional(),
+    checks: BufferDispatchChecksSchema,
+  })
+  .strict();
+export type BufferDispatchSummary = z.infer<typeof BufferDispatchSummarySchema>;
+
+/**
+ * Role 声明/宿主观察到的记忆使用情况。
+ *
+ * `via='auto_recall'|'query'` 都是**宿主实际交付给 Role** 的记忆（宿主观察事实）；
+ * 它们只是「这次任务里出现过」的 dependent 输入，不能直接提高经验的验证置信度。
+ */
+export const BufferMemoryUsedEntrySchema = z
+  .object({
+    kind: z.enum(['experience', 'skill', 'persona']),
+    id: z.string().trim().min(1),
+    via: z.enum(['auto_recall', 'query']),
+  })
+  .strict();
+export type BufferMemoryUsedEntry = z.infer<typeof BufferMemoryUsedEntrySchema>;
+
+/** Role 对任务要求满足情况的陈述（与 finish 的 verification 同义；只作 dependent 输入）。 */
+export const BufferRoleVerificationSchema = z
+  .object({
+    requirement: z.string().trim().min(1).max(2_000),
+    outcome: z.enum(['passed', 'failed', 'not_run']),
+    dispatch_ids: z.array(z.string().trim().min(1).max(200)).max(32),
+    note: z.string().trim().max(2_000).optional(),
+  })
+  .strict();
+export type BufferRoleVerification = z.infer<typeof BufferRoleVerificationSchema>;
+
+/** Role 接受的结束状态（与 RoleFinishStatus 同一取值域；不是从摘要文本推断出来的）。 */
+export const BufferRoleStatusSchema = z.enum(['completed', 'blocked', 'failed']);
+export type BufferRoleStatus = z.infer<typeof BufferRoleStatusSchema>;
+
+/** Role 反思：summary/reflection 是 Role 的语义结论，verification 是其证据陈述。 */
+export const BufferRoleReflectionSchema = z
+  .object({
+    /**
+     * 本次 Role 结束状态：必须来自**已接受的 finish.status**，不从 summary 文本推断。
+     *
+     * 兼容：阶段 3 早期写下的 v2 没有该字段（缺省 = 状态未知），读取方不得把它当成
+     * completed；新写入必须明确提供。离线验证能用受控 Journal finish 行补回时按补回值处理
+     * 并留诊断，不能凭空补一个状态。
+     */
+    status: BufferRoleStatusSchema.optional(),
+    summary: z.string().max(8_000),
+    reflection: z.string().max(8_000),
+    unresolved: z.array(z.string().max(2_000)).max(32),
+    verification: z.array(BufferRoleVerificationSchema).max(32),
+    memory_used: z.array(BufferMemoryUsedEntrySchema).max(256),
+  })
+  .strict();
+export type BufferRoleReflection = z.infer<typeof BufferRoleReflectionSchema>;
+
+/**
+ * Buffer v2 — 证据与 Role 反思驱动的学习输入（不要求 Driver 六字段报告）。
+ *
+ * 与 v1 的关系是**并存**，不是改写：v1 记录原样可读、不原地重写；v2 是判别联合的另一支。
+ * 零派工任务是合法记录：`dispatches: []`、`source_drivers: []`（或 `null`）、
+ * 不伪造 driver、不伪造执行事实、不伪造六字段报告。`source_driver` 只为兼容保留，
+ * 不是 v2 的来源权威（来源权威是 `source_drivers`）。
+ */
+export const BufferSnapshotV2Schema = z.object({
+  /** 契约族标识；版本判别见 `buffer_version` */
+  schema_version: z.literal(BUFFER_SNAPSHOT_V2_SCHEMA_VERSION),
+  /** 版本判别主键 */
+  buffer_version: z.literal(2),
+  task_id: z.string(),
+  task_description: z.string(),
+  user_rating: UserRatingSchema.optional(),
+  source_task_id: z.string(),
+  /** 可确定边界的 Journal 前缀引用与 hash */
+  journal_ref: BufferJournalRefSchema,
+  /** 派工摘要（含零派工空数组） */
+  dispatches: z.array(BufferDispatchSummarySchema).max(256),
+  /** Role 的计划文本（可选；没有就是没有） */
+  plan: z.string().max(8_000).optional(),
+  /** Role 反思 + 记忆使用情况 */
+  role_reflection: BufferRoleReflectionSchema,
+  /**
+   * 来源 Driver 集合：零派工用空列表 `[]` 或 `null`（契约二选一，不填虚构身份）；
+   * 多次派工按 dispatch 顺序去重。
+   */
+  source_drivers: z.array(z.string().min(1)).nullable(),
+  /** 兼容字段：只用于读取旧消费者/人读；不承担 v2 来源权威 */
+  source_driver: z.string().optional(),
+  context_snapshot_ref: z.string().optional(),
+  received_at: z.iso.datetime(),
+  retry_count: z.number().int().min(0),
+  extraction_status: ExtractionStatusSchema,
+});
+export type BufferSnapshotV2 = z.infer<typeof BufferSnapshotV2Schema>;
+
+/** v1/v2 并存的读取类型：消费者必须按 `buffer_version` 分支。 */
+export type BufferSnapshotLike = BufferSnapshot | BufferSnapshotV2;
+
+/** 是不是 v2 学习输入（判别主键是 `buffer_version`）。 */
+export function isBufferSnapshotV2(
+  snapshot: BufferSnapshotLike,
+): snapshot is BufferSnapshotV2 {
+  return (snapshot as { buffer_version?: unknown }).buffer_version === 2;
+}
+
+/**
+ * 读取任意分区里的 Buffer 快照：**先判 `buffer_version` 再解析**。
+ *
+ * 顺序不能反：v1 `BufferSnapshotSchema` 是非 strict 对象，先按 v1 解析 v2 会静默
+ * strip 掉 v2 字段并返回一条「看起来正常」的 v1 记录。未知版本（未来 v3）显式拒绝，
+ * 不降级成 v1。
+ */
+export function parseBufferSnapshot(value: unknown): BufferSnapshotLike {
+  const version =
+    value !== null && typeof value === 'object'
+      ? (value as { buffer_version?: unknown }).buffer_version
+      : undefined;
+  if (version === undefined) return BufferSnapshotSchema.parse(value);
+  if (version === 2) return BufferSnapshotV2Schema.parse(value);
+  throw new Error(
+    `unsupported BufferSnapshot buffer_version=${String(version)}; this build reads v1 (absent) and v2`,
+  );
+}
+
 /** 缓冲区元数据 */
 export const BufferMetaSchema = z.object({
   /** 关联的 Agent role_id */
@@ -996,8 +1189,18 @@ export const ContextDeliveryItemSchema = z.object({
   report_ref: z.string(),
   /** AgentContextSnapshot 在 Buffer 中的文件名；缺失表示本次没有上下文快照 */
   context_snapshot_ref: z.string().optional(),
-  /** 执行该任务的 Driver 标识 */
-  source_driver: z.string(),
+  /**
+   * Buffer 契约版本：缺席 = v1（旧数据语义），2 = v2 学习输入。
+   * 下游消费者据此决定读取 v1 的 DriverReturn 还是 v2 的执行事实 + Role 反思。
+   */
+  buffer_version: z.number().int().positive().optional(),
+  /**
+   * 来源 Driver 标识（v1 必填的兼容字段）。
+   * v2 零派工任务没有 driver，这里可以缺席——来源权威是 `source_drivers`。
+   */
+  source_driver: z.string().optional(),
+  /** v2 来源 Driver 集合：零派工为 `[]` 或 `null`，不虚构身份 */
+  source_drivers: z.array(z.string()).nullable().optional(),
   /** 契约版本；下游据此判断自己能不能消费这条 */
   schema_version: z.string(),
   ...lifecycleRecordFields,

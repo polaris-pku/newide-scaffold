@@ -109,10 +109,39 @@ describe('buildRoleAutonomySelectionConfig', () => {
     expect(buildRoleAutonomySelectionConfig({}, { wired: true })).toEqual({
       enabled: false,
       wired: true,
+      switches: { evidence_only: false, buffer_v2: false },
     });
     expect(() =>
       buildRoleAutonomySelectionConfig({ NEWIDE_ROLE_MAX_DISPATCHES: '0' }, { wired: true }),
     ).toThrow('NEWIDE_ROLE_MAX_DISPATCHES');
+  });
+
+  it('parses stage 3 switches and rejects illegal combinations at startup', () => {
+    expect(
+      buildRoleAutonomySelectionConfig(
+        {
+          NEWIDE_ROLE_AUTONOMY: '1',
+          NEWIDE_DRIVER_EVIDENCE_ONLY: '1',
+          NEWIDE_BUFFER_V2: '1',
+        },
+        { wired: true },
+      ).switches,
+    ).toEqual({ evidence_only: true, buffer_v2: true });
+    expect(() =>
+      buildRoleAutonomySelectionConfig({ NEWIDE_BUFFER_V2: '1' }, { wired: true }),
+    ).toThrow('require NEWIDE_ROLE_AUTONOMY=1');
+    expect(() =>
+      buildRoleAutonomySelectionConfig(
+        { NEWIDE_ROLE_AUTONOMY: '1', NEWIDE_BUFFER_V2: '1' },
+        { wired: true },
+      ),
+    ).toThrow('NEWIDE_BUFFER_V2 requires NEWIDE_DRIVER_EVIDENCE_ONLY=1');
+    expect(() =>
+      buildRoleAutonomySelectionConfig(
+        { NEWIDE_ROLE_AUTONOMY: '1', NEWIDE_DRIVER_EVIDENCE_ONLY: 'maybe' },
+        { wired: true },
+      ),
+    ).toThrow('NEWIDE_DRIVER_EVIDENCE_ONLY');
   });
 });
 

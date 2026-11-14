@@ -16,6 +16,9 @@
  *   祖先链只读（peek），预算余额与原 deadline 继承、不因 restart 重置。
  * - 本文件不做选路（选路在 role-autonomy-selection.ts，stage executor 调用）；不写
  *   coordination 终态，也不改 Gate/Deliver。
+ * - 阶段 3（默认关闭）：冻结策略的 `evidence_only` 传给 driver invoker 作为派工 prompt 分支；
+ *   `buffer_v2` 时把 finish 后的执行事实 + Role 反思交给 `role-learning-input.ts` 落 Buffer v2
+ *   并在线登记一条 Context Delivery（不在本文件做经验提取）。
  *
  * 依赖注入：预算控制器 / finish 校验器 / loop 本体通过工厂注入，因此本文件不 import
  * 它们的实现模块，避免与并行开发互相耦合；真实实现由组合根装配。
@@ -71,6 +74,7 @@ import {
   repositoryRetrieveMemoryForTask,
   AgentQueryMemoryTool,
   type AgentTaskRequest,
+  type BufferMemoryUsedEntry,
   type BufferRepository,
   type EmbeddingProvider,
   type MemoryRepository,
@@ -92,6 +96,7 @@ import {
 } from '../coordinator/workspace-change-detector';
 import {
   buildRoleFreezeInitInput,
+  isRoleAutonomySwitchCombinationValid,
   resolveRolePolicyBudget,
   resolveUnresolvedDispatchIds,
   roleFrozenPolicyFromJournalInit,
@@ -128,6 +133,12 @@ import {
   type RoleBudgetFacts,
 } from './role-autonomy-budget';
 import { armAbortDeadline } from './role-deadline';
+import {
+  buildRoleLearningInput,
+  persistRoleLearningInput,
+  type RoleLearningInputDeps,
+  type RoleLearningInputWriteResult,
+} from './role-learning-input';
 
 export interface RoleAutonomyEngineDeps {
   runs_root: string;
@@ -151,6 +162,11 @@ export interface RoleAutonomyEngineDeps {
   budget_overrides?: RoleBudgetOverrides;
   routing?: RoleFrozenRouting;
   clock?: () => Date;
+  /**
+   * 阶段 3 在线学习输入登记端口（组合根接到 Context Delivery outbox）。
+   * 只负责登记，不做经验提取；缺省时 Buffer 仍落盘，诊断里记 registration_error。
+   */
+  learning_input?: RoleLearningInputDeps;
   /** 测试/故障注入用 IO（默认 Node 实现）。 */
   journal_io?: DispatchJournalIo;
 }
@@ -407,6 +423,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       return this.resultFromRecoveredFinish(
         input,
         runDir,
+        journal,
+        policy,
         fold.finish,
         currentDispatches,
         artifacts,
@@ -467,7 +485,10 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
         return observation;
       },
     };
-    const memoryPort = this.createMemoryPort(input);
+    // 宿主实际交付给 Role 的记忆（召回/查询结果）。它是 host-observed 的使用情况，
+    // 与 Role 自述区分开：写进 v2 学习输入，但不据此提高记忆置信度。
+    const memoryUsed: BufferMemoryUsedEntry[] = [];
+    const memoryPort = this.createMemoryPort(input, memoryUsed);
 
     const outcome = await this.deps.run_loop({
       llm: this.createLlmPort(),
@@ -504,6 +525,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     });
 
     const usage = outcome.usage;
+    // 学习输入的派工摘要要在 loop 之后重新折叠：入口快照只有本 Run 开始前的记录，
+    // loop 期间新写的 accepted/settled 行不在里面。
+    const finalRecords = (await this.foldOrTerminate(journal, 'current')).records;
     const finalArtifacts = await this.collectFinalArtifacts(input, workspaceBefore, artifactState);
     await this.writeArtifactIndex(runDir, finalArtifacts);
     // 只带本 Run 自己的回执错误；并发/后续 Run 的错误不会串进这份 transcript。
@@ -521,6 +545,11 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       // 未收束的 unknown dispatch 用独立原因码表达（RD-TRM-01 的
       // `dispatch_unknown_unresolved`）；Task/Run 状态仍由 C 层保持 failed。
       const unresolved = outcome.unresolved_dispatches;
+      // 失败/阻塞的 finish 也是一条真实执行事实：buffer_v2 打开时同样登记为学习输入，
+      // 让离线提取能产出「负经验」而不是只在成功路径学习。登记失败不掩盖终止原因。
+      const learningInput = policy.buffer_v2
+        ? await this.persistLearningInput(input, runDir, journal, outcome, memoryUsed, finalRecords)
+        : undefined;
       throw new RoleTerminationError({
         code:
           unresolved.length > 0
@@ -539,11 +568,70 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
             dispatch_id: dispatch.dispatch_id,
             status: dispatch.status,
           })),
+          ...(learningInput !== undefined ? { learning_input: learningInput } : {}),
         },
       });
     }
 
-    return this.completedResult(input, outcome, transcript, usage, finalArtifacts);
+    return this.completedResult(
+      input,
+      runDir,
+      journal,
+      policy,
+      outcome,
+      transcript,
+      usage,
+      finalArtifacts,
+      finalRecords,
+      memoryUsed,
+    );
+  }
+
+  /**
+   * 阶段 3：把一次 role finish 变成 Buffer v2 学习输入（落盘 + 在线登记）。
+   *
+   * 只做登记，不做提取；任何失败都转成可诊断事实而不是终止原因（学习输入不该让一个
+   * 已经达成的执行结果变成失败）。journal_read 在这里现读：前缀 hash 必须覆盖到 finish 行。
+   */
+  private async persistLearningInput(
+    input: RoleAutonomyEngineRequest,
+    runDir: string,
+    journal: RunDispatchJournal,
+    outcome: RoleLoopOutcome,
+    memoryUsed: readonly BufferMemoryUsedEntry[],
+    records: readonly DispatchRecord[],
+  ): Promise<RoleLearningInputWriteResult | { buffer_version: 2; error: string }> {
+    try {
+      const journalRead = await journal.read();
+      const snapshot = buildRoleLearningInput({
+        task: {
+          task_id: input.task_id,
+          run_id: input.run_id,
+          role_id: input.role_id,
+          task_description: input.instruction,
+          ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+        },
+        outcome,
+        records,
+        journal_read: journalRead,
+        memory_used: memoryUsed,
+      });
+      return await persistRoleLearningInput({
+        run_dir: runDir,
+        role_id: input.role_id,
+        task_id: input.task_id,
+        run_id: input.run_id,
+        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+        snapshot,
+        deps: this.deps.learning_input ?? {},
+        buffer_repository: this.deps.buffer_repository,
+      });
+    } catch (error) {
+      return {
+        buffer_version: 2,
+        error: `learning input was not persisted: ${errorMessage(error)}`,
+      };
+    }
   }
 
   // ── 冻结与恢复 ────────────────────────────────────────────
@@ -625,10 +713,23 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     const deadlineAt = inherited?.budget.deadline_at ?? plan!.deadline_at;
     const routing = inherited?.routing ?? plan!.routing;
     const maxToolCalls = inherited?.budget.max_tool_calls ?? plan?.max_tool_calls;
+    // 阶段 3 开关与预算同源冻结：新 Run 取选路计划，继承链取祖先冻结值（恢复不切换）。
+    const evidenceOnly = inherited?.evidence_only ?? plan!.evidence_only;
+    const bufferV2 = inherited?.buffer_v2 ?? plan!.buffer_v2;
+    if (!isRoleAutonomySwitchCombinationValid({ evidence_only: evidenceOnly, buffer_v2: bufferV2 })) {
+      throw new RoleTerminationError({
+        code: 'host_failed',
+        actor: 'host',
+        message: 'buffer_v2 requires evidence_only in the frozen role autonomy policy',
+        details: { reason: 'role_switch_invalid', evidence_only: evidenceOnly, buffer_v2: bufferV2 },
+      });
+    }
     const freezeInput = buildRoleFreezeInitInput({
       limits,
       deadline_at: deadlineAt,
       routing,
+      evidence_only: evidenceOnly,
+      buffer_v2: bufferV2,
       ...(maxToolCalls !== undefined ? { max_tool_calls: maxToolCalls } : {}),
     });
     try {
@@ -652,8 +753,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       engine: 'role_autonomy',
       engine_version: freezeInput.engine_version,
       tool_allowlist: freezeInput.tool_allowlist,
-      evidence_only: false,
-      buffer_v2: false,
+      evidence_only: evidenceOnly,
+      buffer_v2: bufferV2,
       budget: {
         limits,
         deadline_at: deadlineAt,
@@ -668,7 +769,14 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
    * 缺省时用 {@link resolveRolePolicyBudget}（部署覆盖 + TaskBudget 的唯一入口）。
    */
   private resolveBudgetPlan(input: RoleAutonomyEngineRequest): RoleFrozenPolicyPlan | undefined {
-    if (input.freeze_plan !== undefined) return input.freeze_plan;
+    if (input.freeze_plan !== undefined) {
+      // 选路计划是权威；直接调用者/旧测试夹具没带阶段 3 开关时按关闭解释。
+      return {
+        ...input.freeze_plan,
+        evidence_only: input.freeze_plan.evidence_only ?? false,
+        buffer_v2: input.freeze_plan.buffer_v2 ?? false,
+      };
+    }
     const resolved = resolveRolePolicyBudget({
       overrides: this.deps.budget_overrides ?? {},
       ...(input.task_budget !== undefined ? { task_budget: input.task_budget } : {}),
@@ -684,6 +792,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       frozen_at: frozenAt,
       max_tool_calls: resolved.max_tool_calls,
       routing: this.deps.routing ?? this.defaultRouting(input),
+      // 直接调用 engine（无选路计划）的调用者拿不到部署开关：默认关闭，不猜。
+      evidence_only: false,
+      buffer_v2: false,
     };
   }
 
@@ -928,6 +1039,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
   private async resultFromRecoveredFinish(
     input: RoleAutonomyEngineRequest,
     runDir: string,
+    journal: RunDispatchJournal,
+    policy: RoleFrozenPolicy,
     finish: JournalFinishEntry,
     records: readonly DispatchRecord[],
     artifacts: readonly ArtifactRef[],
@@ -955,17 +1068,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       verification: finish.verification ?? [],
       accepted_at: finish.at,
     };
-    if (finishRecord.status !== 'completed') {
-      throw new RoleTerminationError({
-        code: finishRecord.status === 'blocked' ? 'role_blocked' : 'role_failed',
-        actor: 'role',
-        message: finishRecord.summary,
-        details: { recovered: true, evidence_refs: finishRecord.evidence_refs },
-      });
-    }
-    const transcript = await this.transcriptArtifact(runDir, input);
     const outcome: RoleLoopOutcome = {
-      status: 'completed',
+      status: finishRecord.status,
       finish: finishRecord,
       // finish.summary 就是最终答复：不拿恢复前的旧正文冒充（RD-FIN-01）。
       response: finishRecord.summary,
@@ -981,7 +1085,36 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
         .filter((record) => record.status === 'unknown')
         .map((record) => record.dispatch_id),
     };
-    return this.completedResult(input, outcome, transcript, outcome.usage, artifacts);
+    if (finishRecord.status !== 'completed') {
+      // 恢复到一条 blocked/failed finish：学习输入照样登记（与首次执行同一规则）。
+      const learningInput = policy.buffer_v2
+        ? await this.persistLearningInput(input, runDir, journal, outcome, [], records)
+        : undefined;
+      throw new RoleTerminationError({
+        code: finishRecord.status === 'blocked' ? 'role_blocked' : 'role_failed',
+        actor: 'role',
+        message: finishRecord.summary,
+        details: {
+          recovered: true,
+          evidence_refs: finishRecord.evidence_refs,
+          ...(learningInput !== undefined ? { learning_input: learningInput } : {}),
+        },
+      });
+    }
+    const transcript = await this.transcriptArtifact(runDir, input);
+    // 恢复路径拿不到恢复前的记忆交付事实（不伪造）：memory_used 如实为空。
+    return this.completedResult(
+      input,
+      runDir,
+      journal,
+      policy,
+      outcome,
+      transcript,
+      outcome.usage,
+      artifacts,
+      records,
+      [],
+    );
   }
 
   // ── 端口组装 ──────────────────────────────────────────────
@@ -1009,7 +1142,10 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     };
   }
 
-  private createMemoryPort(input: RoleAutonomyEngineRequest): RoleMemoryPort {
+  private createMemoryPort(
+    input: RoleAutonomyEngineRequest,
+    memoryUsed: BufferMemoryUsedEntry[],
+  ): RoleMemoryPort {
     const scope = createAgentMemoryScope(
       this.deps.repository,
       this.deps.buffer_repository,
@@ -1024,6 +1160,16 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       call_id: createId('call'),
       source_driver: this.deps.driver_for(input.role_id, input.run_id).driver_id,
     };
+    /** 记录宿主实际交给 Role 的记忆（按 kind:id 去重；只作 dependent 输入）。 */
+    const recordMemoryUsed = (
+      kind: BufferMemoryUsedEntry['kind'],
+      id: string,
+      via: BufferMemoryUsedEntry['via'],
+    ): void => {
+      if (id.length === 0) return;
+      if (memoryUsed.some((entry) => entry.kind === kind && entry.id === id)) return;
+      memoryUsed.push({ kind, id, via });
+    };
     return {
       recall: async (_input, signal) => {
         // 自动召回 + Persona 进入 role 首轮上下文（RD-OWN/阶段 2 上下文要求）。
@@ -1035,6 +1181,13 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
             ...(this.deps.embedding ? { embedding: this.deps.embedding } : {}),
           }),
         ]);
+        if (persona !== undefined) {
+          recordMemoryUsed('persona', `${persona.role_id}@v${String(persona.version)}`, 'auto_recall');
+        }
+        for (const skill of retrieval.skills) recordMemoryUsed('skill', skill.id, 'auto_recall');
+        for (const experience of retrieval.experiences) {
+          recordMemoryUsed('experience', experience.id, 'auto_recall');
+        }
         const sections = [
           ...(persona !== undefined ? [renderPersona(persona)] : []),
           renderRecall(retrieval.skills, retrieval.experiences),
@@ -1043,6 +1196,10 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       },
       query: async ({ query, limit }) => {
         const output = await queryTool.execute({ query });
+        for (const skill of output.skills ?? []) recordMemoryUsed('skill', skill.id, 'query');
+        for (const experience of output.experiences ?? []) {
+          recordMemoryUsed('experience', experience.id, 'query');
+        }
         const rendered = renderRecall(output.skills ?? [], output.experiences ?? []);
         const count = (output.skills?.length ?? 0) + (output.experiences?.length ?? 0);
         return {
@@ -1230,6 +1387,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
             : {}),
           call_id: createId('call'),
           source_driver: driver.driver_id,
+          // 阶段 3：evidence-only 分支不要求六字段报告/报告文件；legacy/Council 冻结在
+          // evidence_only=false 时仍走原 converter（既有路径行为不变）。
+          report_mode: policy.evidence_only ? 'evidence_only' : 'six_field',
           driver_context: {
             task_instruction: renderBriefInstruction(brief),
             skills: [],
@@ -1863,13 +2023,23 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     };
   }
 
-  private completedResult(
+  private async completedResult(
     input: RoleAutonomyEngineRequest,
+    runDir: string,
+    journal: RunDispatchJournal,
+    policy: RoleFrozenPolicy,
     outcome: RoleLoopOutcome,
     transcript: ArtifactRef,
     usage: RoleUsage,
     artifacts: readonly ArtifactRef[],
-  ): AgentExecutionResult {
+    records: readonly DispatchRecord[],
+    memoryUsed: readonly BufferMemoryUsedEntry[],
+  ): Promise<AgentExecutionResult> {
+    // 阶段 3：buffer_v2 打开时，把这次 finish 登记成 v2 学习输入（落盘 + 在线登记 Context
+    // Delivery）。只登记、不提取；失败降级为 diagnostics 事实，不把已完成任务报成失败。
+    const learningInput = policy.buffer_v2
+      ? await this.persistLearningInput(input, runDir, journal, outcome, memoryUsed, records)
+      : undefined;
     const withDriverResult = [...outcome.dispatches]
       .reverse()
       .find((dispatch) => dispatch.evidence.driver_run_result_id !== undefined);
@@ -1902,6 +2072,7 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
             violations: dispatch.violations,
           })),
         },
+        ...(learningInput !== undefined ? { learning_input: learningInput } : {}),
       },
       status: 'completed',
       created_at: nowTimestamp(),

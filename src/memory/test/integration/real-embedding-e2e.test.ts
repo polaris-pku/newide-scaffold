@@ -43,6 +43,7 @@ import { LlmExperienceExtractor } from '../../adapters/llm-experience-extractor'
 import { extractBuffer } from '../../services/memory-cycle';
 import { createAgentMemoryScope } from '../../adapters/agent-memory-scope';
 import type { DriverReturn } from '../../schemas';
+import { isBufferSnapshotV2 } from '../../schemas';
 import type { AgentTaskRequest } from '../../agent-types';
 
 // ──────────────────────────────────────────────
@@ -282,7 +283,12 @@ describeE2E('Real Embedding Provider E2E (PG + LiteLLM)', () => {
     // 验证 buffer 快照内容
     const pendingBuf = await fileRepo.getPendingBuffer(roleId, seq);
     expect(pendingBuf?.snapshot.task_id).toBe(task.task_id);
-    expect(pendingBuf?.snapshot.driver_return.summary).toBe(mockDriverReturn.summary);
+    const pendingSnapshot = pendingBuf?.snapshot;
+    expect(
+      pendingSnapshot !== undefined && !isBufferSnapshotV2(pendingSnapshot)
+        ? pendingSnapshot.driver_return.summary
+        : undefined,
+    ).toBe(mockDriverReturn.summary);
 
     // ── 3. 处理 buffer：LlmExperienceExtractor 提取经验 ──
     const llmClient = new LiteLLMClientAdapter('extract-driver-return');

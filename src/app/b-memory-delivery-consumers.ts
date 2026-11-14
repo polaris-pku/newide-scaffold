@@ -58,6 +58,7 @@ import {
   type ContextDeliveryProcessOutcome,
   type ContextDeliveryProcessor,
   type ExperienceExtractor,
+  type LearningEvidenceVerifier,
   type LlmClient,
   type MaintenanceFailure,
   type MaintenanceRun,
@@ -182,8 +183,19 @@ export interface MemoryDeliveryConsumersOptions {
   evidenceStore: BMemoryMaintenanceEvidenceStore;
   /** B 侧文本 LLM：提取器的模型侧依赖；调用失败时提取器自己降级到规则版 */
   llm: LlmClient;
-  /** 提取器覆盖（测试缝）；缺省 LlmExperienceExtractor（内含规则版降级） */
+  /**
+   * 提取器覆盖（测试缝）；缺省 LlmExperienceExtractor（内含规则版降级）。
+   * 注入覆盖时本组合根不再自动包装证据核验：由该 extractor 自行携带 verifier。
+   */
   extractor?: ExperienceExtractor;
+  /**
+   * v2 学习输入的受控证据核验端口（Journal/evidence 边界、hash 与计数重建）。
+   *
+   * 生产由组合根注入（`RunJournalLearningEvidenceVerifier`）；缺省 = 未接线，v2 提取按
+   * 「证据未核验」降级并留警告。Context Delivery worker 与手动提取共用同一个提取器构造，
+   * 不存在「只在一个入口核验」的第二条路径。
+   */
+  learningEvidence?: LearningEvidenceVerifier;
   /**
    * 晋升通道的配置。`min_confidence` 缺省 0.95（与 `DefaultPromotionStrategy` 同值，
    * 两处判据必须一致——对同一条经验给出相反结论的第二个阈值是 bug，不是配置项）。
@@ -258,7 +270,12 @@ export class MemoryDeliveryConsumers {
         ? { max_duration_ms: options.max_duration_ms }
         : {}),
     };
-    const extractor = options.extractor ?? new LlmExperienceExtractor(options.llm);
+    const extractor =
+      options.extractor ??
+      new LlmExperienceExtractor(
+        options.llm,
+        options.learningEvidence !== undefined ? { evidence: options.learningEvidence } : {},
+      );
     const inner = new DefaultContextDeliveryProcessor({
       deliveryRepository: options.deliveryRepository,
       bufferRepository: options.bufferRepository,

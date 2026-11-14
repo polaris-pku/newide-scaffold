@@ -42,6 +42,11 @@ pending Buffer
 
 两个 Processor 没有内置定时器或 worker，调用方需要自行决定何时运行。`ExperienceExtractorProcessor` 处理成功后会把 Buffer 从 `pending` 移到 `processed`；技能晋升独立扫描已经保存的 Experience。
 
+阶段 3 起，role 自主循环（`NEWIDE_ROLE_AUTONOMY=1` + `NEWIDE_DRIVER_EVIDENCE_ONLY=1` +
+`NEWIDE_BUFFER_V2=1`）不再依赖 Driver 六字段报告：在线只把执行事实与 Role 反思写成 **Buffer v2**
+并登记一条 Context Delivery；提取/晋升/演化仍然全部发生在离线维护 worker。v1 数据与 legacy/Council
+路径原样保留（详见下方「Buffer v2 学习输入」）。
+
 ## 快速开始
 
 以下示例使用内存存储和一个确定性的 `ToolCallingClient`，不需要数据库或 API key：
@@ -169,6 +174,44 @@ if (selected) {
 技能晋升候选必须同时满足：`type === 'positive'`、`confidence > 0.95`、尚未设置 `promoted_to`。是否真正生成 Skill 仍由注入的晋升实现决定。
 
 这里的 `SkillPromotionProcessor` 与维护通道里的 **Skill 晋升 Job**（见「Skill 晋升 Job」一节）不是同一套：Processor 是同步的、由调用方在 Buffer 流程里直接调；job 是带 claim/lease、批上限与 run 审计的批量外壳。新接入的调度器应当用 job。
+
+### Buffer v2 学习输入（阶段 3）
+
+`BufferSnapshot`（v1，六字段 `driver_return`）与 `BufferSnapshotV2` 并存，读取时**先看
+`buffer_version === 2`**（`parseBufferSnapshot` / `isBufferSnapshotV2`）：版本判别主键不是
+`schema_version`，且 v1 是非 strict 的 `z.object`，先按 v1 解析 v2 会静默 strip 掉 v2 字段。
+旧数据没有 `buffer_version` → 按 v1 读，不原地重写；未知版本显式拒绝。
+
+v2 的最小字段：`journal_ref {run_id, path, lines, sha256}`（可确定边界的 Journal 前缀引用）、
+`dispatches[]`（dispatch_id/kind/status/driver_id/evidence_ref/checks 计数）、`role_reflection`
+（**status**/summary/reflection/unresolved/verification/memory_used）、`plan?`、`source_drivers`。
+`role_reflection.status`（`completed|blocked|failed`）取自已接受的 `finish.status`，不从摘要文本
+推断；正常 finish 与从 Journal finish 恢复的路径都填。阶段 3 修复前写入的旧 v2 可缺该字段：读取方
+按「状态未知」处理（不默认 completed、不原地重写），离线核验可用受控 Journal finish 补回并留诊断。
+零派工任务是合法记录：`dispatches: []`、`source_drivers: []`（或 `null`）、不伪造 driver/执行事实；
+`source_driver` 只作兼容字段。落点：role 引擎在 `src/app/role-learning-input.ts` 构造并落盘，通过
+`BufferRepository.pending` 队列写入并在 role 名下登记 Context Delivery（同 run_id 恢复不重复写）。
+
+提取器按来源分级（`services/learning-input-grade.ts`，规则版与 LLM 版共用唯一实现）：
+只有「`host_observed` + 数据完整 + 命令级退出码 0」**且经离线证据核验**的检查才算宿主观察到通过；
+Role 的 `verification.passed` 必须引用真实派工与该证据才被支撑，否则按 `role_declared` 上限产出
+经验并留 warning。runner 进程退出码不参与；`role_reflection.memory_used` 是 dependent 输入，**不会**
+直接提高记忆的验证置信度（v2 不做用后置信度回写）。v2 没有 `driver_return`，因此也不生成 Driver
+Feedback。
+
+**结束状态与正负经验**：blocked/failed 的摘要不会仅因非空就变成正经验——正经验只来自 completed 的
+「执行事实 + Role 反思」，或非 completed 结局里**经核验的宿主通过子结果**（只写执行事实，不夹带
+失败陈述）；非成功结局一定产出带结构化状态的负经验，没有可提炼内容时返回空结果。
+
+**离线证据核验（`ports/learning-evidence-verifier.ts`）**：Buffer v2 保存的是引用，消费前必须回
+Journal/evidence 核对——`journal_ref` 必须是契约路径且前缀边界落在 finish 行、按写入端同一算法重算
+hash、受控折叠重建 dispatch 摘要并与 Buffer 的集合/状态/evidence ref/检查计数逐项比对、
+`RunDispatchJournal.readEvidence` 核对每个 evidence 侧车的存在与 sha256。生产实现在
+`src/app/learning-evidence-verifier.ts`，由组合根注入 `BMemoryMaintenanceRunner` 与
+`MemoryDeliveryConsumers` 的默认提取器（Context Delivery worker 与手动提取共用）。`missing`
+（Run/证据已删除）与 `mismatch`（hash/边界/计数不一致）降级为 `role_declared` 并写诊断，保留 Role
+反思、照常归档/ack，不判死信；暂时性存储错误继续抛出走既有重试/死信。没有核验端口时同样降级并留
+warning，绝不默认信任 Buffer 里声称的 host_observed 计数。
 
 **触发策略与降级**：`checkAndExtract` / `checkAndPromote` 在**执行前**用策略端口评估是否触发——`BufferTriggerPolicy`（`BatchBufferTriggerPolicy`：pending ≥3 / 最老 ≥6h / 含 ineffective；`AlwaysExtractPolicy`：无条件）+ `PromotionTriggerPolicy`（`DefaultPromotionTriggerPolicy`：eligible ≥5 / 高信 >0.98 / 距上次 ≥24h）。两个 Processor 均无内置调度器，**触发方是外部调用者**（后台 Worker / 定时器 / 前端主动）。LLM 版提取/晋升/归纳（`LlmExperienceExtractor` / `LlmSkillPromotion` / `LlmPersonaInduction`）内部在 LLM 失败或空结果时**降级到规则版**（`RuleBasedExperienceExtractor` / `ruleBasedSkillPromotion` / `ruleBasedPersonaInduction`），规则版仅作兜底，主线全走 LLM。
 

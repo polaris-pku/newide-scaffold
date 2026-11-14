@@ -7,7 +7,7 @@
 import type {
   AgentContextSnapshot,
   BufferMeta,
-  BufferSnapshot,
+  BufferSnapshotLike,
   UserRating,
 } from '../schemas';
 import type {
@@ -23,7 +23,7 @@ import type {
 import { nowTimestamp } from '../../core';
 
 interface PendingEntry {
-  snapshot: BufferSnapshot;
+  snapshot: BufferSnapshotLike;
   agentContext?: AgentContextSnapshot;
   /** 进入死信的原因（markBufferDeadLetter 时记录） */
   dead_letter_reason?: string;
@@ -64,7 +64,7 @@ export class InMemoryBufferRepository implements BufferRepository {
 
   async saveBufferSnapshot(
     role_id: string,
-    snapshot: BufferSnapshot,
+    snapshot: BufferSnapshotLike,
     agentContext?: AgentContextSnapshot,
   ): Promise<SaveBufferResult> {
     // 与文件实现同一个不变量：分配的 seq 从没被用过。内存实现天然满足——从读 cursor 到
@@ -75,7 +75,7 @@ export class InMemoryBufferRepository implements BufferRepository {
     store.bufferMeta.cursor = seq;
     store.bufferMeta.pending_count += 1;
 
-    const storedSnapshot: BufferSnapshot = agentContext
+    const storedSnapshot: BufferSnapshotLike = agentContext
       ? { ...snapshot, context_snapshot_ref: String(seq) }
       : snapshot;
 

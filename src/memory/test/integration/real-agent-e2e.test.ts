@@ -41,7 +41,8 @@ import { SkillPromotionProcessor } from '../../runtime/skill-promotion-processor
 import { ruleBasedSkillPromotion } from '../../services/skill-promotion';
 import { DriverBridge } from '../../../driver/driver-bridge';
 import { CliDriverRuntime } from '../drivers/cli-driver-runtime';
-import type { BufferSnapshot } from '../../schemas';
+import type { BufferSnapshotLike } from '../../schemas';
+import { isBufferSnapshotV2 } from '../../schemas';
 import type { AgentTaskRequest } from '../../agent-types';
 import type { BufferTriggerPolicy } from '../../ports/buffer-trigger-policy';
 import type { PromotionTriggerPolicy } from '../../ports/promotion-trigger-policy';
@@ -476,7 +477,7 @@ suite('E2E 真实 Agent 循环 (Agent → Driver → Buffer → Extract → PG �
     const reportFile = pendingFiles.find((f) => f.startsWith('report_'));
     if (reportFile) {
       const raw = await readFile(join(bufferDir, 'pending', reportFile), 'utf-8');
-      const snapshot = JSON.parse(raw) as BufferSnapshot;
+      const snapshot = JSON.parse(raw) as BufferSnapshotLike;
       console.log(`\n  📄 ${reportFile} (BufferSnapshot):`);
       console.log(`    task_id: ${snapshot.task_id}`);
       console.log(`    task_description: ${snapshot.task_description}`);
@@ -484,9 +485,13 @@ suite('E2E 真实 Agent 循环 (Agent → Driver → Buffer → Extract → PG �
       console.log(`    received_at: ${snapshot.received_at}`);
       console.log(`    retry_count: ${snapshot.retry_count}`);
       console.log(`    extraction_status: ${snapshot.extraction_status}`);
-      console.log(`    driver_return.summary: ${snapshot.driver_return.summary}`);
-      console.log(`    driver_return.decisions: ${snapshot.driver_return.decisions.length} 条`);
-      console.log(`    driver_return.blockers: ${snapshot.driver_return.blockers.length} 条`);
+      if (isBufferSnapshotV2(snapshot)) {
+        console.log(`    role_reflection.summary: ${snapshot.role_reflection.summary}`);
+      } else {
+        console.log(`    driver_return.summary: ${snapshot.driver_return.summary}`);
+        console.log(`    driver_return.decisions: ${snapshot.driver_return.decisions.length} 条`);
+        console.log(`    driver_return.blockers: ${snapshot.driver_return.blockers.length} 条`);
+      }
     }
 
     // 读取 meta
@@ -514,15 +519,20 @@ suite('E2E 真实 Agent 循环 (Agent → Driver → Buffer → Extract → PG �
     // 打印提取器的输入
     for (const seq of pendingSeqs) {
       const pending = await memory.getPendingBuffer(seq);
-      if (pending) {
-        console.log(`\n  📥 提取输入 (BufferSnapshot seq=${seq}):`);
-        console.log(`    task_description: ${pending.snapshot.task_description}`);
-        console.log(`    driver_return.summary: ${pending.snapshot.driver_return.summary}`);
+      if (!pending) continue;
+      const snapshot = pending.snapshot;
+      console.log(`\n  📥 提取输入 (BufferSnapshot seq=${seq}):`);
+      console.log(`    task_description: ${snapshot.task_description}`);
+      if (isBufferSnapshotV2(snapshot)) {
+        console.log(`    role_reflection.summary: ${snapshot.role_reflection.summary}`);
+        console.log(`    dispatches: ${snapshot.dispatches.length} 条`);
+      } else {
+        console.log(`    driver_return.summary: ${snapshot.driver_return.summary}`);
         console.log(
-          `    driver_return.decisions: ${JSON.stringify(pending.snapshot.driver_return.decisions, null, 2).slice(0, 500)}`,
+          `    driver_return.decisions: ${JSON.stringify(snapshot.driver_return.decisions, null, 2).slice(0, 500)}`,
         );
         console.log(
-          `    driver_return.blockers: ${JSON.stringify(pending.snapshot.driver_return.blockers, null, 2).slice(0, 300)}`,
+          `    driver_return.blockers: ${JSON.stringify(snapshot.driver_return.blockers, null, 2).slice(0, 300)}`,
         );
       }
     }

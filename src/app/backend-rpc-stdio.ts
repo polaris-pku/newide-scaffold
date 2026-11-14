@@ -75,6 +75,7 @@ import {
 } from './b-memory-delivery-consumers';
 import { FileMaintenanceRunStore } from '../memory';
 import { BMemoryBackendService } from './b-memory-backend-service';
+import { RunJournalLearningEvidenceVerifier } from './learning-evidence-verifier';
 import { createBPublicCapabilities, createLedgerRoleTokenUsage } from './b-public-capabilities';
 import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
@@ -83,6 +84,7 @@ import { RoleBudget } from './role-autonomy-budget';
 import { createRoleFinishValidator } from './role-autonomy-finish';
 import { runRoleExecutionLoop } from './role-execution-loop';
 import type { RoleBudgetOverrides } from './role-autonomy-contract';
+import { isRoleAutonomySwitchCombinationValid } from './role-autonomy-contract';
 import type { RoleAutonomySelectionConfig } from './role-autonomy-selection';
 import {
   marketAuctionCompletedPayload,
@@ -334,6 +336,10 @@ export async function createProductionBackendService(
     const maintenanceEvidenceStore = new FileBMemoryMaintenanceEvidenceStore(
       path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
     );
+    // 离线学习输入的受控证据核验：Buffer v2 只保存引用，消费者回 Journal/evidence 核对
+    // 前缀边界、hash 与检查计数后，才允许把检查当成 host_observed 事实。runner 与消费者
+    // 共用同一个 verifier 实例（同一套 runs root 与同一份实现）。
+    const learningEvidence = new RunJournalLearningEvidenceVerifier({ runs_root: runsRoot });
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
@@ -343,6 +349,7 @@ export async function createProductionBackendService(
         llm: memoryLlm,
         evidenceStore: maintenanceEvidenceStore,
         runsRoot,
+        learningEvidence,
         // dependencies.memoryMaintenance 覆盖路径会绕过留档（测试缝，接受）
         callJournal: protocolCallJournal,
         promotion: {
@@ -365,6 +372,7 @@ export async function createProductionBackendService(
       }),
       evidenceStore: maintenanceEvidenceStore,
       llm: memoryLlm,
+      learningEvidence,
       ...readMemoryJobOptions(env),
       logger: (message) => {
         process.stderr.write(`[newide] ${message}\n`);
@@ -427,6 +435,19 @@ export async function createProductionBackendService(
         }),
       create_finish_validator: () => createRoleFinishValidator(),
       run_loop: runRoleExecutionLoop,
+      // 阶段 3：在线只登记一条 Context Delivery；经验提取/晋升/演化仍在离线维护 worker。
+      // 登记失败由 engine 降级成 diagnostics 事实，不阻塞 Role 执行循环（不在这里 await 学习）。
+      learning_input: {
+        register: async ({ task_id, run_id, role_id, buffer_seq, workspace_path }) => {
+          await bCapabilities.maintenance.scheduleBuffer({
+            task_id,
+            run_id,
+            role_id,
+            buffer_seq,
+            ...(workspace_path !== undefined ? { workspace_path } : {}),
+          });
+        },
+      },
       ...(roleAutonomyConfig.budget_overrides
         ? { budget_overrides: roleAutonomyConfig.budget_overrides }
         : {}),
@@ -834,6 +855,9 @@ export async function drainMemoryDeliveriesOnce(
         path.join(bRuntime.app_state_root, 'b', 'maintenance'),
       ),
       llm: memoryLlm,
+      learningEvidence: new RunJournalLearningEvidenceVerifier({
+        runs_root: path.join(stateRoot, 'runs'),
+      }),
       ...readMemoryJobOptions(env),
     });
     return await consumers.runOnce(options);
@@ -1302,6 +1326,30 @@ export function readRoleAutonomyEnabled(value: string | undefined): boolean {
   throw new Error(`Invalid NEWIDE_ROLE_AUTONOMY: ${value}. Expected 0/1/true/false.`);
 }
 
+/**
+ * NEWIDE_DRIVER_EVIDENCE_ONLY：阶段 3 evidence-only 派工分支，默认关闭。
+ * 只影响 role 自主循环的 driver prompt/converter；legacy/Council 路径不变。
+ */
+export function readDriverEvidenceOnlyEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return false;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_DRIVER_EVIDENCE_ONLY: ${value}. Expected 0/1/true/false.`);
+}
+
+/**
+ * NEWIDE_BUFFER_V2：阶段 3 Buffer v2 学习输入写入，默认关闭。
+ * 依赖 evidence-only（v2 的定义就是没有六字段报告），组合非法时启动即拒绝。
+ */
+export function readBufferV2Enabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return false;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_BUFFER_V2: ${value}. Expected 0/1/true/false.`);
+}
+
 const ROLE_BUDGET_ENV_KEYS = {
   max_dispatches: 'NEWIDE_ROLE_MAX_DISPATCHES',
   max_role_rounds: 'NEWIDE_ROLE_MAX_ROUNDS',
@@ -1311,17 +1359,34 @@ const ROLE_BUDGET_ENV_KEYS = {
 } as const;
 
 /**
- * 阶段 2 组合根的**唯一选路配置对象**：开关 + 部署预算覆盖。
+ * 阶段 2/3 组合根的**唯一选路配置对象**：引擎开关 + 阶段 3 开关 + 部署预算覆盖。
  * engine 与 stage executor 都只能消费这一份，禁止各自读 env/合并（RD-SEL-03）。
+ *
+ * 非法开关组合在启动期显式抛错：不在同一个 Run 内静默降级，也不让「只开了
+ * EVIDENCE_ONLY/BUFFER_V2 却没开 ROLE_AUTONOMY」看起来像一切正常。
  */
 export function buildRoleAutonomySelectionConfig(
   env: Record<string, string | undefined>,
   options: { wired: boolean },
 ): RoleAutonomySelectionConfig {
   const budgetOverrides = readRoleBudgetOverrides(env);
+  const enabled = readRoleAutonomyEnabled(env.NEWIDE_ROLE_AUTONOMY);
+  const switches = {
+    evidence_only: readDriverEvidenceOnlyEnabled(env.NEWIDE_DRIVER_EVIDENCE_ONLY),
+    buffer_v2: readBufferV2Enabled(env.NEWIDE_BUFFER_V2),
+  };
+  if ((switches.evidence_only || switches.buffer_v2) && !enabled) {
+    throw new Error(
+      'NEWIDE_DRIVER_EVIDENCE_ONLY / NEWIDE_BUFFER_V2 require NEWIDE_ROLE_AUTONOMY=1.',
+    );
+  }
+  if (!isRoleAutonomySwitchCombinationValid(switches)) {
+    throw new Error('NEWIDE_BUFFER_V2 requires NEWIDE_DRIVER_EVIDENCE_ONLY=1.');
+  }
   return {
-    enabled: readRoleAutonomyEnabled(env.NEWIDE_ROLE_AUTONOMY),
+    enabled,
     wired: options.wired,
+    switches,
     ...(budgetOverrides !== undefined ? { budget_overrides: budgetOverrides } : {}),
   };
 }

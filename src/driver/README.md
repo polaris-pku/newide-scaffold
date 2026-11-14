@@ -123,8 +123,7 @@ role/driver 职责完善：让每次派工有身份、有证据、有可对账�
 边界：
 
 - `JournalVerificationClaimSchema` 同时定义工具输入与 finish 持久化的验证陈述字段；app 只添加
-  输入默认值，persistence 引用派生类型，不再各维护一份字段表。
-- 契约 schema 是单一来源；persistence 的 journal 只做文件 I/O 与折叠，不复制 schema；实例内
+  输入默认值，persistence 引用派生类型，不再各维护一份字段表。- 契约 schema 是单一来源；persistence 的 journal 只做文件 I/O 与折叠，不复制 schema；实例内
   所有修改经**单一串行临界区**执行，`close()` 排空已准入修改后才释放写锁（生命周期与锁协议见
   `src/persistence/README.md`）。
 - `DispatchRecord` 折叠显式区分 `not_executed`（accepted 无 dispatched、无交付证据）与
@@ -132,6 +131,21 @@ role/driver 职责完善：让每次派工有身份、有证据、有可对账�
 - 迟到结果只能对账，不能触发新执行或悄悄改写已发出的终态回执。
 - 阶段 1 边界：本阶段不新增 role-loop、不新增 Agent 工具、不改变任何生产选路；阶段 2 已另行在
   `src/app` 接入（默认关闭，仅显式 `NEWIDE_ROLE_AUTONOMY=1`）。
+
+## evidence-only 派工分支（阶段 3，默认关闭）
+
+`driver-runtime-invoker.ts` 的 `DriverRuntimeInvokerInput.report_mode` 是唯一分叉点：
+
+- `six_field`（默认）：行为与历史一致——prompt 追加六字段报告 + 报告文件指令（受
+  `ACP_WRITE_REPORT_FILE` 控制），结果经 `DriverReturnConverter` 转成 `DriverReturn`；
+  legacy/Council 路径全部走这一支。
+- `evidence_only`（role 自主循环、`NEWIDE_DRIVER_EVIDENCE_ONLY=1`）：prompt **只给本次
+  ExecutionBrief**（不含整批 skills/experiences 渲染、不含六字段/报告文件指令），不调用
+  converter，`DriverRuntimeInvocationResult.report` 缺席（不伪造空报告）。执行事实由阶段 1
+  Journal/evidence 记录，Role 的验证陈述与来源分级在 `src/app/role-learning-input.ts`。
+
+`report` 缺席只可能来自 evidence-only；legacy 消费者（facade `invoke_driver`、ADP endpoint）
+在缺席时显式失败，不会拿空壳当报告。测试：`test/driver/driver-runtime-invoker-evidence-only.test.ts`。
 
 ## 测试映射
 

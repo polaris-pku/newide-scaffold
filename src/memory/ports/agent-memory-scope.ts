@@ -8,7 +8,7 @@ import type {
   AgentHandle,
   AgentMetrics,
   BufferMeta,
-  BufferSnapshot,
+  BufferSnapshotLike,
   AgentContextSnapshot,
   ExperienceRecord,
   PersonaDef,
@@ -29,7 +29,7 @@ export interface AgentMemoryScope {
   searchExperiences(options: MemoryVectorSearchOptions): Promise<ExperienceRecord[]>;
 
   saveBufferSnapshot(
-    snapshot: BufferSnapshot,
+    snapshot: BufferSnapshotLike,
     agentContext?: AgentContextSnapshot,
   ): Promise<SaveBufferResult>;
   getBufferMeta(): Promise<BufferMeta>;

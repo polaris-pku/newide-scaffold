@@ -9,12 +9,17 @@
  * （persistExtractedExperiences）统一补上 role_id，`source_task_id` 只作溯源。
  * 因此任何提取入口都不可能写出空 agent_id 或挂到别的 Agent 名下。
  */
-import type { AgentContextSnapshot, BufferSnapshot } from "../schemas";
+import type { AgentContextSnapshot, BufferSnapshotLike } from "../schemas";
 import type { ExtractionOutput } from "../types";
 
 export interface ExperienceExtractor {
+  /**
+   * 从一条学习输入（v1 DriverReturn 快照或 v2 执行事实 + Role 反思）提取经验候选。
+   * 实现必须按 `buffer_version` 分支；v2 的 Role 反思/driver 自述都只是 dependent 输入，
+   * 不得据此生成无来源的高置信度经验。
+   */
   extract(
-    snapshot: BufferSnapshot,
+    snapshot: BufferSnapshotLike,
     agentContext?: AgentContextSnapshot,
   ): Promise<ExtractionOutput>;
 }
