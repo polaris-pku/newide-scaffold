@@ -30,7 +30,8 @@ export async function runDriverPromptWithSignal(
 ): Promise<DriverRunResult> {
   if (signal?.aborted) {
     const reason = abortReason(signal);
-    await driver.interrupt(reason.message, input.run_id);
+    // 宿主侧超时必须独立收束：interrupt 只是尽力通知，不能等待它返回（它可能永远挂起）。
+    requestInterrupt(driver, reason.message, input.run_id);
     throw reason;
   }
 
@@ -54,10 +55,10 @@ export async function runDriverPromptWithSignal(
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => {
       const reason = abortReason(signal);
-      void driver.interrupt(reason.message, input.run_id).then(
-        () => reject(reason),
-        (error: unknown) => reject(error),
-      );
+      // 同步 reject：不能等 driver.interrupt 返回（复审复现：prompt/interrupt 都不合作时
+      // 单派工超时必须仍及时收束）。interrupt 的失败/迟到结算只吞掉，不影响终止。
+      requestInterrupt(driver, reason.message, input.run_id);
+      reject(reason);
     };
     signal.addEventListener('abort', onAbort, { once: true });
   });
@@ -78,6 +79,20 @@ export async function runDriverPromptWithSignal(
   } finally {
     if (onAbort) signal.removeEventListener('abort', onAbort);
     unsubscribe?.();
+  }
+}
+
+/** fire-and-forget interrupt：迟到 resolve/reject 都消费掉，绝不阻塞宿主终止。 */
+function requestInterrupt(
+  driver: DriverRuntimeHandle,
+  reason: string,
+  runId: string | undefined,
+): void {
+  try {
+    const pending = driver.interrupt(reason, runId);
+    void Promise.resolve(pending).catch(() => undefined);
+  } catch {
+    // 同步抛错同样不影响 abort 收束。
   }
 }
 

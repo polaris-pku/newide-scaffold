@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef, type Event } from '../core';
+import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../core';
 import { ArtifactSelector, WorktreeMaterializer } from '../coordinator';
 import {
   buildChangesetManifest,
@@ -51,21 +51,27 @@ import {
 import type { GateResult } from '../gate';
 import type { TaskResumeCursor } from '../persistence';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../protocol/agent-execution';
-import { recordRunEventConsumed } from '../telemetry';
-import type {
-  CouncilStageExecutor,
-  DeliverStageExecutor,
-  ExecuteAgentStageExecutor,
-  GateStageExecutor,
-  SelectAgentStageExecutor,
-  TaskExecutionLoopExecutors,
-  TaskStageExecutionContext,
+import {
+  StageTerminationError,
+  type CouncilStageExecutor,
+  type DeliverStageExecutor,
+  type ExecuteAgentStageExecutor,
+  type GateStageExecutor,
+  type SelectAgentStageExecutor,
+  type TaskExecutionLoopExecutors,
+  type TaskStageExecutionContext,
 } from '../coordination';
+import {
+  selectRoleExecutionEngine,
+  type RoleAutonomySelectionConfig,
+} from './role-autonomy-selection';
+import { RoleTerminationError } from './role-autonomy-contract';
 import {
   marketAuctionCompletedPayload,
   marketAuctionStartedPayload,
   type MarketEventContext,
 } from './market-event-payload';
+import { emitStageEvent } from './stage-event-emitter';
 
 export interface ProductionStageExecutorDependencies {
   selectAgentHandler: Pick<SelectAgentHandler, 'execute'>;
@@ -82,6 +88,12 @@ export interface ProductionStageExecutorDependencies {
   auctionEnabled?: boolean;
   /** 关闭竞标时指定的 primary role_id。 */
   primaryAgentId?: string;
+  /**
+   * 阶段 2：role 自主循环的选路配置。缺省 = 新路径不参与选路（全部按 legacy 解释）。
+   * `enabled` 来自显式部署开关（NEWIDE_ROLE_AUTONOMY）；`wired` 表示组合根是否装配了
+   * role-loop 引擎。判定由 stage executor 完成，再把显式引擎标记传给 facade。
+   */
+  roleAutonomy?: RoleAutonomySelectionConfig;
 }
 
 interface ProductionSelectionState {
@@ -231,6 +243,55 @@ export function createProductionStageExecutors(
   const executeAgent: ExecuteAgentStageExecutor = {
     async execute(context) {
       context.signal?.throwIfAborted();
+      // 阶段 2：引擎必须在首次进入 execute_agent、调用 LLM 之前判定一次（RD-SEL-01）。
+      // mode/cursor/task_request 只在这里可见（AgentExecutionRequest 没有 mode，不能按
+      // context_policy 反推——solo 类模式共用 production_task_loop）。
+      const roleSelection = dependencies.roleAutonomy
+        ? await selectRoleExecutionEngine({
+            runs_root: dependencies.runsRoot,
+            run_id: context.run_id,
+            task_id: context.task_id,
+            role_id: context.cursor_input.winner_agent_id,
+            mode: context.mode,
+            task_request: context.task_request,
+            cursor_input: context.cursor_input,
+            ...(context.restarted_from_run_id
+              ? { restarted_from_run_id: context.restarted_from_run_id }
+              : {}),
+            config: {
+              ...dependencies.roleAutonomy,
+              ...(context.task_request.budget !== undefined
+                ? { task_budget: context.task_request.budget }
+                : {}),
+            },
+          })
+        : undefined;
+      if (roleSelection !== undefined && roleSelection.engine === 'rejected') {
+        throw new StageTerminationError({
+          code: 'host_failed',
+          actor: 'host',
+          message: roleSelection.message,
+          details: { reason: roleSelection.reason, selection_code: roleSelection.code },
+        });
+      }
+      const executionEngine = roleSelection?.engine === 'role_autonomy' ? 'role_autonomy' : 'legacy';
+      // 选路与 engine 的同一份冻结策略：fresh 时把选路算好的计划原样传下去（不二次合并）；
+      // 已冻结 Run 沿用 Journal 记录，只传任务预算（engine 不会覆盖已冻结值）。
+      const freshSelection =
+        roleSelection?.engine === 'role_autonomy' && roleSelection.reason === 'fresh_role_autonomy'
+          ? roleSelection
+          : undefined;
+      const roleAutonomyOptions =
+        executionEngine === 'role_autonomy'
+          ? {
+              ...(context.task_request.budget !== undefined
+                ? { task_budget: context.task_request.budget }
+                : {}),
+              ...(freshSelection !== undefined
+                ? { freeze_plan: freshSelection.freeze_plan }
+                : {}),
+            }
+          : undefined;
       const strategyName = councilStrategyName(dependencies.councilProvider);
       const planFirst = context.mode === 'council' && strategyName === 'plan_first';
       const executionWorkspace =
@@ -270,6 +331,13 @@ export function createProductionStageExecutors(
             input_artifact_refs: [],
             context_policy: planFirst ? 'council_primary_plan' : 'production_task_loop',
             schema_version: SCHEMA_VERSION,
+            execution_engine: executionEngine,
+            ...(context.restarted_from_run_id
+              ? { restarted_from_run_id: context.restarted_from_run_id }
+              : {}),
+            ...(executionEngine === 'role_autonomy'
+              ? { completion_criteria: [...context.task_request.completion_criteria] }
+              : {}),
             ...(context.mode === 'single_agent' && context.task_request.allow_agent_council
               ? { allow_agent_council: true }
               : {}),
@@ -284,11 +352,39 @@ export function createProductionStageExecutors(
           {
             ...(context.signal ? { signal: context.signal } : {}),
             ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
+            ...(roleAutonomyOptions !== undefined
+              ? { role_autonomy: roleAutonomyOptions }
+              : {}),
           },
         );
-      let result = await executePrimary(primaryInstruction);
-      if (result.council_request && !(context.mode === 'single_agent' && context.task_request.allow_agent_council === true)) {
-        throw new Error('Agent Council escalation is disabled for this run');
+      // role 自主循环的终止是 app 层 typed termination；coordination 不能反向 import app，
+      // 因此必须在 stage 边界包装成 StageTerminationError，否则 task.error.code 会退化成
+      // stage_execution_failed（RD-TRM-02 的两段式修正）。
+      const runPrimary = async (instruction: string, sessionId = context.session_id) => {
+        try {
+          return await executePrimary(instruction, sessionId);
+        } catch (error) {
+          if (error instanceof RoleTerminationError) {
+            throw new StageTerminationError(
+              {
+                code: error.termination.code,
+                actor: error.termination.actor,
+                message: error.termination.message,
+                ...(error.termination.details !== undefined
+                  ? { details: error.termination.details }
+                  : {}),
+              },
+              error,
+            );
+          }
+          throw error;
+        }
+      };
+      let result = await runPrimary(primaryInstruction);
+      if (result.council_request) {
+        if (!(context.mode === 'single_agent' && context.task_request.allow_agent_council === true)) {
+          throw new Error('Agent Council escalation is disabled for this run');
+        }
       }
       let mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
       if (planFirst && result.status === 'completed' && !mailboxWait) {
@@ -1314,26 +1410,12 @@ async function artifactSetHash(
 }
 
 function emit<TCursor extends TaskResumeCursor>(
-  context: TaskStageExecutionContext<TCursor>,
+  context: Pick<TaskStageExecutionContext<TCursor>, 'task_id' | 'run_id' | 'on_event'>,
   eventType: string,
   subjectId: string,
   payload: Record<string, unknown>,
 ): void {
-  if (!context.on_event) return;
-  const event: Event = {
-    event_id: createId('event'),
-    event_type: eventType,
-    subject_id: subjectId,
-    task_id: context.task_id,
-    run_id: context.run_id,
-    payload,
-    created_at: nowTimestamp(),
-    schema_version: SCHEMA_VERSION,
-  };
-  // 只在这一处计数：这是全部阶段事件的唯一出口，计数因此不可能漏掉某个调用点。
-  // 放在 on_event 之前——事件此时已经产生，消费方随后抛错不该让它从计数里消失。
-  recordRunEventConsumed(eventType, payload);
-  context.on_event(event);
+  emitStageEvent(context, eventType, subjectId, payload);
 }
 
 function lifecycleSubjectId(payload: Record<string, unknown>, fallback: string): string {

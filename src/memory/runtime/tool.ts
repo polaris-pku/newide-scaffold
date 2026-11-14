@@ -58,10 +58,21 @@ export interface ToolDefinition {
   };
 }
 
+/** 单次 tool-calling 调用的 token 用量；缺失时**不填**（绝不填 0 冒充已知用量）。 */
+export interface ToolCallUsage {
+  input_tokens: number;
+  output_tokens: number;
+}
+
 /** Tool-calling 调用的返回 */
 export interface ToolCallResult {
   content: string | null;
   tool_calls: ToolCall[] | undefined;
+  /**
+   * provider 返回的本次调用用量（加法扩展，旧调用方可忽略）。
+   * role token 预算依赖它可观测；缺失时省略字段，由消费方标记 missing。
+   */
+  usage?: ToolCallUsage;
 }
 
 /**

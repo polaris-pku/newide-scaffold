@@ -2,10 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION, type TaskCreateRequest } from '../../src/core';
 import {
   SapTaskBridge,
+  StageTerminationError,
   TaskExecutionLoop,
+  isStageTerminationError,
+  type StageTermination,
   type TaskExecutionLoopExecutors,
 } from '../../src/coordination';
-import { TaskProcessor } from '../../src/coordination';
+import { TaskInterruptedError, TaskProcessor } from '../../src/coordination';
 import {
   createRunLatency,
   getLlmUsageAttribution,
@@ -528,6 +531,207 @@ describe('TaskExecutionLoop', () => {
       releaseRunLlmUsageLedger('run_loop');
     }
   });
+
+  // ── 阶段 2：typed termination → stageFailure → task.error.code / run.failed ──
+
+  const typedTerminations: Array<{ code: string; actor: StageTermination['actor'] }> = [
+    { code: 'role_blocked', actor: 'role' },
+    { code: 'role_failed', actor: 'role' },
+    { code: 'budget_dispatches', actor: 'host' },
+    { code: 'budget_rounds', actor: 'host' },
+    { code: 'budget_tokens', actor: 'host' },
+    { code: 'budget_wall_clock', actor: 'host' },
+    { code: 'budget_tool_calls', actor: 'host' },
+    { code: 'host_failed', actor: 'host' },
+    { code: 'host_cancelled', actor: 'user' },
+    { code: 'dispatch_unknown_unresolved', actor: 'role' },
+    { code: 'dispatch_timeout', actor: 'host' },
+    { code: 'journal_write_failed', actor: 'host' },
+    { code: 'journal_corrupt', actor: 'host' },
+    { code: 'journal_unreadable', actor: 'host' },
+    { code: 'evidence_write_failed', actor: 'host' },
+  ];
+
+  it.each(typedTerminations)(
+    'typed termination $code（actor=$actor）透传到 task.error.code 与 run.failed',
+    async ({ code, actor }) => {
+      const fixture = createFixture({
+        terminationAt: 'execute_agent',
+        termination: {
+          code,
+          actor,
+          message: `${code} from stage executor`,
+          details: { round: 3, dispatch_id: 'dispatch_typed' },
+        },
+      });
+      begin(fixture.processor, selectInput, 'single_agent');
+      const committed: PersistedCoordinationEvent[] = [];
+
+      const failed = await fixture.loop.run({
+        task_id: 'task_loop',
+        run_id: 'run_loop',
+        on_committed_events: (events) => committed.push(...events),
+      });
+
+      // 下游不再执行；终态仍由 C 层 failStage 提交（role blocked/failed 仍是 failed，
+      // 不会被改写成可 resume 的 Task blocked）。
+      expect(fixture.calls).toEqual(['select_agent', 'execute_agent']);
+      expect(failed.task.status).toBe('failed');
+      expect(failed.error).toMatchObject({
+        code,
+        message: `${code} from stage executor`,
+        details: { cursor: 'execute_agent', actor, round: 3, dispatch_id: 'dispatch_typed' },
+      });
+      expect(failed.run_history).toHaveLength(1);
+      expect(failed.run_history[0]).toMatchObject({
+        status: 'failed',
+        error: {
+          code,
+          message: `${code} from stage executor`,
+          // run.failed 事件只带 status/code/message；details 仍落在 task.error/run.error。
+          details: { cursor: 'execute_agent', actor, round: 3, dispatch_id: 'dispatch_typed' },
+        },
+      });
+      expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state).toMatchObject({
+        resume_cursor: 'done',
+        cursor_input: { cursor: 'done' },
+      });
+
+      // run.failed 事件 code 与 task.error.code 同源：failStage 用同一 error 构造两者。
+      const runFailed = committed.find((event) => event.event_type === 'run.failed');
+      expect(runFailed?.payload).toMatchObject({
+        status: 'failed',
+        code,
+        message: `${code} from stage executor`,
+      });
+      const handlerFailed = committed.find((event) => event.event_type === 'handler.failed');
+      expect(handlerFailed?.payload).toMatchObject({ cursor: 'execute_agent', code });
+
+      // 失败证据写入同一个原因码与 details。
+      const failureEvidence = await fixture.evidenceStore.readFailure({
+        run_id: 'run_loop',
+        stage: 'execute_agent',
+      });
+      expect(failureEvidence?.evidence).toMatchObject({
+        status: 'failed',
+        code,
+        details: { cursor: 'execute_agent', actor, round: 3, dispatch_id: 'dispatch_typed' },
+      });
+    },
+  );
+
+  it('typed termination 在任意阶段生效，details.cursor 指向实际失败阶段', async () => {
+    const fixture = createFixture({
+      terminationAt: 'gate',
+      termination: { code: 'host_failed', actor: 'system', message: 'gate executor exploded' },
+    });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const failed = await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(fixture.calls).toEqual(['select_agent', 'execute_agent', 'gate']);
+    expect(failed.error).toMatchObject({
+      code: 'host_failed',
+      details: { cursor: 'gate', actor: 'system' },
+    });
+  });
+
+  it('只有 StageTerminationError 透传原因码；普通 Error 仍是 stage_execution_failed', async () => {
+    const plain = createFixture({ failAt: 'execute_agent' });
+    begin(plain.processor, selectInput, 'single_agent');
+    const plainFailed = await plain.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(plainFailed.error).toMatchObject({
+      code: 'stage_execution_failed',
+      details: { cursor: 'execute_agent' },
+    });
+    // 普通错误没有 actor——原因码只来自 typed termination，不靠文案推断。
+    expect(plainFailed.error?.details).not.toHaveProperty('actor');
+  });
+
+  it('isStageTerminationError 只依赖 instance，不解析 name / message', () => {
+    const lookalike = Object.assign(
+      new Error('StageTerminationError: role_blocked from somewhere'),
+      { name: 'StageTerminationError' },
+    );
+    expect(isStageTerminationError(lookalike)).toBe(false);
+    expect(isStageTerminationError({ termination: { code: 'role_blocked', actor: 'role' } })).toBe(
+      false,
+    );
+
+    const real = new StageTerminationError({
+      code: 'role_failed',
+      actor: 'role',
+      message: 'role finished failed',
+    });
+    expect(isStageTerminationError(real)).toBe(true);
+    expect(real.name).toBe('StageTerminationError');
+    expect(real.termination).toMatchObject({ code: 'role_failed', actor: 'role' });
+  });
+
+  it('StageTerminationError 保留 cause，message 缺省回退到 code', () => {
+    const cause = new Error('journal device unavailable');
+    const error = new StageTerminationError(
+      { code: 'journal_write_failed', actor: 'host' },
+      cause,
+    );
+    expect(error.termination.code).toBe('journal_write_failed');
+    expect(error.message).toBe('journal_write_failed');
+    expect(error.cause).toBe(cause);
+  });
+
+  it('用户取消（AbortSignal）优先于 typed termination：仍以 cancelled 终结', async () => {
+    const controller = new AbortController();
+    const fixture = createFixture({
+      terminationAt: 'execute_agent',
+      termination: { code: 'role_blocked', actor: 'role', message: 'role gave up' },
+      abortDuringStage: { cursor: 'execute_agent', controller },
+    });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const snapshot = await fixture.loop.run({
+      task_id: 'task_loop',
+      run_id: 'run_loop',
+      signal: controller.signal,
+    });
+
+    expect(snapshot.task.status).toBe('cancelled');
+    expect(snapshot.error).toBeUndefined();
+    expect(snapshot.run_history[0]).toMatchObject({ status: 'cancelled' });
+    expect(
+      fixture.store.listEvents('task_loop').some((event) => event.event_type === 'run.failed'),
+    ).toBe(false);
+  });
+
+  it('TaskInterruptedError 中断优先于 typed termination：task blocked / run interrupted', async () => {
+    const controller = new AbortController();
+    const fixture = createFixture({
+      terminationAt: 'execute_agent',
+      termination: { code: 'role_failed', actor: 'role', message: 'role failed' },
+      abortDuringStage: {
+        cursor: 'execute_agent',
+        controller,
+        reason: new TaskInterruptedError('user', 'pause before the role decision'),
+      },
+    });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const snapshot = await fixture.loop.run({
+      task_id: 'task_loop',
+      run_id: 'run_loop',
+      signal: controller.signal,
+    });
+
+    expect(snapshot.task.status).toBe('blocked');
+    expect(snapshot.run_history[0]).toMatchObject({ status: 'interrupted' });
+    // 中断保留 active stage 供 resume，不写 failed / 不写原因码到 task.error。
+    expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state.resume_cursor).toBe(
+      'execute_agent',
+    );
+    const eventTypes = fixture.store.listEvents('task_loop').map((event) => event.event_type);
+    expect(eventTypes).toContain('run.interrupted');
+    expect(eventTypes).not.toContain('run.failed');
+  });
 });
 
 interface FixtureOptions {
@@ -548,6 +752,18 @@ interface FixtureOptions {
    */
   llmUsageAt?: ReadonlyArray<TaskCursorInput['cursor']>;
   sapEnabled?: boolean;
+  /** 在该 stage 抛 `StageTerminationError`（模拟 role-loop / 预算控制器的 typed 终止）。 */
+  terminationAt?: TaskCursorInput['cursor'];
+  termination?: StageTermination;
+  /**
+   * 在该 stage 执行器抛错前中止它的 signal：确定性覆盖「取消/中断优先于 typed
+   * termination」的竞态。`reason` 传 `TaskInterruptedError` 即走中断分支。
+   */
+  abortDuringStage?: {
+    cursor: TaskCursorInput['cursor'];
+    controller: AbortController;
+    reason?: unknown;
+  };
 }
 
 function createFixture(options: FixtureOptions = {}): {
@@ -611,6 +827,14 @@ function createFixture(options: FixtureOptions = {}): {
       }
       if (cursor === 'execute_agent' && options.overrideDuringExecute) {
         processor.setCouncilOverride('run_loop');
+      }
+      if (options.abortDuringStage?.cursor === cursor) {
+        const { controller, reason } = options.abortDuringStage;
+        if (reason === undefined) controller.abort();
+        else controller.abort(reason);
+      }
+      if (options.terminationAt === cursor && options.termination) {
+        throw new StageTerminationError(options.termination);
       }
       if (options.failAt === cursor) throw new Error(`${cursor.replace('_agent', '')} failed`);
       return result;

@@ -57,11 +57,13 @@ import type {
   EvidenceRef,
   ExecutionBrief,
   ExecutionEvidence,
+  ForeignRetryAnchor,
   JournalControlEntry,
   JournalFinishEntry,
   JournalInitEntry,
   JournalRepairEntry,
   JournalViolation,
+  JournalVerificationClaim,
   ReconciledAppendInput,
   SettledAppendInput,
 } from '../driver';
@@ -86,6 +88,7 @@ import {
   JournalFinishEntrySchema,
   JournalInitEntrySchema,
   JournalRepairEntrySchema,
+  JournalRoleRoundEntrySchema,
   sha256Hex,
 } from '../driver';
 
@@ -406,6 +409,14 @@ export interface JournalInitAppendInput {
   max_role_rounds: number;
   role_token_budget: number;
   deadline_at: string;
+  /** 阶段 2 加法扩展：冻结引擎、工具授权、routing 引用与单 dispatch 超时。 */
+  engine?: 'legacy' | 'role_autonomy';
+  engine_version?: string;
+  tool_allowlist?: string[];
+  routing?: { driver_id?: string; profile_id?: string };
+  dispatch_timeout_ms?: number;
+  /** TaskBudget.max_tool_calls 映射后的任务级工具调用上限。 */
+  max_tool_calls?: number;
   entry_id?: string;
   at?: string;
 }
@@ -415,6 +426,26 @@ export interface JournalFinishAppendInput {
   status: 'completed' | 'blocked' | 'failed' | 'cancelled' | 'interrupted';
   reason: string;
   evidence_refs: EvidenceRef[];
+  /** 阶段 2 role finish 事实（加法扩展）。 */
+  summary?: string;
+  unresolved?: string[];
+  role_reflection?: string;
+  response_only?: boolean;
+  zero_dispatch?: boolean;
+  /** role 对任务要求满足情况的显式陈述（阶段 2 精简后的唯一写入形状）。 */
+  verification?: JournalVerificationClaim[];
+  entry_id?: string;
+  at?: string;
+}
+
+/** 单回合预算消费事实（阶段 2 新增 control 行）；恢复时据此还原已消费回合与 token。 */
+export interface RoleRoundAppendInput {
+  round: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  usage_missing: boolean;
+  /** 本回合执行的环境工具调用数（用于恢复任务级 tool-call 预算）。 */
+  tool_calls?: number;
   entry_id?: string;
   at?: string;
 }
@@ -487,10 +518,13 @@ export function foldDispatchJournalLines(
         repairs.push(line);
       } else if (line.event === 'init') {
         if (init !== undefined && canonicalWithoutAt(init) !== canonicalWithoutAt(line)) {
-          throw new JournalCorruptionError('journal_conflict', 'journal has conflicting init entries');
+          throw new JournalCorruptionError(
+            'journal_conflict',
+            'journal has conflicting init entries',
+          );
         }
         init ??= line;
-      } else {
+      } else if (line.event === 'finish') {
         if (finish !== undefined && canonicalWithoutAt(finish) !== canonicalWithoutAt(line)) {
           throw new JournalCorruptionError(
             'journal_conflict',
@@ -499,6 +533,7 @@ export function foldDispatchJournalLines(
         }
         finish ??= line;
       }
+      // role_round 是预算消费事实，不参与 dispatch 折叠；由恢复逻辑直接读原始行。
       continue;
     }
 
@@ -639,7 +674,10 @@ export function foldDispatchJournalLines(
 function buildDispatchRecord(group: DispatchJournalGroup): DispatchRecord {
   const accepted = group.accepted;
   if (accepted === undefined) {
-    throw new JournalCorruptionError('journal_corrupt', 'dispatch record requires an accepted entry');
+    throw new JournalCorruptionError(
+      'journal_corrupt',
+      'dispatch record requires an accepted entry',
+    );
   }
 
   let phase: 'accepted' | 'dispatched' | 'settled' = 'accepted';
@@ -709,7 +747,10 @@ function buildDispatchRecord(group: DispatchJournalGroup): DispatchRecord {
   return DispatchRecordSchema.parse(recordInput);
 }
 
-function assertLineIdentity(line: DispatchJournalLine, identity: DispatchJournalFoldIdentity): void {
+function assertLineIdentity(
+  line: DispatchJournalLine,
+  identity: DispatchJournalFoldIdentity,
+): void {
   if (
     line.run_id !== identity.run_id ||
     line.task_id !== identity.task_id ||
@@ -811,6 +852,8 @@ export class RunDispatchJournal implements DispatchJournalPort {
   private readonly maxEvidenceBytes: number;
   private readonly maxEvidencePageBytes: number;
   private readonly registeredRefs = new Map<string, Set<string>>();
+  /** engine 注入的祖先 dispatch 锚点（只读元数据，不参与折叠）。 */
+  private foreignRetryAnchors: readonly ForeignRetryAnchor[] = [];
   private durability: DispatchJournalDurability = {
     mode: 'fsync',
     directory_sync: true,
@@ -843,6 +886,29 @@ export class RunDispatchJournal implements DispatchJournalPort {
     this.identity = identity;
     this.maxEvidenceBytes = maxEvidenceBytes;
     this.maxEvidencePageBytes = maxEvidencePageBytes;
+  }
+
+  /**
+   * 只读打开：**不取写锁、不创建目录/文件**。用于阶段 2 引擎选路/恢复时读取冻结记录；
+   * 调用方对 `ENOENT`（run 目录/日志不存在）应视为「无冻结记录」。
+   */
+  static async peek(
+    options: Pick<RunDispatchJournalOptions, 'runDir' | 'identity' | 'io'>,
+  ): Promise<RunDispatchJournal> {
+    const io = options.io ?? createNodeDispatchJournalIo();
+    const identity = normalizeIdentity(options.identity);
+    const runDir = path.resolve(options.runDir);
+    const realRunDir = await io.realpath(runDir);
+    const journal = new RunDispatchJournal(
+      io,
+      runDir,
+      realRunDir,
+      identity,
+      DEFAULT_MAX_EVIDENCE_BYTES,
+      DEFAULT_MAX_EVIDENCE_PAGE_BYTES,
+    );
+    journal.journalFileExists = (await io.stat(journal.journalFilePath)) !== undefined;
+    return journal;
   }
 
   /** 打开 journal 并取得独占写锁；已有活锁时抛 `journal_locked`。 */
@@ -1133,9 +1199,9 @@ export class RunDispatchJournal implements DispatchJournalPort {
     return this.enqueueMutation(() => this.repairTailNow(options));
   }
 
-  private async repairTailNow(
-    options: { reason?: string },
-  ): Promise<DispatchJournalRepairResult | undefined> {
+  private async repairTailNow(options: {
+    reason?: string;
+  }): Promise<DispatchJournalRepairResult | undefined> {
     await this.assertLockOwnership();
     const snapshot = await this.read();
     if (snapshot.kind === 'legacy' || snapshot.status === 'ok') return undefined;
@@ -1549,6 +1615,14 @@ export class RunDispatchJournal implements DispatchJournalPort {
       max_role_rounds: input.max_role_rounds,
       role_token_budget: input.role_token_budget,
       deadline_at: input.deadline_at,
+      ...(input.engine !== undefined ? { engine: input.engine } : {}),
+      ...(input.engine_version !== undefined ? { engine_version: input.engine_version } : {}),
+      ...(input.tool_allowlist !== undefined ? { tool_allowlist: input.tool_allowlist } : {}),
+      ...(input.routing !== undefined ? { routing: input.routing } : {}),
+      ...(input.dispatch_timeout_ms !== undefined
+        ? { dispatch_timeout_ms: input.dispatch_timeout_ms }
+        : {}),
+      ...(input.max_tool_calls !== undefined ? { max_tool_calls: input.max_tool_calls } : {}),
     });
     if (dedupeByEntryId(snapshot, line)) return;
     const existing = snapshot.lines.find((entry) => entry.event === 'init');
@@ -1582,6 +1656,12 @@ export class RunDispatchJournal implements DispatchJournalPort {
       status: input.status,
       reason: input.reason,
       evidence_refs: input.evidence_refs,
+      ...(input.summary !== undefined ? { summary: input.summary } : {}),
+      ...(input.unresolved !== undefined ? { unresolved: input.unresolved } : {}),
+      ...(input.role_reflection !== undefined ? { role_reflection: input.role_reflection } : {}),
+      ...(input.response_only !== undefined ? { response_only: input.response_only } : {}),
+      ...(input.zero_dispatch !== undefined ? { zero_dispatch: input.zero_dispatch } : {}),
+      ...(input.verification !== undefined ? { verification: input.verification } : {}),
     });
     if (dedupeByEntryId(snapshot, line)) return;
     const existing = snapshot.lines.find((entry) => entry.event === 'finish');
@@ -1592,6 +1672,35 @@ export class RunDispatchJournal implements DispatchJournalPort {
         'journal already has a different finish entry',
       );
     }
+    await this.appendLine(line);
+  }
+
+  /**
+   * `role_round`：单回合预算消费事实（阶段 2）。恢复时据此还原已消费回合与 token，
+   * 不靠 restart 清零；`usage_missing` 为 true 时 token 字段不写，绝不填 0 冒充已知。
+   */
+  async appendRoleRound(input: RoleRoundAppendInput): Promise<void> {
+    return this.enqueueMutation(() => this.appendRoleRoundNow(input));
+  }
+
+  private async appendRoleRoundNow(input: RoleRoundAppendInput): Promise<void> {
+    const { snapshot } = await this.loadForAppend();
+    const at = input.at ?? new Date().toISOString();
+    const line = JournalRoleRoundEntrySchema.parse({
+      schema_version: DISPATCH_JOURNAL_ENTRY_SCHEMA_VERSION,
+      entry_id: input.entry_id ?? createId('jrn'),
+      run_id: this.identity.run_id,
+      task_id: this.identity.task_id,
+      role_id: this.identity.role_id,
+      at,
+      event: 'role_round',
+      round: input.round,
+      usage_missing: input.usage_missing,
+      ...(input.input_tokens !== undefined ? { input_tokens: input.input_tokens } : {}),
+      ...(input.output_tokens !== undefined ? { output_tokens: input.output_tokens } : {}),
+      ...(input.tool_calls !== undefined ? { tool_calls: input.tool_calls } : {}),
+    });
+    if (dedupeByEntryId(snapshot, line)) return;
     await this.appendLine(line);
   }
 
@@ -1625,6 +1734,16 @@ export class RunDispatchJournal implements DispatchJournalPort {
   }
 
   /**
+   * 跨 Run 重试锚点：由 engine 从祖先 Journal 读出并经受控 evidence 校验后注入。
+   * 只影响 `retry_of` 对**祖先 dispatch** 的校验，不伪造任何执行事实、不写 Journal。
+   */
+  setForeignRetryAnchors(anchors: readonly ForeignRetryAnchor[]): void {
+    this.foreignRetryAnchors = anchors.filter((anchor) =>
+      SAFE_PATH_SEGMENT.test(anchor.dispatch_id),
+    );
+  }
+
+  /**
    * 受控读取 evidence：只接受已登记 ref；安全相对路径 + realpath 仍在 runDir 内；
    * 限大小、全量校验 sha256、按 offset/limit 分页。
    */
@@ -1634,7 +1753,11 @@ export class RunDispatchJournal implements DispatchJournalPort {
   ): Promise<DispatchJournalEvidencePage> {
     const parsedRef = parseEvidenceRef(ref);
     const offset = normalizePageNumber(options.offset ?? 0, 'offset', 0);
-    const requestedLimit = normalizePageNumber(options.limit ?? this.maxEvidencePageBytes, 'limit', 1);
+    const requestedLimit = normalizePageNumber(
+      options.limit ?? this.maxEvidencePageBytes,
+      'limit',
+      1,
+    );
     const limit = Math.min(requestedLimit, this.maxEvidencePageBytes);
 
     const registry = this.collectRegisteredEvidenceRefs(await this.tryFoldForEvidence());
@@ -1739,12 +1862,18 @@ export class RunDispatchJournal implements DispatchJournalPort {
       );
     }
     if (snapshot.status === 'corrupt') {
-      throw new JournalCorruptionError('journal_corrupt', 'journal is corrupt; refusing to append', {
-        problems: snapshot.problems,
-      });
+      throw new JournalCorruptionError(
+        'journal_corrupt',
+        'journal is corrupt; refusing to append',
+        {
+          problems: snapshot.problems,
+        },
+      );
     }
     const fold =
-      snapshot.kind === 'legacy' ? emptyFoldResult() : foldDispatchJournalLines(snapshot.lines, this.identity);
+      snapshot.kind === 'legacy'
+        ? emptyFoldResult()
+        : foldDispatchJournalLines(snapshot.lines, this.identity);
     return { snapshot, fold };
   }
 
@@ -1786,10 +1915,7 @@ export class RunDispatchJournal implements DispatchJournalPort {
     this.journalFileExists = true;
   }
 
-  private requireRecord(
-    fold: DispatchJournalFoldResult,
-    dispatchId: string,
-  ): DispatchRecord {
+  private requireRecord(fold: DispatchJournalFoldResult, dispatchId: string): DispatchRecord {
     const record = fold.byDispatchId.get(dispatchId);
     if (record === undefined) {
       throw new RunDispatchJournalError(
@@ -1806,10 +1932,17 @@ export class RunDispatchJournal implements DispatchJournalPort {
     if (retryOf === undefined) return;
     const target = fold.byDispatchId.get(retryOf);
     if (target === undefined) {
-      throw new RunDispatchJournalError(
-        'journal_retry_not_allowed',
-        `retry_of ${retryOf} does not reference an existing dispatch`,
+      const anchor = this.foreignRetryAnchors.find(
+        (candidate) => candidate.dispatch_id === retryOf,
       );
+      if (anchor === undefined) {
+        throw new RunDispatchJournalError(
+          'journal_retry_not_allowed',
+          `retry_of ${retryOf} does not reference an existing dispatch`,
+        );
+      }
+      this.assertForeignRetryAllowed(anchor, brief);
+      return;
     }
     if (target.status === 'succeeded') {
       throw new RunDispatchJournalError(
@@ -1834,6 +1967,33 @@ export class RunDispatchJournal implements DispatchJournalPort {
           `reconciliation_ref ${reconciliationRef.path} is not registered evidence`,
         );
       }
+    }
+  }
+
+  /** 跨 Run 重试：祖先 unknown 必须带在祖先 Journal 中可验证的 reconciliation_ref。 */
+  private assertForeignRetryAllowed(anchor: ForeignRetryAnchor, brief: ExecutionBrief): void {
+    if (anchor.status === 'succeeded') {
+      throw new RunDispatchJournalError(
+        'journal_retry_not_allowed',
+        `retry_of ${anchor.dispatch_id} already succeeded; it must not be retried`,
+      );
+    }
+    if (anchor.status !== 'unknown') return;
+    const reconciliationRef = brief.reconciliation_ref;
+    if (reconciliationRef === undefined) {
+      throw new RunDispatchJournalError(
+        'journal_retry_without_evidence',
+        `retrying unknown dispatch ${anchor.dispatch_id} requires reconciliation_ref evidence`,
+      );
+    }
+    const registered = anchor.evidence_refs.some(
+      (ref) => ref.path === reconciliationRef.path && ref.sha256 === reconciliationRef.sha256,
+    );
+    if (!registered) {
+      throw new RunDispatchJournalError(
+        'journal_retry_without_evidence',
+        `reconciliation_ref ${reconciliationRef.path} is not verified evidence of ancestor dispatch ${anchor.dispatch_id}`,
+      );
     }
   }
 
@@ -2275,10 +2435,7 @@ function verifyBriefSha256(brief: ExecutionBrief, expected: string): string {
   return actual;
 }
 
-function assertBriefIdentity(
-  brief: ExecutionBrief,
-  identity: RunDispatchJournalIdentity,
-): void {
+function assertBriefIdentity(brief: ExecutionBrief, identity: RunDispatchJournalIdentity): void {
   if (
     brief.run_id !== identity.run_id ||
     brief.task_id !== identity.task_id ||

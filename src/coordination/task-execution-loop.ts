@@ -18,6 +18,7 @@ import {
   type TaskRunExecutionState,
   type TaskStageCommitResult,
 } from './task-processor';
+import { isStageTerminationError } from './stage-termination';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
 import {
   recordRunEventCommittedBatch,
@@ -777,6 +778,22 @@ function stageFailure(
   error: unknown,
   cursor: TaskResumeCursor,
 ): { code: string; message: string; details: Record<string, unknown> } {
+  // typed termination（阶段 2，RD-TRM-01/02）：阶段执行器/role-loop 给出的原因码是权威，
+  // 原样交给 failStage({ error }) 写入 task.error.code 与 run.failed 载荷。只按 instance
+  // 识别，绝不解析 message。StageEvidenceWriteError 不是 typed termination，其优先级语义
+  // 保持不变（证据/提交写失败仍映射为 stage_evidence_write_failed）。
+  if (isStageTerminationError(error)) {
+    const termination = error.termination;
+    return {
+      code: termination.code,
+      message: termination.message ?? errorMessage(error),
+      details: {
+        ...termination.details,
+        cursor,
+        actor: termination.actor,
+      },
+    };
+  }
   return {
     code:
       error instanceof StageEvidenceWriteError

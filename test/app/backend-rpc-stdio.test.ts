@@ -9,6 +9,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  buildRoleAutonomySelectionConfig,
   createProductionBackendService,
   parseDriverEnv,
   ProductionAgentToolCallingClient,
@@ -75,6 +76,43 @@ describe('readTelemetryJsonlEnabled', () => {
 
   it('rejects invalid values', () => {
     expect(() => readTelemetryJsonlEnabled('maybe')).toThrow('NEWIDE_TELEMETRY_JSONL');
+  });
+});
+
+describe('buildRoleAutonomySelectionConfig', () => {
+  it('combines the explicit switch with all five deployment budget overrides', () => {
+    const config = buildRoleAutonomySelectionConfig(
+      {
+        NEWIDE_ROLE_AUTONOMY: '1',
+        NEWIDE_ROLE_MAX_DISPATCHES: '1',
+        NEWIDE_ROLE_MAX_ROUNDS: '2',
+        NEWIDE_ROLE_TOKEN_BUDGET: '300',
+        NEWIDE_ROLE_WALL_CLOCK_SECONDS: '60',
+        NEWIDE_ROLE_DISPATCH_TIMEOUT_MS: '50',
+      },
+      { wired: true },
+    );
+    expect(config).toMatchObject({
+      enabled: true,
+      wired: true,
+      budget_overrides: {
+        max_dispatches: 1,
+        max_role_rounds: 2,
+        role_token_budget: 300,
+        wall_clock_seconds: 60,
+        dispatch_timeout_ms: 50,
+      },
+    });
+  });
+
+  it('defaults to disabled with no overrides; invalid override fails at the composition boundary', () => {
+    expect(buildRoleAutonomySelectionConfig({}, { wired: true })).toEqual({
+      enabled: false,
+      wired: true,
+    });
+    expect(() =>
+      buildRoleAutonomySelectionConfig({ NEWIDE_ROLE_MAX_DISPATCHES: '0' }, { wired: true }),
+    ).toThrow('NEWIDE_ROLE_MAX_DISPATCHES');
   });
 });
 

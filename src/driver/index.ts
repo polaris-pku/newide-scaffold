@@ -1,5 +1,6 @@
 export * from './contract';
 export * from './execution-contract';
+export * from './command-observation';
 export * from './dispatch-attempt';
 export * from './adp-receipt-reconciler';
 export * from './profile';

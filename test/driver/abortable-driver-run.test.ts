@@ -42,6 +42,38 @@ describe('runDriverPromptWithSignal', () => {
     expect(interrupt).not.toHaveBeenCalled();
   });
 
+  it('interrupt 永不返回时 abort 仍立即收束（宿主超时不依赖 driver 中断返回）', async () => {
+    const controller = new AbortController();
+    const driver = new ExternalDriverRuntime({
+      driver_id: 'external-driver',
+      transport: {
+        invoke: () => new Promise<DriverRunResult>(() => undefined),
+        interrupt: () => new Promise<void>(() => undefined),
+      },
+    });
+    const running = runDriverPromptWithSignal(driver, PROMPT, controller.signal);
+    controller.abort(new Error('dispatch timed out'));
+    const started = Date.now();
+    await expect(running).rejects.toThrow('dispatch timed out');
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it('interrupt 同步抛错也不会阻塞/覆盖 abort 收束', async () => {
+    const controller = new AbortController();
+    const driver = new ExternalDriverRuntime({
+      driver_id: 'external-driver',
+      transport: {
+        invoke: () => new Promise<DriverRunResult>(() => undefined),
+        interrupt: () => {
+          throw new Error('interrupt failed synchronously');
+        },
+      },
+    });
+    const running = runDriverPromptWithSignal(driver, PROMPT, controller.signal);
+    controller.abort(new Error('cancelled while interrupt fails'));
+    await expect(running).rejects.toThrow('cancelled while interrupt fails');
+  });
+
   it('preserves cancellation when the external runtime converts transport shutdown to failure', async () => {
     const controller = new AbortController();
     let rejectInvoke!: (error: Error) => void;

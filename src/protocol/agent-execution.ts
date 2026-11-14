@@ -6,6 +6,7 @@ import type {
   RoleId,
   RunId,
   SchemaVersion,
+  TaskBudget,
   TaskId,
   Timestamp,
 } from '../core';
@@ -53,6 +54,15 @@ export interface AgentExecutionRequest {
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   /** Per-run capability gate for the top-level Agent's Council request tool. */
   allow_agent_council?: boolean;
+  /**
+   * 阶段 2：由 stage executor 依据 mode/cursor/task_request 显式冻结/选择的执行引擎。
+   * 缺省按 `legacy` 解释（旧行为）；禁止 facade 从 `context_policy` 反推。
+   */
+  execution_engine?: 'legacy' | 'role_autonomy';
+  /** 恢复链上一 Run id（role-loop 只读继承/冻结记录回溯用；legacy 路径忽略）。 */
+  restarted_from_run_id?: RunId;
+  /** 任务完成标准（role-loop 的 finish 证据校验需要；legacy 路径可忽略）。 */
+  completion_criteria?: string[];
   schema_version: SchemaVersion;
 }
 
@@ -76,9 +86,32 @@ export interface AgentExecutionResult {
   schema_version: SchemaVersion;
 }
 
+/** role 引擎冻结计划（与 app 的 RoleFrozenPolicyPlan 结构一致，避免 protocol→app 依赖）。 */
+export interface RoleFreezePlanInput {
+  limits: {
+    max_dispatches: number;
+    max_role_rounds: number;
+    role_token_budget: number;
+    wall_clock_seconds: number;
+    dispatch_timeout_ms: number;
+  };
+  deadline_at: string;
+  frozen_at: string;
+  max_tool_calls: number;
+  routing: { driver_id?: string; profile_id?: string };
+}
+
 export interface AgentExecutionOptions {
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
+  /**
+   * 阶段 2 role 自主循环的请求侧输入：TaskBudget（只收紧）与 stage 选路算好的冻结计划。
+   * 只有显式 `execution_engine='role_autonomy'` 的请求会读取；legacy 路径忽略。
+   */
+  role_autonomy?: {
+    task_budget?: TaskBudget;
+    freeze_plan?: RoleFreezePlanInput;
+  };
 }
 
 export interface AgentExecutionFacade {

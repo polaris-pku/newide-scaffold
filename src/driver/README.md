@@ -12,7 +12,7 @@ converter),以及 **ADP(Agent-Driver Protocol)v1 的 System 内代理 endpoint**
 | 文件 | 职责 |
 | --- | --- |
 | `adp-driver-endpoint.ts` | invoke/result/cancel 的 exchange 生命周期:帧构造(P0 校验)、P1 落账、判重、回执经宿主内回调交还 Agent |
-| `adp-status-mapping.ts` | 驱动结局 → ADP status 的证据化映射(纯函数) |
+| `adp-status-mapping.ts` | 驱动结局 → ADP status 的证据化映射(纯函数)。阶段 2 role 引擎的派工观察**复用本映射**（`mapAdpOutcome`），不维护第二套语义：`DRIVER_OUTCOME_UNKNOWN` / `EXTERNAL_DRIVER_TRANSPORT_ERROR` / `DRIVER_RUNTIME_INVOKER_ERROR` 等保持 unknown，interrupted + 副作用保持 unknown，启动失败才是 failed+not_executed；`isDriverEffectEvent` 供 role 侧识别副作用证据。 |
 | `adp-invocation-state.ts` | 单次 exchange 的状态机与证据模型(dispatched / 副作用活动 / transport 阶段证据) |
 | `adp-retry-policy.ts` | 部署级 `auto_retry[side_effect]` 读取与判定 |
 | `driver-transport-error.ts` | 传输层失败的阶段证据载体(`not_executed` / `execution_unconfirmed`) |
@@ -108,25 +108,30 @@ ADP 调用链是两条独立的关注点：
 
 ## 执行契约、写屏障与回执对账（阶段 1，未接生产 role-loop）
 
-role/driver 职责完善的第一阶段：让每次派工有身份、有证据、有可对账状态。
-**这些文件尚未被生产组合根使用，默认运行路径不变**；role-loop 接线属阶段 2。
+role/driver 职责完善：让每次派工有身份、有证据、有可对账状态。
+阶段 2 的 role-loop 已在**显式 `NEWIDE_ROLE_AUTONOMY=1`** 时由组合根使用；默认运行路径不变。
 
 | 文件 | 职责 |
 | --- | --- |
 | `execution-contract.ts` | Brief / Evidence / Journal 行 / `DispatchRecord` 的**唯一 zod schema 来源**：宿主身份（`dispatch_id`/`task_id`/`run_id`/`role_id`/sequence/`accepted_at`）只能由 `buildExecutionBrief` 填；role 请求 `.strict()` 拒收身份键；`investigate` 强制只读、`execute` 非只读、`verify` 显式声明；`reuse` 必须命中宿主确认的本 role/run Session。Evidence 的 transport 是两个正交字段 `transport.evidence`（`not_executed \| execution_unconfirmed`）+ `transport.result_received`（布尔），**不能互相推导**：`result_received` 表示**是否收到过 `DriverRunResult`**，不等于「结局已确认」——driver 返回 failed + `EXTERNAL_DRIVER_TRANSPORT_ERROR` 时 ADP 结局是 `unknown`，但 result 确实收到，因此 `unknown + true + execution_unconfirmed` 合法；启动失败才是 `failed + false + not_executed`。旧数据缺该事实时用 `transport.result_received_missing: true` 显式表达缺失。真矛盾（result 与 not_executed、succeeded 却无结果、missing 又声称收到）抛 `evidence_inconsistent`。`unknown` 的副作用不确定语义不变、禁止自动重放、不得改写成 failed。宿主 `status_override` 只能把成功降级（如只读违规），不改写原始 receipt/result 事实。runner 退出码只进 transport，不能冒充 `checks[].exit_code`；usage 缺失记 `missing: true`/`source: 'none'`，不填 0。 |
+| `command-observation.ts` | 阶段 2 复审修复：**受支持 Driver 的命令级观察事件协议** `driver.command_observed`（strict schema：`command`/`exit_code`/`stdout`/`stderr`/`truncated`/`target_paths`/`checked_workspace_sha256`/`observed_at`）。driver runtime 的命令执行端在命令结束时经 `NEWIDE_DRIVER_EVENT` 通道上报；host 只据此生成 `host_observed + complete + exit_code` 的检查证据（原始输出写受控 evidence 文件、hash 绑定）。**最新复审：受支持 Driver 必须在命令结束、交还 agent 控制权之前计算工作区 canonical 内容指纹（与宿主 `hashWorkspaceContent` 同一算法）并随事件上报；宿主在收到事件时独立重算同一指纹比对，只把校验通过的指纹写成检查的 `workspace_sha256`。** 事件接收时刻的快照不能直接当被检查版本，driver 自报 hash 也不能未经校验直接信任；缺失/截断/不一致 → `observation=partial`（明确证据缺口），finish 不会把它当通过。driver 自述与 runner 进程退出码都不能冒充；没有该事件的 Driver 是明确的证据缺口，真实 ACP runner 仍是该证据缺口（不是假通过）。 |
+| `abortable-driver-run.ts` | 可中止的 driver 调用包装：abort 时**同步 reject** 并 fire-and-forget 发出 `driver.interrupt`，不再等待 `interrupt` 返回（它可能永不返回）；interrupt 的同步抛错/迟到 settle 都被消费，不阻塞宿主超时收束、不产生未处理 rejection。abort 后底层 `sendPrompt` 的迟到真实结果经 `onLateResult` 交还上层对账（不改变中止结局）。 |
 | `dispatch-attempt.ts` | 阶段 1 写屏障：`accepted durable → dispatched durable → 调用 driver → evidence durable → settled durable → 返回`。accepted/dispatched 写失败**不调用 driver**；evidence/settled 写失败抛 `DispatchJournalBarrierError`（`driver_invoked` + `side_effect_state`），调用方不得继续或成功返回；一次 dispatch 一次 attempt；只读派工产生工作区改动时通过 `status_override` 降级为 failed（violation 入账、不回滚副作用），返回/evidence/settled/恢复折叠状态一致。只依赖 `DispatchJournalPort` 抽象，不 import persistence 运行时。 |
 | `adp-receipt-reconciler.ts` | 把 ADP `AdpReceiptDelivery` / 迟到结果对账进 Dispatch Journal：receipt status 权威（经 `adp_receipt` 传给 `buildExecutionEvidence`），只追加 `reconciled` 行，**绝不执行 driver**；重复 receipt 幂等；已 settled 的可信终态冲突时 fail closed、不改写；`unknown` 可被迟到可信结果升级；把 `result_received` 与旧数据 `result_received_missing` 原样带入 evidence；journal 写失败向上抛（不吞）。 |
 | `adp-driver-endpoint.ts`（增量） | 回执有两个明确分工的回调：`request.onReceipt`（per-invoke **通知**，同步 fire-and-forget）与 `request.onReceiptReconciled`（per-invoke **写屏障/对账**：invoke 必须 await，失败以 `AdpReceiptReconciliationError` 从 invoke 抛出）；首次 settle 与已 settled 判重重放/崩溃恢复两条路径遵守同一完成条件，重放不重执行。**settle 时把 `result_received`/`transport_evidence` 等阶段证据作为 `driver.invocation_evidence` 调用行持久化**，重启回放优先读该事实，不再从 receipt.status 反推；旧数据缺该行时按回执做有依据的保守回退并标记 `result_received_missing`。可选 `options.lateResultObserver` 允许异步，其 Promise 被跟踪、不产生未处理 rejection，由 `flushLateResultObservers()` 等待并重抛。未提供这些回调时行为与基线一致（生产当前未提供）。 |
 
 边界：
 
+- `JournalVerificationClaimSchema` 同时定义工具输入与 finish 持久化的验证陈述字段；app 只添加
+  输入默认值，persistence 引用派生类型，不再各维护一份字段表。
 - 契约 schema 是单一来源；persistence 的 journal 只做文件 I/O 与折叠，不复制 schema；实例内
   所有修改经**单一串行临界区**执行，`close()` 排空已准入修改后才释放写锁（生命周期与锁协议见
   `src/persistence/README.md`）。
 - `DispatchRecord` 折叠显式区分 `not_executed`（accepted 无 dispatched、无交付证据）与
   `unknown`（dispatched 无 settled/可信 receipt）；可信 ADP receipt 优先于本地猜测。
 - 迟到结果只能对账，不能触发新执行或悄悄改写已发出的终态回执。
-- 本阶段不新增 `src/app/role-execution-loop.ts`、不新增 Agent 工具、不改变任何生产选路。
+- 阶段 1 边界：本阶段不新增 role-loop、不新增 Agent 工具、不改变任何生产选路；阶段 2 已另行在
+  `src/app` 接入（默认关闭，仅显式 `NEWIDE_ROLE_AUTONOMY=1`）。
 
 ## 测试映射
 
@@ -136,7 +141,9 @@ role/driver 职责完善的第一阶段：让每次派工有身份、有证据�
 | `adp-retry-policy.test.ts` | unknown 永不重跑、按档位查配置 |
 | `adp-driver-endpoint.test.ts` | 故障注入:执行前/写工作区后/返回结果前断连、同 exchange 重复 invoke、副作用执行中取消、interrupted 适配、迟到结果对账、崩溃恢复对账、真实 runtime 链路的阶段证据、契约断言(帧过 P0 校验、配置不入帧)、降级记账 |
 | `test/app/driver-runtime-agent-execution-facade.test.ts` | facade 接线:落账与回执回调、unknown 不重跑、failed 按策略重执行 |
-| `test/driver/execution-contract.test.ts` | 阶段 1 契约：kind/只读、宿主身份防伪、Session reuse 确认、evidence 五态/transport 两字段/usage missing/runner 退码不冒充检查退码 |
+| `test/driver/execution-contract.test.ts` | 阶段 1 契约：kind/只读、宿主身份防伪、Session reuse 确认、evidence 五态/transport 两字段/usage missing/runner 退码不冒充检查退码；阶段 2 复审修复：`result_received` 独立事实（含 unknown+true）、`host_observed` 检查可带 `target_paths`/`workspace_sha256`/`observed_at`、`command_observed` strict schema |
+| `test/app/role-autonomy-engine-dispatch.test.ts` | 阶段 2 复审修复真实链路：真实 journal + fake driver/Driver 事件：unknown 语义、命令级 host_observed checks、产物、迟到 reconciled、恢复摘要、TaskBudget、跨 Run retry；复审 7 项：检查证据绑定被检查版本、恢复链祖先违规/基线/产物、单派工超时独立收束、迟到结果 durable 回执与安全对账；本轮 6 项：真实 `CommandDriverTransport`+子进程「先发事件再改、宿主延迟处理」拒绝旧证据/正确绑定可完成、迟到回执归属多 Run（顺序/并发/关闭/写锁 drain 不串）、产物索引与基线逐成员 fail closed（`artifact_index_corrupt`/`workspace_baseline_corrupt`）；第 3 轮：finish 检查义务（宿主抽取显式命令义务、`&&` 组合命令覆盖、验证对象覆盖方向）真实 engine/loop/finish 链路（`echo ok` 被拒→blocked、`pnpm test && pnpm lint`→completed）；第 4 轮：观测命令与完成要求统一到受限命令表示（`|| true`/`--help` 被拒后可补证据或 blocked、反引号组合标准 + 分次观察→completed、不含关键词的显式命令标准 `tsc --noEmit` 拿别的命令冒充→blocked） |
+| `test/driver/abortable-driver-run.test.ts` | abort 立即收束、`interrupt` 永不返回/同步抛错不阻塞、不误伤正常完成、取消原因保留 |
 | `test/driver/dispatch-attempt.test.ts` | 阶段 1 写屏障：顺序、各屏障失败不调用 driver/不成功返回、5 个崩溃窗口恢复折叠、真实 journal 集成与半写修复 |
 | `src/driver/adp-receipt-reconciler.test.ts` | 阶段 1 回执对账：receipt 优先、重复幂等、重启后迟到 receipt 只对账、settled 冲突不改写、journal 写失败向上抛 |
 | `test/driver/adp-journal-reconciliation.test.ts` | 真实 `RunDispatchJournal` + 真实 SQLite ADP 底座：receipt→reconciled 折叠、重启重放不重执行、accepted-only 时 receipt 优先；复审修复：failed+传输错误码 → unknown+result_received=true、interrupted+副作用、无结果抛错、启动失败、重启回放事实一致、旧数据 missing 回退 |

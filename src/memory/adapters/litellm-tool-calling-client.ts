@@ -37,8 +37,9 @@ import { recordProxyLlmUsage } from '../../telemetry/llm-usage-ledger';
 import type {
   ToolCallingClient,
   ToolCallMessage,
-  ToolDefinition,
   ToolCallResult,
+  ToolCallUsage,
+  ToolDefinition,
 } from '../runtime/tool';
 
 // ──────────────────────────────────────────────
@@ -164,6 +165,22 @@ function toToolCalls(resultToolCalls: unknown[]): ToolCall[] {
       },
     };
   });
+}
+
+/**
+ * AI SDK 的 usage → `ToolCallResult.usage`（与 `CompletionResponse.usage` 的
+ * prompt_tokens/completion_tokens 同义，供 role token 预算观测）。
+ * 任一 token 数字缺失/非法时整体省略字段，**绝不填 0** 冒充已知用量。
+ */
+function toToolCallUsage(
+  usage: { inputTokens?: number | undefined; outputTokens?: number | undefined } | undefined,
+): ToolCallUsage | undefined {
+  const input = usage?.inputTokens;
+  const output = usage?.outputTokens;
+  if (typeof input !== 'number' || typeof output !== 'number') return undefined;
+  if (!Number.isFinite(input) || !Number.isFinite(output)) return undefined;
+  if (input < 0 || output < 0) return undefined;
+  return { input_tokens: input, output_tokens: output };
 }
 
 // ──────────────────────────────────────────────
@@ -365,12 +382,14 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       temperature,
       source: 'proxy',
     });
+    const usage = toToolCallUsage(result.usage);
     return {
       content: result.text ?? null,
       tool_calls:
         result.toolCalls && result.toolCalls.length > 0
           ? toToolCalls(result.toolCalls as unknown[])
           : undefined,
+      ...(usage !== undefined ? { usage } : {}),
     };
   }
 }

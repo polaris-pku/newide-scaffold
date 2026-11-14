@@ -78,6 +78,12 @@ import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities, createLedgerRoleTokenUsage } from './b-public-capabilities';
 import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
+import { RoleAutonomyEngine } from './role-autonomy-engine';
+import { RoleBudget } from './role-autonomy-budget';
+import { createRoleFinishValidator } from './role-autonomy-finish';
+import { runRoleExecutionLoop } from './role-execution-loop';
+import type { RoleBudgetOverrides } from './role-autonomy-contract';
+import type { RoleAutonomySelectionConfig } from './role-autonomy-selection';
 import {
   marketAuctionCompletedPayload,
   marketAuctionStartedPayload,
@@ -396,6 +402,35 @@ export async function createProductionBackendService(
         refresh: (probeOptions) => driverDiscoveryRuntime.service.refresh(probeOptions),
       },
     });
+    // 阶段 2：role 自主循环默认关闭，仅在显式 NEWIDE_ROLE_AUTONOMY=1 时参与选路。
+    // 部署预算覆盖 + 开关是**唯一权威配置对象**：engine 与 stage 选路必须用同一份，
+    // 否则选路会算出默认 freeze_plan，engine 的覆盖被静默绕过（复审 P1 复现 5）。
+    const roleAutonomyConfig = buildRoleAutonomySelectionConfig(env, { wired: true });
+    const agentLlmClient =
+      dependencies.agentLlm ??
+      new ProductionAgentToolCallingClient(
+        createProductionToolCallingClient(productionLlm, env),
+      );
+    const roleAutonomyEngine = new RoleAutonomyEngine({
+      runs_root: runsRoot,
+      llm: agentLlmClient,
+      repository: bCapabilities.repository,
+      buffer_repository: bCapabilities.bufferRepository,
+      ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
+      driver_for: (roleId, runId) => driverRoutingService.resolveForRunRole(runId, roleId).handle,
+      create_budget: ({ frozen, consumed, journal, clock }) =>
+        new RoleBudget({
+          frozen,
+          consumed,
+          journal,
+          ...(clock ? { clock } : {}),
+        }),
+      create_finish_validator: () => createRoleFinishValidator(),
+      run_loop: runRoleExecutionLoop,
+      ...(roleAutonomyConfig.budget_overrides
+        ? { budget_overrides: roleAutonomyConfig.budget_overrides }
+        : {}),
+    });
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       // driver 可配置化：role 显式映射优先，否则落 default_driver。未配置任何档案时
@@ -411,11 +446,8 @@ export async function createProductionBackendService(
       // 复用 B 侧那个文本 LLM（与 memoryMaintenance 同一个），失败只是降级不留痕变留痕。
       contextCleaner: dependencies.contextCleaner ?? new LlmContextCleaner(memoryLlm),
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
-      llm:
-        dependencies.agentLlm ??
-        new ProductionAgentToolCallingClient(
-          createProductionToolCallingClient(productionLlm, env),
-        ),
+      llm: agentLlmClient,
+      roleAutonomy: roleAutonomyEngine,
       memoryMaintenance: bCapabilities.maintenance,
       // B1 调用留档与 mailbox.sessionRegistry 无关：journal 用自己持有的注册表引用，
       // ephemeral 会话下注册表为空 → session_id 记 null（规定回退）。
@@ -619,6 +651,7 @@ export async function createProductionBackendService(
         runsRoot,
         councilRoot: path.join(stateRoot, 'council'),
         worktreesRoot: path.join(stateRoot, 'worktrees'),
+        roleAutonomy: roleAutonomyConfig,
       }),
     });
     const mailboxRecovery = mailboxService.replayPendingDeliveries();
@@ -1255,6 +1288,65 @@ export function readAuctionEnabled(value: string | undefined): boolean {
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
   throw new Error(`Invalid NEWIDE_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
+}
+
+/**
+ * NEWIDE_ROLE_AUTONOMY：阶段 2 role 自主循环的显式开关，默认关闭。
+ * 打开后也只对全新 single_agent Run 生效；排除项与已冻结 Run 由选路模块处理。
+ */
+export function readRoleAutonomyEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return false;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_ROLE_AUTONOMY: ${value}. Expected 0/1/true/false.`);
+}
+
+const ROLE_BUDGET_ENV_KEYS = {
+  max_dispatches: 'NEWIDE_ROLE_MAX_DISPATCHES',
+  max_role_rounds: 'NEWIDE_ROLE_MAX_ROUNDS',
+  role_token_budget: 'NEWIDE_ROLE_TOKEN_BUDGET',
+  wall_clock_seconds: 'NEWIDE_ROLE_WALL_CLOCK_SECONDS',
+  dispatch_timeout_ms: 'NEWIDE_ROLE_DISPATCH_TIMEOUT_MS',
+} as const;
+
+/**
+ * 阶段 2 组合根的**唯一选路配置对象**：开关 + 部署预算覆盖。
+ * engine 与 stage executor 都只能消费这一份，禁止各自读 env/合并（RD-SEL-03）。
+ */
+export function buildRoleAutonomySelectionConfig(
+  env: Record<string, string | undefined>,
+  options: { wired: boolean },
+): RoleAutonomySelectionConfig {
+  const budgetOverrides = readRoleBudgetOverrides(env);
+  return {
+    enabled: readRoleAutonomyEnabled(env.NEWIDE_ROLE_AUTONOMY),
+    wired: options.wired,
+    ...(budgetOverrides !== undefined ? { budget_overrides: budgetOverrides } : {}),
+  };
+}
+
+/**
+ * role-loop 四类预算的部署级上限覆盖：缺省 = 设计初值；出现但非法 → 启动失败，
+ * 不在一个 Run 内静默降级（请求侧也只能收紧，见 resolveRoleBudgetLimits）。
+ */
+export function readRoleBudgetOverrides(
+  env: Record<string, string | undefined>,
+): RoleBudgetOverrides | undefined {
+  const overrides: Record<string, number> = {};
+  for (const [key, envKey] of Object.entries(ROLE_BUDGET_ENV_KEYS)) {
+    const raw = env[envKey]?.trim();
+    if (!raw) continue;
+    if (!/^\d+$/.test(raw)) {
+      throw new Error(`Invalid ${envKey}: ${raw}. Expected a positive integer.`);
+    }
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`Invalid ${envKey}: ${raw}. Expected a positive integer.`);
+    }
+    overrides[key] = value;
+  }
+  return Object.keys(overrides).length > 0 ? (overrides as RoleBudgetOverrides) : undefined;
 }
 
 /**

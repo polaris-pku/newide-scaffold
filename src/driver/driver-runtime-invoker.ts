@@ -62,6 +62,12 @@ export interface DriverRuntimeReport {
 export interface DriverRuntimeInvocationResult {
   report: DriverRuntimeReport;
   execution: DriverRunResult;
+  /**
+   * 执行体抛出的原始错误（仅在非 abort 的失败路径）。`execution` 仍是合成的
+   * failed 结果以保持旧 consumer 行为；role 新路径需要原始错误来判断
+   * 「明确未执行 vs 执行结果未知」，不能只看合成结果的 status。
+   */
+  thrown?: unknown;
 }
 
 export function createDriverRuntimeInvoker(
@@ -80,6 +86,7 @@ export function createDriverRuntimeInvoker(
 
     const runId = input.run_id ?? input.call_id;
     let execution: DriverRunResult;
+    let thrown: unknown;
     try {
       execution = await runDriverPromptWithSignal(
         driver,
@@ -113,6 +120,7 @@ export function createDriverRuntimeInvoker(
       );
     } catch (error) {
       if (isAbort(error, options?.signal)) throw error;
+      thrown = error;
       execution = failedExecution(driver, input, error);
     }
 
@@ -123,7 +131,7 @@ export function createDriverRuntimeInvoker(
       taskId: input.task_id,
       ...(input.workspace_path ? { workspace: input.workspace_path } : {}),
     });
-    return { report, execution };
+    return { report, execution, ...(thrown !== undefined ? { thrown } : {}) };
   };
 }
 

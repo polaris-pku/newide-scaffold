@@ -131,6 +131,8 @@ export type ExecutionContractViolationCode =
   | 'session_reuse_requires_session_id'
   | 'session_reuse_unconfirmed'
   | 'brief_hash_mismatch'
+  | 'retry_not_allowed'
+  | 'retry_without_evidence'
   | 'evidence_inconsistent';
 
 /** 宿主侧校验失败：调用方据此返回 typed error，**不得**降级成「继续执行」。 */
@@ -355,7 +357,11 @@ export function buildExecutionBrief(input: BuildExecutionBriefInput): BuiltExecu
   try {
     request = RoleExecutionRequestSchema.parse(input.request);
   } catch (error) {
-    throw new ExecutionContractViolation('brief_invalid', 'execution brief request is invalid', error);
+    throw new ExecutionContractViolation(
+      'brief_invalid',
+      'execution brief request is invalid',
+      error,
+    );
   }
 
   const readOnly = normalizeReadOnlyForKind(request.kind, request.read_only);
@@ -442,6 +448,23 @@ export const ExecutionCheckSchema = z
     stderr_ref: EvidenceRefSchema.optional(),
     provenance: z.enum(['host_observed', 'driver_reported']),
     observation: z.enum(['complete', 'partial', 'missing']),
+    /**
+     * 证据适用对象（工作区相对路径，交付产物目标）。host_observed 检查只有作用于最终
+     * 交付对象时才能支撑 completed；旧行为/旧数据可缺省。
+     */
+    target_paths: z.array(z.string().trim().min(1).max(1_024)).max(256).optional(),
+    /**
+     * 被检查内容身份（工作区 canonical 内容指纹）。只有 Driver 在命令结束时上报、宿主独立重算
+     * 比对通过的指纹才会写入（`driver.command_observed.checked_workspace_sha256`）；finish 校验时
+     * 与当前最终内容指纹比较，不一致即「旧版本成功后又修改」→ 过期证据，不能支撑 completed。
+     * 事件到达时刻的快照不能直接冒充该值（见 `command-observation.ts`）。
+     */
+    workspace_sha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    /** 观察时间（ISO）；仅作审计，不替代指纹过期判定。 */
+    observed_at: z.iso.datetime().optional(),
   })
   .strict()
   .superRefine((check, ctx) => {
@@ -553,7 +576,11 @@ export const ExecutionUsageSchema = z
     ] as const;
     const hasTokens = tokenKeys.some((key) => usage[key] !== undefined);
     if (usage.missing && usage.source !== 'none') {
-      ctx.addIssue({ code: 'custom', path: ['source'], message: 'missing usage must use source=none' });
+      ctx.addIssue({
+        code: 'custom',
+        path: ['source'],
+        message: 'missing usage must use source=none',
+      });
     }
     if (!usage.missing && usage.source === 'none') {
       ctx.addIssue({
@@ -730,7 +757,12 @@ export function normalizeDriverUsage(
   const tokens: Record<string, number> = {};
   for (const key of USAGE_NUMBER_KEYS) {
     const value = usage?.[key];
-    if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0) {
+    if (
+      typeof value === 'number' &&
+      Number.isFinite(value) &&
+      Number.isInteger(value) &&
+      value >= 0
+    ) {
       tokens[key] = value;
     }
   }
@@ -747,12 +779,18 @@ export function hostObservedCheck(input: {
   stdout_ref?: EvidenceRef;
   stderr_ref?: EvidenceRef;
   observation?: 'complete' | 'partial';
+  target_paths?: string[];
+  workspace_sha256?: string;
+  observed_at?: string;
 }): ExecutionCheck {
   return ExecutionCheckSchema.parse({
     ...(input.command !== undefined ? { command: input.command } : {}),
     ...(input.exit_code !== undefined ? { exit_code: input.exit_code } : {}),
     ...(input.stdout_ref !== undefined ? { stdout_ref: input.stdout_ref } : {}),
     ...(input.stderr_ref !== undefined ? { stderr_ref: input.stderr_ref } : {}),
+    ...(input.target_paths !== undefined ? { target_paths: input.target_paths } : {}),
+    ...(input.workspace_sha256 !== undefined ? { workspace_sha256: input.workspace_sha256 } : {}),
+    ...(input.observed_at !== undefined ? { observed_at: input.observed_at } : {}),
     provenance: 'host_observed',
     observation: input.observation ?? 'complete',
   });
@@ -813,6 +851,13 @@ export interface HostStatusOverride {
 export interface DriverAttemptObservation {
   result?: DriverAttemptResultLike;
   error?: ExecutionErrorInfo;
+  /**
+   * 「是否收到过 DriverRunResult」的**独立事实**。当调用方用证据化状态映射把
+   * 已收到结果映射成 `unknown`（例如 failed + EXTERNAL_DRIVER_TRANSPORT_ERROR）时，
+   * 结果对象本身无法放进 `result`（其 status 不允许 unknown），必须通过本字段如实表达，
+   * 不能从 status 反推。缺省时按 `result !== undefined || adp_receipt?.result_received` 判定。
+   */
+  result_received?: boolean;
   transport: {
     evidence: DriverExecutionEvidence;
     runner_exit_code?: number | null;
@@ -865,20 +910,34 @@ export interface BuildExecutionEvidenceInput {
  * - runner 退出码只放 transport，checks 只由调用方显式提供（不会被 runner 退码自动填充）；
  * - usage 缺失 → missing，不填 0。
  */
-export function buildExecutionEvidence(
-  input: BuildExecutionEvidenceInput,
-): ExecutionEvidence {
+export function buildExecutionEvidence(input: BuildExecutionEvidenceInput): ExecutionEvidence {
   const { observation } = input;
   const result = observation.result;
   const receipt = observation.adp_receipt;
   const transportEvidence = observation.transport.evidence;
 
-  // 1) result_received：与 transport.evidence 正交，不能从 receipt.status 推导。
+  // 1) result_received：与 transport.evidence 正交，不能从 receipt.status / 映射后的 status 推导。
+  const explicitReceived = observation.result_received;
   const resultReceived =
-    result !== undefined ? true : receipt !== undefined ? receipt.result_received : false;
+    explicitReceived !== undefined
+      ? explicitReceived
+      : result !== undefined
+        ? true
+        : receipt !== undefined
+          ? receipt.result_received
+          : false;
+  // 允许 explicitReceived=true 且没有 result/receipt：调用方明确声明收到过 DriverRunResult
+  // （但证据化映射后的结局未知，例如 failed + EXTERNAL_DRIVER_TRANSPORT_ERROR）。
+  if (explicitReceived === false && result !== undefined) {
+    throw new ExecutionContractViolation(
+      'evidence_inconsistent',
+      'observation.result_received=false contradicts a local driver result',
+    );
+  }
   // 旧持久化数据显式标注缺失时，只在「没有 result 且未声称收到」时透传，不凭空猜。
   const resultReceivedMissing =
     result === undefined &&
+    explicitReceived === undefined &&
     receipt !== undefined &&
     receipt.result_received_missing === true &&
     !receipt.result_received;
@@ -950,11 +1009,9 @@ export function buildExecutionEvidence(
   const responseExcerpt = observation.response_excerpt ?? result?.response;
   const usage = normalizeDriverUsage(observation.usage ?? result?.usage ?? null);
   const artifacts = observation.artifacts ?? result?.artifacts ?? [];
-  const overrideError = status !== 'succeeded' && override?.status === 'failed' ? override.error : undefined;
-  const error = deriveEvidenceError(
-    status,
-    overrideError ?? observation.error ?? result?.error,
-  );
+  const overrideError =
+    status !== 'succeeded' && override?.status === 'failed' ? override.error : undefined;
+  const error = deriveEvidenceError(status, overrideError ?? observation.error ?? result?.error);
 
   const evidence: Record<string, unknown> = {
     schema_version: EXECUTION_EVIDENCE_SCHEMA_VERSION,
@@ -991,7 +1048,8 @@ export function buildExecutionEvidence(
   }
   if (result?.transcript_ref !== undefined) evidence.transcript_ref = result.transcript_ref;
   if (result?.tool_events_ref !== undefined) evidence.tool_events_ref = result.tool_events_ref;
-  if (observation.transcript_ref !== undefined) evidence.transcript_ref = observation.transcript_ref;
+  if (observation.transcript_ref !== undefined)
+    evidence.transcript_ref = observation.transcript_ref;
   if (observation.tool_events_ref !== undefined) {
     evidence.tool_events_ref = observation.tool_events_ref;
   }
@@ -1109,9 +1167,7 @@ export const DispatchDispatchedJournalEntrySchema = z
   })
   .strict();
 
-export type DispatchDispatchedJournalEntry = z.infer<
-  typeof DispatchDispatchedJournalEntrySchema
->;
+export type DispatchDispatchedJournalEntry = z.infer<typeof DispatchDispatchedJournalEntrySchema>;
 
 export const DispatchSettledJournalEntrySchema = z
   .object({
@@ -1198,9 +1254,7 @@ export const DispatchReconciledJournalEntrySchema = z
     }
   });
 
-export type DispatchReconciledJournalEntry = z.infer<
-  typeof DispatchReconciledJournalEntrySchema
->;
+export type DispatchReconciledJournalEntry = z.infer<typeof DispatchReconciledJournalEntrySchema>;
 
 const controlJournalEntryBaseShape = {
   schema_version: z.literal(DISPATCH_JOURNAL_ENTRY_SCHEMA_VERSION),
@@ -1211,7 +1265,23 @@ const controlJournalEntryBaseShape = {
   at: z.iso.datetime(),
 } as const;
 
-/** 冻结配置与预算（RD-SEL-03/§5）；control 行不属于某个 dispatch，不伪造 sequence。 */
+/** 冻结的 routing 引用（阶段 2 只做记录，不迁移 Session/记忆）。 */
+export const JournalFrozenRoutingSchema = z
+  .object({
+    driver_id: IdSchema.optional(),
+    profile_id: IdSchema.optional(),
+  })
+  .strict();
+
+export type JournalFrozenRouting = z.infer<typeof JournalFrozenRoutingSchema>;
+
+/**
+ * 冻结配置与预算（RD-SEL-03/§5）；control 行不属于某个 dispatch，不伪造 sequence。
+ *
+ * 阶段 2 在阶段 1 基础上做**加法扩展**（全部 optional，旧行仍可解析）：
+ * `engine` / `engine_version` / `tool_allowlist` / `routing` / `dispatch_timeout_ms`。
+ * 没有这些字段的旧 init 行按 legacy 解释，不得用部署默认值补假冻结记录。
+ */
 export const JournalInitEntrySchema = z
   .object({
     ...controlJournalEntryBaseShape,
@@ -1223,10 +1293,44 @@ export const JournalInitEntrySchema = z
     max_role_rounds: z.number().int().positive(),
     role_token_budget: z.number().int().positive(),
     deadline_at: z.iso.datetime(),
+    engine: z.enum(['legacy', 'role_autonomy']).optional(),
+    engine_version: z.string().trim().min(1).max(120).optional(),
+    tool_allowlist: z.array(z.string().trim().min(1).max(120)).max(32).optional(),
+    routing: JournalFrozenRoutingSchema.optional(),
+    dispatch_timeout_ms: z.number().int().positive().optional(),
+    /** TaskBudget.max_tool_calls 映射后的任务级工具调用上限（旧行可缺省）。 */
+    max_tool_calls: z.number().int().positive().optional(),
   })
   .strict();
 
 export type JournalInitEntry = z.infer<typeof JournalInitEntrySchema>;
+
+/** Role 验证陈述的唯一字段契约；工具输入可添加默认值，持久化仍要求完整引用数组。 */
+export const JournalVerificationClaimSchema = z
+  .object({
+    requirement: z
+      .string()
+      .trim()
+      .min(1)
+      .max(2_000)
+      .describe('你用一句话描述的一条任务要求（自由文本，不要求逐字照抄 completion_criteria）'),
+    outcome: z
+      .enum(['passed', 'failed', 'not_run'])
+      .describe(
+        'passed=你确认该要求已满足；failed=尝试过但没有满足；not_run=未验证/无法验证（必须如实说明）',
+      ),
+    dispatch_ids: z
+      .array(z.string().trim().min(1).max(120))
+      .max(32)
+      .describe('支撑该结论的派工 id；outcome=passed 时必须至少一个，且宿主观察到通过的检查证据'),
+    evidence_refs: z
+      .array(EvidenceRefSchema)
+      .max(32)
+      .describe('支撑该结论的受控 evidence 引用（host 校验登记与 sha256）'),
+    note: z.string().trim().max(2_000).optional().describe('补充说明（如未验证原因）'),
+  })
+  .strict();
+export type JournalVerificationClaim = z.infer<typeof JournalVerificationClaimSchema>;
 
 export const JournalFinishEntrySchema = z
   .object({
@@ -1236,10 +1340,80 @@ export const JournalFinishEntrySchema = z
     status: z.enum(['completed', 'blocked', 'failed', 'cancelled', 'interrupted']),
     reason: z.string().max(4_000),
     evidence_refs: z.array(EvidenceRefSchema),
+    /**
+     * 阶段 2 的 role finish 事实（加法扩展，旧行可读）：summary / unresolved /
+     * role_reflection / response_only / zero_dispatch。暂停原因仍走 `reason`。
+     */
+    summary: z.string().max(8_000).optional(),
+    unresolved: z.array(z.string().trim().min(1).max(2_000)).max(32).optional(),
+    role_reflection: z.string().max(8_000).optional(),
+    response_only: z.boolean().optional(),
+    zero_dispatch: z.boolean().optional(),
+    /**
+     * role 对任务要求满足情况的显式陈述（阶段 2 精简后的完成语义载体）：
+     * `passed` 必须引用真实派工及其 host_observed 通过检查；`failed`/`not_run` 是 role 的如实陈述。
+     * 旧 finish 行没有该字段时按空数组解释。
+     */
+    verification: z.array(JournalVerificationClaimSchema).max(32).optional(),
+    /**
+     * 已退役的「完成要求 → 宿主命令」映射（阶段 2 早期格式）。只为读取旧 finish 行保留；
+     * 生产不再写入、宿主也不据此放行。新记录用 `verification`。
+     */
+    checks: z
+      .array(
+        z
+          .object({
+            criterion: z.string().trim().min(1).max(2_000),
+            command: z.string().trim().min(1).max(4_096),
+            clause: z.string().trim().min(1).max(2_000).optional(),
+            target_paths: z.array(z.string().trim().min(1).max(1_024)).max(256).optional(),
+          })
+          .strict(),
+      )
+      .max(32)
+      .optional(),
   })
   .strict();
 
 export type JournalFinishEntry = z.infer<typeof JournalFinishEntrySchema>;
+
+/**
+ * role 单回合的预算消费事实（阶段 2 新增 control 行）：恢复时据此还原已消费回合与 token，
+ * 不能靠 restart 清零。`usage_missing` 为 true 时 token 字段不得填 0 冒充已知用量。
+ */
+export const JournalRoleRoundEntrySchema = z
+  .object({
+    ...controlJournalEntryBaseShape,
+    event: z.literal('role_round'),
+    round: z.number().int().positive(),
+    input_tokens: z.number().int().min(0).optional(),
+    output_tokens: z.number().int().min(0).optional(),
+    usage_missing: z.boolean(),
+    /** 本回合执行的环境工具调用数；恢复工具调用预算用（旧行可缺省）。 */
+    tool_calls: z.number().int().min(0).optional(),
+  })
+  .strict()
+  .superRefine((entry, ctx) => {
+    if (entry.usage_missing) {
+      if (entry.input_tokens !== undefined || entry.output_tokens !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['usage_missing'],
+          message: 'usage_missing role_round must not carry token counts',
+        });
+      }
+      return;
+    }
+    if (entry.input_tokens === undefined || entry.output_tokens === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['usage_missing'],
+        message: 'role_round requires input_tokens/output_tokens unless usage is missing',
+      });
+    }
+  });
+
+export type JournalRoleRoundEntry = z.infer<typeof JournalRoleRoundEntrySchema>;
 
 /**
  * 尾部半写修复痕迹：`discarded_tail_sha256` 指向被丢弃的原始字节；
@@ -1269,12 +1443,13 @@ export type DispatchJournalEntry = z.infer<typeof DispatchJournalEntrySchema>;
 export const JournalControlEntrySchema = z.discriminatedUnion('event', [
   JournalInitEntrySchema,
   JournalFinishEntrySchema,
+  JournalRoleRoundEntrySchema,
   JournalRepairEntrySchema,
 ]);
 
 export type JournalControlEntry = z.infer<typeof JournalControlEntrySchema>;
 
-/** 一行 journal：7 个 event 值互斥，统一按 `event` 判别。 */
+/** 一行 journal：event 值互斥，统一按 `event` 判别。 */
 export const DispatchJournalLineSchema = z.discriminatedUnion('event', [
   JournalInitEntrySchema,
   DispatchAcceptedJournalEntrySchema,
@@ -1282,18 +1457,22 @@ export const DispatchJournalLineSchema = z.discriminatedUnion('event', [
   DispatchSettledJournalEntrySchema,
   DispatchReconciledJournalEntrySchema,
   JournalFinishEntrySchema,
+  JournalRoleRoundEntrySchema,
   JournalRepairEntrySchema,
 ]);
 
 export type DispatchJournalLine = z.infer<typeof DispatchJournalLineSchema>;
 
 export function isControlJournalEntry(entry: DispatchJournalLine): entry is JournalControlEntry {
-  return entry.event === 'init' || entry.event === 'finish' || entry.event === 'repair';
+  return (
+    entry.event === 'init' ||
+    entry.event === 'finish' ||
+    entry.event === 'role_round' ||
+    entry.event === 'repair'
+  );
 }
 
-export function isDispatchJournalEntry(
-  entry: DispatchJournalLine,
-): entry is DispatchJournalEntry {
+export function isDispatchJournalEntry(entry: DispatchJournalLine): entry is DispatchJournalEntry {
   return !isControlJournalEntry(entry);
 }
 
@@ -1390,6 +1569,19 @@ export interface SettledAppendInput {
   violations: readonly JournalViolation[];
   entry_id?: string;
   at?: string;
+}
+
+/**
+ * 跨 Run 显式重试的锚点（阶段 2 复审修复）：当前 Run 的 Journal 不认识祖先 Run 的
+ * dispatch_id，engine 必须先从祖先 Journal 读出真实记录并**通过受控 evidence 读取校验**
+ * 后，才能把锚点交给当前 Journal 的 retry 校验。锚点不是执行事实，只是外部引用。
+ */
+export interface ForeignRetryAnchor {
+  dispatch_id: string;
+  /** accepted-only 的 not_executed 也允许作为锚点（明确未执行，可安全重试）。 */
+  status: ExecutionStatus | 'not_executed';
+  /** 祖先 Journal 中该记录可验证的受控 ref（path+sha256 双向绑定）。 */
+  evidence_refs: EvidenceRef[];
 }
 
 export interface ReconciledAppendInput {

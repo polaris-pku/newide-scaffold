@@ -98,6 +98,7 @@ import type {
   BMemoryMaintenanceEvidence,
   BMemoryMaintenancePort,
 } from './b-memory-maintenance-runner';
+import type { RoleAutonomyEnginePort } from './role-autonomy-contract';
 import type { DriverFeedbackRecord } from '../memory/schemas';
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
@@ -158,6 +159,12 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
     defaultDeadlineSeconds?: number;
     sessionRegistry?: ParticipantSessionRegistry;
   };
+  /**
+   * 阶段 2：role 自主循环引擎（组合根注入）。仅在 stage executor 显式传出
+   * `execution_engine: 'role_autonomy'` 时使用；legacy 路径完全不看它。
+   * 未装配而请求标记为 role_autonomy 时明确报错，不静默退化成旧路径。
+   */
+  roleAutonomy?: RoleAutonomyEnginePort;
 }
 
 interface InvocationContext {
@@ -459,6 +466,44 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     options?: AgentExecutionOptions,
   ): Promise<AgentExecutionResult> {
     throwIfAborted(options?.signal);
+    if (input.execution_engine === 'role_autonomy') {
+      // 引擎标记由 stage executor 依据 mode/cursor/task_request 冻结；facade 不再猜测。
+      // role 侧 blocked/failed/预算/host 终止由引擎抛 RoleTerminationError，
+      // stage executor 负责转成 coordination 的 typed termination。
+      const engine = this.options.roleAutonomy;
+      if (!engine) {
+        throw new Error(
+          'execution_engine=role_autonomy but the backend has no role autonomy engine wired',
+        );
+      }
+      return engine.run({
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: input.role_id,
+        instruction: input.instruction,
+        ...(input.driver_instruction !== undefined
+          ? { driver_instruction: input.driver_instruction }
+          : {}),
+        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+        ...(input.session_id ? { session_id: input.session_id } : {}),
+        ...(input.resume_session ? { resume_session: true } : {}),
+        ...(input.restarted_from_run_id
+          ? { restarted_from_run_id: input.restarted_from_run_id }
+          : {}),
+        ...(input.completion_criteria
+          ? { completion_criteria: [...input.completion_criteria] }
+          : {}),
+        ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
+        ...(options?.signal ? { signal: options.signal } : {}),
+        ...(options?.onDriverEvent ? { on_driver_event: options.onDriverEvent } : {}),
+        ...(options?.role_autonomy?.task_budget !== undefined
+          ? { task_budget: options.role_autonomy.task_budget }
+          : {}),
+        ...(options?.role_autonomy?.freeze_plan !== undefined
+          ? { freeze_plan: options.role_autonomy.freeze_plan }
+          : {}),
+      });
+    }
     const normalizedInput = input.workspace_path
       ? { ...input, workspace_path: path.resolve(input.workspace_path) }
       : input;

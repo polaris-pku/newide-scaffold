@@ -21,7 +21,7 @@
  * | 取消生效(未执行)/ 副作用不明     | 明确未执行 / 证据不足        | cancelled/unknown |
  */
 import type { AdpStatus, ProtocolError } from '../core';
-import type { DriverRunResult } from './contract';
+import type { DriverRunResult, DriverStreamEvent } from './contract';
 import type { AdpInvocationEvidence } from './adp-invocation-state';
 
 /** 这些错误码表示「执行结果无法确认」,不得当成确定失败。 */
@@ -48,6 +48,16 @@ export interface AdpMappedOutcome {
   summary: string;
   /** 证据/判定依据,写入诊断与 journal 摘要,便于对账 */
   notes: string[];
+}
+
+/**
+ * driver 事件流里的**副作用活动证据**（tool 事件/工具调用）：与 ADP endpoint 的
+ * `isEffectEvidence` 同一判定（role 新路径复用，不维护第二套语义）。
+ */
+export function isDriverEffectEvent(event: DriverStreamEvent): boolean {
+  if (event.event_type.includes('tool')) return true;
+  const payload = event.payload;
+  return !!payload && typeof payload === 'object' && 'tool_name' in payload;
 }
 
 export function mapAdpOutcome(input: AdpMappingInput): AdpMappedOutcome {

@@ -49,6 +49,9 @@ idempotent by `exchange_id` when an expired lease is reclaimed after a crash.
 
 ## Run dispatch journal (stage 1)
 
+Role finish 的 `verification` 使用 driver 的 `JournalVerificationClaimSchema` 和派生类型；
+工具输入的默认值由 app 添加，落盘仍校验完整引用数组，历史 finish 行可缺省该字段。
+
 `run-dispatch-journal.ts` is the append-only, per-Run dispatch fact source for
 the role/driver autonomy work. It is **not wired into the production
 composition root yet** (that is stage 2); the default run path is unchanged.
@@ -132,6 +135,43 @@ I/O, folding and the controlled evidence reader only.
   with a different hash (`evidence_ref_conflict`); `retry_of` /
   `reconciliation_ref` validation reuses the same registry. Large evidence stays
   in the sidecar; the journal line stores refs and hashes.
+- **Stage-2 role-loop facts ride the same ledger (additive, backward readable)**:
+  `init` gained optional `engine` / `engine_version` / `tool_allowlist` / `routing` /
+  `dispatch_timeout_ms`; `finish` gained optional `summary` / `unresolved` / `role_reflection` /
+  `response_only` / `zero_dispatch`; a new `role_round` control row records one role LLM round
+  (`round`, `input_tokens`/`output_tokens` or `usage_missing: true`). Old rows still parse; no
+  parallel budget ledger is created. `RunDispatchJournal.peek({runDir, identity})` opens the file
+  **read-only** (no writer lock, creates nothing) so engine selection/recovery can read the frozen
+  `init` from the current Run or its ancestry.
+- **Stage-2 review fixes (additive, backward readable)**: `init` gained optional
+  `max_tool_calls` (TaskBudget tool-call cap; absent = old rows keep no such
+  constraint); the freeze record's `deadline_at` and `frozen_at` come from the
+  same clock reading (`init.at`), so `deadline_at - at` equals the frozen wall
+  clock exactly. `role_round` gained optional `tool_calls` (per-round
+  environment-tool count, summed on restore; `finish_task` is not counted).
+  `setForeignRetryAnchors(anchors)` lets the engine hand the journal
+  **verified ancestor dispatch records** (`ForeignRetryAnchor`) so `retry_of` can
+  target an ancestor Run; the anchor only supplies `{dispatch_id,status,
+  evidence_refs}` and never fabricates a dispatch. Unknown ancestor retries still
+  require a `reconciliation_ref` that is registered **and** hash-verified in the
+  ancestor journal; a succeeded ancestor must not be retried. Corrupt
+  (`journal_corrupt`) / unreadable (`journal_unreadable`) journals fail closed —
+  they are never treated as "no journal" and never silently downgraded to legacy.
+- **Stage-2 latest review (additive, backward readable)**: `finish` gained optional
+  `checks` (`[{criterion, command}]`), the audit/recovery copy of the role's
+  completion-requirement → host-command mapping; it is not trusted on read and the
+  finish validator must still verify the underlying evidence. The current round added
+  optional `clause` (the natural-language check clause a claim proves) and
+  `target_paths` (the verification object for no-code-change tasks) to each `checks`
+  item, still additive/backward readable and still audit-only; the round-3 review
+  tightened their *validation semantics* without changing the persisted shape (the
+  validator derives explicit check-command obligations from the criterion text, accepts
+  successful `&&` composites for several obligations, and requires every declared
+  verification object to be covered by a passing check scope). No new journal file
+  or sidecar is introduced. The late-result path lives in the app layer as durable
+  receipts under the run directory and **re-acquires the same single-writer journal**
+  after close for `reconciled` appends (never direct file appends, never a stale
+  writer); `close()`/lock/FIFO/repair semantics in this module are unchanged.
 - A Run directory without `journal/dispatches.jsonl` is `legacy`: read/fold
   report `kind: 'legacy'` and fabricate no dispatch, create no file and migrate
   no history.
