@@ -290,6 +290,13 @@ export function createProductionStageExecutors(
               ...(freshSelection !== undefined
                 ? { freeze_plan: freshSelection.freeze_plan }
                 : {}),
+              // 阶段 4：低频生命周期事件的唯一接线点。事件经阶段事件出口进 run 时间线，
+              // 由两个 snapshot projector 与 terminal writer 折叠成 dispatch 进度投影。
+              emit_event: (event: {
+                type: string;
+                subject_id: string;
+                payload: Record<string, unknown>;
+              }) => emit(context, event.type, event.subject_id, event.payload),
             }
           : undefined;
       const strategyName = councilStrategyName(dependencies.councilProvider);

@@ -9,6 +9,9 @@ import {
 } from '../../src/app/run-terminal-output-writer';
 import type { AppRunSnapshot } from '../../src/app/run-registry';
 import { createRunLatency } from '../../src/telemetry';
+import { ROLE_DISPATCH_EVENT } from '../../src/app/run-dispatch-events';
+import { RunDispatchJournal } from '../../src/persistence';
+import { buildExecutionBrief, buildExecutionEvidence, hashExecutionBrief } from '../../src/driver';
 
 const tempDirs: string[] = [];
 
@@ -475,6 +478,184 @@ describe('FileRunTerminalOutputWriter', () => {
     } finally {
       stderr.mockRestore();
     }
+  });
+
+  it('persists dispatch summary/progress alongside the snapshot and summary', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const writer = new FileRunTerminalOutputWriter(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events = [
+      {
+        event_id: 'run_event_accepted',
+        sequence: 1,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: ROLE_DISPATCH_EVENT.accepted,
+        source: 'agent',
+        created_at: '2026-07-11T08:00:00.000Z',
+        payload: { dispatch_id: 'dsp_1', kind: 'execute', read_only: false, session_mode: 'fresh' },
+        schema_version: 'v0',
+      },
+      {
+        event_id: 'run_event_started',
+        sequence: 2,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: ROLE_DISPATCH_EVENT.started,
+        source: 'agent',
+        created_at: '2026-07-11T08:00:01.000Z',
+        payload: { dispatch_id: 'dsp_1', kind: 'execute' },
+        schema_version: 'v0',
+      },
+      {
+        event_id: 'run_event_settled',
+        sequence: 3,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: ROLE_DISPATCH_EVENT.settled,
+        source: 'agent',
+        created_at: '2026-07-11T08:00:02.000Z',
+        payload: { dispatch_id: 'dsp_1', kind: 'execute', status: 'unknown', violations: [] },
+        schema_version: 'v0',
+      },
+      {
+        event_id: 'run_event_terminated',
+        sequence: 4,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: ROLE_DISPATCH_EVENT.role_terminated,
+        source: 'agent',
+        created_at: '2026-07-11T08:00:03.000Z',
+        payload: { code: 'dispatch_unknown_unresolved', actor: 'role' },
+        schema_version: 'v0',
+      },
+    ];
+
+    await writer.finalize(snapshot);
+
+    const runDir = path.join(runsRoot, 'run_failed');
+    const summary = (await readJson(path.join(runDir, 'summary.json'))) as Record<string, unknown>;
+    expect(summary.dispatch_summary).toMatchObject({
+      total: 1,
+      by_status: { unknown: 1 },
+      unknown: { count: 1, dispatch_ids: ['dsp_1'] },
+    });
+    expect(summary.dispatch_progress).toMatchObject({
+      terminated: { code: 'dispatch_unknown_unresolved', actor: 'role' },
+    });
+    // 上位快照与落盘回读同源：frontend-snapshot / result 带着与 summary 相同的投影。
+    await expect(readJson(path.join(runDir, 'frontend-snapshot.json'))).resolves.toMatchObject({
+      dispatch_summary: summary.dispatch_summary,
+      dispatch_progress: summary.dispatch_progress,
+    });
+    await expect(readJson(path.join(runDir, 'result.json'))).resolves.toMatchObject({
+      dispatch_summary: summary.dispatch_summary,
+    });
+  });
+
+  it('R4-01: rebuilds the dispatch summary from Journal when the settled event was lost', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_failed');
+    await mkdir(runDir, { recursive: true });
+    const identity = { run_id: 'run_failed', task_id: 'task_failed', role_id: 'role_1' };
+    const journal = await RunDispatchJournal.open({ runDir, identity });
+    const brief = buildExecutionBrief({
+      identity: {
+        dispatch_id: 'dsp_journal',
+        run_id: identity.run_id,
+        task_id: identity.task_id,
+        role_id: identity.role_id,
+        sequence: 1,
+        accepted_at: '2026-07-11T08:00:00.000Z',
+      },
+      request: { kind: 'execute', instruction: 'do the work' },
+    }).brief;
+    await journal.appendAccepted({
+      brief,
+      brief_sha256: hashExecutionBrief(brief),
+      budget_before: {
+        dispatches_left: 1,
+        role_tokens_left: 1_000,
+        deadline_at: '2026-07-11T09:00:00.000Z',
+      },
+    });
+    await journal.appendDispatched({ dispatch_id: 'dsp_journal' });
+    const evidence = buildExecutionEvidence({
+      dispatch_id: 'dsp_journal',
+      observation: {
+        transport: { evidence: 'execution_unconfirmed' },
+        result: { status: 'succeeded', response: 'done' },
+      },
+    });
+    const ref = await journal.appendEvidence({ dispatch_id: 'dsp_journal', evidence });
+    await journal.appendSettled({
+      dispatch_id: 'dsp_journal',
+      status: 'succeeded',
+      evidence,
+      evidence_sha256: ref.sha256,
+      violations: [],
+    });
+    await journal.close();
+
+    // 事件出口只成功落了 accepted；settled 事件丢失 → 纯事件投影会停在 unknown。
+    const snapshot = failedSnapshot();
+    snapshot.events = [
+      {
+        event_id: 'run_event_accepted',
+        sequence: 2,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: ROLE_DISPATCH_EVENT.accepted,
+        source: 'agent',
+        created_at: '2026-07-11T08:00:01.000Z',
+        payload: {
+          dispatch_id: 'dsp_journal',
+          kind: 'execute',
+          read_only: false,
+          session_mode: 'fresh',
+          sequence: 1,
+        },
+        schema_version: 'v0',
+      },
+    ];
+
+    const writer = new FileRunTerminalOutputWriter(runsRoot);
+    await writer.finalize(snapshot);
+    // 重复收尾：同一份事实不放大计数（文件已存在时首写为空操作）。
+    await writer.finalize(snapshot);
+
+    const summary = (await readJson(path.join(runDir, 'summary.json'))) as Record<string, unknown>;
+    expect(summary.dispatch_summary).toMatchObject({
+      total: 1,
+      by_status: { succeeded: 1 },
+      unknown: { count: 0, dispatch_ids: [] },
+    });
+    expect(summary.dispatch_progress).toMatchObject({
+      evidence_refs: [
+        {
+          dispatch_id: 'dsp_journal',
+          path: 'journal/evidence/dsp_journal.json',
+          sha256: ref.sha256,
+        },
+      ],
+    });
+    // 终态产物与 summary 同源：result / frontend-snapshot 也按 Journal 事实补齐。
+    await expect(readJson(path.join(runDir, 'result.json'))).resolves.toMatchObject({
+      dispatch_summary: summary.dispatch_summary,
+    });
+    await expect(readJson(path.join(runDir, 'frontend-snapshot.json'))).resolves.toMatchObject({
+      dispatch_summary: summary.dispatch_summary,
+    });
+    // legacy Run（没有 Journal）不得被补出派工事实。
+    const legacyRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(legacyRoot);
+    await new FileRunTerminalOutputWriter(legacyRoot).finalize(failedSnapshot());
+    const legacySummary = (await readJson(
+      path.join(legacyRoot, 'run_failed', 'summary.json'),
+    )) as Record<string, unknown>;
+    expect(legacySummary).not.toHaveProperty('dispatch_summary');
   });
 });
 

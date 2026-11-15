@@ -169,6 +169,17 @@ import type {
   RunArtifactContentReader,
 } from './run-artifact-content-reader';
 import type { RunPayloadReader } from './run-payload-reader';
+import {
+  readRunDispatchEvidencePage,
+  readRunDispatchFacts,
+  readRunDispatchJournalPage,
+} from './run-dispatch-read';
+import type {
+  GetRunDispatchEvidenceInput,
+  GetRunDispatchJournalInput,
+  RunDispatchEvidencePage,
+  RunDispatchJournalPage,
+} from '../protocol/run-dispatch-read';
 import type {
   DurableRunUsage,
   RunUsageHistoryReader,
@@ -413,6 +424,14 @@ export class NewideBackendService {
      */
     driverRouting?: DriverRoutingPort,
     driverProbe?: DriverProbeService,
+    /**
+     * Dispatch Journal / evidence 只读读取的 runs root（生产为 `<stateRoot>/runs`）。
+     *
+     * 这两个读取口（`run.getDispatchJournal` / `run.getDispatchEvidence`）读的是 run 目录里的
+     * 事实源文件，不是协调库里的状态；默认值与其它 File* 适配器一致，生产组装点显式传
+     * absolute runs root，因此自定义 `NEWIDE_STATE_ROOT` 时不会读错目录。
+     */
+    private readonly runsRoot: string = '.newide/runs',
   ) {
     this.driverRouting = driverRouting;
     this.driverProbe = driverProbe;
@@ -498,6 +517,36 @@ export class NewideBackendService {
       latest_sequence: timeline.reduce((max, event) => Math.max(max, event.sequence), 0),
       has_more: limited.length < candidates.length,
     };
+  }
+
+  /**
+   * 读一页派工 Journal 事实（`run.getDispatchJournal`）。
+   *
+   * 只读：用 `RunDispatchJournal.peek` 打开，不取写锁、不修坏尾、不写任何文件。run 必须存在
+   * （否则 `RunNotFoundError`，RPC 层映射 `RUN_NOT_FOUND`）；Journal 不存在是老 Run 的常态，
+   * 返回 `state='absent'` 而不是错误。行投影只含事实元数据，正文按 evidence ref 分页读。
+   */
+  async getRunDispatchJournal(input: GetRunDispatchJournalInput): Promise<RunDispatchJournalPage> {
+    this.assertRunExists(input.run_id);
+    return readRunDispatchJournalPage(this.runsRoot, input);
+  }
+
+  /**
+   * 读一页受控 evidence 侧车（`run.getDispatchEvidence`）。
+   *
+   * ref 只从本 Run Journal 行派生（settled 侧车路径 + evidence_sha256，或 reconciled 的显式
+   * evidence_ref），不接受调用方给路径；未登记/不属于本 Run 的 dispatch 由读取器抛稳定错误。
+   */
+  async getRunDispatchEvidence(
+    input: GetRunDispatchEvidenceInput,
+  ): Promise<RunDispatchEvidencePage> {
+    this.assertRunExists(input.run_id);
+    return readRunDispatchEvidencePage(this.runsRoot, input);
+  }
+
+  /** 用既有快照投影判定 run 是否存在：未知 run 抛 `RunNotFoundError`（含已收尾、进程重启后的 run）。 */
+  private assertRunExists(runId: string): void {
+    this.getRunSnapshot(runId);
   }
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
@@ -2422,7 +2471,11 @@ export class NewideBackendService {
       await this.driverStreamAuditWriter.flush(runId);
       await this.auditWriter.flush(runId);
       const terminalEvidence = await this.terminalWriter.finalize(staged.snapshot);
-      const projected = projectRunSnapshot(staged.snapshot);
+      // 阶段 4 修复 R4-01：写进协调库的 `run.snapshot` 也按 Journal 事实补齐派工字段，
+      // 这样重启后 `run.getSnapshot` 的持久化回读与终态产物、存活期投影是同一份解释。
+      // 只读 Journal；补投影不派工、不改 Task/Run 终态，失败时退回事件投影。
+      const dispatchJournalFacts = await readRunDispatchFacts(this.runsRoot, runId);
+      const projected = projectRunSnapshot(staged.snapshot, dispatchJournalFacts);
       this.taskProcessor?.finishRun({
         run_id: runId,
         status: terminalStatus(staged.snapshot.status),

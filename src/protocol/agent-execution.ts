@@ -114,6 +114,17 @@ export interface AgentExecutionOptions {
   role_autonomy?: {
     task_budget?: TaskBudget;
     freeze_plan?: RoleFreezePlanInput;
+    /**
+     * 阶段 4：role 低频生命周期事件的出口（app 组合根接到 run 事件流）。
+     *
+     * 这里刻意用结构镜像而不是 import app 的 `RoleLifecycleEvent`：protocol 层不依赖
+     * app 层（与 `RoleFreezePlanInput` 的理由相同）。事件只是投影，缺失/失败不影响执行。
+     */
+    emit_event?: (event: {
+      type: string;
+      subject_id: string;
+      payload: Record<string, unknown>;
+    }) => void;
   };
 }
 

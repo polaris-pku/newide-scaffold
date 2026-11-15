@@ -151,6 +151,140 @@ export const runUsageSchema = z
   .strict();
 
 /**
+ * 派工的可对账状态词表。
+ *
+ * 与 Journal 折叠记录同一套语义（`ExecutionStatus` + `not_executed`）：`unknown` 是
+ * 「已派发但无法确认执行/副作用状态」，不是 failed，也不是「未执行」；`not_executed`
+ * 只在明确证据下成立（accepted 之后没有 dispatched、也没有任何交付证据）。
+ */
+export const runDispatchStatusSchema = z.enum([
+  'succeeded',
+  'failed',
+  'cancelled',
+  'interrupted',
+  'unknown',
+  'not_executed',
+]);
+
+/**
+ * 派工计数摘要（阶段 4）。
+ *
+ * 它是 **Journal 事实的投影**，不是新的账本：身份按 `dispatch_id` 去重，同一派工重复的
+ * accepted/settled/reconciled 事件不会重复计数。`inherited` 单独成块——父链已有的派工
+ * 不能与当前 Run 的派工混加，否则恢复链越长数字越假。
+ */
+export const runDispatchSummarySchema = z
+  .object({
+    /** 当前 Run 自己的派工数（不含继承）。 */
+    total: z.number().int().nonnegative(),
+    /** 当前 Run 自己的派工按状态计数；只出现实际发生过的状态键。 */
+    by_status: z.record(z.string(), z.number().int().nonnegative()),
+    /** 最近发生状态变化的派工；一次派工都没有时缺席。 */
+    last_dispatch: z
+      .object({
+        dispatch_id: z.string().min(1),
+        kind: z.enum(['investigate', 'execute', 'verify']).optional(),
+        status: runDispatchStatusSchema,
+        updated_at: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+    /**
+     * 未收束的 unknown：恢复/交付必须显式可见，不允许被成功状态掩盖。
+     * `dispatch_ids` 有上限（足够人工定位；完整清单走 Journal 分页读取）。
+     */
+    unknown: z
+      .object({
+        count: z.number().int().nonnegative(),
+        dispatch_ids: z.array(z.string().min(1)).max(64),
+      })
+      .strict(),
+    /** 只读违规计数与种类（violation 的完整明细在 Journal/evidence 里）。 */
+    violations: z
+      .object({
+        count: z.number().int().nonnegative(),
+        kinds: z.array(z.string().min(1)),
+      })
+      .strict(),
+    /** 父链继承的派工事实；没有继承时整个字段缺席（不是 0 的另一种写法）。 */
+    inherited: z
+      .object({
+        total: z.number().int().nonnegative(),
+        by_status: z.record(z.string(), z.number().int().nonnegative()),
+        source_run_ids: z.array(z.string().min(1)),
+        /** 祖先链上仍未收束的 dispatch（按 id 去重）。 */
+        unresolved_dispatch_ids: z.array(z.string().min(1)).max(64),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+/**
+ * 动态派工进度（阶段 4，可选顶层字段）。
+ *
+ * 只描述**当前还在发生/刚发生**的低频事实：在飞派工、role 的计划、结束请求与实际终止
+ * 原因。刻意没有百分比：派工总量由 role 动态决定，任何「已完成 / 总数」都是编的。
+ * 持久进度来自事件投影，不依赖瞬态 activity。
+ */
+export const runDispatchProgressSchema = z
+  .object({
+    /** 当前在飞（accepted/started 尚无 settled）的派工；没有时缺席。 */
+    current: z
+      .object({
+        dispatch_id: z.string().min(1),
+        kind: z.enum(['investigate', 'execute', 'verify']).optional(),
+        state: z.enum(['accepted', 'started']),
+        started_at: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    /** role 最近一次计划更新（来自 `update_plan` 工具，只是计划、不是执行证据）。 */
+    plan: z
+      .object({
+        plan: z.string().min(1).max(8_000),
+        updated_at: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+    /** role 最近一次结束请求（finish_task 被接受时的自述状态）。 */
+    finish_requested: z
+      .object({
+        status: z.enum(['completed', 'blocked', 'failed']),
+        requested_at: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+    /**
+     * 实际终止原因（typed termination 的 code/actor）。与 `errors[]` 同源但这里更窄：
+     * 只报 role 引擎给出的终止事实；用户取消/中断仍以 Run `status` 为准。
+     */
+    terminated: z
+      .object({
+        code: z.string().min(1),
+        actor: z.enum(['role', 'host', 'user']),
+        message: z.string().max(4_000).optional(),
+        terminated_at: z.string().min(1),
+      })
+      .strict()
+      .optional(),
+    /** 受控 evidence 引用（只给引用与 hash，正文按 `run.getDispatchEvidence` 分页读取）。 */
+    evidence_refs: z
+      .array(
+        z
+          .object({
+            dispatch_id: z.string().min(1),
+            path: z.string().min(1),
+            sha256: z.string().min(1),
+          })
+          .strict(),
+      )
+      .max(32)
+      .optional(),
+  })
+  .strict();
+
+/**
  * 跨 run 的用量历史。
  *
  * `role` 从「不支持」变为支持，靠的不是 `summary`——它至今没有 proxy 腿的角色归属——
@@ -455,6 +589,13 @@ export const runSnapshotSchema = z
       .strict()
       .optional(),
     usage: runUsageSchema.optional(),
+    /**
+     * 阶段 4：派工计数摘要（Journal 事实的投影）。旧快照没有该字段仍可读；legacy Run
+     * （无 Journal/无派工事件）不出现它，不编一个 0 派工。
+     */
+    dispatch_summary: runDispatchSummarySchema.optional(),
+    /** 阶段 4：低频派工进度（在飞派工、计划、结束请求、终止原因）。 */
+    dispatch_progress: runDispatchProgressSchema.optional(),
     /** 只有本进程持有的 run 才有——在飞状态是内存里的，重启即失。 */
     activity: runActivitySchema.optional(),
   })
@@ -500,6 +641,9 @@ export type RunActivity = z.infer<typeof runActivitySchema>;
 export type RunActivityEntry = z.infer<typeof runActivityEntrySchema>;
 export type RunDriverActivity = z.infer<typeof runDriverActivitySchema>;
 export type RunUsageHistory = z.infer<typeof runUsageHistorySchema>;
+export type RunDispatchSummary = z.infer<typeof runDispatchSummarySchema>;
+export type RunDispatchProgress = z.infer<typeof runDispatchProgressSchema>;
+export type RunDispatchStatus = z.infer<typeof runDispatchStatusSchema>;
 export type RunUsageTokens = z.infer<typeof runUsageTokensSchema>;
 export type RunUsageStageMetrics = z.infer<typeof runUsageStageMetricsSchema>;
 export type FrontendWorkflowV01Snapshot = RunSnapshot & {

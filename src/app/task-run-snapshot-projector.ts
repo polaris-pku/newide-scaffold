@@ -1,4 +1,5 @@
 import { SCHEMA_VERSION } from '../core';
+import type { DispatchRecord } from '../driver';
 import type {
   PersistedCoordinationEvent,
   PersistedRunState,
@@ -13,11 +14,20 @@ import { projectRunEventSource } from '../protocol/run-event';
 import type { RunOutcome } from '../coordinator/run-outcome';
 import { buildRunOutputPaths } from '../coordinator/run-result';
 import { nodeCodeForCursor, stageForCursor } from './run-stage-mapping';
+import { projectDispatchFacts } from './run-dispatch-projection';
 
+/**
+ * 从协调库持久事件投影 Run 快照（重启后的 `run.getSnapshot` 回读路径）。
+ *
+ * `journalRecords` 是只读 Journal 事实（阶段 4 修复 R4-01）：持久事件里缺 accepted/settled
+ * 时用它补齐派工摘要/进度，与存活期投影器共用同一条合并/有效状态规则。不传则保持纯事件
+ * 投影（legacy Run 语义不变）。
+ */
 export function projectPersistedRunSnapshot(
   aggregate: PersistedTaskAggregate,
   runId: string,
   runsRoot = '.newide/runs',
+  journalRecords?: readonly DispatchRecord[],
 ): RunSnapshot {
   const run = aggregate.runs.find((candidate) => candidate.run_id === runId);
   if (!run) throw new Error(`Run ${runId} does not belong to Task ${aggregate.task.task_id}`);
@@ -74,6 +84,19 @@ export function projectPersistedRunSnapshot(
     stringValue(delivered?.payload.workspace_path);
   const outputPaths = buildRunOutputPaths(runId, runsRoot);
   const { run_dir: _runDir, ...standardLinks } = outputPaths;
+  // 派工进度只由**持久事件**折叠（与存活期投影器同一口径、同一个纯函数），
+  // 不读瞬态 activity：重启后 `run.getSnapshot` 的数字与运行时一致。
+  const dispatchFacts = projectDispatchFacts(
+    events.map((event) => ({
+      type: event.event_type,
+      payload: event.payload,
+      created_at: event.created_at,
+    })),
+    {
+      running: status === 'running',
+      ...(journalRecords !== undefined ? { journal_records: journalRecords } : {}),
+    },
+  );
   const links = compactRecord({
     ...standardLinks,
     changeset_manifest_ref:
@@ -164,6 +187,12 @@ export function projectPersistedRunSnapshot(
       ? { council: councilProjection(events, status) }
       : {}),
     errors: run.error ? [{ ...run.error }] : [],
+    ...(dispatchFacts.summary !== undefined
+      ? { dispatch_summary: dispatchFacts.summary }
+      : {}),
+    ...(dispatchFacts.progress !== undefined
+      ? { dispatch_progress: dispatchFacts.progress }
+      : {}),
     ...(status !== 'running' && status !== 'interrupted'
       ? {
           final_output: {

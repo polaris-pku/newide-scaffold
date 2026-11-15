@@ -8,6 +8,7 @@ import {
   createProductionBackendService,
   startBackendRpcServer,
   type BackendRpcServer,
+  type ProductionBackendServiceDependencies,
 } from '../src/app/backend-rpc-stdio';
 import {
   InMemoryBufferRepository,
@@ -18,6 +19,16 @@ import {
 import type { RunSnapshot } from '../src/protocol/run-snapshot';
 import type { RunEvent } from '../src/protocol/run-event';
 import { writeFakeAcpRunnerBuild } from '../test/fixtures/fake-acp-runner-build';
+import {
+  assertRoleSmokeDispatchTermination,
+  assertRoleSmokeSummaryFile,
+  buildRoleSmokeEnv,
+  buildRoleSmokeSample,
+  createRoleSmokeLlm,
+  ROLE_SMOKE_DISPATCH_BUDGET,
+  ROLE_SMOKE_RUN_FILES,
+  ROLE_SMOKE_SAMPLE_KEY,
+} from '../test/fixtures/role-autonomy-smoke';
 
 interface JsonRpcMessage {
   jsonrpc: '2.0';
@@ -80,13 +91,9 @@ if (usesTemporaryRunner) {
       {
         agentLlm: invokeDriverLlm(),
         memoryLlm: deterministicMaintenanceLlm(),
-        bRuntime: {
-          repository: new InMemoryRepository(),
-          bufferRepository: new InMemoryBufferRepository(),
-          app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(stateRoot, 'b'),
-          market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
-          close: async () => undefined,
-        },
+        bRuntime: inMemoryBRuntime(
+          process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(stateRoot, 'b'),
+        ),
       },
     ),
   });
@@ -156,6 +163,26 @@ try {
       `Expected ${expectedInvocations} driver invocations, received ${driverInvocations}`,
     );
   }
+  // 阶段 4：独立场景——**第二个后端实例**（role autonomy，dispatch 预算收紧到 2）跑一次
+  // 全新 single_agent Run，检查「派工进度 + 终止原因」能从 run.getSnapshot / run.getEvents
+  // 读到、且落盘 summary.json 同源。
+  // 只在默认 all 模式跑一次：`--mode single_agent/council` 是各自模式的独立快跑用例，
+  // 不该为这个场景多付一个后端实例的启动成本。
+  // 外部 runner 模式不跑：该场景的「恰好 2 次 driver 调用」依赖确定性临时 fake runner，
+  // 外部真 driver 的调用次数没有这个语义，如实标记 skipped 而不是假装通过。
+  const roleAutonomy =
+    smokeMode !== 'all'
+      ? {
+          skipped: true,
+          reason: `--mode ${smokeMode}: the role-autonomy scenario runs once in the default all mode`,
+        }
+      : usesTemporaryRunner
+        ? await runRoleAutonomyTerminationScenario()
+        : {
+            skipped: true,
+            reason:
+              'external ACP runner mode (RPC_SMOKE_ACP_RUNNER_DIR set): the scenario needs the deterministic temporary fake runner to assert the exact driver invocation count',
+          };
   const parseError =
     smokeMode === 'all' ? await sendRaw('not-json\n', (message) => message.id === null) : undefined;
   if (parseError) {
@@ -203,6 +230,7 @@ try {
       ...(council ? { council } : {}),
       ...(driverInvocations === undefined ? {} : { driver_invocations: driverInvocations }),
       ...(cancelled ? { cancelled } : {}),
+      role_autonomy: roleAutonomy,
       ...(parseError ? { malformed_json_error: parseError.error?.code } : {}),
       ...(unknown ? { unknown_method_error: unknown.error?.code } : {}),
       ...(driverConfig?.result === undefined ? {} : { driver_config: driverConfig.result }),
@@ -424,6 +452,185 @@ async function createAndCancel(): Promise<Record<string, unknown>> {
   return { run_id: created.run_id, status: snapshot.status };
 }
 
+/**
+ * 阶段 4 场景：在新的（第二个）生产后端实例里跑一次 role 自主循环 Run，验证
+ * 「派工进度（dispatch_summary / dispatch_progress）+ 终止原因（typed termination）」
+ * 既能在存活期快照/事件里读到，也落进了终态落盘文件。
+ *
+ * 为什么必须第二个实例：主实例的 env 没有 `NEWIDE_ROLE_AUTONOMY=1`/收紧的 dispatch 预算，
+ * 而且它的 fake LLM 只会调 `invoke_driver`（legacy 路径）。两个实例各自独立 stateRoot，
+ * 互不影响；本场景结束时关闭第二个服务，把状态目录留给脚本统一的清理逻辑。
+ *
+ * 确定性：role LLM 在工具表里出现 `dispatch_execution` 时连续返回派工；第 3 次在
+ * `assertDispatchAllowed` 抛 `budget_dispatches`，**不会**产生第 3 次 driver 调用。
+ */
+async function runRoleAutonomyTerminationScenario(): Promise<Record<string, unknown>> {
+  const roleStateRoot = path.join(stateRoot, 'role-autonomy-smoke');
+  const roleEnv = buildRoleSmokeEnv({
+    base: backendEnv,
+    state_root: roleStateRoot,
+    runner_dir: runnerDir,
+  });
+  const channel = createInProcessChannel();
+  const server = startBackendRpcServer({
+    input: channel.input,
+    writeLine: (line) => channel.output.write(`${line}\n`),
+    service: await createProductionBackendService(roleEnv, {
+      // 同一份客户端被 role 引擎与 legacy 路径共用：role 工具表出现时走确定性派工，
+      // 否则原样回退 invokeDriverLlm（本场景不会走，但避免两个客户端各说一套）。
+      agentLlm: createRoleSmokeLlm(invokeDriverLlm()),
+      memoryLlm: deterministicMaintenanceLlm(),
+      bRuntime: inMemoryBRuntime(path.join(roleStateRoot, 'b')),
+    }),
+  });
+  const prompt = 'RPC smoke role autonomy dispatch budget';
+  const invocationsBefore = await countDriverInvocations();
+  try {
+    const created = await requestOnChannel<{
+      run_id: string;
+      task_id: string;
+      status: 'running';
+    }>(channel, 'run.create', { prompt, mode: 'single_agent', workspace_path: workspacePath });
+    await requestOnChannel(channel, 'run.subscribe', { run_id: created.run_id });
+    const snapshot = await waitForTerminalOnChannel(channel, created.run_id);
+    // 全量拉取：事件计数的断言读的是持久事件，不是内存通知。
+    const events = await requestOnChannel<RunEventsPage>(channel, 'run.getEvents', {
+      run_id: created.run_id,
+    });
+    const facts = assertRoleSmokeDispatchTermination({ snapshot, events: events.events });
+    const invocationsAfter = await countDriverInvocations();
+    assert(
+      invocationsAfter - invocationsBefore === ROLE_SMOKE_DISPATCH_BUDGET,
+      `Role autonomy smoke: expected exactly ${String(ROLE_SMOKE_DISPATCH_BUDGET)} driver invocations, received ${String(
+        invocationsAfter - invocationsBefore,
+      )} (no automatic replay/retry is allowed)`,
+    );
+    await assertRunFilesIn(roleStateRoot, created.run_id, ROLE_SMOKE_RUN_FILES);
+    const summaryPath = path.join(roleStateRoot, 'runs', created.run_id, 'summary.json');
+    assertRoleSmokeSummaryFile(await waitForRunJson(summaryPath));
+    samples[ROLE_SMOKE_SAMPLE_KEY] = buildRoleSmokeSample({
+      run_id: created.run_id,
+      prompt,
+      snapshot,
+      events: events.events,
+      facts,
+    });
+    return {
+      run_id: created.run_id,
+      status: snapshot.status,
+      error_code: facts.termination_code,
+      termination_actor: facts.termination_actor,
+      dispatch_total: facts.summary.total,
+      dispatch_by_status: facts.summary.by_status,
+      dispatch_ids: facts.dispatch_ids,
+      last_dispatch_id: facts.summary.last_dispatch_id,
+      event_counts: facts.event_counts,
+      driver_invocations: invocationsAfter - invocationsBefore,
+      summary_path: summaryPath,
+    };
+  } finally {
+    // 关闭第二个后端（含它自己的服务与资源）；失败不掩盖场景本身的断言错误。
+    await server.close().catch(() => undefined);
+  }
+}
+
+/** 独立后端实例的 RPC 通道：与主后端完全隔离的消息/请求 id/等待者。 */
+interface InProcessRpcChannel {
+  input: PassThrough;
+  output: PassThrough;
+  messages: JsonRpcMessage[];
+  waiters: Set<{
+    predicate: (message: JsonRpcMessage) => boolean;
+    resolve: (message: JsonRpcMessage) => void;
+  }>;
+  nextId: number;
+}
+
+function createInProcessChannel(): InProcessRpcChannel {
+  const channel: InProcessRpcChannel = {
+    input: new PassThrough(),
+    output: new PassThrough(),
+    messages: [],
+    waiters: new Set(),
+    nextId: 1,
+  };
+  createInterface({ input: channel.output }).on('line', (line) => {
+    let message: JsonRpcMessage;
+    try {
+      message = JSON.parse(line) as JsonRpcMessage;
+    } catch {
+      return;
+    }
+    channel.messages.push(message);
+    for (const waiter of channel.waiters) {
+      if (!waiter.predicate(message)) continue;
+      channel.waiters.delete(waiter);
+      waiter.resolve(message);
+    }
+  });
+  return channel;
+}
+
+async function requestOnChannel<T = unknown>(
+  channel: InProcessRpcChannel,
+  method: string,
+  params: unknown,
+): Promise<T> {
+  const id = channel.nextId++;
+  const waiting = waitForChannelMessage(channel, (message) => message.id === id);
+  channel.input.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+  const response = await waiting;
+  if (response.error)
+    throw new Error(`${method}: ${response.error.code} ${response.error.message}`);
+  return response.result as T;
+}
+
+function waitForChannelMessage(
+  channel: InProcessRpcChannel,
+  predicate: (message: JsonRpcMessage) => boolean,
+): Promise<JsonRpcMessage> {
+  const existing = channel.messages.find(predicate);
+  if (existing) return Promise.resolve(existing);
+  return new Promise((resolve, reject) => {
+    const waiter = { predicate, resolve };
+    channel.waiters.add(waiter);
+    setTimeout(() => {
+      if (!channel.waiters.delete(waiter)) return;
+      reject(new Error('Timed out waiting for the role-autonomy backend message'));
+    }, 15_000).unref();
+  });
+}
+
+async function waitForTerminalOnChannel(
+  channel: InProcessRpcChannel,
+  runId: string,
+): Promise<RunSnapshot> {
+  const deadline = Date.now() + readTimeoutMs();
+  while (Date.now() < deadline) {
+    const snapshot = await requestOnChannel<RunSnapshot>(channel, 'run.getSnapshot', {
+      run_id: runId,
+    });
+    if (snapshot.status !== 'running') return snapshot;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Role autonomy run ${runId} did not reach a terminal state`);
+}
+
+/** 轮询读取 run 目录里的 JSON（终态落盘与状态提交之间存在毫秒级窗口）。 */
+async function waitForRunJson(filePath: string): Promise<unknown> {
+  const deadline = Date.now() + 5_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      return JSON.parse(await fs.readFile(filePath, 'utf8')) as unknown;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw new Error(`Role autonomy smoke: ${filePath} is not readable: ${String(lastError)}`);
+}
+
 async function waitForTerminal(runId: string): Promise<RunSnapshot> {
   const timeoutMs = readTimeoutMs();
   const deadline = Date.now() + timeoutMs;
@@ -470,15 +677,31 @@ function readTimeoutMs(): number {
 }
 
 async function assertRunFiles(runId: string): Promise<void> {
-  const files = [
-    path.join(stateRoot, 'runs', runId, 'audit.jsonl'),
-    path.join(stateRoot, 'runs', runId, 'result.json'),
-    path.join(stateRoot, 'runs', runId, 'frontend-snapshot.json'),
-  ];
-  const deadline = Date.now() + 5_000;
+  await assertRunFilesIn(
+    stateRoot,
+    runId,
+    ['audit.jsonl', 'result.json', 'frontend-snapshot.json'],
+    5_000,
+  );
+}
+
+/** 轮询等待指定 stateRoot 下该 run 的落盘文件全部出现；超时后逐个 access 让错误指到缺的那个。 */
+async function assertRunFilesIn(
+  root: string,
+  runId: string,
+  fileNames: readonly string[],
+  timeoutMs = 5_000,
+): Promise<void> {
+  const files = fileNames.map((name) => path.join(root, 'runs', runId, name));
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const visible = await Promise.all(
-      files.map((file) => fs.access(file).then(() => true, () => false)),
+      files.map((file) =>
+        fs.access(file).then(
+          () => true,
+          () => false,
+        ),
+      ),
     );
     if (visible.every(Boolean)) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -554,6 +777,26 @@ async function waitForBackendClose(): Promise<number | null> {
   if (terminated !== 'timeout') return terminated;
   child.kill('SIGKILL');
   return childClosed;
+}
+
+/**
+ * 冒烟脚本注入的内存 B runtime（两个 backend 实例共用同一形状）。
+ *
+ * 生产组合根的类型要求 `deliveryRepository` / `embedding_info`，但冒烟路径只消费
+ * `repository` / `bufferRepository` / `app_state_root`（delivery 只在 mailbox 流里用，
+ * 脚本不走；embedding 缺省即降级检索）。既有装配就是这么传这份子集，这里集中成一个
+ * helper 并把「类型上更宽、运行时只用子集」这件事写在注释里，避免第二份同样的形状手抄。
+ */
+function inMemoryBRuntime(
+  appStateRoot: string,
+): NonNullable<ProductionBackendServiceDependencies['bRuntime']> {
+  return {
+    repository: new InMemoryRepository(),
+    bufferRepository: new InMemoryBufferRepository(),
+    app_state_root: appStateRoot,
+    market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
+    close: async () => undefined,
+  } as unknown as NonNullable<ProductionBackendServiceDependencies['bRuntime']>;
 }
 
 function invokeDriverLlm(): ToolCallingClient {

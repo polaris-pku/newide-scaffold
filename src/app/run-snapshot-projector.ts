@@ -1,8 +1,26 @@
+import type { DispatchRecord } from '../driver';
 import type { FrontendRunSnapshot } from '../coordinator/frontend-run-snapshot';
 import type { RunSnapshot } from '../protocol/run-snapshot';
 import type { AppRunSnapshot } from './run-registry';
+import { projectDispatchFacts } from './run-dispatch-projection';
 
-export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
+/**
+ * 存活期快照投影。
+ *
+ * `journal_records` 是恢复/终态边界的只读 Journal 事实（阶段 4 修复 R4-01）：事件出口失败
+ * 时用它补齐缺失的派工事实；不传时行为与纯事件投影一致。
+ */
+export function projectRunSnapshot(
+  input: AppRunSnapshot,
+  journalRecords?: readonly DispatchRecord[],
+): RunSnapshot {
+  // 派工进度来自**持久事件**的折叠（不是瞬态 activity）。两个分支都必须用同一份口径：
+  // 存活期重放旧 `projected_snapshot` 时也要按当前事件重算，否则会出现「快照里的计数比
+  // timeline 旧」这种只有重启后才看得见的漂移。
+  const dispatchFacts = projectDispatchFacts(input.events, {
+    running: input.status === 'running',
+    ...(journalRecords !== undefined ? { journal_records: journalRecords } : {}),
+  });
   if (input.projected_snapshot) {
     return {
       ...structuredClone(input.projected_snapshot),
@@ -17,6 +35,16 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
       },
       timeline: [...input.events],
       errors: input.error ? [{ ...input.error }] : [...input.projected_snapshot.errors],
+      ...(dispatchFacts.summary !== undefined
+        ? { dispatch_summary: dispatchFacts.summary }
+        : input.projected_snapshot.dispatch_summary !== undefined
+          ? { dispatch_summary: input.projected_snapshot.dispatch_summary }
+          : {}),
+      ...(dispatchFacts.progress !== undefined
+        ? { dispatch_progress: dispatchFacts.progress }
+        : input.projected_snapshot.dispatch_progress !== undefined
+          ? { dispatch_progress: input.projected_snapshot.dispatch_progress }
+          : {}),
     };
   }
   const rich = input.snapshot;
@@ -84,6 +112,8 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
         }
       : {}),
     timeline: [...input.events],
+    ...(dispatchFacts.summary !== undefined ? { dispatch_summary: dispatchFacts.summary } : {}),
+    ...(dispatchFacts.progress !== undefined ? { dispatch_progress: dispatchFacts.progress } : {}),
     agent_runs: input.events
       .filter((event) => event.source === 'agent')
       .map((event) => ({

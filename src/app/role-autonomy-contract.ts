@@ -26,6 +26,7 @@ import type {
   DispatchJournalBarrierError,
   DriverStreamEvent,
   DispatchRecord,
+  DispatchRecordStatus,
   EvidenceRef,
   ExecutionBrief,
   ExecutionEvidence,
@@ -46,6 +47,7 @@ import type {
 } from '../persistence';
 import type { ToolCallMessage, ToolCallResult, ToolDefinition } from '../memory';
 import type { AgentExecutionResult, RoleFreezePlanInput } from '../protocol/agent-execution';
+import type { RoleLifecycleEvent } from './run-dispatch-events';
 
 // ─────────────────────────────────────────────────────────────
 // 引擎标记与版本
@@ -309,6 +311,27 @@ export function roleTerminationFromDispatchBarrier(
 export function isTrustedDispatchRecord(record: DispatchRecord): boolean {
   if (record.status !== 'unknown' && record.status !== 'not_executed') return true;
   return record.reconciled !== undefined && record.reconciled.status !== 'unknown';
+}
+
+/**
+ * 派工的**有效状态**：原始 settled 状态 + 可信 reconciled 的唯一解释规则（阶段 4 修复 R4-02）。
+ *
+ * - 原始 settled 为 `unknown` 且后来有可信 `reconciled`（非 unknown）时，对外按对账后状态计；
+ * - 已发出的终态（succeeded/failed/cancelled/interrupted）不被 reconciled 改写（RD-JRN-04）；
+ * - `not_executed` 保持原义（明确未执行，不是 unknown 的另一种写法）；
+ * - **不改写 Journal 记录本身的 `status`**：原始 settled 行/记录继续如实保留 `unknown`。
+ *
+ * 快照投影、Journal RPC 摘要、祖先继承摘要与报告对账都必须走这一条规则，不得各写一份。
+ */
+export function effectiveDispatchRecordStatus(record: DispatchRecord): DispatchRecordStatus {
+  if (
+    record.status === 'unknown' &&
+    record.reconciled !== undefined &&
+    record.reconciled.status !== 'unknown'
+  ) {
+    return record.reconciled.status;
+  }
+  return record.status;
 }
 
 /**
@@ -932,6 +955,17 @@ export interface RoleLoopOptions {
   signal?: AbortSignal;
   /** 单回合普通文本上限/工具结果上限（防止上下文无限增长）。 */
   limits?: { history_messages?: number; tool_result_chars?: number; dispatch_history?: number };
+  /**
+   * 阶段 4 生命周期观察（只作投影信号，不参与决策/验收）：
+   * role 计划更新。缺失时不发事件，loop 语义与从前逐位一致。
+   */
+  on_plan_updated?: (plan: string) => void;
+  /** 阶段 4 生命周期观察：finish 被接受时（在 persistRoleFinish 之前上报）。 */
+  on_finish_requested?: (input: {
+    status: RoleFinishStatus;
+    verification_count: number;
+    unresolved_count: number;
+  }) => void;
 }
 
 export type RoleLoopStatus = 'completed' | 'blocked' | 'failed';
@@ -977,6 +1011,11 @@ export interface RoleAutonomyEngineRequest {
   freeze_plan?: RoleFreezePlanInput;
   signal?: AbortSignal;
   on_driver_event?: (event: DriverStreamEvent) => void;
+  /**
+   * 阶段 4 低频生命周期事件出口（app 组合根接到 run 事件流）。
+   * 缺失时不发事件；事件是投影，**绝不**因其失败改变执行结果。
+   */
+  emit_event?: (event: RoleLifecycleEvent) => void;
 }
 
 /**

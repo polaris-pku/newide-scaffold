@@ -3,10 +3,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  driverUsageObservationFromRecord,
+  driverUsageRecordFromObservation,
+  foldDriverUsageObservations,
   mergeTaskDriverUsage,
   preferDriverUsage,
+  projectRunDriverUsageByDispatch,
   projectTaskDriverUsage,
+  readRunDriverUsageObservations,
   TaskDriverUsageAccumulator,
+  usageObservationFromDriverEvent,
   type TaskDriverUsage,
 } from '../../src/app/driver-usage-projector';
 
@@ -183,6 +189,90 @@ describe('TaskDriverUsageAccumulator', () => {
   });
 });
 
+describe('dispatch_id 归属（阶段 4）', () => {
+  it('carries dispatch_id through event → observation → ledger record → observation', () => {
+    // Lead 在 role 派工期间给 driver 事件补 event.dispatch_id；这里守的是读取链路不丢它，
+    // 且账本行能如实记录（旧路径缺字段时必须缺席，而不是填空串）。
+    const event = { ...usageEvent('session_dsp', 'role_a', 120, 0.5), dispatch_id: 'dsp_1' };
+    const observation = usageObservationFromDriverEvent(event, '2026-08-14T00:00:01Z', true);
+    expect(observation).toMatchObject({
+      session_id: 'session_dsp',
+      dispatch_id: 'dsp_1',
+      context_tokens_used: 120,
+    });
+
+    const record = driverUsageRecordFromObservation(observation!, {
+      run_id: 'run_1',
+      task_id: 'task_1',
+      stream_sequence: 7,
+      recorded_at: '2026-08-14T00:00:01Z',
+    });
+    expect(record).toMatchObject({ dispatch_id: 'dsp_1', metric: 'context_tokens_used' });
+    expect(driverUsageObservationFromRecord(record as unknown as Record<string, unknown>)).toMatchObject(
+      { dispatch_id: 'dsp_1', session_id: 'session_dsp' },
+    );
+
+    // legacy 事件没有 dispatch_id：观测里就不该出现该字段。
+    const legacy = usageObservationFromDriverEvent(
+      usageEvent('session_legacy', 'role_a', 10),
+      '2026-08-14T00:00:02Z',
+      true,
+    );
+    expect(legacy).not.toHaveProperty('dispatch_id');
+  });
+
+  it('groups one run by dispatch, folds duplicate cumulative updates, and keeps legacy unattributed', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-driver-usage-'));
+    await writeLedger(runsRoot, 'run_dispatch', [
+      ledgerRecord({ session_id: 'session_a', used: 100, cost: 0.1, sequence: 1, dispatch: 'dsp_1' }),
+      // 同一 session 的累计更新（重复输入）：取 max，不累加。
+      ledgerRecord({ session_id: 'session_a', used: 140, sequence: 2, dispatch: 'dsp_1' }),
+      ledgerRecord({ session_id: 'session_b', used: 60, cost: 0.3, sequence: 3, dispatch: 'dsp_2' }),
+      // legacy 路径没有 dispatch_id：必须进 unattributed，而不是被丢掉或记到某个派工头上。
+      ledgerRecord({ session_id: 'session_legacy', used: 20, sequence: 4 }),
+    ]);
+
+    const projected = await projectRunDriverUsageByDispatch(runsRoot, 'run_dispatch');
+    expect(projected.by_dispatch.dsp_1).toMatchObject({
+      context_tokens_used: 140,
+      complete: true,
+      sessions: [{ session_id: 'session_a', dispatch_id: 'dsp_1', context_tokens_used: 140 }],
+    });
+    expect(projected.by_dispatch.dsp_2).toMatchObject({ context_tokens_used: 60, complete: true });
+    expect(projected.unattributed).toMatchObject({
+      context_tokens_used: 20,
+      complete: false,
+      sessions: [{ session_id: 'session_legacy' }],
+    });
+
+    // 分组是 session 的 partition：各组之和 == 同一批观测的 session 口径总量。
+    const folded = foldDriverUsageObservations(
+      await readRunDriverUsageObservations(runsRoot, 'run_dispatch'),
+    );
+    expect(
+      projected.by_dispatch.dsp_1!.context_tokens_used +
+        projected.by_dispatch.dsp_2!.context_tokens_used +
+        projected.unattributed!.context_tokens_used,
+    ).toBe(folded.context_tokens_used);
+  });
+
+  it('reads dispatch_id from the capped stream fallback and reports no unattributed when all attributed', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-driver-usage-'));
+    await writeUsage(runsRoot, 'run_stream_dispatch', [
+      usage('task_stream_dispatch', 'session_a', 'role_a', 90, 0.2, '2026-08-14T00:00:01Z', 'dsp_s'),
+    ]);
+
+    const projected = await projectRunDriverUsageByDispatch(runsRoot, 'run_stream_dispatch');
+    expect(projected.by_dispatch.dsp_s).toMatchObject({ context_tokens_used: 90, complete: true });
+    // 没有无归属记录时字段缺席（不是 0 的另一种写法）。
+    expect(projected).not.toHaveProperty('unattributed');
+
+    const missing = await projectRunDriverUsageByDispatch(runsRoot, 'run_without_usage');
+    expect(missing.by_dispatch).toEqual({});
+    expect(missing).not.toHaveProperty('unattributed');
+  });
+});
+
 describe('mergeTaskDriverUsage / preferDriverUsage', () => {
   it('heals a truncated file scan with the in-process accumulator and reports complete', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'newide-driver-usage-'));
@@ -277,6 +367,7 @@ function usage(
   used: number,
   cost: number | undefined,
   recordedAt: string,
+  dispatchId?: string,
 ): Record<string, unknown> {
   return {
     task_id: taskId,
@@ -285,6 +376,7 @@ function usage(
       event_type: 'usage_update',
       session_id: sessionId,
       role_id: roleId,
+      ...(dispatchId !== undefined ? { dispatch_id: dispatchId } : {}),
       payload: {
         sessionId,
         update: {
@@ -338,6 +430,7 @@ function ledgerRecord(input: {
   task?: string;
   session_id: string;
   role?: string;
+  dispatch?: string;
   used: number;
   cost?: number;
   sequence?: number;
@@ -350,6 +443,7 @@ function ledgerRecord(input: {
     stream_sequence: input.sequence ?? 1,
     session_id: input.session_id,
     ...(input.role ? { role_id: input.role } : {}),
+    ...(input.dispatch ? { dispatch_id: input.dispatch } : {}),
     metric: 'context_tokens_used',
     context_tokens_used: input.used,
     context_window_size: 200_000,

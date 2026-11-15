@@ -83,6 +83,9 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
     context: options.context,
     now,
     ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    ...(options.on_plan_updated !== undefined
+      ? { on_plan_updated: options.on_plan_updated }
+      : {}),
   });
 
   let round = Math.max(0, Math.trunc(options.consumed.role_rounds));
@@ -155,6 +158,12 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
 
     const finishRecord = executor.finishRecord;
     if (finishRecord !== undefined) {
+      // 阶段 4：结束请求也是低频投影事实（在唯一落盘点之前上报，失败不影响落盘语义）。
+      options.on_finish_requested?.({
+        status: finishRecord.status,
+        verification_count: finishRecord.verification.length,
+        unresolved_count: finishRecord.unresolved.length,
+      });
       const recoveredDispatches = options.context.recovered_dispatches ?? [];
       const recoveredUnresolved = options.context.recovered_unresolved_dispatches ?? [];
       const allDispatches = [...recoveredDispatches, ...executor.dispatches];

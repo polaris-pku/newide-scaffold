@@ -163,6 +163,25 @@ role/driver 职责完善：让每次派工有身份、有证据、有可对账�
 | `test/driver/adp-journal-reconciliation.test.ts` | 真实 `RunDispatchJournal` + 真实 SQLite ADP 底座：receipt→reconciled 折叠、重启重放不重执行、accepted-only 时 receipt 优先；复审修复：failed+传输错误码 → unknown+result_received=true、interrupted+副作用、无结果抛错、启动失败、重启回放事实一致、旧数据 missing 回退 |
 | `test/persistence/run-dispatch-journal.test.ts` | 阶段 1 Journal：正常写序与折叠、append 校验、受控 evidence ref、半写修复/缺换行、故障注入、单写者锁与回收闸门；串行化复核：在途 append/evidence/repair 期间 close 不释放锁、同实例并发同 sequence 单成功、并发 close 共享关闭 Promise、修改失败不毒化队列、内部嵌套登记无死锁 |
 
+## 派工生命周期投影与 driver 事件身份（阶段 4）
+
+阶段 4 让 Role 的派工过程对前端可见，但不新增事实源：Journal 仍是唯一权威，driver 侧只多一个
+**可选身份字段**和一组低频投影事件。
+
+- `DriverStreamEvent.dispatch_id?`（`contract.ts`）：只有 role 自主循环在派工期间转发的事件带它；
+  legacy/Council 调用没有这个概念，读的一侧必须容忍缺失（不得填假 id）。`driver-usage.jsonl`
+  的观测行据此可按 dispatch 归组；无该字段的旧记录进 `unattributed`，不填 0。
+- 低频生命周期事件（`src/app/run-dispatch-events.ts`，公共 source 仍是 `agent`）：
+  `agent.dispatch_accepted` / `started` / `settled` / `reconciled` / `inherited`、
+  `agent.plan_updated`、`agent.finish_requested`、`agent.role_terminated`。载荷只含
+  dispatch_id/kind/status/violations/受控 evidence ref 等元数据，**不含**完整指令、对话或
+  transcript；正文经 `run.getDispatchEvidence` 按受控 ref 分页读取。
+- 投影口径：`src/app/run-dispatch-projection.ts` 按 `dispatch_id` 去重，accepted-only 折叠
+  `not_executed`、started 无 settled 折叠 `unknown`；unknown/迟到回执/违规语义不变，
+  `unknown` 仍禁止自动重放、不得改写 failed。父链派工只进 `inherited`，不伪造当前 Run 的 dispatch。
+- 只读读取：`RunDispatchJournal.peek` 不取写锁、不修坏尾、不写盘；Journal 不存在的老 Run 是
+  `absent` 而不是错误。
+
 ## 边界(不在本卡)
 
 多帧 progress、`observed_effects`、ADP → SAP 状态机械映射、外部 Driver 仓库改造;

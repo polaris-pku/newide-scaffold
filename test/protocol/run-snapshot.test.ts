@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { isFrontendWorkflowV01Snapshot, runSnapshotSchema } from '../../src/protocol/run-snapshot';
 import { projectRunSnapshot } from '../../src/app/run-snapshot-projector';
+import { ROLE_DISPATCH_EVENT } from '../../src/app/run-dispatch-events';
 
 describe('RunSnapshot protocol', () => {
   it('keeps the cancelled fixture compatible with the runtime schema', async () => {
@@ -164,6 +165,65 @@ describe('RunSnapshot protocol', () => {
     });
     expect(runSnapshotSchema.parse(projected)).toEqual(projected);
     expect(isFrontendWorkflowV01Snapshot(projected)).toBe(true);
+  });
+
+  it('keeps a legacy projected snapshot readable and recomputes dispatch facts when events exist', () => {
+    const legacy = runSnapshotSchema.parse({
+      schema_version: 'v0',
+      run_id: 'run_legacy',
+      task_id: 'task_legacy',
+      mode: 'single_agent',
+      status: 'completed',
+      current: { stage: 'delivery', active_node_code: 'N18' },
+      timeline: [],
+      agent_runs: [],
+      artifacts: [],
+      gates: [],
+      errors: [],
+    });
+
+    // 旧快照没有 dispatch 字段：仍然可读，不补 0 派工。
+    const stale = projectRunSnapshot({
+      schema_version: 'v0',
+      revision: 1,
+      run_id: 'run_legacy',
+      task_id: 'task_legacy',
+      status: 'completed',
+      mode: 'single_agent',
+      current: { stage: 'delivery', active_node_code: 'N18' },
+      events: [],
+      projected_snapshot: legacy,
+    });
+    expect(stale.dispatch_summary).toBeUndefined();
+    expect(runSnapshotSchema.parse(stale)).toEqual(stale);
+
+    // 存活期事件里有派工事实时按当前事件重算，而不是沿用旧快照的缺失。
+    const refreshed = projectRunSnapshot({
+      schema_version: 'v0',
+      revision: 2,
+      run_id: 'run_legacy',
+      task_id: 'task_legacy',
+      status: 'running',
+      mode: 'single_agent',
+      current: { stage: 'executing', active_node_code: 'N8' },
+      events: [
+        event(1, ROLE_DISPATCH_EVENT.accepted, {
+          dispatch_id: 'dsp_1',
+          kind: 'investigate',
+        }),
+        event(2, ROLE_DISPATCH_EVENT.started, { dispatch_id: 'dsp_1', kind: 'investigate' }),
+      ],
+      projected_snapshot: legacy,
+    });
+    expect(refreshed.dispatch_summary).toMatchObject({
+      total: 1,
+      by_status: { unknown: 1 },
+    });
+    expect(refreshed.dispatch_progress?.current).toMatchObject({
+      dispatch_id: 'dsp_1',
+      state: 'started',
+    });
+    expect(runSnapshotSchema.parse(refreshed)).toEqual(refreshed);
   });
 });
 

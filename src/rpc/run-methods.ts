@@ -16,6 +16,17 @@ import type {
 import { RunNotFoundError, type AppRunEvent } from '../app/run-registry';
 import { RunRequestNotFoundError } from '../app/run-request-store';
 import type { RunSnapshot, RunUsage, RunUsageHistory } from '../protocol/run-snapshot';
+import type {
+  GetRunDispatchEvidenceInput,
+  GetRunDispatchJournalInput,
+  RunDispatchEvidencePage,
+  RunDispatchJournalPage,
+} from '../protocol/run-dispatch-read';
+import {
+  RUN_DISPATCH_EVIDENCE_MAX_PAGE_BYTES,
+  RUN_DISPATCH_JOURNAL_MAX_LIMIT,
+} from '../protocol/run-dispatch-read';
+import { RunDispatchReadError } from '../app/run-dispatch-read';
 import { JSON_RPC_ERROR_CODES } from './json-rpc-line-protocol';
 import { JsonRpcMethodError } from './json-rpc-dispatcher';
 import type { JsonRpcDispatcher } from './json-rpc-dispatcher';
@@ -61,6 +72,15 @@ export interface RunMethodsService {
     scope_id?: string;
     run_id?: string;
   }): Promise<{ usage?: RunUsage; history: RunUsageHistory }>;
+  /**
+   * 读一页派工 Journal 事实元数据（只读；Journal 不存在时 `state='absent'`，不是错误）。
+   *
+   * 行只含 event/dispatch_id/kind/status/at + 物理行号，正文按 `getRunDispatchEvidence`
+   * 分页读取——对外契约不内联指令/对话/transcript。
+   */
+  getRunDispatchJournal(input: GetRunDispatchJournalInput): Promise<RunDispatchJournalPage>;
+  /** 读一页受控 evidence 侧车（ref 只从本 Run Journal 派生，未登记即拒绝）。 */
+  getRunDispatchEvidence(input: GetRunDispatchEvidenceInput): Promise<RunDispatchEvidencePage>;
 }
 
 const createParamsSchema = z
@@ -131,6 +151,35 @@ const usageParamsSchema = z
     run_id: z.string().min(1).optional(),
   })
   .strict();
+
+/**
+ * 派工 Journal 分页参数。
+ *
+ * `after_line` 是物理行号水位（`line > after_line`）；`limit` 上限 200，防止把整份事实源
+ * 塞进一帧 RPC。未给 limit 时服务端按 50 取页。
+ */
+const dispatchJournalParamsSchema = z
+  .object({
+    run_id: z.string().min(1),
+    after_line: z.number().int().nonnegative().optional(),
+    limit: z.number().int().positive().max(RUN_DISPATCH_JOURNAL_MAX_LIMIT).optional(),
+  })
+  .strict();
+
+/**
+ * 派工 evidence 分页参数。
+ *
+ * `offset` 是**字节**偏移；`limit` 上限与受控读取的单页字节上限同值（64 KiB），超过直接
+ * INVALID_PARAMS 而不是静默截断。
+ */
+const dispatchEvidenceParamsSchema = z
+  .object({
+    run_id: z.string().min(1),
+    dispatch_id: z.string().min(1),
+    offset: z.number().int().nonnegative().optional(),
+    limit: z.number().int().positive().max(RUN_DISPATCH_EVIDENCE_MAX_PAGE_BYTES).optional(),
+  })
+  .strict();
 const emptyParamsSchema = z.object({}).strict();
 
 export class RunRpcMethods {
@@ -193,6 +242,27 @@ export class RunRpcMethods {
         }),
       );
     });
+    dispatcher.register('run.getDispatchJournal', (params) => {
+      const parsed = parseParams(dispatchJournalParamsSchema, params);
+      return this.callWithDispatchReadError(() =>
+        this.service.getRunDispatchJournal({
+          run_id: parsed.run_id,
+          ...(parsed.after_line !== undefined ? { after_line: parsed.after_line } : {}),
+          ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
+        }),
+      );
+    });
+    dispatcher.register('run.getDispatchEvidence', (params) => {
+      const parsed = parseParams(dispatchEvidenceParamsSchema, params);
+      return this.callWithDispatchReadError(() =>
+        this.service.getRunDispatchEvidence({
+          run_id: parsed.run_id,
+          dispatch_id: parsed.dispatch_id,
+          ...(parsed.offset !== undefined ? { offset: parsed.offset } : {}),
+          ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
+        }),
+      );
+    });
     dispatcher.register('run.getUsage', async (params) => {
       const parsed = parseParams(usageParamsSchema, params);
       if (parsed.scope !== 'system' && parsed.scope_id === undefined) {
@@ -246,6 +316,38 @@ export class RunRpcMethods {
       if (error instanceof RunNotFoundError) {
         throw new JsonRpcMethodError(JSON_RPC_ERROR_CODES.RUN_NOT_FOUND, 'Run not found', {
           run_id: error.runId,
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * dispatch 读取错误的 RPC 映射（异步口，兼带 RUN_NOT_FOUND）。
+   *
+   * 二选一的稳定语义：
+   * - **换取口径的错**（非法目录段、未登记/不属于本 Run 的 dispatch、分页参数）→
+   *   `INVALID_PARAMS`，客户端改请求即可；
+   * - **引用解析得了但内容不可用**（evidence 文件缺失、hash 失配、realpath 逃出 run 目录）→
+   *   `PAYLOAD_REF_UNAVAILABLE`，与 `run.getPayload` 同一语义，前端据此渲染「不可用」而不是
+   *   以为拿到了空数据。
+   */
+  private async callWithDispatchReadError<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof RunNotFoundError) {
+        throw new JsonRpcMethodError(JSON_RPC_ERROR_CODES.RUN_NOT_FOUND, 'Run not found', {
+          run_id: error.runId,
+        });
+      }
+      if (error instanceof RunDispatchReadError) {
+        const code =
+          error.code === 'dispatch_evidence_unavailable' || error.code === 'unsafe_run_path'
+            ? JSON_RPC_ERROR_CODES.PAYLOAD_REF_UNAVAILABLE
+            : JSON_RPC_ERROR_CODES.INVALID_PARAMS;
+        throw new JsonRpcMethodError(code, 'Dispatch read request was rejected', {
+          read_error_code: error.code,
         });
       }
       throw error;

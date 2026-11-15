@@ -215,6 +215,8 @@ export interface RoleToolExecutorOptions {
   now?: () => Date;
   /** 用户取消信号：取消后不得再派工；finish 校验会带上 cancelled。 */
   signal?: AbortSignal;
+  /** 阶段 4：计划更新的投影观察（不改变工具语义；缺失时不发事件）。 */
+  on_plan_updated?: (plan: string) => void;
 }
 
 /**
@@ -437,6 +439,8 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
 
   const executeUpdatePlan = async (args: RoleUpdatePlanArgs): Promise<RoleToolResult> => {
     plan = args.plan;
+    // 计划只是 role 的自述事实（投影用），不是执行/完成证据；观察失败不影响工具结果。
+    options.on_plan_updated?.(plan);
     return { ok: true, data: { plan, updated: true } };
   };
 

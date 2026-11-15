@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { RunNotFoundError, type AppRunEvent } from '../../src/app/run-registry';
+import { RunDispatchReadError } from '../../src/app/run-dispatch-read';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../../src/rpc/json-rpc-dispatcher';
 import { JSON_RPC_ERROR_CODES } from '../../src/rpc/json-rpc-line-protocol';
 import { RunRpcMethods, type RunMethodsService } from '../../src/rpc/run-methods';
@@ -389,7 +390,141 @@ describe('RunRpcMethods', () => {
     });
   });
 
-  it('returns the external RunSnapshot view from run.getSnapshot', async () => {
+  it('registers dispatch reads with strict bounds and stable error mappings', async () => {
+    // 新 run.* 方法：参数严格校验（limit 上限、水位非负），错误二选一映射——
+    // 引用/参数问题 INVALID_PARAMS，引用解析得了但内容不可用 PAYLOAD_REF_UNAVAILABLE。
+    const output: string[] = [];
+    const journalCalls: unknown[] = [];
+    const service = fakeService({
+      getRunDispatchJournal: async (input) => {
+        if (input.run_id === 'missing') throw new RunNotFoundError(input.run_id);
+        journalCalls.push(input);
+        return {
+          run_id: input.run_id,
+          state: 'absent',
+          durability: { mode: 'fsync', directory_sync: true, notes: [] },
+          total_lines: 0,
+          lines: [],
+          has_more: false,
+          next_after_line: null,
+          problems: [],
+        } as never;
+      },
+      getRunDispatchEvidence: async (input) => {
+        if (input.dispatch_id === 'dsp_unknown') {
+          throw new RunDispatchReadError('dispatch_not_in_journal', 'not in journal');
+        }
+        if (input.dispatch_id === 'dsp_tampered') {
+          throw new RunDispatchReadError('dispatch_evidence_unavailable', 'hash mismatch');
+        }
+        return {
+          run_id: input.run_id,
+          dispatch_id: input.dispatch_id,
+          path: `journal/evidence/${input.dispatch_id}.json`,
+          sha256: 'a'.repeat(64),
+          total_bytes: 10,
+          offset: input.offset ?? 0,
+          limit: input.limit ?? 64 * 1024,
+          truncated: false,
+          content: '{}',
+          next_offset: null,
+        } as never;
+      },
+    });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, (method, params) => session.sendNotification(method, params)).register(
+      dispatcher,
+    );
+
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":1,"method":"run.getDispatchJournal","params":{"run_id":"run_1","after_line":4,"limit":10}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":2,"method":"run.getDispatchJournal","params":{"run_id":"missing"}}',
+    );
+    // limit 上限与负水位在参数校验阶段就拦下，不把「要 10 万行」透传到读取层。
+    await session.handleLine(
+      `{"jsonrpc":"2.0","id":3,"method":"run.getDispatchJournal","params":{"run_id":"run_1","limit":201}}`,
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":4,"method":"run.getDispatchJournal","params":{"run_id":"run_1","after_line":-1}}',
+    );
+    // 多余字段（.strict()）同样拒绝。
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":5,"method":"run.getDispatchJournal","params":{"run_id":"run_1","unknown_field":1}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":6,"method":"run.getDispatchEvidence","params":{"run_id":"run_1","dispatch_id":"dsp_ok","offset":0,"limit":512}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":7,"method":"run.getDispatchEvidence","params":{"run_id":"run_1","dispatch_id":"dsp_unknown"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":8,"method":"run.getDispatchEvidence","params":{"run_id":"run_1","dispatch_id":"dsp_tampered"}}',
+    );
+    // 未知方法名保持既有 -32601，不被新 namespace 吞掉。
+    await session.handleLine('{"jsonrpc":"2.0","id":9,"method":"run.getDispatchNothing"}');
+
+    expect(journalCalls).toEqual([{ run_id: 'run_1', after_line: 4, limit: 10 }]);
+    const responses = output.map((line) => JSON.parse(line));
+    expect(responses[0]).toMatchObject({
+      id: 1,
+      result: { run_id: 'run_1', state: 'absent', lines: [] },
+    });
+    expect(responses[1]).toMatchObject({
+      id: 2,
+      error: { code: JSON_RPC_ERROR_CODES.RUN_NOT_FOUND, data: { run_id: 'missing' } },
+    });
+    expect(responses[2]).toMatchObject({
+      id: 3,
+      error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
+    });
+    expect(responses[3]).toMatchObject({
+      id: 4,
+      error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
+    });
+    expect(responses[4]).toMatchObject({
+      id: 5,
+      error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
+    });
+    expect(responses[5]).toEqual({
+      jsonrpc: '2.0',
+      id: 6,
+      result: {
+        run_id: 'run_1',
+        dispatch_id: 'dsp_ok',
+        path: 'journal/evidence/dsp_ok.json',
+        sha256: 'a'.repeat(64),
+        total_bytes: 10,
+        offset: 0,
+        limit: 512,
+        truncated: false,
+        content: '{}',
+        next_offset: null,
+      },
+    });
+    expect(responses[6]).toMatchObject({
+      id: 7,
+      error: {
+        code: JSON_RPC_ERROR_CODES.INVALID_PARAMS,
+        data: { read_error_code: 'dispatch_not_in_journal' },
+      },
+    });
+    expect(responses[7]).toMatchObject({
+      id: 8,
+      error: {
+        code: JSON_RPC_ERROR_CODES.PAYLOAD_REF_UNAVAILABLE,
+        data: { read_error_code: 'dispatch_evidence_unavailable' },
+      },
+    });
+    expect(responses[8]).toMatchObject({
+      id: 9,
+      error: { code: JSON_RPC_ERROR_CODES.METHOD_NOT_FOUND },
+    });
+  });
+
+  it('still returns the external RunSnapshot view for an open run', async () => {
     const output: string[] = [];
     const service = fakeService({
       getRunSnapshot: () => ({
@@ -448,6 +583,12 @@ function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService 
     },
     getRunUsage: async () => {
       throw new Error('getRunUsage fixture is not configured');
+    },
+    getRunDispatchJournal: async () => {
+      throw new Error('getRunDispatchJournal fixture is not configured');
+    },
+    getRunDispatchEvidence: async () => {
+      throw new Error('getRunDispatchEvidence fixture is not configured');
     },
     ...overrides,
   };

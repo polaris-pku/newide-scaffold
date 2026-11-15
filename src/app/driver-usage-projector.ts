@@ -34,6 +34,11 @@ export interface DriverUsageCost {
 export interface DriverSessionUsage {
   session_id: string;
   role_id?: string;
+  /**
+   * 该 Session 归属的派工（阶段 4）。legacy 路径没有 Journal 派工概念，缺省表示
+   * 「无归属」，报告里必须进 `unattributed`——不填 0、不猜一个 id。
+   */
+  dispatch_id?: string;
   context_tokens_used: number;
   context_window_size?: number;
   reported_cost?: DriverUsageCost;
@@ -50,6 +55,12 @@ export interface TaskDriverUsage {
   sessions: DriverSessionUsage[];
   /** 全部 Session 都完整时为 true；存在可能缺尾的 Session 时为 false。 */
   complete: boolean;
+}
+
+/** 一个 run 的 driver usage 观测按派工归属后的结果（`unattributed` 缺席 = 没有旧记录）。 */
+export interface DriverUsageByDispatch {
+  by_dispatch: Record<string, TaskDriverUsage>;
+  unattributed?: TaskDriverUsage;
 }
 
 interface MutableSessionUsage extends DriverSessionUsage {
@@ -79,6 +90,8 @@ export interface DriverUsageRecord {
   stream_sequence: number;
   session_id: string;
   role_id?: string;
+  /** 产生该观测的派工；legacy 路径缺省（报告归入 `unattributed`，不填假 id）。 */
+  dispatch_id?: string;
   metric: 'context_tokens_used';
   context_tokens_used: number;
   context_window_size?: number;
@@ -99,6 +112,7 @@ export function driverUsageRecordFromObservation(
     stream_sequence: identity.stream_sequence,
     session_id: observation.session_id,
     ...(observation.role_id ? { role_id: observation.role_id } : {}),
+    ...(observation.dispatch_id ? { dispatch_id: observation.dispatch_id } : {}),
     metric: 'context_tokens_used',
     context_tokens_used: observation.context_tokens_used,
     ...(observation.context_window_size !== undefined
@@ -122,6 +136,7 @@ export function driverUsageObservationFromRecord(
   if (!sessionId || used === undefined) return undefined;
   const size = finiteNonnegative(record.context_window_size);
   const roleId = nonemptyString(record.role_id);
+  const dispatchId = nonemptyString(record.dispatch_id);
   const cost = asRecord(record.reported_cost);
   const amount = finiteNonnegative(cost?.amount);
   const currency = nonemptyString(cost?.currency);
@@ -129,6 +144,7 @@ export function driverUsageObservationFromRecord(
   return {
     session_id: sessionId,
     ...(roleId ? { role_id: roleId } : {}),
+    ...(dispatchId ? { dispatch_id: dispatchId } : {}),
     context_tokens_used: used,
     ...(size !== undefined ? { context_window_size: size } : {}),
     ...(reportedCost
@@ -177,6 +193,7 @@ export function mergeTaskDriverUsage(
       foldUsageObservation(sessions, {
         session_id: session.session_id,
         ...(session.role_id ? { role_id: session.role_id } : {}),
+        ...(session.dispatch_id ? { dispatch_id: session.dispatch_id } : {}),
         context_tokens_used: session.context_tokens_used,
         ...(session.context_window_size !== undefined
           ? { context_window_size: session.context_window_size }
@@ -208,26 +225,100 @@ export async function projectTaskDriverUsage(
   const runDirectories = await fs.readdir(runsRoot, { withFileTypes: true }).catch(() => []);
   for (const directory of runDirectories) {
     if (!directory.isDirectory()) continue;
-    const runDir = path.join(runsRoot, directory.name);
-    const ledger = await readUsageLedgerObservations(path.join(runDir, 'driver-usage.jsonl'), taskId);
-    const observations =
-      ledger.length > 0
-        ? ledger
-        : await readCappedStreamObservations(path.join(runDir, 'driver-stream.jsonl'), taskId);
+    const observations = await readRunDriverUsageObservations(runsRoot, directory.name, taskId);
     for (const observation of observations) foldUsageObservation(sessions, observation);
   }
   return finalizeUsageSessions(sessions);
 }
 
-/** 逐条追加的账本：没有保留上限，所以只需按 task 过滤。 */
+/**
+ * 读一个 run 的 driver usage 观测（账本优先、副本兜底）。
+ *
+ * `projectTaskDriverUsage` 与 `projectRunDriverUsageByDispatch` 共用这一条读取路径，跨 run
+ * 汇总与 per-run 派工归属才不会是两套读法。`taskId` 只用于跨 run 场景过滤，按 run 读时
+ * 不需要（目录本身已经限定了 run）。
+ */
+export async function readRunDriverUsageObservations(
+  runsRoot: string,
+  runId: string,
+  taskId?: string,
+): Promise<DriverUsageObservation[]> {
+  const runDir = path.join(runsRoot, runId);
+  const ledger = await readUsageLedgerObservations(
+    path.join(runDir, 'driver-usage.jsonl'),
+    taskId,
+  );
+  return ledger.length > 0
+    ? ledger
+    : await readCappedStreamObservations(path.join(runDir, 'driver-stream.jsonl'), taskId);
+}
+
+/**
+ * 按派工归属折叠一个 run 的 usage 观测（阶段 4 报告用）。
+ *
+ * 归属口径：**同一 session 只归一处**，取该 session 首个带 `dispatch_id` 的观测的归属；
+ * 整个 session 都没有 id 的旧记录进 `unattributed`。这样各派工组之和仍然等于
+ * `finalizeUsageSessions` 的 session 口径总量，不会因为「一个 session 的累计量被多个派工
+ * 各算一次」而虚高；`unattributed` 缺席表示没有这类记录（不是 0）。
+ */
+export async function projectRunDriverUsageByDispatch(
+  runsRoot: string,
+  runId: string,
+): Promise<DriverUsageByDispatch> {
+  const observations = await readRunDriverUsageObservations(runsRoot, runId);
+  const sessionDispatch = new Map<string, string>();
+  for (const observation of observations) {
+    if (observation.dispatch_id === undefined) continue;
+    if (!sessionDispatch.has(observation.session_id)) {
+      sessionDispatch.set(observation.session_id, observation.dispatch_id);
+    }
+  }
+  // 首次非空归属优先：先扫一遍建 session→dispatch，再折叠，避免「先到的无 id 观测」把
+  // 整个 session 误判成 unattributed。
+  const groups = new Map<string, Map<string, MutableSessionUsage>>();
+  const unattributed = new Map<string, MutableSessionUsage>();
+  for (const observation of observations) {
+    const dispatchId = sessionDispatch.get(observation.session_id);
+    if (dispatchId === undefined) {
+      foldUsageObservation(unattributed, observation);
+      continue;
+    }
+    let group = groups.get(dispatchId);
+    if (group === undefined) {
+      group = new Map();
+      groups.set(dispatchId, group);
+    }
+    foldUsageObservation(group, observation);
+  }
+  const byDispatch: Record<string, TaskDriverUsage> = {};
+  for (const [dispatchId, group] of groups) {
+    byDispatch[dispatchId] = finalizeUsageSessions(group);
+  }
+  return {
+    by_dispatch: byDispatch,
+    ...(unattributed.size > 0 ? { unattributed: finalizeUsageSessions(unattributed) } : {}),
+  };
+}
+
+/** 折叠一批观测为 Task 聚合；与 `projectTaskDriverUsage` 共用同一套 session 口径。 */
+export function foldDriverUsageObservations(
+  observations: readonly DriverUsageObservation[],
+): TaskDriverUsage {
+  const sessions = new Map<string, MutableSessionUsage>();
+  for (const observation of observations) foldUsageObservation(sessions, observation);
+  return finalizeUsageSessions(sessions);
+}
+
+/** 逐条追加的账本：没有保留上限，所以只需按 task 过滤（给了 taskId 时）。 */
 async function readUsageLedgerObservations(
   ledgerPath: string,
-  taskId: string,
+  taskId?: string,
 ): Promise<MutableSessionUsage[]> {
   const records = await readJsonLines(ledgerPath);
   const observations: MutableSessionUsage[] = [];
   for (const record of records) {
-    if (!record || record.task_id !== taskId) continue;
+    if (!record) continue;
+    if (taskId !== undefined && record.task_id !== taskId) continue;
     const observation = driverUsageObservationFromRecord(record);
     if (observation) observations.push(observation);
   }
@@ -240,7 +331,7 @@ async function readUsageLedgerObservations(
  */
 async function readCappedStreamObservations(
   auditPath: string,
-  taskId: string,
+  taskId?: string,
 ): Promise<MutableSessionUsage[]> {
   const records = await readJsonLines(auditPath);
   // 截断标记是文件级事实：标记之后的观测没落盘，标记之前的观测也都缺「后续
@@ -251,7 +342,7 @@ async function readCappedStreamObservations(
   for (const record of records) {
     if (!record) continue;
     if (record.truncated === true) continue;
-    if (record.task_id !== taskId) continue;
+    if (taskId !== undefined && record.task_id !== taskId) continue;
     const observation = usageObservationFromDriverEvent(
       asRecord(record.event) as unknown as DriverStreamEvent,
       typeof record.recorded_at === 'string' ? record.recorded_at : '',
@@ -292,6 +383,7 @@ export function usageObservationFromDriverEvent(
   return {
     session_id: sessionId,
     ...(nonemptyString(event?.role_id) ? { role_id: nonemptyString(event?.role_id)! } : {}),
+    ...(nonemptyString(event?.dispatch_id) ? { dispatch_id: nonemptyString(event?.dispatch_id)! } : {}),
     context_tokens_used: used,
     ...(size !== undefined ? { context_window_size: size } : {}),
     ...(amount !== undefined && currency
@@ -325,6 +417,11 @@ function foldUsageObservation(
     );
   }
   if (!current.role_id && observation.role_id) current.role_id = observation.role_id;
+  // session 级归属只认**首次带 dispatch_id 的观测**：同一 session 后续若换了派工 id，
+  // 累计占用仍然只有一份，重复归属会造成跨派工重复记账。
+  if (!current.dispatch_id && observation.dispatch_id) {
+    current.dispatch_id = observation.dispatch_id;
+  }
   if (
     observation.reported_cost &&
     (!current.costObservedAt || (observation.costObservedAt ?? '') >= current.costObservedAt)

@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import type { RunLatency, RunLatencyTotals } from '../telemetry';
 import type { AppRunSnapshot } from './run-registry';
 import { projectRunSnapshot } from './run-snapshot-projector';
+import { readRunDispatchFacts } from './run-dispatch-read';
 import {
   isDriverStreamUsage,
   mergeTaskDriverUsage,
@@ -114,7 +115,11 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
     const timelinePath = path.join(runDir, 'timeline.json');
     const frontendSnapshotPath = path.join(runDir, 'frontend-snapshot.json');
 
-    const projected = projectRunSnapshot(snapshot);
+    // 阶段 4 修复 R4-01：终态产物与快照使用同一份事实——事件出口失败/进程在事件落盘前
+    // 崩溃时，从 Journal（事实源）补齐缺失的派工事实。只读、不派工、不改变终态；Journal
+    // 缺失（legacy Run）时退回纯事件投影，行为与从前一致。
+    const dispatchJournalFacts = await readRunDispatchFacts(this.runsRoot, snapshot.run_id);
+    const projected = projectRunSnapshot(snapshot, dispatchJournalFacts);
     const tokenUsage = mergeTaskDriverUsage(
       await projectTaskDriverUsage(this.runsRoot, snapshot.task_id),
       this.accumulatedUsage?.(snapshot.task_id),
@@ -278,6 +283,14 @@ function buildBackendSummary(
     artifacts_materialized: projected.artifacts.length,
     ...(proxyTokenUsage ? { token_usage: proxyTokenUsage } : {}),
     consumption,
+    // 阶段 4：派工摘要/进度跟着快照一起落盘。读的是**同一个投影结果**（`projectRunSnapshot`），
+    // 不在这里另算一份——summary 与快照口径漂移比少一个字段更难查。
+    ...(projected.dispatch_summary !== undefined
+      ? { dispatch_summary: projected.dispatch_summary }
+      : {}),
+    ...(projected.dispatch_progress !== undefined
+      ? { dispatch_progress: projected.dispatch_progress }
+      : {}),
     ...(tokenUsage.available ? { driver_context_usage: tokenUsage } : {}),
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     result_path: paths.result_path,

@@ -48,6 +48,11 @@ export interface DriverStreamEvent {
   session_id?: DriverSessionId;
   sequence?: number;
   created_at?: Timestamp;
+  /**
+   * 阶段 4：产生该事件的 role 派工身份。只有 role 自主循环的派工期间转发的事件带它；
+   * legacy/Council 调用没有这个概念，读的一侧必须容忍缺失（不得填假 id）。
+   */
+  dispatch_id?: string;
 }
 
 export type DriverStreamEventListener = (event: DriverStreamEvent) => void;

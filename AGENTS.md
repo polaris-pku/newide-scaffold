@@ -218,7 +218,9 @@ CLI 会把 `process.env` 叠在 `.env.local` 之上，**shell 里已导出的变
 已注册方法（按命名空间）：
 
 - `task.*` — `create` `get` `list` `cancel` `delete` `interrupt` `resume` `startCouncil` `subscribe` `unsubscribe`
-- `run.*` — `create` `getSnapshot` `subscribe` `unsubscribe` `getPayload` `getEvents` `getUsage` `cancel` `list` `restart`
+- `run.*` — `create` `getSnapshot` `subscribe` `unsubscribe` `getPayload` `getEvents` `getUsage` `getDispatchJournal` `getDispatchEvidence` `cancel` `list` `restart`
+  （后两个是阶段 4 的受控派工明细读取：Journal 行元数据分页 + 已登记 evidence 侧车分页；只读、
+  不派工、不改终态，不接受任意本地路径）
 - `memory.*` — Agent/Skill/Experience/Persona CRUD + 检索 + 市场 + 维护面
   （`claimDelivery` / `renewDeliveryClaim` / `ackDelivery` / `retryDelivery` /
   `restoreExpiredDeliveries` / `listMaintenance` / `listContextDeliveries` / `listDriverFeedback` …）
@@ -252,9 +254,27 @@ CLI 会把 `process.env` 叠在 `.env.local` 之上，**shell 里已导出的变
   telemetry.jsonl                本 run 的遥测（NEWIDE_TELEMETRY_JSONL=0 关闭）
   driver-stream.jsonl            原始 driver 事件流，8 MiB 封顶——truth source
   driver-usage.jsonl             每次 driver usage 观测一行，永不截断（NEWIDE_DRIVER_USAGE_JSONL=0 关闭）
+  journal/dispatches.jsonl       role 派工事实源（accepted/dispatched/settled/reconciled + init/finish/role_round）
+  journal/evidence/<dsp>.json    每派工的证据侧车（sha256 绑定，正文按受控 ref 分页读）
+  journal/.writer.lock/          单写者锁；peek 读取不取锁、不修坏尾
 ```
 
 三个 `.jsonl` 各自有开关、加入时间不同，所以**老 run 少一两个文件是正常的**。
+
+派工进度（阶段 4）：role 引擎把 `agent.dispatch_accepted|started|settled|reconciled|inherited`、
+`agent.plan_updated`、`agent.finish_requested`、`agent.role_terminated` 等低频事件写进 run 时间线；
+`src/app/run-dispatch-projection.ts` 把它们折成快照的 `dispatch_summary` / `dispatch_progress`
+（按 `dispatch_id` 去重，父链派工只进 `inherited`）。Journal 仍是事实源，事件只是投影——补投影
+永远不触发补执行；详情用 `run.getDispatchJournal` / `run.getDispatchEvidence` 分页读。
+
+**阶段 4 审核修复（2026-11-15）**：事件可能缺失（写盘失败/崩溃），所以投影支持按 `dispatch_id`
+幂等合并 Journal 折叠记录（`projectDispatchFacts(..., {journal_records})`）；role 引擎在恢复入口
+（入口已有记录即恢复）补发 `recovered: true` 的低频事件，terminal writer 与持久化 `run.snapshot`
+用只读 `readRunDispatchFacts`（peek，损坏/缺失降级）补齐；legacy 无 Journal 不虚构。派工**有效
+状态**只有一条规则 `effectiveDispatchRecordStatus`（仅原始 `unknown` + 可信 `reconciled` 才采用
+对账后状态，已发终态不改写；Journal 原始行仍保留 `unknown`），快照 / 祖先 inherited / Journal RPC
+摘要 / `report:driver-stream` 对账共用；`run.getDispatchJournal.summary.reconciled_dispatch_ids`
+列出被可信对账收束的 id。不要为展示一致性改写 settled 行或复制第二套状态机。
 
 `pnpm report:consumption` 与 `pnpm report:driver-stream` 是**降级而不是失败**的：
 run 早于某个产物时，缺的东西写进 `missing`，不是报成 0。**读数字之前先读 `missing`。**
@@ -334,7 +354,7 @@ pnpm vitest run --project default <file>  # 跳过 pg-serial
 | --- | --- |
 | 摸清全局 | `README.md`（对外）→ `docs/architecture/系统架构-模块划分与依赖关系.md`（本地） |
 | 看当前设计方向 | `design/role-driver-rebalance.md`（v3.0 现行设计稿，**未实现**；v2.0 存档同目录；§12 是 2026-11-13 阶段 0 核对记录；`design/` 为本地目录，不入 git） |
-| 实施 role/driver 职责完善 | `docs/plans/role-driver-autonomy-development-plan.md`（2026-11-14，**阶段 0–1 已验收；阶段 2 复审/精简完成、待用户审核；阶段 3 审核修复完成、待用户验收；阶段 4–5 未开始**；各阶段的目标、交付物与验收门槛，§6 末为 2026-11-14 三轮精简记录，§7 为阶段 3 目标/开发/审核修复记录）→ 阶段 0 契约 `docs/contracts/role-driver-autonomy.md`（含 §11 阶段 1/2 实现与修复记录、`RD-IMP-17` 阶段 3 evidence-only/Buffer v2 落点、`RD-IMP-18` 阶段 3 审核修复（结束状态 + 离线证据核验）；**阶段 2 精简后 `RD-FIN-03` 重写为「Role 语义判断 + 宿主事实校验」**，`RD-IMP-14` 为精简重构的唯一实现入口/退役/保留项与残余风险，`RD-IMP-16` 为最后一轮局部精简） + 测试矩阵 `docs/contracts/role-driver-autonomy-test-matrix.md`（含 §13/§14 阶段 1/2 执行记录与 §15 阶段 3 记录，§15.4 为审核修复执行记录） + 基线 `docs/reports/role-driver-autonomy-baseline-2026-11-13.md` + 阶段 3 实施报告 `docs/reports/role-driver-phase3-implementation-2026-11-14.md` + 阶段 3 审核报告/修复报告 `docs/reports/role-driver-phase3-review-2026-11-14.md`、`docs/reports/role-driver-phase3-review-fix-2026-11-14.md` + 精简依据 `docs/reports/role-driver-phase2-redundancy-review-2026-11-14.md`、`docs/reports/role-driver-phase2-further-simplification-report-2026-11-14.md` 与 `docs/reports/role-driver-phase2-final-simplification-report-2026-11-14.md` |
+| 实施 role/driver 职责完善 | `docs/plans/role-driver-autonomy-development-plan.md`（2026-11-15，**阶段 0–4 已验收；阶段 4 收尾提交完成；阶段 5 未开始（准备中）**；各阶段的目标、交付物与验收门槛，§6 末为阶段 2 三轮精简记录，§7 为阶段 3 目标/开发/审核修复记录与遗留非阻断 P2，§8 为阶段 4 恢复/投影/事件/RPC/用量记录、审核修复与收尾记录，§9 为阶段 5 目标与启动准备清单）→ 阶段 0 契约 `docs/contracts/role-driver-autonomy.md`（含 §11 阶段 1/2 实现与修复记录、`RD-IMP-17` 阶段 3 evidence-only/Buffer v2 落点、`RD-IMP-18` 阶段 3 审核修复、`RD-IMP-19` 阶段 4 dispatch 投影/低频事件/RPC 读取/用量归属、`RD-IMP-20` 阶段 4 审核修复 R4-01/R4-02；**阶段 2 精简后 `RD-FIN-03` 重写为「Role 语义判断 + 宿主事实校验」**） + 测试矩阵 `docs/contracts/role-driver-autonomy-test-matrix.md`（含 §13/§14 阶段 1/2 执行记录、§15 阶段 3 记录、§16 阶段 4 记录、§17 阶段 4 审核修复与收尾记录） + 基线 `docs/reports/role-driver-autonomy-baseline-2026-11-13.md` + 阶段 3 实施报告 `docs/reports/role-driver-phase3-implementation-2026-11-14.md` + 阶段 3 审核报告/修复报告 `docs/reports/role-driver-phase3-review-2026-11-14.md`、`docs/reports/role-driver-phase3-review-fix-2026-11-14.md` + 阶段 4 实施报告 `docs/reports/role-driver-phase4-implementation-2026-11-15.md`、阶段 4 审核报告/修复报告 `docs/reports/role-driver-phase4-review-2026-11-15.md`、`docs/reports/role-driver-phase4-review-fix-2026-11-15.md`、收尾报告 `docs/reports/role-driver-stage4-closeout-2026-11-15.md` + 阶段 2 精简依据 `docs/reports/role-driver-phase2-redundancy-review-2026-11-14.md`、`docs/reports/role-driver-phase2-further-simplification-report-2026-11-14.md` 与 `docs/reports/role-driver-phase2-final-simplification-report-2026-11-14.md` |
 | 查本地文档索引 / 已删材料 | `docs/README.md`（§9 已知问题）+ `.newide/docs-backup-*.zip`（删除前快照） |
 | 改协调/游标 | `src/coordination/README.md` → `src/coordination/task-execution-loop.ts` |
 | 改 Driver | `src/driver/README.md`（含 ADP 状态映射表与未知态语义） |

@@ -27,9 +27,16 @@ import {
   type DriverStreamAuditLine,
 } from '../src/app/driver-stream-refs';
 import { projectDriverStreamLifecycleEvent } from '../src/app/driver-stream-projection';
+import { ROLE_DISPATCH_EVENT } from '../src/app/run-dispatch-events';
+import { effectiveDispatchRecordStatus } from '../src/app/role-autonomy-contract';
+import {
+  foldDispatchJournalLines,
+  RunDispatchJournal,
+  RunDispatchJournalError,
+} from '../src/persistence';
 
 /** 缺哪份数据。看报告的人据此区分「对账通过」与「没得对」。 */
-export type MissingReconcileSignal = 'driver-stream' | 'timeline';
+export type MissingReconcileSignal = 'driver-stream' | 'timeline' | 'summary' | 'journal';
 
 /** 重放产物：真相源投影出的事件，按信封序号排列。 */
 export interface ReplayedDriverEvent {
@@ -55,6 +62,55 @@ export interface TypeMismatch {
   timeline: string;
 }
 
+/** timeline 里的派工事件事实（只取身份，不看正文）。 */
+export interface TimelineDispatchFacts {
+  /** 出现在任一 `agent.dispatch_*` 事件里的 dispatch_id。 */
+  dispatch_ids: string[];
+  /** `agent.dispatch_settled` 的 dispatch_id 集合。 */
+  settled_ids: string[];
+}
+
+/** Journal 折叠后的派工事实（损坏/半写时视为不可对账）。 */
+export interface JournalDispatchFacts {
+  total: number;
+  by_status: Record<string, number>;
+  dispatch_ids: string[];
+  settled_ids: string[];
+}
+
+/** `summary.json` 的 `dispatch_summary` 事实：全量 id 不在摘要里，只能取它显式列出的部分。 */
+export interface SummaryDispatchFacts {
+  total: number;
+  by_status: Record<string, number>;
+  /** `last_dispatch.dispatch_id` + `unknown.dispatch_ids` ——摘要里唯一可对身份的部分。 */
+  known_ids: string[];
+}
+
+/**
+ * 派工身份/计数对账（阶段 4，OBS-02）。
+ *
+ * 三方口径：timeline 中 `agent.dispatch_settled` 的 id 集合、`summary.json` 的
+ * `dispatch_summary`、Journal 折叠。差集只在两侧都有数据时计算；缺失来源进 `missing`，
+ * 不把「没得对」写成「对上了」。
+ */
+export interface DispatchReconcile {
+  journal?: JournalDispatchFacts;
+  summary?: SummaryDispatchFacts;
+  timeline: TimelineDispatchFacts;
+  /** Journal 里已 settled 的派工，timeline 的 settled 集合里没有。 */
+  missing_in_timeline: string[];
+  /** timeline 的 settled 集合里出现、Journal 里没有的派工。 */
+  unexpected_in_timeline: string[];
+  /** summary 显式列出的派工，timeline 里没有对应事件。 */
+  summary_ids_missing_in_timeline: string[];
+  /** summary 显式列出的派工，Journal 里没有记录。 */
+  summary_ids_not_in_journal: string[];
+  /** 计数不一致（只在两侧来源都存在时比较）。 */
+  count_mismatches: Array<{ metric: string; expected: number; actual: number }>;
+  /** 派工视角没有差异（缺数据时两边都空也算 true，配合 missing 一起读）。 */
+  ok: boolean;
+}
+
 export interface DriverStreamReconcileResult {
   run_id: string;
   missing: MissingReconcileSignal[];
@@ -76,6 +132,8 @@ export interface DriverStreamReconcileResult {
   type_mismatches: TypeMismatch[];
   by_type_replayed: Record<string, number>;
   by_type_timeline: Record<string, number>;
+  /** 派工身份/计数对账（阶段 4）：Journal / summary.dispatch_summary / timeline 三方。 */
+  dispatch: DispatchReconcile;
   /** 已有数据里没有差异。缺数据时两边都空也算 true，配合 missing 一起读。 */
   ok: boolean;
 }
@@ -120,6 +178,17 @@ export async function reconcileDriverStreamRun(
   const missing: MissingReconcileSignal[] = [];
   if (replay.audit_events === 0) missing.push('driver-stream');
   if (timelineEvents === undefined) missing.push('timeline');
+  // 派工三方对账的另外两个来源；缺了就不比较，但要在 missing 里说清楚「没得对」。
+  const summaryFacts = await readSummaryDispatchFacts(runsRoot, runId);
+  const journalFacts = await readJournalDispatchFacts(runsRoot, runId);
+  if (summaryFacts === undefined) missing.push('summary');
+  if (journalFacts === undefined) missing.push('journal');
+  const timelineDispatch =
+    (await readTimelineDispatchFacts(runsRoot, runId)) ?? {
+      dispatch_ids: [],
+      settled_ids: [],
+    };
+  const dispatch = reconcileDispatchFacts(journalFacts, summaryFacts, timelineDispatch);
 
   // 键的选择：两侧都有 run 级唯一序号时精确配对；否则退化为 driver 侧序号，
   // 按「同键类型多重集」配对——invoke 间序号碰撞不再报假差异。
@@ -181,6 +250,7 @@ export async function reconcileDriverStreamRun(
     type_mismatches: typeMismatches,
     by_type_replayed: sortRecord(byTypeReplayed),
     by_type_timeline: sortRecord(byTypeTimeline),
+    dispatch,
     ok: missingInTimeline.length === 0 && typeMismatches.length === 0 && unexpectedInTimeline.length === 0,
   };
 }
@@ -249,6 +319,244 @@ function sortRecord(record: Record<string, number>): Record<string, number> {
   );
 }
 
+// ─────────────────────────────────────────────────────────────
+// 派工三方对账：Journal / summary.dispatch_summary / timeline
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 三方对账纯函数：只在两侧来源都存在时算差集与计数差，缺失的一侧不参与比较。
+ * `summary` 只显式列出 `last_dispatch.dispatch_id` 与 `unknown.dispatch_ids`，
+ * 因此身份比较只用这组已知 id，不凭空补全。
+ */
+function reconcileDispatchFacts(
+  journal: JournalDispatchFacts | undefined,
+  summary: SummaryDispatchFacts | undefined,
+  timeline: TimelineDispatchFacts,
+): DispatchReconcile {
+  const journalIds = new Set(journal?.dispatch_ids ?? []);
+  const journalSettled = new Set(journal?.settled_ids ?? []);
+  const timelineIds = new Set(timeline.dispatch_ids);
+  const timelineSettled = new Set(timeline.settled_ids);
+
+  const missingInTimeline =
+    journal === undefined
+      ? []
+      : [...journalSettled].filter((id) => !timelineSettled.has(id)).sort();
+  const unexpectedInTimeline =
+    journal === undefined
+      ? []
+      : [...timelineSettled].filter((id) => !journalIds.has(id)).sort();
+
+  const summaryIds = summary?.known_ids ?? [];
+  const summaryIdsMissingInTimeline =
+    summary === undefined ? [] : summaryIds.filter((id) => !timelineIds.has(id)).sort();
+  const summaryIdsNotInJournal =
+    summary === undefined || journal === undefined
+      ? []
+      : summaryIds.filter((id) => !journalIds.has(id)).sort();
+
+  const countMismatches: DispatchReconcile['count_mismatches'] = [];
+  if (journal !== undefined && summary !== undefined) {
+    if (journal.total !== summary.total) {
+      countMismatches.push({ metric: 'total', expected: journal.total, actual: summary.total });
+    }
+    const statuses = new Set([
+      ...Object.keys(journal.by_status),
+      ...Object.keys(summary.by_status),
+    ]);
+    for (const status of [...statuses].sort()) {
+      const expected = journal.by_status[status] ?? 0;
+      const actual = summary.by_status[status] ?? 0;
+      if (expected !== actual) {
+        countMismatches.push({
+          metric: `by_status.${status}`,
+          expected,
+          actual,
+        });
+      }
+    }
+  }
+  // timeline 的去重派工数只在它确实有派工事件时比较（没有事件是「没投影」，不是 0）。
+  if (journal !== undefined && timelineIds.size > 0 && journal.total !== timelineIds.size) {
+    countMismatches.push({
+      metric: 'timeline.dispatch_ids',
+      expected: journal.total,
+      actual: timelineIds.size,
+    });
+  }
+
+  return {
+    ...(journal !== undefined ? { journal } : {}),
+    ...(summary !== undefined ? { summary } : {}),
+    timeline,
+    missing_in_timeline: missingInTimeline,
+    unexpected_in_timeline: unexpectedInTimeline,
+    summary_ids_missing_in_timeline: summaryIdsMissingInTimeline,
+    summary_ids_not_in_journal: summaryIdsNotInJournal,
+    count_mismatches: countMismatches,
+    ok:
+      missingInTimeline.length === 0 &&
+      unexpectedInTimeline.length === 0 &&
+      summaryIdsMissingInTimeline.length === 0 &&
+      summaryIdsNotInJournal.length === 0 &&
+      countMismatches.length === 0,
+  };
+}
+
+/** 读 timeline.json 里的派工事件身份；timeline 缺失返回 undefined（与「没有派工事件」区分）。 */
+async function readTimelineDispatchFacts(
+  runsRoot: string,
+  runId: string,
+): Promise<TimelineDispatchFacts | undefined> {
+  const raw = await fs
+    .readFile(path.join(runsRoot, runId, 'timeline.json'), 'utf8')
+    .catch(() => undefined);
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed)) return undefined;
+  const dispatchIds = new Set<string>();
+  const settledIds = new Set<string>();
+  for (const entry of parsed) {
+    const record = readRecord(entry);
+    if (!record) continue;
+    const eventType = readString(record.type);
+    const payload = readRecord(record.payload);
+    const dispatchId = readString(payload?.dispatch_id);
+    if (eventType === undefined || dispatchId === undefined) continue;
+    if (
+      eventType !== ROLE_DISPATCH_EVENT.accepted &&
+      eventType !== ROLE_DISPATCH_EVENT.started &&
+      eventType !== ROLE_DISPATCH_EVENT.settled &&
+      eventType !== ROLE_DISPATCH_EVENT.reconciled
+    ) {
+      continue;
+    }
+    dispatchIds.add(dispatchId);
+    if (eventType === ROLE_DISPATCH_EVENT.settled) settledIds.add(dispatchId);
+  }
+  return {
+    dispatch_ids: [...dispatchIds].sort(),
+    settled_ids: [...settledIds].sort(),
+  };
+}
+
+/** 读 `summary.json` 的 `dispatch_summary`；没有该字段（旧 run）返回 undefined。 */
+async function readSummaryDispatchFacts(
+  runsRoot: string,
+  runId: string,
+): Promise<SummaryDispatchFacts | undefined> {
+  const raw = await fs
+    .readFile(path.join(runsRoot, runId, 'summary.json'), 'utf8')
+    .catch(() => undefined);
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  const summary = readRecord(readRecord(parsed)?.dispatch_summary);
+  if (summary === undefined) return undefined;
+  const total = readCount(summary.total);
+  const byStatus = readCountRecord(summary.by_status);
+  const knownIds = new Set<string>();
+  const lastDispatch = readString(readRecord(summary.last_dispatch)?.dispatch_id);
+  if (lastDispatch !== undefined) knownIds.add(lastDispatch);
+  const unknownIds = readRecord(summary.unknown)?.dispatch_ids;
+  if (Array.isArray(unknownIds)) {
+    for (const id of unknownIds) {
+      const value = readString(id);
+      if (value !== undefined) knownIds.add(value);
+    }
+  }
+  return { total, by_status: byStatus, known_ids: [...knownIds].sort() };
+}
+
+/** 读本 run 的 Journal 并折叠成派工事实；没有 Journal / 损坏 / 半写都返回 undefined。 */
+async function readJournalDispatchFacts(
+  runsRoot: string,
+  runId: string,
+): Promise<JournalDispatchFacts | undefined> {
+  const runDir = path.join(runsRoot, runId);
+  let journal: RunDispatchJournal;
+  try {
+    journal = await RunDispatchJournal.peek({
+      runDir,
+      identity: { run_id: runId, task_id: runId, role_id: 'driver-stream-reconcile' },
+    });
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) return undefined;
+    throw error;
+  }
+  const read = await journal.read();
+  if (read.kind !== 'journal' || read.status !== 'ok') return undefined;
+  const first = read.lines[0];
+  if (first === undefined) return undefined;
+  try {
+    const fold = foldDispatchJournalLines(read.lines, {
+      run_id: first.run_id,
+      task_id: first.task_id,
+      role_id: first.role_id,
+    });
+    const byStatus: Record<string, number> = {};
+    const settledIds: string[] = [];
+    for (const record of fold.records) {
+      // 与快照投影 / Journal RPC 共用有效状态规则：原始 settled unknown 经可信 reconciled
+      // 收束后按对账后状态计数，否则三方对账会拿两个不同的口径互相「对不上」（R4-02）。
+      const status = effectiveDispatchRecordStatus(record);
+      byStatus[status] = (byStatus[status] ?? 0) + 1;
+      if (record.phase === 'settled') settledIds.push(record.dispatch_id);
+    }
+    return {
+      total: fold.records.length,
+      by_status: sortRecord(byStatus),
+      dispatch_ids: fold.records.map((record) => record.dispatch_id).sort(),
+      settled_ids: settledIds.sort(),
+    };
+  } catch (error) {
+    if (error instanceof RunDispatchJournalError) return undefined;
+    throw error;
+  }
+}
+
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function readCount(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+function readCountRecord(value: unknown): Record<string, number> {
+  const record = readRecord(value);
+  const counts: Record<string, number> = {};
+  if (!record) return counts;
+  for (const [key, entry] of Object.entries(record)) {
+    const count = readCount(entry);
+    if (count > 0) counts[key] = count;
+  }
+  return counts;
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    (error as { code?: unknown }).code === code
+  );
+}
+
 export function renderDriverStreamReconcile(results: readonly DriverStreamReconcileResult[]): string {
   const lines: string[] = [];
   for (const result of results) {
@@ -272,8 +580,37 @@ export function renderDriverStreamReconcile(results: readonly DriverStreamReconc
         `  类型不一致 seq=${mismatch.sequence}: 重放=${mismatch.replayed} timeline=${mismatch.timeline}`,
       );
     }
+    lines.push(...renderDispatchReconcile(result.dispatch));
   }
   return lines.join('\n');
+}
+
+/** 渲染派工三方对账：只报实际算出来的差集与计数差，缺来源时上面已由 missing 标注。 */
+function renderDispatchReconcile(dispatch: DispatchReconcile): string[] {
+  const counts: string[] = [];
+  if (dispatch.journal !== undefined) counts.push(`journal=${dispatch.journal.total}`);
+  if (dispatch.summary !== undefined) counts.push(`summary=${dispatch.summary.total}`);
+  counts.push(`timeline_settled=${dispatch.timeline.settled_ids.length}`);
+  const lines = [`  派工对账：${counts.join('  ')}`];
+  if (dispatch.missing_in_timeline.length > 0) {
+    lines.push(`  Journal 已 settled 但 timeline 缺席: ${dispatch.missing_in_timeline.join(', ')}`);
+  }
+  if (dispatch.unexpected_in_timeline.length > 0) {
+    lines.push(`  timeline settled 但 Journal 无记录: ${dispatch.unexpected_in_timeline.join(', ')}`);
+  }
+  if (dispatch.summary_ids_missing_in_timeline.length > 0) {
+    lines.push(
+      `  summary 列出但 timeline 无事件: ${dispatch.summary_ids_missing_in_timeline.join(', ')}`,
+    );
+  }
+  if (dispatch.summary_ids_not_in_journal.length > 0) {
+    lines.push(`  summary 列出但 Journal 无记录: ${dispatch.summary_ids_not_in_journal.join(', ')}`);
+  }
+  for (const mismatch of dispatch.count_mismatches) {
+    lines.push(`  计数不一致 ${mismatch.metric}: ${mismatch.expected} != ${mismatch.actual}`);
+  }
+  if (dispatch.ok) lines.push('  派工身份/计数一致');
+  return lines;
 }
 
 export interface DriverStreamCliOptions {

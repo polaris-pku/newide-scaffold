@@ -99,6 +99,65 @@ async function writeLegacyRun(runsRoot: string, runId: string): Promise<void> {
   );
 }
 
+/**
+ * 带派工区块的 run：summary.json 有 dispatch_summary，driver-usage.jsonl 有按派工归属与
+ * legacy 无归属各一条。同一 session 的累计更新重复出现，用来验证「重复输入不重复记账」。
+ */
+async function writeDispatchRun(runsRoot: string, runId: string): Promise<void> {
+  const runDir = path.join(runsRoot, runId);
+  await mkdir(runDir, { recursive: true });
+  await writeFile(
+    path.join(runDir, 'summary.json'),
+    JSON.stringify({
+      run_id: runId,
+      status: 'completed',
+      dispatch_summary: {
+        total: 2,
+        by_status: { succeeded: 1, unknown: 1 },
+        last_dispatch: { dispatch_id: 'dsp_2', status: 'unknown', updated_at: '2026-11-14T00:00:02Z' },
+        unknown: { count: 1, dispatch_ids: ['dsp_2'] },
+        violations: { count: 0, kinds: [] },
+      },
+    }),
+    'utf8',
+  );
+  await writeFile(
+    path.join(runDir, 'driver-usage.jsonl'),
+    [
+      ledgerRow({ runId, session: 'session_1', dispatch: 'dsp_1', used: 100, sequence: 1 }),
+      ledgerRow({ runId, session: 'session_1', dispatch: 'dsp_1', used: 300, sequence: 2, cost: 0.5 }),
+      ledgerRow({ runId, session: 'session_2', dispatch: 'dsp_2', used: 50, sequence: 3 }),
+      ledgerRow({ runId, session: 'session_legacy', used: 10, sequence: 4, cost: 0.1 }),
+    ].join('\n'),
+    'utf8',
+  );
+}
+
+function ledgerRow(input: {
+  runId: string;
+  session: string;
+  dispatch?: string;
+  used: number;
+  sequence: number;
+  cost?: number;
+}): string {
+  return JSON.stringify({
+    schema_version: 'newide.driver-usage-record.v1',
+    recorded_at: '2026-11-14T00:00:00Z',
+    run_id: input.runId,
+    task_id: 'task_dispatch',
+    stream_sequence: input.sequence,
+    session_id: input.session,
+    ...(input.dispatch !== undefined ? { dispatch_id: input.dispatch } : {}),
+    metric: 'context_tokens_used',
+    context_tokens_used: input.used,
+    context_window_size: 200_000,
+    ...(input.cost !== undefined
+      ? { reported_cost: { amount: input.cost, currency: 'USD' } }
+      : {}),
+  });
+}
+
 describe('collectRunConsumption', () => {
   it('reads all four streams when the run has them', async () => {
     const runsRoot = await createRunsRoot();
@@ -180,6 +239,78 @@ describe('collectRunConsumption', () => {
 
     expect(run.total_events).toBe(0);
     expect(run.missing).toEqual(['audit', 'consumption', 'latency', 'summary', 'telemetry']);
+  });
+
+  it('reports the dispatch block: summary, per-dispatch usage, and legacy unattributed', async () => {
+    const runsRoot = await createRunsRoot();
+    await writeDispatchRun(runsRoot, 'run_dispatch');
+
+    const run = await collectRunConsumption(runsRoot, 'run_dispatch');
+
+    // dispatch_summary 原样展示（不重新解释它的字段）。
+    expect(run.dispatch.dispatch_summary).toMatchObject({
+      total: 2,
+      by_status: { succeeded: 1, unknown: 1 },
+      unknown: { count: 1, dispatch_ids: ['dsp_2'] },
+    });
+    // 同 session 的累计更新取 max（300 而不是 100+300），重复输入不重复记账。
+    expect(run.dispatch.usage_by_dispatch).toEqual({
+      dsp_1: { context_tokens_used: 300, sessions: 1, complete: true },
+      dsp_2: { context_tokens_used: 50, sessions: 1, complete: false },
+    });
+    // 没有 dispatch_id 的旧记录单独成块；没有这类记录时该字段缺席（另一条用例）。
+    expect(run.dispatch.unattributed).toEqual({
+      context_tokens_used: 10,
+      sessions: 1,
+      complete: true,
+    });
+    expect(run.dispatch.missing).toEqual([]);
+
+    const rendered = renderConsumptionReport([run], { aggregate: false });
+    expect(rendered).toContain('按派工 driver usage');
+    expect(rendered).toContain('dsp_1');
+    expect(rendered).toContain('无归属（legacy，无 dispatch_id）');
+    expect(rendered).toContain('摘要：total=2');
+  });
+
+  it('keeps a legacy run honest: dispatch sources are missing, not zero', async () => {
+    const runsRoot = await createRunsRoot();
+    await writeLegacyRun(runsRoot, 'run_legacy');
+
+    const run = await collectRunConsumption(runsRoot, 'run_legacy');
+
+    expect(run.dispatch).toEqual({
+      usage_by_dispatch: {},
+      missing: ['dispatch_summary', 'driver_usage'],
+    });
+    expect(run.dispatch).not.toHaveProperty('unattributed');
+
+    const rendered = renderConsumptionReport([run], { aggregate: false });
+    expect(rendered).toContain('派工区块缺失：dispatch_summary / driver_usage（缺不等于 0）');
+  });
+
+  it('reports an affected run without crashing while another run keeps the dispatch data', async () => {
+    const runsRoot = await createRunsRoot();
+    await writeDispatchRun(runsRoot, 'run_dispatch');
+    await writeLegacyRun(runsRoot, 'run_legacy');
+
+    const dispatchFull = await collectRunConsumption(runsRoot, 'run_dispatch');
+    const legacy = await collectRunConsumption(runsRoot, 'run_legacy');
+    const totals = aggregateConsumption([dispatchFull, legacy]);
+
+    // --all 不合并 per-run dispatch_summary（合并摘要等于编一个新的派工分母），但 usage 可以按
+    // dispatch_id 相加；缺失信号取并集，缺的那 run 不会被读成 0。
+    expect(totals.dispatch).not.toHaveProperty('dispatch_summary');
+    expect(totals.dispatch.usage_by_dispatch).toEqual({
+      dsp_1: { context_tokens_used: 300, sessions: 1, complete: true },
+      dsp_2: { context_tokens_used: 50, sessions: 1, complete: false },
+    });
+    expect(totals.dispatch.missing).toEqual(['dispatch_summary', 'driver_usage']);
+    expect(totals.dispatch.unattributed).toEqual({
+      context_tokens_used: 10,
+      sessions: 1,
+      complete: true,
+    });
   });
 });
 

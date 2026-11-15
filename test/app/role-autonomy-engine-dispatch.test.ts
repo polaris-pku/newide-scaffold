@@ -47,6 +47,11 @@ import {
 import { reconcileLateDriverResult, RoleAutonomyEngine } from '../../src/app/role-autonomy-engine';
 import { runRoleExecutionLoop } from '../../src/app/role-execution-loop';
 import { createRoleFinishValidator } from '../../src/app/role-autonomy-finish';
+import {
+  ROLE_DISPATCH_EVENT,
+  type RoleLifecycleEvent,
+} from '../../src/app/run-dispatch-events';
+import { projectDispatchFacts } from '../../src/app/run-dispatch-projection';
 
 const temporaryDirectories: string[] = [];
 
@@ -486,6 +491,22 @@ async function readFold(runsRoot: string, runId: string) {
     identity: { run_id: runId, ...IDENTITY },
   });
   return journal.fold();
+}
+
+/** role 真正结束时的唯一 durable 写入点（engine 自己不写 finish，恢复测试按真实路径补写）。 */
+async function appendCompletedFinish(runsRoot: string, runId: string): Promise<void> {
+  const journal = await RunDispatchJournal.open({
+    runDir: path.join(runsRoot, runId),
+    identity: { run_id: runId, ...IDENTITY },
+  });
+  await journal.appendFinish({
+    actor: 'role',
+    status: 'completed',
+    reason: 'done',
+    evidence_refs: [],
+    summary: 'done',
+  });
+  await journal.close();
 }
 
 /** 轮询等待测试内部条件成立（用于等异步派工真正进入 sendPrompt）。 */
@@ -3723,5 +3744,351 @@ describe('verification 接线（真实 engine + 真实 loop/finish + 真实子�
       observation: 'complete',
       exit_code: 0,
     });
+  });
+});
+
+describe('阶段 4：派工生命周期投影事件（真实 journal + fake driver）', () => {
+  it('accepted/started/settled 同身份各一条，载荷只含低频元数据', async () => {
+    const { runsRoot, runId, workspace } = await makeFixture();
+    const harness = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      sendPrompt: async () => driverResult('succeeded'),
+    });
+    const events: RoleLifecycleEvent[] = [];
+    const result = await harness.engine.run({
+      task_id: IDENTITY.task_id,
+      run_id: runId,
+      role_id: IDENTITY.role_id,
+      instruction: 'do the work',
+      workspace_path: workspace,
+      emit_event: (event) => events.push(event),
+    });
+    expect(result.status).toBe('completed');
+
+    const accepted = events.filter((event) => event.type === ROLE_DISPATCH_EVENT.accepted);
+    const started = events.filter((event) => event.type === ROLE_DISPATCH_EVENT.started);
+    const settled = events.filter((event) => event.type === ROLE_DISPATCH_EVENT.settled);
+    expect(accepted).toHaveLength(1);
+    expect(started).toHaveLength(1);
+    expect(settled).toHaveLength(1);
+    const dispatchId = accepted[0]!.payload.dispatch_id;
+    expect(typeof dispatchId).toBe('string');
+    expect(started[0]!.payload.dispatch_id).toBe(dispatchId);
+    expect(settled[0]!.payload).toMatchObject({ dispatch_id: dispatchId, status: 'succeeded' });
+    expect(settled[0]!.payload.evidence_ref).toMatchObject({
+      path: `journal/evidence/${String(dispatchId)}.json`,
+    });
+    // 低频元数据：完整指令/transcript 不得进投影载荷。
+    expect(JSON.stringify(events)).not.toContain('do the work');
+  });
+
+  it('typed termination 投影 role_terminated，且不伪造 settled', async () => {
+    const { runsRoot, runId, workspace } = await makeFixture();
+    const harness = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      loop: async () => {
+        throw new RoleTerminationError({
+          code: 'budget_dispatches',
+          actor: 'host',
+          message: 'dispatch budget exhausted',
+        });
+      },
+    });
+    const events: RoleLifecycleEvent[] = [];
+    const error = await harness.engine
+      .run({
+        task_id: IDENTITY.task_id,
+        run_id: runId,
+        role_id: IDENTITY.role_id,
+        instruction: 'do the work',
+        workspace_path: workspace,
+        emit_event: (event) => events.push(event),
+      })
+      .then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+    expect(error).toBeInstanceOf(RoleTerminationError);
+    const terminated = events.filter((event) => event.type === ROLE_DISPATCH_EVENT.role_terminated);
+    expect(terminated).toHaveLength(1);
+    expect(terminated[0]!.payload).toMatchObject({
+      code: 'budget_dispatches',
+      actor: 'host',
+    });
+    expect(events.some((event) => event.type === ROLE_DISPATCH_EVENT.settled)).toBe(false);
+  });
+
+  it('plan_updated / finish_requested 通过 loop 的观察口接线', async () => {
+    const { runsRoot, runId, workspace } = await makeFixture();
+    const harness = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      loop: async (options) => {
+        options.on_plan_updated?.('plan: inspect then fix');
+        options.on_finish_requested?.({
+          status: 'completed',
+          verification_count: 2,
+          unresolved_count: 1,
+        });
+        return completedOutcome();
+      },
+    });
+    const events: RoleLifecycleEvent[] = [];
+    const result = await harness.engine.run({
+      task_id: IDENTITY.task_id,
+      run_id: runId,
+      role_id: IDENTITY.role_id,
+      instruction: 'do the work',
+      workspace_path: workspace,
+      emit_event: (event) => events.push(event),
+    });
+    expect(result.status).toBe('completed');
+    const plan = events.filter((event) => event.type === ROLE_DISPATCH_EVENT.plan_updated);
+    const finish = events.filter((event) => event.type === ROLE_DISPATCH_EVENT.finish_requested);
+    expect(plan).toHaveLength(1);
+    expect(plan[0]!.payload).toMatchObject({ plan: 'plan: inspect then fix' });
+    expect(finish).toHaveLength(1);
+    expect(finish[0]!.payload).toMatchObject({ status: 'completed', verification_count: 2 });
+  });
+
+  it('父链既有派工只作 inherited 投影，不伪造当前 Run 的 dispatch', async () => {
+    const parentId = 'run_parent_lifecycle';
+    const { runsRoot, runId, workspace } = await makeFixture();
+    const parentDir = path.join(runsRoot, parentId);
+    await fs.mkdir(parentDir, { recursive: true });
+    // 恢复链要求工作区基线可证明交付边界；父 Run 的基线属于同一次逻辑执行，必须存在。
+    const baseline = await snapshotWorkspaceContent(workspace);
+    await fs.mkdir(path.join(parentDir, 'role-autonomy'), { recursive: true });
+    await fs.writeFile(
+      path.join(parentDir, 'role-autonomy', 'workspace-before.json'),
+      JSON.stringify({
+        version: 2,
+        workspace_path: path.resolve(workspace),
+        entries: [...baseline.entries()],
+      }),
+      'utf8',
+    );
+    const parent = await RunDispatchJournal.open({
+      runDir: parentDir,
+      identity: { run_id: parentId, ...IDENTITY },
+    });
+    const brief = buildExecutionBrief({
+      identity: {
+        dispatch_id: 'dsp_parent_lifecycle',
+        run_id: parentId,
+        task_id: IDENTITY.task_id,
+        role_id: IDENTITY.role_id,
+        sequence: 1,
+        accepted_at: '2026-11-13T00:00:00.000Z',
+      },
+      request: { kind: 'execute', instruction: 'parent dispatch' },
+    }).brief;
+    await parent.appendAccepted({
+      brief,
+      brief_sha256: hashExecutionBrief(brief),
+      budget_before: {
+        dispatches_left: 12,
+        role_tokens_left: 120_000,
+        deadline_at: '2026-11-13T00:45:00.000Z',
+      },
+    });
+    await parent.appendDispatched({ dispatch_id: 'dsp_parent_lifecycle' });
+    const evidence = buildExecutionEvidence({
+      dispatch_id: 'dsp_parent_lifecycle',
+      observation: {
+        transport: { evidence: 'execution_unconfirmed' },
+        result: { status: 'succeeded', response: 'parent done' },
+      },
+    });
+    const artifact = await parent.appendEvidence({
+      dispatch_id: 'dsp_parent_lifecycle',
+      evidence,
+    });
+    await parent.appendSettled({
+      dispatch_id: 'dsp_parent_lifecycle',
+      status: 'succeeded',
+      evidence,
+      evidence_sha256: artifact.sha256,
+      violations: [],
+    });
+    await parent.close();
+
+    // 本 Run 不派工（只读恢复）：投影里只应有 inherited，不应出现当前 Run 的 dispatch 事件。
+    const harness = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      loop: async () => completedOutcome(),
+    });
+    const events: RoleLifecycleEvent[] = [];
+    await harness.engine.run({
+      task_id: IDENTITY.task_id,
+      run_id: runId,
+      role_id: IDENTITY.role_id,
+      instruction: 'continue the task',
+      workspace_path: workspace,
+      restarted_from_run_id: parentId,
+      emit_event: (event) => events.push(event),
+    });
+
+    const inherited = events.filter((event) => event.type === ROLE_DISPATCH_EVENT.inherited);
+    expect(inherited).toHaveLength(1);
+    expect(inherited[0]!.payload).toMatchObject({
+      source_run_id: parentId,
+      dispatch_count: 1,
+      by_status: { succeeded: 1 },
+      unresolved_dispatch_ids: [],
+    });
+    // 父链记录只读：当前 Run 的事件流里没有它的 accepted/settled 伪造副本。
+    expect(events.filter((event) => event.type === ROLE_DISPATCH_EVENT.accepted)).toHaveLength(0);
+    expect(events.filter((event) => event.type === ROLE_DISPATCH_EVENT.settled)).toHaveLength(0);
+  });
+
+  it('R4-01：settled 已落盘但事件出口失败，恢复时从 Journal 补发事实（driver 仍只 1 次）', async () => {
+    const { runsRoot, runId, workspace } = await makeFixture();
+    const first = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      sendPrompt: async () => driverResult('succeeded'),
+    });
+    const firstResult = await first.engine.run({
+      task_id: IDENTITY.task_id,
+      run_id: runId,
+      role_id: IDENTITY.role_id,
+      instruction: 'do the work',
+      workspace_path: workspace,
+      // 事件出口在 settled 落盘之后失败：事实已在 Journal，时间线缺这一条。
+      emit_event: (event) => {
+        if (event.type === ROLE_DISPATCH_EVENT.settled) {
+          throw new Error('event sink unavailable');
+        }
+      },
+    });
+    expect(firstResult.status).toBe('completed');
+    expect(first.driverCalls()).toBe(1);
+    const foldAfterFirst = await readFold(runsRoot, runId);
+    expect(foldAfterFirst.records).toHaveLength(1);
+    expect(foldAfterFirst.records[0]).toMatchObject({ dispatch_id: 'dsp_1', status: 'succeeded' });
+    // 审核复现：settled 已 durable 后事件出口失败；随后 role 写入 completed finish。
+    await appendCompletedFinish(runsRoot, runId);
+
+    // 恢复：同一 Run 已有 completed finish → 直接复现终态（不再派工/不再调 LLM），
+    // 但必须把 Journal 里已 durable 的派工事实补进投影。
+    const recoveredEvents: RoleLifecycleEvent[] = [];
+    const second = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      loop: async () => {
+        throw new Error('loop must not run on a recovered finish');
+      },
+    });
+    const recovered = await second.engine.run({
+      task_id: IDENTITY.task_id,
+      run_id: runId,
+      role_id: IDENTITY.role_id,
+      instruction: 'do the work',
+      workspace_path: workspace,
+      emit_event: (event) => recoveredEvents.push(event),
+    });
+    expect(recovered.status).toBe('completed');
+    expect(second.driverCalls()).toBe(0);
+
+    const projection = projectDispatchFacts(
+      recoveredEvents.map((event) => ({
+        type: event.type,
+        payload: event.payload,
+        created_at: '2026-11-15T00:00:00.000Z',
+      })),
+    );
+    expect(projection.summary).toMatchObject({
+      total: 1,
+      by_status: { succeeded: 1 },
+      unknown: { count: 0 },
+    });
+    expect(projection.summary?.last_dispatch).toMatchObject({
+      dispatch_id: 'dsp_1',
+      status: 'succeeded',
+    });
+
+    // 再恢复一次：Journal 不新增行，补投影按 dispatch_id 幂等（重复读取不放大计数）。
+    const foldAfterRecovery = await readFold(runsRoot, runId);
+    expect(foldAfterRecovery.records).toEqual(foldAfterFirst.records);
+    const replay = projectDispatchFacts(
+      [...recoveredEvents, ...recoveredEvents].map((event) => ({
+        type: event.type,
+        payload: event.payload,
+        created_at: '2026-11-15T00:00:00.000Z',
+      })),
+    );
+    expect(replay.summary?.total).toBe(1);
+    expect(replay.summary?.by_status).toEqual({ succeeded: 1 });
+  });
+
+  it('R4-01：全部派工事件缺失时，恢复后仍得到正确派工摘要且不补执行', async () => {
+    const { runsRoot, runId, workspace } = await makeFixture();
+    const first = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      sendPrompt: async () => driverResult('succeeded'),
+    });
+    const firstResult = await first.engine.run({
+      task_id: IDENTITY.task_id,
+      run_id: runId,
+      role_id: IDENTITY.role_id,
+      instruction: 'do the work',
+      workspace_path: workspace,
+      emit_event: () => {
+        throw new Error('every lifecycle event write fails');
+      },
+    });
+    expect(firstResult.status).toBe('completed');
+    expect(first.driverCalls()).toBe(1);
+    expect((await readFold(runsRoot, runId)).records[0]).toMatchObject({ status: 'succeeded' });
+    // 审核复现：全部派工事件丢失，但 Journal 的 settled 与 completed finish 都已 durable。
+    await appendCompletedFinish(runsRoot, runId);
+
+    const recoveredEvents: RoleLifecycleEvent[] = [];
+    const second = makeHarness({
+      runsRoot,
+      runId,
+      workspace,
+      loop: async () => {
+        throw new Error('loop must not run on a recovered finish');
+      },
+    });
+    const recovered = await second.engine.run({
+      task_id: IDENTITY.task_id,
+      run_id: runId,
+      role_id: IDENTITY.role_id,
+      instruction: 'do the work',
+      workspace_path: workspace,
+      emit_event: (event) => recoveredEvents.push(event),
+    });
+    expect(recovered.status).toBe('completed');
+    expect(second.driverCalls()).toBe(0);
+
+    const projection = projectDispatchFacts(
+      recoveredEvents.map((event) => ({
+        type: event.type,
+        payload: event.payload,
+        created_at: '2026-11-15T00:00:00.000Z',
+      })),
+    );
+    expect(projection.summary).toMatchObject({
+      total: 1,
+      by_status: { succeeded: 1 },
+      unknown: { count: 0, dispatch_ids: [] },
+    });
+    // 补投影只发低频事实，不发指令/摘要正文。
+    const serialized = JSON.stringify(recoveredEvents);
+    expect(serialized).not.toContain('do the work');
   });
 });

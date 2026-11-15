@@ -96,6 +96,7 @@ import {
 } from '../coordinator/workspace-change-detector';
 import {
   buildRoleFreezeInitInput,
+  effectiveDispatchRecordStatus,
   isRoleAutonomySwitchCombinationValid,
   resolveRolePolicyBudget,
   resolveUnresolvedDispatchIds,
@@ -133,6 +134,7 @@ import {
   type RoleBudgetFacts,
 } from './role-autonomy-budget';
 import { armAbortDeadline } from './role-deadline';
+import { ROLE_DISPATCH_EVENT, type RoleLifecycleEvent } from './run-dispatch-events';
 import {
   buildRoleLearningInput,
   persistRoleLearningInput,
@@ -229,13 +231,33 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
         journalClosed: false,
         receipt_errors: [],
         active: true,
+        emit: (event) => this.emitLifecycle(input, event),
       };
       // 同一 Run 并发进入（第二个写者）已经被 Journal 锁在上层拒绝；这里按 run 目录覆盖注册，
       // 并发不同 Run 各有自己的上下文，关闭/drain/错误列表互不干扰。
       this.lateContexts.set(context.runDir, context);
       // 上次进程/引擎结束后遗留的迟到回执：在本 Run 自己的写者所有权下先补偿对账。
       await this.drainReceiptsFor(context);
-      return await this.runWithJournal(input, journal, runDir, context);
+      try {
+        return await this.runWithJournal(input, journal, runDir, context);
+      } catch (error) {
+        // 阶段 4：typed termination 留一条低频投影事件（原因码/actor 与发往 C 层的同一份）。
+        // 事件只是投影：Task/Run 状态仍由既有 C 层提交路径写，这里不改变任何终态。
+        if (error instanceof RoleTerminationError) {
+          this.emitLifecycle(input, {
+            type: ROLE_DISPATCH_EVENT.role_terminated,
+            subject_id: input.run_id,
+            payload: {
+              code: error.termination.code,
+              actor: error.termination.actor,
+              ...(error.termination.message.length > 0
+                ? { message: error.termination.message.slice(0, 4_000) }
+                : {}),
+            },
+          });
+        }
+        throw error;
+      }
     } finally {
       const context = this.lateContexts.get(runDir);
       try {
@@ -358,7 +380,12 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     for (let attempt = 0; attempt < LATE_RECONCILE_ATTEMPTS; attempt += 1) {
       try {
         if (!context.journalClosed) {
-          await reconcileLateDriverResult(context.journal, receipt.dispatch_id, receipt.execution);
+          const status = await reconcileLateDriverResult(
+            context.journal,
+            receipt.dispatch_id,
+            receipt.execution,
+          );
+          this.emitReconciled(context, receipt.dispatch_id, status);
           return;
         }
         await this.reconcileWithReopenedJournal(context, receipt);
@@ -388,7 +415,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
         identity: context.identity,
         ...(this.deps.journal_io ? { io: this.deps.journal_io } : {}),
       });
-      await reconcileLateDriverResult(journal, receipt.dispatch_id, receipt.execution);
+      await reconcileLateDriverResult(journal, receipt.dispatch_id, receipt.execution).then(
+        (status) => this.emitReconciled(context, receipt.dispatch_id, status),
+      );
     } finally {
       await journal?.close().catch(() => undefined);
     }
@@ -409,6 +438,13 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     const lineage = await this.lineageRunIds(input);
     // 祖先 Journal 只读；损坏/不可读同样 fail closed（只有「没有 Journal」才按旧 Run 忽略）。
     const ancestors = await this.peekAncestorJournals(input, lineage);
+    // 阶段 4：把父链已有的派工事实作为**只读投影**发进本 Run 的时间线。它不写父目录、
+    // 也不伪造当前 Run 的 dispatch；`dispatch_summary.inherited` 据此与当前计数分开。
+    this.emitInheritedDispatches(input, ancestors);
+    // 阶段 4 修复 R4-01：事件是投影、Journal 是事实源。上一轮执行的事件出口可能失败，或
+    // 进程在 accepted/settled 事件落盘前被杀；恢复入口用已折叠的 Journal 记录按
+    // dispatch_id 幂等补发当前 Run 的低频事实（不派工、不重置预算/游标、不改终态）。
+    this.emitRecoveredDispatches(input, currentDispatches);
     // 基线/产物索引属于**同一次逻辑执行**：沿恢复链继承并核验，不能把恢复前的已修改状态
     // 重新当成初始基线（否则恢复后不再改文件就会漏交付）。
     const workspaceBefore = await this.loadWorkspaceBaseline(runDir, input.workspace_path, lineage);
@@ -522,6 +558,24 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       ...(this.deps.clock ? { clock: this.deps.clock } : {}),
       ...(input.signal ? { signal: input.signal } : {}),
       limits: { history_messages: 60, tool_result_chars: 12_000, dispatch_history: 24 },
+      on_plan_updated: (plan: string) => {
+        this.emitLifecycle(input, {
+          type: ROLE_DISPATCH_EVENT.plan_updated,
+          subject_id: input.run_id,
+          payload: { plan: plan.slice(0, 8_000) },
+        });
+      },
+      on_finish_requested: (finish) => {
+        this.emitLifecycle(input, {
+          type: ROLE_DISPATCH_EVENT.finish_requested,
+          subject_id: input.run_id,
+          payload: {
+            status: finish.status,
+            verification_count: finish.verification_count,
+            unresolved_count: finish.unresolved_count,
+          },
+        });
+      },
     });
 
     const usage = outcome.usage;
@@ -1081,9 +1135,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       // 旧数据没有该字段时按折叠记录数保守判断。
       zero_dispatch: finish.zero_dispatch ?? records.length === 0,
       plan: undefined,
-      unresolved_dispatches: records
-        .filter((record) => record.status === 'unknown')
-        .map((record) => record.dispatch_id),
+      // 与 finish 校验/engine 最终闸门共用同一 reducer：可信 reconciled 收束过的 unknown
+      // 不再是未决派工（原始记录仍保留 unknown）。
+      unresolved_dispatches: resolveUnresolvedDispatchIds(records),
     };
     if (finishRecord.status !== 'completed') {
       // 恢复到一条 blocked/failed finish：学习输入照样登记（与首次执行同一规则）。
@@ -1223,6 +1277,21 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     const brief = dispatchInput.brief;
     this.assertSessionReuseAllowed(input, brief);
     await this.assertCrossRunRetryAllowed(journal, brief, ancestors);
+    // 阶段 4：宿主接受 brief 的低频投影。它在 Journal accepted 写屏障之前发出——
+    // 若屏障失败，投影里只会有 accepted 没有 started，按契约折叠为 not_executed，
+    // 语义仍然正确（没有派工执行过）。
+    this.emitLifecycle(input, {
+      type: ROLE_DISPATCH_EVENT.accepted,
+      subject_id: brief.dispatch_id,
+      payload: {
+        dispatch_id: brief.dispatch_id,
+        kind: brief.kind,
+        read_only: brief.read_only,
+        session_mode: brief.session.mode,
+        sequence: brief.sequence,
+        ...(brief.retry_of !== undefined ? { retry_of: brief.retry_of } : {}),
+      },
+    });
     const captured: { driver_artifacts: ArtifactRef[] } = { driver_artifacts: [] };
     try {
       const result: DispatchAttemptResult = await runJournaledDispatch({
@@ -1230,8 +1299,31 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
         brief,
         brief_sha256: dispatchInput.brief_sha256,
         budget_before: dispatchInput.budget_before,
-        execute: async () =>
-          this.executeDriver(input, journal, brief, policy, runDir, captured, context),
+        execute: async () => {
+          // Journal 的 accepted/dispatched 两行已经 durable，这里才是真正开始 driver 调用。
+          this.emitLifecycle(input, {
+            type: ROLE_DISPATCH_EVENT.started,
+            subject_id: brief.dispatch_id,
+            payload: { dispatch_id: brief.dispatch_id, kind: brief.kind },
+          });
+          return this.executeDriver(input, journal, brief, policy, runDir, captured, context);
+        },
+      });
+      // 派工已按事实 settle：投影只带身份/状态/违规/受控 evidence 引用（正文在侧车）。
+      this.emitLifecycle(input, {
+        type: ROLE_DISPATCH_EVENT.settled,
+        subject_id: brief.dispatch_id,
+        payload: {
+          dispatch_id: brief.dispatch_id,
+          kind: brief.kind,
+          status: result.status,
+          violations: [...result.violations],
+          attempts: result.attempts,
+          evidence_ref: {
+            path: result.evidence_ref.path,
+            sha256: result.evidence_sha256,
+          },
+        },
       });
       appendArtifacts(artifacts, captured.driver_artifacts);
       // 取消/墙钟在派工等待期间发生：dispatch 已按事实 settle（unknown，不重放），
@@ -1431,7 +1523,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
                 fingerprint_verified: verified,
               });
             }
-            input.on_driver_event?.(event);
+            // 阶段 4：把「哪个派工产生了这条 driver 事件」作为事实随事件转发（usage 归属用）。
+            // 只加元数据，不改 driver 事件本身的任何字段。
+            input.on_driver_event?.({ ...event, dispatch_id: brief.dispatch_id });
           },
           onLateResult: (execution) => {
             // 超时/取消后迟到的真实结果：先落 durable receipt，再尽力追加 reconciled；
@@ -2023,6 +2117,153 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     };
   }
 
+  /**
+   * 阶段 4：低频生命周期事件的唯一出口。
+   *
+   * 事件只是投影：出口未注入时静默跳过（单测/嵌入式使用零副作用）；出口抛错也不能把一次
+   * 已经发生的派工改写成失败——只留一行 stderr 诊断。
+   */
+  private emitLifecycle(input: RoleAutonomyEngineRequest, event: RoleLifecycleEvent): void {
+    if (input.emit_event === undefined) return;
+    try {
+      input.emit_event(event);
+    } catch (error) {
+      process.stderr.write(
+        `[role-autonomy] lifecycle event ${event.type} was not projected: ${errorMessage(error)}\n`,
+      );
+    }
+  }
+
+  /**
+   * 阶段 4 修复 R4-01：恢复入口把 Journal 已 durable 的当前 Run 派工事实补发成低频投影。
+   *
+   * 触发条件：入口折叠后当前 Run 已有派工记录（正常首次执行时为空），也就是这是一次恢复。
+   * 只补投影——不派工、不碰预算/游标/Task/Run 终态；载荷带 `recovered: true` 标明来源是
+   * 恢复补发。投影按 `dispatch_id` 幂等合并，重复恢复不会放大计数；已落账终态不被覆盖。
+   * 父链事实不在这里重发（走 inherited），因此补投影不会把继承派工算进当前 Run。
+   */
+  private emitRecoveredDispatches(
+    input: RoleAutonomyEngineRequest,
+    records: readonly DispatchRecord[],
+  ): void {
+    for (const record of records) {
+      const dispatchId = record.dispatch_id;
+      const kind = record.brief.kind;
+      this.emitLifecycle(input, {
+        type: ROLE_DISPATCH_EVENT.accepted,
+        subject_id: dispatchId,
+        payload: {
+          dispatch_id: dispatchId,
+          kind,
+          read_only: record.brief.read_only,
+          session_mode: record.brief.session.mode,
+          sequence: record.sequence,
+          recovered: true,
+          ...(record.brief.retry_of !== undefined ? { retry_of: record.brief.retry_of } : {}),
+        },
+      });
+      if (record.dispatched_at !== undefined) {
+        this.emitLifecycle(input, {
+          type: ROLE_DISPATCH_EVENT.started,
+          subject_id: dispatchId,
+          payload: {
+            dispatch_id: dispatchId,
+            kind,
+            started_at: record.dispatched_at,
+            recovered: true,
+          },
+        });
+      }
+      if (record.phase === 'settled') {
+        this.emitLifecycle(input, {
+          type: ROLE_DISPATCH_EVENT.settled,
+          subject_id: dispatchId,
+          payload: {
+            dispatch_id: dispatchId,
+            kind,
+            // 原始 settled 状态照实补发（unknown 仍是 unknown）；可信对账由下一条
+            // reconciled 事件表达，投影按同一有效状态规则收束（R4-02）。
+            status: record.status,
+            violations: [...record.violations],
+            ...(record.settled_at !== undefined ? { settled_at: record.settled_at } : {}),
+            ...(record.evidence_sha256 !== undefined
+              ? {
+                  evidence_ref: {
+                    path: `${DISPATCH_JOURNAL_DIR}/${DISPATCH_EVIDENCE_DIR}/${dispatchId}.json`,
+                    sha256: record.evidence_sha256,
+                  },
+                }
+              : {}),
+            recovered: true,
+          },
+        });
+      }
+      if (record.reconciled !== undefined) {
+        this.emitLifecycle(input, {
+          type: ROLE_DISPATCH_EVENT.reconciled,
+          subject_id: dispatchId,
+          payload: {
+            dispatch_id: dispatchId,
+            status: record.reconciled.status,
+            source: 'journal_recovery',
+            recovered: true,
+          },
+        });
+      }
+    }
+  }
+
+  /**
+   * 父链派工事实的只读投影：每个祖先 Run 一条（空 Journal 不发）。
+   *
+   * 不逐条复制父链 dispatch 事件：那会让「父链事实」看起来像本 Run 的执行记录，也会把
+   * 计数放大。这里只给**计数 + 未决 id + 违规摘要**，逐条身份走 Journal 分页读取。
+   * 状态计数与当前 Run / Journal RPC 共用有效状态规则（原始 unknown + 可信 reconciled）。
+   */
+  private emitInheritedDispatches(
+    input: RoleAutonomyEngineRequest,
+    ancestors: readonly AncestorJournal[],
+  ): void {
+    for (const ancestor of ancestors) {
+      const records = ancestor.readRecords;
+      if (records.length === 0) continue;
+      const byStatus: Record<string, number> = {};
+      const violationKinds = new Set<string>();
+      let violationCount = 0;
+      for (const record of records) {
+        const status = effectiveDispatchRecordStatus(record);
+        byStatus[status] = (byStatus[status] ?? 0) + 1;
+        violationCount += record.violations.length;
+        for (const violation of record.violations) violationKinds.add(violation);
+      }
+      this.emitLifecycle(input, {
+        type: ROLE_DISPATCH_EVENT.inherited,
+        subject_id: ancestor.run_id,
+        payload: {
+          source_run_id: ancestor.run_id,
+          dispatch_count: records.length,
+          by_status: byStatus,
+          unresolved_dispatch_ids: resolveUnresolvedDispatchIds(records),
+          violations: { count: violationCount, kinds: [...violationKinds].sort() },
+        },
+      });
+    }
+  }
+
+  /** 迟到回执对账成功的投影（只对账，不重放；已发终态不被覆盖）。 */
+  private emitReconciled(
+    context: LateResultContext,
+    dispatchId: string,
+    status: 'succeeded' | 'failed' | 'unknown' | undefined,
+  ): void {
+    if (status === undefined) return;
+    context.emit({
+      type: ROLE_DISPATCH_EVENT.reconciled,
+      subject_id: dispatchId,
+      payload: { dispatch_id: dispatchId, status, source: 'late_result' },
+    });
+  }
+
   private async completedResult(
     input: RoleAutonomyEngineRequest,
     runDir: string,
@@ -2121,6 +2362,11 @@ interface LateResultContext {
   active: boolean;
   /** 对账失败/回执写入失败的可诊断事实（进入 transcript diagnostics，不静默）。 */
   receipt_errors: string[];
+  /**
+   * 阶段 4：该 Run 自己的生命周期事件出口。迟到回执回调发生在 run() 之外，
+   * 必须把出口随上下文绑定到**派工所属 Run**，不能读「当前/最近一次 run」猜归属。
+   */
+  emit: (event: RoleLifecycleEvent) => void;
 }
 
 /** durable 迟到回执；`pending` 表示尚未成功追加 reconciled（后续 drain 可补偿）。 */
@@ -2307,7 +2553,7 @@ export async function reconcileLateDriverResult(
   journal: Pick<RunDispatchJournal, 'appendReconciled'>,
   dispatchId: string,
   execution: DriverRunResult,
-): Promise<void> {
+): Promise<'succeeded' | 'failed' | 'unknown' | undefined> {
   // 复用同一 ADP 证据化映射：迟到结果仍按「明确未执行/确定失败/结局不明」分类，
   // interrupted + 副作用 → unknown，不因为「结果迟到」就升级成成功或降级成确定失败。
   const mapped = mapAdpOutcome({
@@ -2346,7 +2592,7 @@ export async function reconcileLateDriverResult(
           },
   });
   const status = evidence.status;
-  if (status !== 'succeeded' && status !== 'failed' && status !== 'unknown') return;
+  if (status !== 'succeeded' && status !== 'failed' && status !== 'unknown') return undefined;
   await journal.appendReconciled({
     dispatch_id: dispatchId,
     status,
@@ -2354,6 +2600,8 @@ export async function reconcileLateDriverResult(
     evidence,
     evidence_sha256: hashExecutionEvidence(evidence),
   });
+  // 返回对账状态供上层发低频投影事件（只对账、不重放，不改变已发终态）。
+  return status;
 }
 
 function evidenceRefsOf(evidence: ExecutionEvidence): EvidenceRef[] {

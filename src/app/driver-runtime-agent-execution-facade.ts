@@ -476,33 +476,41 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           'execution_engine=role_autonomy but the backend has no role autonomy engine wired',
         );
       }
-      return engine.run({
-        task_id: input.task_id,
-        run_id: input.run_id,
-        role_id: input.role_id,
-        instruction: input.instruction,
-        ...(input.driver_instruction !== undefined
-          ? { driver_instruction: input.driver_instruction }
-          : {}),
-        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
-        ...(input.session_id ? { session_id: input.session_id } : {}),
-        ...(input.resume_session ? { resume_session: true } : {}),
-        ...(input.restarted_from_run_id
-          ? { restarted_from_run_id: input.restarted_from_run_id }
-          : {}),
-        ...(input.completion_criteria
-          ? { completion_criteria: [...input.completion_criteria] }
-          : {}),
-        ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
-        ...(options?.signal ? { signal: options.signal } : {}),
-        ...(options?.onDriverEvent ? { on_driver_event: options.onDriverEvent } : {}),
-        ...(options?.role_autonomy?.task_budget !== undefined
-          ? { task_budget: options.role_autonomy.task_budget }
-          : {}),
-        ...(options?.role_autonomy?.freeze_plan !== undefined
-          ? { freeze_plan: options.role_autonomy.freeze_plan }
-          : {}),
-      });
+      // Stage 2 的 `runStageWithAttribution` 只把 stage 绑到 execute_agent；role LLM 调用发生
+      // 在引擎内部，必须在这里再套一层 role_id 归属，否则这些 token 只进 execute_agent 桶、
+      // 在 role 维度永远缺席（阶段 4 OBS-03）。两层归属字段是合并而不是覆盖。
+      return runWithLlmUsageAttribution({ role_id: input.role_id }, () =>
+        engine.run({
+          task_id: input.task_id,
+          run_id: input.run_id,
+          role_id: input.role_id,
+          instruction: input.instruction,
+          ...(input.driver_instruction !== undefined
+            ? { driver_instruction: input.driver_instruction }
+            : {}),
+          ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+          ...(input.session_id ? { session_id: input.session_id } : {}),
+          ...(input.resume_session ? { resume_session: true } : {}),
+          ...(input.restarted_from_run_id
+            ? { restarted_from_run_id: input.restarted_from_run_id }
+            : {}),
+          ...(input.completion_criteria
+            ? { completion_criteria: [...input.completion_criteria] }
+            : {}),
+          ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
+          ...(options?.signal ? { signal: options.signal } : {}),
+          ...(options?.onDriverEvent ? { on_driver_event: options.onDriverEvent } : {}),
+          ...(options?.role_autonomy?.task_budget !== undefined
+            ? { task_budget: options.role_autonomy.task_budget }
+            : {}),
+          ...(options?.role_autonomy?.freeze_plan !== undefined
+            ? { freeze_plan: options.role_autonomy.freeze_plan }
+            : {}),
+          ...(options?.role_autonomy?.emit_event !== undefined
+            ? { emit_event: options.role_autonomy.emit_event }
+            : {}),
+        }),
+      );
     }
     const normalizedInput = input.workspace_path
       ? { ...input, workspace_path: path.resolve(input.workspace_path) }

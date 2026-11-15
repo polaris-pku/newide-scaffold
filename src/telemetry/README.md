@@ -166,6 +166,18 @@ class JsonlTelemetrySink implements TelemetrySink {
 | `B-owned-observed` | B 域数据，F 只读观测                   |
 | `C-owned-observed` | C 域 EventStore 事件或实体，F 只读观测 |
 
+## 用量归属（role 自主循环 / driver 派工）
+
+`runWithLlmUsageAttribution` 是「这次 LLM 调用替哪个环节花的」的唯一携带方式，嵌套是**叠加**而非覆盖：
+
+- stage 循环用 `runWithLlmUsageAttribution({ stage_cursor })`（`runStageWithAttribution`）；
+- 阶段 4 起，role 自主引擎的 LLM 调用在 facade 边界再包一层 `{ role_id }`，因此账本行同时带
+  `stage_cursor=execute_agent` 与 `role_id`——不会因为内层只给 role 就抹掉 stage。
+- driver 侧的观测走另一条链：role 派工期间转发的 `DriverStreamEvent` 带可选 `dispatch_id`，
+  `driver-usage.jsonl` 的一行据此可按派工归组；同一 session 只归一处，无 id 的 legacy 记录进
+  `unattributed`（缺项不填 0）。上下文占用（`context_tokens_used`）与计费 token 是**两条口径**，
+  报表侧不合并相加。
+
 ---
 
 ## 已接入 vs 未接入（相对 `埋点清单.md`）

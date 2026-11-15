@@ -21,6 +21,10 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import {
+  projectRunDriverUsageByDispatch,
+  type TaskDriverUsage,
+} from '../src/app/driver-usage-projector';
 
 /** 根 span：唯一覆盖整个 run 的那个，它的耗时才是墙钟口径。 */
 const ROOT_SPAN_NAME = 'run.loop_total';
@@ -41,6 +45,34 @@ export interface SpanSignals {
 /** 缺哪类信号。看报告的人据此区分「没有」与「是 0」。 */
 export type MissingSignal = 'summary' | 'consumption' | 'latency' | 'telemetry' | 'audit';
 
+/** 派工区块自己的缺失信号：Journal/派工摘要与按派工的 usage 归属都可能不存在。 */
+export type MissingDispatchSignal = 'dispatch_summary' | 'driver_usage';
+
+/** 单个 dispatch 的 driver usage 归属（session 级累计占用口径，不混加计费 token）。 */
+export interface DispatchUsageGroup {
+  context_tokens_used: number;
+  /** 归到该组的 session 段数（同一 session 只算一次）。 */
+  sessions: number;
+  /** 该组 session 是否都拿到了终值（有成本观测）；缺尾就是 false，不冒充完整。 */
+  complete: boolean;
+}
+
+/**
+ * 派工区块：`summary.json` 的 `dispatch_summary`（若有）+ driver usage 按派工归属。
+ *
+ * 归属口径与 `projectRunDriverUsageByDispatch` 同源：同一 session 只归一处，legacy 路径
+ * 没有 dispatch_id 的观测进 `unattributed`（没有这类记录时字段缺席，不填 0）。
+ */
+export interface RunDispatchConsumption {
+  /** `summary.json` 的 `dispatch_summary` 原样（阶段 4 才写入；旧 run 没有）。 */
+  dispatch_summary?: Record<string, unknown>;
+  /** dispatch_id → 该派工的 driver 占用观测。 */
+  usage_by_dispatch: Record<string, DispatchUsageGroup>;
+  /** 无 dispatch_id 的旧记录；没有时缺席。 */
+  unattributed?: DispatchUsageGroup;
+  missing: MissingDispatchSignal[];
+}
+
 export interface RunConsumption {
   run_id: string;
   mode?: string;
@@ -60,6 +92,8 @@ export interface RunConsumption {
   by_span: Record<string, SpanSignals>;
   by_event_type: Record<string, number>;
   telemetry_records: Record<string, number>;
+  /** 派工区块（阶段 4）：dispatch_summary 与按派工归属的 driver usage。 */
+  dispatch: RunDispatchConsumption;
 }
 
 export interface ConsumptionReportOptions {
@@ -100,6 +134,11 @@ export async function collectRunConsumption(
   const consumption = readRecord(summary?.consumption);
   if (!consumption) missing.push('consumption');
   const byStage = collectStages(consumption);
+  const dispatch = await collectRunDispatchConsumption(
+    runsRoot,
+    runId,
+    readRecord(summary?.dispatch_summary),
+  );
 
   return {
     run_id: runId,
@@ -120,6 +159,48 @@ export async function collectRunConsumption(
     by_span: bySpan,
     by_event_type: byEventType,
     telemetry_records: telemetryByType,
+    dispatch,
+  };
+}
+
+/**
+ * 派工区块取数：`summary.dispatch_summary`（Journal 事实的投影）+ driver usage 按派工归属。
+ *
+ * 复用 `projectRunDriverUsageByDispatch`（账本优先、session 折叠口径与 task 级汇总同源），
+ * 这里只做「Task 聚合 → 报告用的紧凑分组」转换，不另写一套算术。
+ */
+async function collectRunDispatchConsumption(
+  runsRoot: string,
+  runId: string,
+  dispatchSummary: Record<string, unknown> | undefined,
+): Promise<RunDispatchConsumption> {
+  const projected = await projectRunDriverUsageByDispatch(runsRoot, runId);
+  const usageByDispatch: Record<string, DispatchUsageGroup> = {};
+  for (const [dispatchId, usage] of Object.entries(projected.by_dispatch)) {
+    if (!usage.available) continue;
+    usageByDispatch[dispatchId] = toDispatchUsageGroup(usage);
+  }
+  const unattributed = projected.unattributed
+    ? toDispatchUsageGroup(projected.unattributed)
+    : undefined;
+  const missing: MissingDispatchSignal[] = [];
+  if (dispatchSummary === undefined) missing.push('dispatch_summary');
+  if (Object.keys(usageByDispatch).length === 0 && unattributed === undefined) {
+    missing.push('driver_usage');
+  }
+  return {
+    ...(dispatchSummary !== undefined ? { dispatch_summary: dispatchSummary } : {}),
+    usage_by_dispatch: sortRecord(usageByDispatch),
+    ...(unattributed !== undefined ? { unattributed } : {}),
+    missing: missing.sort(),
+  };
+}
+
+function toDispatchUsageGroup(usage: TaskDriverUsage): DispatchUsageGroup {
+  return {
+    context_tokens_used: usage.context_tokens_used,
+    sessions: usage.sessions.length,
+    complete: usage.complete,
   };
 }
 
@@ -136,6 +217,7 @@ export function aggregateConsumption(runs: readonly RunConsumption[]): RunConsum
     by_span: {},
     by_event_type: {},
     telemetry_records: {},
+    dispatch: { usage_by_dispatch: {}, missing: [] },
   };
   const missing = new Set<MissingSignal>();
   for (const run of runs) {
@@ -146,6 +228,31 @@ export function aggregateConsumption(runs: readonly RunConsumption[]): RunConsum
     merged.span_total_duration_ms += run.span_total_duration_ms;
     if (run.wall_ms !== undefined) {
       merged.wall_ms = (merged.wall_ms ?? 0) + run.wall_ms;
+    }
+    // 派工区块：dispatch_summary 是 per-run 事实，不跨 run 合并（合并「摘要」等于编一个新的
+    // 派工分母）；driver usage 分组可以按 dispatch_id 相加——id 全局唯一，加起来仍是事实。
+    for (const signal of run.dispatch.missing) {
+      if (!merged.dispatch.missing.includes(signal)) merged.dispatch.missing.push(signal);
+    }
+    for (const [dispatchId, group] of Object.entries(run.dispatch.usage_by_dispatch)) {
+      const bucket = (merged.dispatch.usage_by_dispatch[dispatchId] ??= {
+        context_tokens_used: 0,
+        sessions: 0,
+        complete: true,
+      });
+      bucket.context_tokens_used += group.context_tokens_used;
+      bucket.sessions += group.sessions;
+      bucket.complete = bucket.complete && group.complete;
+    }
+    if (run.dispatch.unattributed !== undefined) {
+      const bucket = (merged.dispatch.unattributed ??= {
+        context_tokens_used: 0,
+        sessions: 0,
+        complete: true,
+      });
+      bucket.context_tokens_used += run.dispatch.unattributed.context_tokens_used;
+      bucket.sessions += run.dispatch.unattributed.sessions;
+      bucket.complete = bucket.complete && run.dispatch.unattributed.complete;
     }
     for (const [stage, signals] of Object.entries(run.by_stage)) {
       const bucket = (merged.by_stage[stage] ??= {
@@ -177,6 +284,8 @@ export function aggregateConsumption(runs: readonly RunConsumption[]): RunConsum
     }
   }
   merged.missing = [...missing].sort();
+  merged.dispatch.usage_by_dispatch = sortRecord(merged.dispatch.usage_by_dispatch);
+  merged.dispatch.missing = [...merged.dispatch.missing].sort();
   return merged;
 }
 
@@ -220,6 +329,7 @@ export function renderConsumptionReport(
     if (Object.keys(section.telemetry_records).length > 0) {
       lines.push('telemetry 记录：', renderCounts(section.telemetry_records), '');
     }
+    lines.push('派工：', renderDispatch(section), '');
     if (section.missing.length > 0) {
       lines.push(`缺失信号：${section.missing.join(' / ')}（缺不等于 0）`, '');
     }
@@ -282,6 +392,62 @@ function renderCounts(counts: Record<string, number>): string {
   );
 }
 
+/**
+ * 渲染派工区块。
+ *
+ * 摘要只按 `summary.json` 里的事实展示（--all 不合并 per-run 摘要，避免编一个汇总分母）；
+ * driver usage 按 dispatch 分组展示，无归属的旧记录单独一行——缺就写缺，不填 0。
+ */
+function renderDispatch(run: RunConsumption): string {
+  const lines: string[] = [];
+  const summary = run.dispatch.dispatch_summary;
+  if (summary !== undefined) {
+    const byStatus = readRecord(summary.by_status) ?? {};
+    const unknown = readRecord(summary.unknown);
+    const violations = readRecord(summary.violations);
+    lines.push(
+      `  摘要：total=${readNumber(summary.total)}  by_status=${JSON.stringify(byStatus)}  ` +
+        `unknown=${readNumber(unknown?.count)}  violations=${readNumber(violations?.count)}`,
+    );
+  } else if (run.run_id !== '*') {
+    lines.push('  dispatch_summary：缺失（summary.json 没有；旧 run 正常）');
+  } else if (run.dispatch.missing.includes('dispatch_summary')) {
+    lines.push('  dispatch_summary：部分 run 缺失（--all 只按 dispatch_id 汇总 usage）');
+  } else {
+    lines.push('  dispatch_summary：未合并（--all 不合并每 run 摘要，见单 run 报告）');
+  }
+
+  const rows = Object.entries(run.dispatch.usage_by_dispatch);
+  if (rows.length > 0) {
+    lines.push('  按派工 driver usage（context_tokens_used，按 session 折叠）：');
+    lines.push(
+      renderTable(
+        ['dispatch_id', 'sessions', 'context', 'complete'],
+        rows.map(([dispatchId, group]) => [
+          dispatchId,
+          String(group.sessions),
+          String(group.context_tokens_used),
+          group.complete ? 'yes' : 'no（缺终值）',
+        ]),
+      ),
+    );
+  }
+  if (run.dispatch.unattributed !== undefined) {
+    const group = run.dispatch.unattributed;
+    lines.push(
+      `  无归属（legacy，无 dispatch_id）：sessions=${group.sessions}  context=${group.context_tokens_used}  ` +
+        `complete=${group.complete ? 'yes' : 'no（缺终值）'}`,
+    );
+  }
+  if (rows.length === 0 && run.dispatch.unattributed === undefined) {
+    lines.push('  driver usage：无观测（缺不等于 0）');
+  }
+  if (run.dispatch.missing.length > 0) {
+    lines.push(`  派工区块缺失：${run.dispatch.missing.join(' / ')}（缺不等于 0）`);
+  }
+  return lines.join('\n');
+}
+
 function renderTable(header: string[], rows: string[][]): string {
   const widths = header.map((cell, index) =>
     Math.max(cell.length, ...rows.map((row) => (row[index] ?? '').length)),
@@ -324,6 +490,12 @@ function countBy<T>(items: readonly T[], key: (item: T) => string | undefined): 
     counts[name] = (counts[name] ?? 0) + 1;
   }
   return counts;
+}
+
+function sortRecord<T>(record: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(
+    Object.entries(record).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+  );
 }
 
 async function readJsonl(filePath: string): Promise<Array<Record<string, unknown>>> {

@@ -783,6 +783,9 @@ export async function createProductionBackendService(
       // service so the frontend can call it through JSON-RPC (`driver.list` / `driver.probe`),
       // and the same instance the startup probe used (`driver.refresh`)。
       driverProbeService,
+      // 阶段 4 的 `run.getDispatchJournal` / `run.getDispatchEvidence` 读 run 目录里的 Journal
+      // 事实源；必须传同一个 runs root，否则自定义 state root 时会读错目录。
+      runsRoot,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();
