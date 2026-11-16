@@ -220,7 +220,7 @@ async function runCouncilCli(args: string[]): Promise<number> {
     const terminalRunId = latestTerminalRunId(task);
     runId = terminalRunId;
     await waitForTerminal(service, terminalRunId, options.timeout_ms);
-    const snapshot = service.getRunSnapshot(terminalRunId);
+    const snapshot = await service.getRunSnapshot(terminalRunId);
     process.stdout.write(
       `${JSON.stringify(
         buildCouncilCliResult(
@@ -244,7 +244,7 @@ async function runCouncilCli(args: string[]): Promise<number> {
       const cancelError = await service
         .cancelRun(runId, cancellationReason)
         .catch((cancelFailure) => cancelFailure);
-      const terminal = service.getRunSnapshot(runId);
+      const terminal = await service.getRunSnapshot(runId);
       if (options && readiness && councilCapability && terminal) {
         const cancellationMessage =
           cancelError instanceof Error ? cancelError.message : undefined;

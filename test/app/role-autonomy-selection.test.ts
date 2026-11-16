@@ -59,7 +59,6 @@ async function writeFrozenInit(
   runsRoot: string,
   runId: string,
   engine: 'role_autonomy' | 'legacy',
-
 ): Promise<{ deadline_at: string; max_dispatches: number }> {
   const runDir = path.join(runsRoot, runId);
   await fs.mkdir(runDir, { recursive: true });
@@ -140,7 +139,7 @@ describe('role-autonomy 引擎选路', () => {
     expect(selection.freeze_input.dispatch_timeout_ms).toBe(600_000);
   });
 
-  it('请求覆盖只能收紧：调大被忽略，非法值被显式拒绝', async () => {
+  it('部署上限可提高或降低，非法值被显式拒绝', async () => {
     const fixture = await makeFixture();
     const tightened = await selectRoleExecutionEngine({
       ...baseInput(fixture),
@@ -160,11 +159,17 @@ describe('role-autonomy 引擎选路', () => {
       config: {
         enabled: true,
         wired: true,
-        budget_overrides: { max_dispatches: 99 } satisfies RoleBudgetOverrides,
+        budget_overrides: {
+          max_dispatches: 99,
+          role_token_budget: 1_000_000,
+          dispatch_timeout_ms: 1_800_000,
+        } satisfies RoleBudgetOverrides,
       },
     });
     if (raised.engine === 'role_autonomy' && raised.reason === 'fresh_role_autonomy') {
-      expect(raised.freeze_input.max_dispatches).toBe(12);
+      expect(raised.freeze_input.max_dispatches).toBe(99);
+      expect(raised.freeze_input.role_token_budget).toBe(1_000_000);
+      expect(raised.freeze_input.dispatch_timeout_ms).toBe(1_800_000);
     }
     const invalid = await selectRoleExecutionEngine({
       ...baseInput(fixture),
@@ -314,7 +319,11 @@ describe('role-autonomy 引擎选路', () => {
     const frozen = await writeFrozenInit(fixture.runsRoot, fixture.runId, 'role_autonomy');
     const selection = await selectRoleExecutionEngine({
       ...baseInput(fixture),
-      config: { enabled: false, wired: true },
+      config: {
+        enabled: false,
+        wired: true,
+        budget_overrides: { role_token_budget: 1_000_000, dispatch_timeout_ms: 1_800_000 },
+      },
     });
     expect(selection.engine).toBe('role_autonomy');
     if (selection.engine !== 'role_autonomy' || selection.reason !== 'frozen_role_autonomy') return;
@@ -322,6 +331,8 @@ describe('role-autonomy 引擎选路', () => {
     expect(selection.frozen.budget.deadline_at).toBe(frozen.deadline_at);
     expect(selection.frozen.budget.limits.max_dispatches).toBe(frozen.max_dispatches);
     expect(selection.frozen.budget.limits.wall_clock_seconds).toBe(60);
+    expect(selection.frozen.budget.limits.role_token_budget).toBe(1_000);
+    expect(selection.frozen.budget.limits.dispatch_timeout_ms).toBe(2_000);
   });
 
   it('冻结为 legacy 的 Run：即使部署开关后来打开也保持 legacy', async () => {

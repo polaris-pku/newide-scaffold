@@ -306,7 +306,7 @@ describe('role-autonomy 引擎适配层', () => {
     expect(harness.loopCalls).toHaveLength(0);
   });
 
-  it('祖先链继承：冻结预算/deadline 与已消费 dispatches/rounds 不因 restart 清零', async () => {
+  it.each([IDENTITY.task_id, 'task_restarted'])('恢复 Task %s 保留祖先预算与派工', async (taskId) => {
     const parentId = 'run_parent';
     const { runsRoot, runId } = await makeRunsRoot('run_child');
     const parentDir = path.join(runsRoot, parentId);
@@ -364,7 +364,7 @@ describe('role-autonomy 引擎适配层', () => {
 
     const harness = makeHarness(runsRoot);
     await harness.engine.run({
-      task_id: IDENTITY.task_id,
+      task_id: taskId,
       run_id: runId,
       role_id: IDENTITY.role_id,
       instruction: 'continue the task',

@@ -112,7 +112,7 @@ describe('NewideBackendService SQLite lifecycle', () => {
       });
       try {
         await expect(restarted.getTask(created.task.task_id)).resolves.toEqual(completed);
-        expect(restarted.getRunSnapshot(completed.run_history[0]!.run_id)).toMatchObject({
+        expect(await restarted.getRunSnapshot(completed.run_history[0]!.run_id)).toMatchObject({
           status: 'completed',
           final_output: { artifact_refs: ['artifact_persisted'] },
         });

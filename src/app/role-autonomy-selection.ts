@@ -46,7 +46,7 @@ export interface RoleAutonomySelectionConfig {
   wired: boolean;
   /** 阶段 3 开关（`NEWIDE_DRIVER_EVIDENCE_ONLY` / `NEWIDE_BUFFER_V2`），默认都关。 */
   switches?: RoleAutonomySwitches;
-  /** 部署级预算覆盖（只能收紧宿主上限）。 */
+  /** 部署级宿主预算覆盖（可提高或降低默认值，仅影响新 Run）。 */
   budget_overrides?: RoleBudgetOverrides;
   /** 任务请求预算（TaskBudget.max_tokens / max_wall_clock_seconds / max_tool_calls）。 */
   task_budget?: TaskBudget;

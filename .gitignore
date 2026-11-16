@@ -16,6 +16,10 @@ coverage/
 # 本地读码/Agent 交接笔记，不入仓
 agent_context.json
 
+# 本地提示词 / Agent prompt 文件，不入仓
+.prompt/
+AGENTS.md
+
 # 本地状态 / 会话转储 / 归档
 .newide/
 *.session.json
@@ -40,6 +44,10 @@ src/memory/memory-api-surface-plan.md
 
 # 本地架构、设计与执行计划文档，不入仓
 docs/
+# 本地设计稿（role/driver 重平衡等），不入仓
+design/
+# 本地调研/综述材料，不入仓
+research/
 
 # editor & OS
 .DS_Store

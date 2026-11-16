@@ -114,7 +114,7 @@ describe('RunRpcMethods', () => {
     const output: string[] = [];
     const calls: Array<{ run_id: string; after_sequence?: number; limit?: number }> = [];
     const service = fakeService({
-      getRunEvents: (input) => {
+      getRunEvents: async (input) => {
         if (input.run_id === 'missing') throw new RunNotFoundError(input.run_id);
         calls.push(input);
         return {
@@ -527,7 +527,7 @@ describe('RunRpcMethods', () => {
   it('still returns the external RunSnapshot view for an open run', async () => {
     const output: string[] = [];
     const service = fakeService({
-      getRunSnapshot: () => ({
+      getRunSnapshot: async () => ({
         schema_version: 'v0',
         run_id: 'run_1',
         task_id: 'task_1',
@@ -559,7 +559,7 @@ describe('RunRpcMethods', () => {
 function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService {
   return {
     createRun: async () => ({ run_id: 'run_1', task_id: 'task_1', status: 'running' }),
-    getRunSnapshot: (runId) => {
+    getRunSnapshot: async (runId) => {
       throw new RunNotFoundError(runId);
     },
     subscribe: () => () => undefined,
@@ -578,7 +578,7 @@ function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService 
     getRunPayload: async () => {
       throw new Error('getRunPayload fixture is not configured');
     },
-    getRunEvents: () => {
+    getRunEvents: async () => {
       throw new Error('getRunEvents fixture is not configured');
     },
     getRunUsage: async () => {

@@ -35,7 +35,11 @@ import type {
   JournalViolation,
   ReconciledAppendInput,
 } from '../driver';
-import { EvidenceRefSchema, JournalVerificationClaimSchema } from '../driver';
+import {
+  EvidenceRefSchema,
+  JournalVerificationClaimSchema,
+  VerificationCommandSchema,
+} from '../driver';
 import type {
   DispatchJournalEvidencePage,
   DispatchJournalFoldResult,
@@ -113,7 +117,7 @@ export type RoleBudgetLimits = {
   dispatch_timeout_ms: number;
 };
 
-/** 请求侧只能收紧宿主上限，不能放大。 */
+/** 部署级宿主预算，可提高或降低默认值；任务请求仍只能收紧。 */
 export const RoleBudgetOverridesSchema = z
   .object({
     max_dispatches: z.number().int().positive().optional(),
@@ -139,8 +143,8 @@ export interface RoleFrozenBudget {
 }
 
 /**
- * 合并宿主初值与请求覆盖：请求只能收紧（取 min），非法值直接拒绝。
- * 返回 `undefined` 表示请求覆盖非法，调用方必须拒绝选路而不是静默降级。
+ * 合并默认值与部署级宿主配置：显式配置可提高或降低，非法值直接拒绝。
+ * 返回 `undefined` 表示部署覆盖非法，调用方必须拒绝选路而不是静默降级。
  */
 export function resolveRoleBudgetLimits(
   overrides: RoleBudgetOverrides = {},
@@ -149,8 +153,9 @@ export function resolveRoleBudgetLimits(
   for (const key of Object.keys(ROLE_BUDGET_DEFAULTS) as Array<keyof RoleBudgetLimits>) {
     const requested = overrides[key];
     if (requested === undefined) continue;
-    if (!Number.isInteger(requested) || requested <= 0) return undefined;
-    limits[key] = Math.min(limits[key], requested);
+    if (!Number.isSafeInteger(requested) || requested <= 0) return undefined;
+    if (key === 'dispatch_timeout_ms' && requested > 3_600_000) return undefined;
+    limits[key] = requested;
   }
   return limits;
 }
@@ -372,6 +377,32 @@ export function resolveUnresolvedDispatchIds(records: readonly DispatchRecord[])
   return unresolved;
 }
 
+/**
+ * `completed` 的最终闸门只拦**可能影响交付**的未决 unknown。证据明确显示工作区被完整观测且
+ * 零变更的 unknown（典型是一次只读 verify 超时）没有交付副作用；让它阻塞 completed 会把
+ * “验证动作没跑完”误判成“交付不可信”，也会逼 Role 耗尽派工预算去补一次无意义的对账。
+ * 这类派工仍保留原 unknown 记录，并继续出现在 Role 的 `unresolved` 披露里。
+ */
+export function resolveBlockingUnresolvedDispatchIds(
+  records: readonly DispatchRecord[],
+): string[] {
+  return resolveUnresolvedDispatchIds(records).filter((dispatchId) => {
+    const record = records.find((item) => item.dispatch_id === dispatchId);
+    return record === undefined || !isEffectFreeUnknown(record);
+  });
+}
+
+function isEffectFreeUnknown(record: DispatchRecord): boolean {
+  if (record.status !== 'unknown') return false;
+  // verify 派工按语义只跑既定命令；Role 常常不会显式带 read_only，但 evidence 的完整零变更
+  // 差分已足以说明它没有改动交付物。execute 超时即使当前差分为空，也可能在外部或稍后
+  // 留下副作用，仍按旧规则阻塞 completed。
+  const effectFreeKind = record.brief.kind === 'verify' || record.brief.read_only === true;
+  if (!effectFreeKind) return false;
+  const delta = record.evidence?.workspace_delta;
+  return delta !== undefined && delta.coverage === 'complete' && delta.changed_paths.length === 0;
+}
+
 /** role 工具自身返回的错误码（不结束循环，作为工具结果交还 role 继续决策）。 */
 export const ROLE_TOOL_ERROR_CODES = [
   'ROLE_ALREADY_FINISHED',
@@ -424,6 +455,10 @@ export const RoleDispatchExecutionArgsSchema = z
     kind: RoleDispatchKindSchema.describe(
       'investigate=调查（只读）；execute=实现/修改；verify=验证（缺省只读）',
     ),
+    verification_command: VerificationCommandSchema.optional().describe(
+      '仅用于 verify + fresh：直接执行明确的本地检查命令，返回宿主观察的退出码与输出；' +
+        '例如 {executable:"node",args:["verify.mjs"]}。不自动启用 shell；测试会写项目文件时声明 read_only=false',
+    ),
     /** investigate 恒只读；execute/verify 由 role 显式声明，缺省按 kind 推导。 */
     read_only: z
       .boolean()
@@ -451,7 +486,7 @@ export const RoleDispatchExecutionArgsSchema = z
       .number()
       .int()
       .positive()
-      .max(ROLE_BUDGET_DEFAULTS.dispatch_timeout_ms)
+      .max(3_600_000)
       .optional()
       .describe('单次派工超时（只能收紧宿主冻结上限）'),
     /** 显式重试：新 dispatch_id + retry_of 引用；unknown 目标还需 reconciliation_ref 取证。 */

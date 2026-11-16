@@ -1,3 +1,4 @@
+/** Shared workspace snapshots: project content excludes the Driver's local permission state. */
 import { promises as fs, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -16,6 +17,15 @@ const IGNORED_DIRECTORIES = new Set([
 
 export type WorkspaceFileSnapshot = ReadonlyMap<string, string>;
 
+/** Only the root Claude Code permission state; hooks, settings.json and nested files still count. */
+function isDriverRuntimeState(workspacePath: string, absolutePath: string): boolean {
+  const relative = toWorkspaceRelativePath(workspacePath, absolutePath);
+  return (
+    (process.platform === 'win32' ? relative.toLowerCase() : relative) ===
+    '.claude/settings.local.json'
+  );
+}
+
 export async function snapshotWorkspaceFiles(
   workspacePath: string,
 ): Promise<WorkspaceFileSnapshot> {
@@ -31,6 +41,7 @@ export async function snapshotWorkspaceFiles(
         continue;
       }
       if (!entry.isFile()) continue;
+      if (isDriverRuntimeState(workspacePath, absolutePath)) continue;
       const stat = await fs.stat(absolutePath, { bigint: true }).catch(() => undefined);
       if (!stat) continue;
       files.set(
@@ -68,6 +79,7 @@ export async function snapshotWorkspaceContent(
         continue;
       }
       if (!entry.isFile()) continue;
+      if (isDriverRuntimeState(workspacePath, absolutePath)) continue;
       const bytes = await fs.readFile(absolutePath).catch(() => undefined);
       if (bytes === undefined) continue;
       files.set(
@@ -88,9 +100,7 @@ export async function snapshotWorkspaceContent(
  * 让旧检查冒充最终版本通过。这里在回调返回前同步完成读取，至少保证宿主观察到的事件
  * 顺序与快照顺序一致；做不到可靠绑定时，调用方降级为无指纹证据（finish 会拒绝）。
  */
-export function snapshotWorkspaceContentSync(
-  workspacePath: string,
-): WorkspaceContentSnapshot {
+export function snapshotWorkspaceContentSync(workspacePath: string): WorkspaceContentSnapshot {
   const files = new Map<string, string>();
   const walk = (directory: string): void => {
     let entries;
@@ -107,6 +117,7 @@ export function snapshotWorkspaceContentSync(
         continue;
       }
       if (!entry.isFile()) continue;
+      if (isDriverRuntimeState(workspacePath, absolutePath)) continue;
       try {
         const bytes = readFileSync(absolutePath);
         files.set(

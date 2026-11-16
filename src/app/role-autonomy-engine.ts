@@ -47,6 +47,7 @@ import {
   isDriverEffectEvent,
   mapAdpOutcome,
   parseDriverCommandObservation,
+  runVerificationCommand,
   sha256Hex,
   type DispatchRecord,
   type EvidenceRef,
@@ -98,6 +99,7 @@ import {
   buildRoleFreezeInitInput,
   effectiveDispatchRecordStatus,
   isRoleAutonomySwitchCombinationValid,
+  resolveBlockingUnresolvedDispatchIds,
   resolveRolePolicyBudget,
   resolveUnresolvedDispatchIds,
   roleFrozenPolicyFromJournalInit,
@@ -160,7 +162,7 @@ export interface RoleAutonomyEngineDeps {
   create_finish_validator: () => RoleFinishValidatorPort;
   /** loop 本体工厂（真实实现由组合根注入）。 */
   run_loop: (options: RoleLoopOptions) => Promise<RoleLoopOutcome>;
-  /** 部署级预算上限覆盖（只允许收紧；非法由选路模块拒绝）。 */
+  /** 部署级宿主预算覆盖（可提高或降低默认值；非法由选路模块拒绝）。 */
   budget_overrides?: RoleBudgetOverrides;
   routing?: RoleFrozenRouting;
   clock?: () => Date;
@@ -770,12 +772,18 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     // 阶段 3 开关与预算同源冻结：新 Run 取选路计划，继承链取祖先冻结值（恢复不切换）。
     const evidenceOnly = inherited?.evidence_only ?? plan!.evidence_only;
     const bufferV2 = inherited?.buffer_v2 ?? plan!.buffer_v2;
-    if (!isRoleAutonomySwitchCombinationValid({ evidence_only: evidenceOnly, buffer_v2: bufferV2 })) {
+    if (
+      !isRoleAutonomySwitchCombinationValid({ evidence_only: evidenceOnly, buffer_v2: bufferV2 })
+    ) {
       throw new RoleTerminationError({
         code: 'host_failed',
         actor: 'host',
         message: 'buffer_v2 requires evidence_only in the frozen role autonomy policy',
-        details: { reason: 'role_switch_invalid', evidence_only: evidenceOnly, buffer_v2: bufferV2 },
+        details: {
+          reason: 'role_switch_invalid',
+          evidence_only: evidenceOnly,
+          buffer_v2: bufferV2,
+        },
       });
     }
     const freezeInput = buildRoleFreezeInitInput({
@@ -972,6 +980,15 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
           { ancestor_run_id: ancestorId, problems: read.problems },
         );
       }
+      // run.restart 创建新 Task；祖先账本必须按自己的 init.task_id 折叠，
+      // 不能拿当前 Task 身份判祖先为损坏。run_id/role_id 仍由恢复链与当前 Role 约束。
+      const init = read.controls.find((entry) => entry.event === 'init');
+      if (init !== undefined && init.task_id !== input.task_id) {
+        journal = await RunDispatchJournal.peek({
+          runDir,
+          identity: { run_id: ancestorId, task_id: init.task_id, role_id: input.role_id },
+        });
+      }
       const fold = await this.foldOrTerminate(journal, 'ancestor');
       ancestors.push({ run_id: ancestorId, journal, read, readRecords: fold.records });
     }
@@ -1080,7 +1097,7 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     ]) {
       if (!records.has(record.dispatch_id)) records.set(record.dispatch_id, record);
     }
-    const unresolved = resolveUnresolvedDispatchIds([...records.values()]);
+    const unresolved = resolveBlockingUnresolvedDispatchIds([...records.values()]);
     if (unresolved.length === 0) return;
     throw new RoleTerminationError({
       code: 'dispatch_unknown_unresolved',
@@ -1136,8 +1153,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       zero_dispatch: finish.zero_dispatch ?? records.length === 0,
       plan: undefined,
       // 与 finish 校验/engine 最终闸门共用同一 reducer：可信 reconciled 收束过的 unknown
-      // 不再是未决派工（原始记录仍保留 unknown）。
-      unresolved_dispatches: resolveUnresolvedDispatchIds(records),
+      // 不再是未决派工（原始记录仍保留 unknown）；零变更的只读超时不算阻塞交付。
+      unresolved_dispatches: resolveBlockingUnresolvedDispatchIds(records),
     };
     if (finishRecord.status !== 'completed') {
       // 恢复到一条 blocked/failed finish：学习输入照样登记（与首次执行同一规则）。
@@ -1236,7 +1253,11 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
           }),
         ]);
         if (persona !== undefined) {
-          recordMemoryUsed('persona', `${persona.role_id}@v${String(persona.version)}`, 'auto_recall');
+          recordMemoryUsed(
+            'persona',
+            `${persona.role_id}@v${String(persona.version)}`,
+            'auto_recall',
+          );
         }
         for (const skill of retrieval.skills) recordMemoryUsed('skill', skill.id, 'auto_recall');
         for (const experience of retrieval.experiences) {
@@ -1469,6 +1490,69 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       fingerprint_verified: boolean;
     }> = [];
     try {
+      if (brief.verification_command !== undefined) {
+        if (workspace === undefined) {
+          throw new DriverTransportError(
+            'verification command requires a workspace',
+            'not_executed',
+          );
+        }
+        dispatched = true;
+        const observed = await runVerificationCommand({
+          command: brief.verification_command,
+          workspace,
+          signal,
+        });
+        // This command was executed by the host adapter. Capture the checked content before
+        // handing control back to Role, using the same fingerprint as final delivery.
+        const workspaceSha = hashWorkspaceContent(snapshotWorkspaceContentSync(workspace));
+        const observation: DriverCommandObservation = {
+          command: [brief.verification_command.executable, ...brief.verification_command.args]
+            .map((part) => JSON.stringify(part))
+            .join(' '),
+          ...observed,
+          checked_workspace_sha256: workspaceSha,
+          observed_at: now().toISOString(),
+        };
+        input.on_driver_event?.({
+          schema_version: 'driver-event.v1',
+          event_type: 'driver.command_observed',
+          payload: observation,
+          task_id: input.task_id,
+          run_id: input.run_id,
+          dispatch_id: brief.dispatch_id,
+          created_at: now().toISOString(),
+        });
+        const checks = await this.buildCommandChecks(runDir, brief.dispatch_id, [
+          {
+            observation,
+            workspace_sha256: workspaceSha,
+            fingerprint_verified: true,
+          },
+        ]);
+        const response = `exit_code=${observed.exit_code}\n${observed.stdout}\n${observed.stderr}`;
+        const delta = await this.workspaceDelta(workspace, before);
+        return {
+          transport: { evidence: 'execution_unconfirmed' },
+          result: {
+            status: observed.exit_code === 0 ? 'succeeded' : 'failed',
+            driver_id: 'local-verification',
+            response,
+            ...(observed.exit_code !== 0
+              ? {
+                  error: {
+                    code: 'VERIFICATION_FAILED',
+                    message: response.slice(0, 2_000),
+                    retryable: false,
+                  },
+                }
+              : {}),
+          },
+          response_excerpt: response.slice(0, responseExcerptChars()),
+          checks,
+          ...(delta !== undefined ? { workspace_delta: delta } : {}),
+        };
+      }
       const invocation = await invoker(
         {
           task_id: input.task_id,
@@ -1585,6 +1669,23 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       }
       if (timeoutController.signal.aborted) {
         return unknownObservation('dispatch_timeout', 'DRIVER_DISPATCH_TIMEOUT', delta);
+      }
+      if (error instanceof DriverTransportError) {
+        return failureObservation({
+          mapped: mapAdpOutcome({
+            kind: 'thrown',
+            evidence: {
+              dispatched,
+              effects_observed: effectsObserved,
+              result_received: false,
+              cancel_requested: false,
+            },
+            error,
+          }),
+          transportEvidence: evidenceOf(error),
+          delta,
+          checks: [],
+        });
       }
       throw error;
     } finally {
@@ -2429,6 +2530,19 @@ type WorkspaceDeltaObservation =
   | undefined;
 
 /**
+ * Driver 公开报告回传给 Role 的截断长度。默认 2,000 字符；实验/部署可用
+ * `NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS` 放大，让 Role 能读到报告里的失败与限制段落
+ * （报告后段的限制往往决定下一步决策）。非法值回落到默认值。
+ */
+const DEFAULT_RESPONSE_EXCERPT_CHARS = 2_000;
+
+function responseExcerptChars(): number {
+  const raw = process.env.NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS;
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_RESPONSE_EXCERPT_CHARS;
+}
+
+/**
  * 由既有 ADP 证据化映射生成观察：`succeeded/failed/cancelled` 走 `result`，
  * 映射为 `unknown`（已收到结果但结局不明）时只声明独立事实 `result_received=true`，
  * 不把 unknown 塞进不允许 unknown 的 `result.status`，也不从 status 反推收到与否。
@@ -2445,7 +2559,7 @@ function resultObservation(input: {
     checks: [...checks],
     ...(delta !== undefined ? { workspace_delta: delta } : {}),
     ...(execution.response !== undefined
-      ? { response_excerpt: execution.response.slice(0, 2_000) }
+      ? { response_excerpt: execution.response.slice(0, responseExcerptChars()) }
       : {}),
     ...(execution.usage !== undefined ? { usage: execution.usage } : {}),
     duration_ms: execution.diagnostics.duration_ms,

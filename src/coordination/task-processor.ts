@@ -30,7 +30,10 @@ import type { RunSnapshot } from '../protocol/run-snapshot';
 import { projectRunEventSource } from '../protocol/run-event';
 import { taskSnapshotSchema, type TaskSnapshot } from '../protocol/task-snapshot';
 import type { AppRunEvent } from '../app/run-registry';
-import { projectPersistedRunSnapshot } from '../app/task-run-snapshot-projector';
+import {
+  projectPersistedRunSnapshot,
+  type RunDispatchFacts,
+} from '../app/task-run-snapshot-projector';
 import { projectTaskSnapshot, type TaskRunFact } from '../app/task-snapshot-projector';
 import type { ParticipantSessionRegistry } from './participant-session-registry';
 import type {
@@ -1453,14 +1456,22 @@ export class TaskProcessor {
     }));
   }
 
-  getRunSnapshot(runId: string): RunSnapshot | undefined {
+  /**
+   * 读一个 Run 的持久快照。
+   *
+   * `journalRecords` 是调用方（生产为 `NewideBackendService.getRunSnapshot`，它会先只读地
+   * 折叠本 Run Journal）传来的派工事实：保存的 `run.snapshot` 优先；没有保存快照时用它补齐
+   * 事件里缺失的 accepted/settled 投影（阶段 4 修复 R4-01）。本方法保持同步——**不做 I/O**，
+   * 事实由异步读取边界注入，所以这里不会因为读 Journal 而改变投影时序。
+   */
+  getRunSnapshot(runId: string, journalRecords?: RunDispatchFacts): RunSnapshot | undefined {
     const aggregate = this.store
       .listTaskAggregates()
       .find((candidate) => candidate.runs.some((run) => run.run_id === runId));
     if (!aggregate) return undefined;
     return (
       aggregate.runs.find((run) => run.run_id === runId)?.snapshot ??
-      projectPersistedRunSnapshot(aggregate, runId, this.runsRoot)
+      projectPersistedRunSnapshot(aggregate, runId, this.runsRoot, journalRecords)
     );
   }
 

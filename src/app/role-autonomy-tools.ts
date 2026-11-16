@@ -284,6 +284,9 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
       timeout_ms: effectiveTimeoutMs,
     };
     if (args.read_only !== undefined) request.read_only = args.read_only;
+    if (args.verification_command !== undefined) {
+      request.verification_command = args.verification_command;
+    }
     if (args.retry_of !== undefined) request.retry_of = args.retry_of;
     if (args.reconciliation_ref !== undefined) {
       request.reconciliation_ref = args.reconciliation_ref;
@@ -355,6 +358,27 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
       });
     } catch (error) {
       if (error instanceof DispatchJournalBarrierErrorClass) {
+        // retry_of/reconciliation_ref 写错是**可纠正的参数错误**，不是宿主写盘失败：
+        // 把 journal 的原始错误码交还 Role，让它按 recovery_hint 补字段重派，而不是终止 Run。
+        const cause = (error as { original_error?: { code?: unknown; message?: unknown } })
+          .original_error;
+        const causeCode = typeof cause?.code === 'string' ? cause.code : undefined;
+        if (
+          causeCode === 'journal_retry_not_allowed' ||
+          causeCode === 'journal_retry_without_evidence' ||
+          causeCode === 'journal_unknown_dispatch'
+        ) {
+          return toolError(
+            'ROLE_INVALID_ARGUMENTS',
+            `dispatch retry rejected: ${String(cause?.message ?? causeCode)}`,
+            {
+              contract_code: causeCode,
+              recovery_hint:
+                'Recovering an unknown dispatch requires retry_of=<dispatch_id> AND ' +
+                'reconciliation_ref={path, sha256} copied from that dispatch evidence_ref/evidence_sha256.',
+            },
+          );
+        }
         throw roleTerminationFromDispatchBarrier(error);
       }
       if (error instanceof ExecutionContractViolation) {
@@ -388,9 +412,54 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
       violations: observation.violations,
       attempts: observation.attempts,
       sequence: identity.sequence,
+      checks: observation.evidence.checks,
     };
+    // 让 Role 每轮都看到剩余墙钟，而不是只在启动时拿到一个绝对 deadline；
+    // 否则长任务会按“还有几十次派工”的惯性排期，无法为最终验证留窗口。
+    const budgetAfter = options.budget.snapshot(now());
+    const dispatchesLeft = Math.max(
+      0,
+      budgetAfter.frozen.limits.max_dispatches - budgetAfter.consumed.dispatches,
+    );
+    const roleTokensLeft = Math.max(
+      0,
+      budgetAfter.frozen.limits.role_token_budget - budgetAfter.consumed.tokens,
+    );
+    data.budget_after =
+      process.env.NEWIDE_ROLE_TIME_BLIND === '1'
+        ? { dispatches_left: dispatchesLeft, role_tokens_left: roleTokensLeft }
+        : {
+            wall_clock_remaining_ms: budgetAfter.wall_clock_remaining_ms,
+            deadline_at: budgetAfter.frozen.deadline_at,
+            dispatches_left: dispatchesLeft,
+            role_tokens_left: roleTokensLeft,
+          };
+    if (
+      built.brief.kind === 'verify' &&
+      !observation.evidence.checks.some((check) => check.provenance === 'host_observed')
+    ) {
+      data.verification_gap =
+        '本次派工没有宿主检查证据；如需验证命令，请用 verify + fresh + verification_command ' +
+        '给出 executable/args。不要重复同样的自然语言派工取证；无法验证时如实 finish(blocked)。';
+    }
     if (observation.evidence.response_excerpt !== undefined) {
       data.response_excerpt = observation.evidence.response_excerpt;
+    }
+    if (observation.status === 'unknown') {
+      // unknown 不会被宿主自动当作成功或失败；Role 若接续这项工作，必须显式建立
+      // retry 链，否则 finish(completed) 会被“未收束 unknown”拒绝。unknown 目标还要求
+      // reconciliation_ref 取证，所以把现成的 ref 直接写进提示，避免 Role 只写 retry_of
+      // 后被 journal 拒绝、再被误报成宿主写失败。
+      const reconciliation = JSON.stringify({
+        path: observation.evidence_ref.path,
+        sha256: observation.evidence_sha256,
+      });
+      data.recovery_hint =
+        `Dispatch ${observation.dispatch_id} is unresolved (status=unknown). ` +
+        `To recover its work, send a dispatch with retry_of="${observation.dispatch_id}" ` +
+        `AND reconciliation_ref=${reconciliation}; ` +
+        'without both fields the retry is rejected and the run cannot finish as completed. ' +
+        'A verify dispatch that changed no workspace files is treated as harmless.';
     }
     if (options.context.frozen_driver_id !== undefined) {
       data.frozen_driver_id = options.context.frozen_driver_id;

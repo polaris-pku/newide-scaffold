@@ -213,7 +213,13 @@ hash、受控折叠重建 dispatch 摘要并与 Buffer 的集合/状态/evidence
 反思、照常归档/ack，不判死信；暂时性存储错误继续抛出走既有重试/死信。没有核验端口时同样降级并留
 warning，绝不默认信任 Buffer 里声称的 host_observed 计数。
 
-**触发策略与降级**：`checkAndExtract` / `checkAndPromote` 在**执行前**用策略端口评估是否触发——`BufferTriggerPolicy`（`BatchBufferTriggerPolicy`：pending ≥3 / 最老 ≥6h / 含 ineffective；`AlwaysExtractPolicy`：无条件）+ `PromotionTriggerPolicy`（`DefaultPromotionTriggerPolicy`：eligible ≥5 / 高信 >0.98 / 距上次 ≥24h）。两个 Processor 均无内置调度器，**触发方是外部调用者**（后台 Worker / 定时器 / 前端主动）。LLM 版提取/晋升/归纳（`LlmExperienceExtractor` / `LlmSkillPromotion` / `LlmPersonaInduction`）内部在 LLM 失败或空结果时**降级到规则版**（`RuleBasedExperienceExtractor` / `ruleBasedSkillPromotion` / `ruleBasedPersonaInduction`），规则版仅作兜底，主线全走 LLM。
+**回滚兼容约束（阶段 5 核实）**：v2 只有 `buffer_version === 2` 的判别读取这一条路径，v1 数据永远按
+v1 读、不原地重写。**部署回滚的目标二进制必须 ≥ 阶段 3**（具备 v2 reader）；旧二进制不得强读 v2
+数据（v1 的 `z.object` 会静默 strip v2 字段，等于把记录读坏）。回滚演练（
+`scripts/phase5/switch-rollback-drill.ts`，证据 `.newide/phase5/switch-rollback/`）已验证 v1/v2 两种
+记录都能被当前 reader 正确区分读取；回滚只关部署开关，不删除/重写历史 Buffer。
+
+**触发策略与降级**：`checkAndExtract` / `checkAndPromote` 在**执行前**用策略端口评估是否触发——`BufferTriggerPolicy`（`BatchBufferTriggerPolicy`：pending ≥3 / 最老 ≥6h / 含 ineffective；`AlwaysExtractPolicy`：无条件）+ `PromotionTriggerPolicy`（`DefaultPromotionTriggerPolicy`：eligible ≥5 / 高信 >0.98 / 距上次 ≥24h）。两个 Processor 均无内置调度器，**触发方是外部调用者**（后台 Worker / 定时器 / 前端主动）。LLM 版提取/晋升/归纳（`LlmExperienceExtractor` / `LlmSkillPromotion` / `LlamaPersonaInduction`）内部在 LLM 失败或空结果时**降级到规则版**（`RuleBasedExperienceExtractor` / `ruleBasedSkillPromotion` / `ruleBasedPersonaInduction`），规则版仅作兜底，主线全走 LLM。
 
 ### Persona 演化
 

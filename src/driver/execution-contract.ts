@@ -43,6 +43,21 @@ export const DISPATCH_RECORD_SCHEMA_VERSION = 'newide.dispatch_record.v1';
 /** 单次派工默认超时（设计 §5：10 分钟）。 */
 export const DEFAULT_DISPATCH_TIMEOUT_MS = 600_000;
 
+/**
+ * Driver 报告回传给 Role 的截断长度。默认 2,000 字符（既有行为）；部署/实验可用
+ * `NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS` 放大，让 Role 读到报告后段的失败与限制。
+ * schema 上限固定为 20,000，避免凭环境变量把持久化 evidence 撑到不可控大小。
+ */
+const DEFAULT_RESPONSE_EXCERPT_CHARS = 2_000;
+const MAX_RESPONSE_EXCERPT_CHARS = 20_000;
+
+function responseExcerptChars(): number {
+  const raw = process.env.NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS;
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) return DEFAULT_RESPONSE_EXCERPT_CHARS;
+  return Math.min(parsed, MAX_RESPONSE_EXCERPT_CHARS);
+}
+
 export const EXECUTION_KINDS = ['investigate', 'execute', 'verify'] as const;
 export const EXECUTION_STATUSES = [
   'succeeded',
@@ -180,6 +195,33 @@ export const ExecutionSessionSchema = z
 
 export type ExecutionSession = z.infer<typeof ExecutionSessionSchema>;
 
+/** Explicit argv for a local verification dispatch; never parsed from free-form instructions. */
+export const VerificationCommandSchema = z
+  .object({
+    executable: z
+      .string()
+      .trim()
+      .min(1)
+      .max(1_024)
+      .refine((value) => !value.includes('\0')),
+    args: z
+      .array(
+        z
+          .string()
+          .max(8_000)
+          .refine((value) => !value.includes('\0')),
+      )
+      .max(128)
+      .default([]),
+  })
+  .strict()
+  .refine(
+    (command) =>
+      [command.executable, ...command.args].map((part) => JSON.stringify(part)).join(' ').length <=
+      4_096,
+    'verification command exceeds the evidence command size limit',
+  );
+
 /**
  * role 可提供的内容字段。`.strict()` 是身份防伪的第一道门：role 试图塞
  * `dispatch_id` / `task_id` / `run_id` / `role_id` / `sequence` / `accepted_at` 会被拒收。
@@ -188,6 +230,7 @@ export const RoleExecutionRequestSchema = z
   .object({
     kind: ExecutionKindSchema,
     read_only: z.boolean().optional(),
+    verification_command: VerificationCommandSchema.optional(),
     instruction: z.string().trim().min(1).max(24_000),
     acceptance: z.array(z.string().trim().min(1).max(2_000)).max(32).optional().default([]),
     constraints: z.array(z.string().trim().min(1).max(2_000)).max(32).optional().default([]),
@@ -236,6 +279,7 @@ export const ExecutionBriefSchema = z
     // role 内容字段
     kind: ExecutionKindSchema,
     read_only: z.boolean(),
+    verification_command: VerificationCommandSchema.optional(),
     instruction: z.string().trim().min(1).max(24_000),
     acceptance: z.array(z.string().trim().min(1).max(2_000)).max(32),
     constraints: z.array(z.string().trim().min(1).max(2_000)).max(32),
@@ -247,6 +291,16 @@ export const ExecutionBriefSchema = z
   })
   .strict()
   .superRefine((brief, ctx) => {
+    if (
+      brief.verification_command !== undefined &&
+      (brief.kind !== 'verify' || brief.session.mode !== 'fresh')
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['verification_command'],
+        message: 'verification_command requires kind=verify and session.mode=fresh',
+      });
+    }
     if (brief.kind === 'investigate' && brief.read_only !== true) {
       ctx.addIssue({
         code: 'custom',
@@ -364,6 +418,15 @@ export function buildExecutionBrief(input: BuildExecutionBriefInput): BuiltExecu
     );
   }
 
+  if (
+    request.verification_command !== undefined &&
+    (request.kind !== 'verify' || request.session.mode !== 'fresh')
+  ) {
+    throw new ExecutionContractViolation(
+      'brief_invalid',
+      'verification_command requires kind=verify and session.mode=fresh',
+    );
+  }
   const readOnly = normalizeReadOnlyForKind(request.kind, request.read_only);
   if (request.session.mode === 'reuse') {
     const sessionId = request.session.session_id;
@@ -399,6 +462,9 @@ export function buildExecutionBrief(input: BuildExecutionBriefInput): BuiltExecu
     accepted_at: acceptedAt,
     kind: request.kind,
     read_only: readOnly,
+    ...(request.verification_command !== undefined
+      ? { verification_command: request.verification_command }
+      : {}),
     instruction: request.instruction,
     acceptance: request.acceptance,
     constraints: request.constraints,
@@ -649,7 +715,7 @@ export const ExecutionEvidenceSchema = z
     driver_id: IdSchema.optional(),
     driver_run_result_id: IdSchema.optional(),
     session_id: IdSchema.optional(),
-    response_excerpt: z.string().max(2_000).optional(),
+    response_excerpt: z.string().max(MAX_RESPONSE_EXCERPT_CHARS).optional(),
     artifacts: z.array(EvidenceArtifactSchema).max(256),
     transcript_ref: EvidenceRefSchema.optional(),
     tool_events_ref: EvidenceRefSchema.optional(),
@@ -1044,7 +1110,7 @@ export function buildExecutionEvidence(input: BuildExecutionEvidenceInput): Exec
   }
   if (result?.session_id !== undefined) evidence.session_id = result.session_id;
   if (responseExcerpt !== undefined) {
-    evidence.response_excerpt = responseExcerpt.slice(0, 2_000);
+    evidence.response_excerpt = responseExcerpt.slice(0, responseExcerptChars());
   }
   if (result?.transcript_ref !== undefined) evidence.transcript_ref = result.transcript_ref;
   if (result?.tool_events_ref !== undefined) evidence.tool_events_ref = result.tool_events_ref;

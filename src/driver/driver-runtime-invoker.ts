@@ -82,9 +82,16 @@ export interface DriverRuntimeInvocationResult {
   thrown?: unknown;
 }
 
+/**
+ * 构造一个 dispatch 的 invoker。
+ *
+ * `converter` 是**可选**的：六字段 converter 只在真的需要产报告的 `six_field` 分支里
+ * 惰性创建（阶段 5 清理前置）。evidence-only 新路径连构造都不做——否则「不依赖六字段
+ * 报告」只是「不调用」，代码仍会为每次 role 派工实例化一个永不使用的 converter。
+ */
 export function createDriverRuntimeInvoker(
   driver: DriverRuntimeHandle,
-  converter: DriverReturnConverter = createDefaultDriverReturnConverter(),
+  converter?: DriverReturnConverter,
 ) {
   return async function invokeDriverRuntime(
     input: DriverRuntimeInvokerInput,
@@ -139,10 +146,12 @@ export function createDriverRuntimeInvoker(
 
     if (evidenceOnly) {
       // evidence-only：不等价于「报告为空」，而是本次根本不产出六字段报告。
+      // 也不构造默认 converter（`six_field` 分支才惰性创建）。
       return { execution, ...(thrown !== undefined ? { thrown } : {}) };
     }
 
-    const report = await converter(execution, {
+    const convert = converter ?? createDefaultDriverReturnConverter();
+    const report = await convert(execution, {
       ...(execution.response ? { transcriptText: execution.response } : {}),
       instruction: input.driver_context.task_instruction,
       sourceDriver: input.source_driver,

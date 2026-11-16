@@ -83,9 +83,7 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
     context: options.context,
     now,
     ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    ...(options.on_plan_updated !== undefined
-      ? { on_plan_updated: options.on_plan_updated }
-      : {}),
+    ...(options.on_plan_updated !== undefined ? { on_plan_updated: options.on_plan_updated } : {}),
   });
 
   let round = Math.max(0, Math.trunc(options.consumed.role_rounds));
@@ -213,9 +211,7 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
  * 未收束 dispatch：统一 reducer 的结果（本次观察不额外合并——它们已经在 Journal 折叠里；
  * 只保留 Journal 折叠失败时不伪造、不崩的语义）。恢复前的 unknown 由上下文单独传入。
  */
-async function collectUnresolvedDispatchIds(
-  options: RoleLoopOptions,
-): Promise<string[]> {
+async function collectUnresolvedDispatchIds(options: RoleLoopOptions): Promise<string[]> {
   try {
     const fold = await options.journal.fold();
     return resolveUnresolvedDispatchIds(fold.records);
@@ -229,10 +225,7 @@ async function collectUnresolvedDispatchIds(
 // 首轮上下文
 // ─────────────────────────────────────────────────────────────
 
-async function recallMemory(
-  options: RoleLoopOptions,
-  now: () => Date,
-): Promise<string> {
+async function recallMemory(options: RoleLoopOptions, now: () => Date): Promise<string> {
   try {
     const recall = await runGuarded(options, now, (signal) =>
       options.memory.recall(
@@ -256,6 +249,11 @@ async function recallMemory(
   }
 }
 
+/** 实验开关：不向 Role 暴露剩余时间（deadline / wall clock），用于“无时间信息”对照。 */
+function roleTimeBlind(): boolean {
+  return process.env.NEWIDE_ROLE_TIME_BLIND === '1';
+}
+
 function buildSystemPrompt(options: RoleLoopOptions, recallText: string): string {
   const { policy, context } = options;
   const limits = policy.budget.limits;
@@ -266,11 +264,17 @@ function buildSystemPrompt(options: RoleLoopOptions, recallText: string): string
       '不继承原始任务的锁定。',
     `任务指令：${context.instruction}`,
     `冻结预算：max_dispatches=${limits.max_dispatches}，max_role_rounds=${limits.max_role_rounds}，` +
-      `role_token_budget=${limits.role_token_budget}，deadline_at=${policy.budget.deadline_at}。`,
+      `role_token_budget=${limits.role_token_budget}，dispatch_timeout_ms=${limits.dispatch_timeout_ms}` +
+      (roleTimeBlind() ? '。' : `，deadline_at=${policy.budget.deadline_at}。`),
     `允许工具（仅这些）：${policy.tool_allowlist.join('、')}。`,
     '同一回复里的多个 dispatch_execution 会按顺序串行执行；driver 的 succeeded 只代表本次派工' +
       '返回成功，不代表任务完成。',
     '纯文本（包括“完成/done/已完成”等）不会结束任务；必须调用 finish_task 显式结束。',
+    '需要运行测试或其他明确验证命令时，优先 dispatch_execution(kind="verify", ' +
+      'session={mode:"fresh"}, verification_command={executable:"node",args:["verify.mjs"]})；' +
+      '用实际项目命令替换示例。该派工直接执行命令，不再询问 coding agent，checks 返回真实退出码与证据。' +
+      '会写项目文件的验证请声明 read_only=false。纯调查/无需运行命令的任务不要为了结束再额外派 verify。' +
+      '没有宿主证据的自然语言 verify 不应重复取证；改用明确命令，或如实说明限制并 finish(blocked)。',
     '**任务要求是否满足由你判断**：宿主不会从 completion_criteria 文本自动推导检查义务、也不解析命令。' +
       'finish_task 时用 verification 逐条说明：passed（你确认已满足，必须引用真实派工，宿主会核验该派工' +
       '是否有 host_observed + complete + exit 0 且内容指纹与最终交付一致的检查证据）、failed（尝试过但未满足）、' +
@@ -503,7 +507,10 @@ function trimHistory(messages: ToolCallMessage[], maxMessages: number): void {
 }
 
 /** 只保留最近 N 条 dispatch 工具结果的完整内容；更早的压缩成占位符。 */
-function compressOldDispatchResults(messages: ToolCallMessage[], keepDispatchResults: number): void {
+function compressOldDispatchResults(
+  messages: ToolCallMessage[],
+  keepDispatchResults: number,
+): void {
   const dispatchResultIndexes: number[] = [];
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];

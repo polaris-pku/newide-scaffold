@@ -10,7 +10,7 @@
  * - `foldRoleBudgetFacts` / `roleBudgetFactsFromLines`（生产/测试共用的唯一折叠算法）从真实
  *   Journal（关掉再开）的折叠记录与 `role_round` 行还原已消费量，restart 不清零、缺失 usage
  *   不补 0；
- * - 请求侧覆盖只能收紧（复用 `resolveRoleBudgetLimits`）；
+ * - 部署配置可提高上限，TaskBudget 只能收紧；
  * - 取消/墙钟触限后 loop 不再启动后续 LLM/driver 调用（fake port 计数）。
  */
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -39,6 +39,7 @@ import {
   ROLE_BUDGET_DEFAULTS,
   RoleTerminationError,
   resolveRoleBudgetLimits,
+  resolveRolePolicyBudget,
 } from '../../src/app/role-autonomy-contract';
 import {
   emptyRoleBudgetConsumption,
@@ -361,12 +362,10 @@ describe('任务级 tool-call 上限（TaskBudget.max_tool_calls）', () => {
       clock: () => new Date(START_MS),
     });
     expect(restored.snapshot().consumed.tool_calls).toBe(3);
-    const restoreError = await restored
-      .recordRound(2, undefined, ACCEPTED_AT, 0)
-      .then(
-        () => undefined,
-        (caught: unknown) => caught,
-      );
+    const restoreError = await restored.recordRound(2, undefined, ACCEPTED_AT, 0).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
     expectTermination(restoreError, 'budget_tool_calls', 'host');
   });
 });
@@ -510,14 +509,30 @@ async function openJournalIn(runDir: string): Promise<{ journal: RunDispatchJour
 // ─────────────────────────────────────────────────────────────
 
 describe('resolveRoleBudgetLimits', () => {
-  it('放大请求被忽略（取宿主上限），收紧请求生效，非法值返回 undefined', () => {
-    expect(resolveRoleBudgetLimits({ max_dispatches: 100 })).toMatchObject({ max_dispatches: 12 });
+  it('部署覆盖可提高或降低默认值，非法值返回 undefined', () => {
+    expect(resolveRoleBudgetLimits({ max_dispatches: 100 })).toMatchObject({ max_dispatches: 100 });
     expect(resolveRoleBudgetLimits({ max_dispatches: 3 })).toMatchObject({ max_dispatches: 3 });
     expect(resolveRoleBudgetLimits({ wall_clock_seconds: 60 })).toMatchObject({
       wall_clock_seconds: 60,
     });
     expect(resolveRoleBudgetLimits({ max_dispatches: 0 })).toBeUndefined();
     expect(resolveRoleBudgetLimits({ max_dispatches: 1.5 })).toBeUndefined();
+  });
+  it('复杂任务使用部署上限，任务请求仍只能收紧，超出 Driver 超时契约被拒绝', () => {
+    const overrides = { role_token_budget: 1_000_000, dispatch_timeout_ms: 1_800_000 };
+    expect(resolveRolePolicyBudget({ overrides })?.limits).toMatchObject(overrides);
+    expect(
+      resolveRolePolicyBudget({ overrides, task_budget: { max_tokens: 200_000 } })?.limits
+        .role_token_budget,
+    ).toBe(200_000);
+    expect(
+      resolveRolePolicyBudget({ overrides, task_budget: { max_tokens: 2_000_000 } })?.limits
+        .role_token_budget,
+    ).toBe(1_000_000);
+    expect(resolveRoleBudgetLimits({ dispatch_timeout_ms: 3_600_001 })).toBeUndefined();
+    expect(
+      resolveRoleBudgetLimits({ role_token_budget: Number.MAX_SAFE_INTEGER + 1 }),
+    ).toBeUndefined();
   });
 });
 

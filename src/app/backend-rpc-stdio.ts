@@ -322,8 +322,22 @@ export async function createProductionBackendService(
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
-    const sapBridge = new SapTaskBridge({ store: coordinationStore });
-    const aapBridge = new AapMailboxBridge({ store: coordinationStore });
+    // 长阶段（单次 execute_agent 可跑几十分钟）会超过默认 30 分钟的协议 inbox lease；
+    // 阶段结束时 completeInbox 会因 lease 过期而失败。默认保持 30 分钟，部署可用一个
+    // 统一的 env 放宽，并同时作用于 SAP/AAP 两条协议桥。
+    const protocolLeaseMs = readPositiveIntEnv(
+      'NEWIDE_PROTOCOL_LEASE_MS',
+      env.NEWIDE_PROTOCOL_LEASE_MS,
+      30 * 60_000,
+    );
+    const sapBridge = new SapTaskBridge({
+      store: coordinationStore,
+      lease_duration_ms: protocolLeaseMs,
+    });
+    const aapBridge = new AapMailboxBridge({
+      store: coordinationStore,
+      lease_duration_ms: protocolLeaseMs,
+    });
     const mailboxService = new PersistentMailboxService(coordinationStore);
     const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const protocolCallJournal = new ProtocolCallJournal({
@@ -1396,7 +1410,7 @@ export function buildRoleAutonomySelectionConfig(
 
 /**
  * role-loop 四类预算的部署级上限覆盖：缺省 = 设计初值；出现但非法 → 启动失败，
- * 不在一个 Run 内静默降级（请求侧也只能收紧，见 resolveRoleBudgetLimits）。
+ * 可提高或降低新 Run 的宿主上限；任务请求只能收紧，已冻结 Run 不变。
  */
 export function readRoleBudgetOverrides(
   env: Record<string, string | undefined>,

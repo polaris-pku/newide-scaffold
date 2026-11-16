@@ -463,7 +463,7 @@ export class NewideBackendService {
       scope: input.scope,
       ...(input.scope_id ? { scope_id: input.scope_id } : {}),
     });
-    const usage = input.run_id ? this.getRunSnapshot(input.run_id).usage : undefined;
+    const usage = input.run_id ? (await this.getRunSnapshot(input.run_id)).usage : undefined;
     return { ...(usage ? { usage } : {}), history };
   }
 
@@ -500,14 +500,17 @@ export class NewideBackendService {
    * 并列），所以 `events` 保留 timeline 的**数组顺序**（权威顺序），`sequence` 只用于
    * 判缺与去重（去重键是 `event_id`）。并列号事件被同一个水位一起放过的边角，与
    * `run.subscribe` 同构——孪生口的价值在于行为一致，不在于比订阅更聪明。
+   *
+   * 接口变化（阶段 4 修复 R4-01）：`getRunSnapshot` 改成异步后，这个孪生口也只能异步——
+   * 它**必须**继续走同一个快照投影（序号同源），不能为了保持同步另抄一份 timeline。
    */
-  getRunEvents(input: {
+  async getRunEvents(input: {
     run_id: string;
     after_sequence?: number;
     limit?: number;
-  }): RunEventsResult {
+  }): Promise<RunEventsResult> {
     const after = input.after_sequence ?? 0;
-    const timeline = this.getRunSnapshot(input.run_id).timeline;
+    const timeline = (await this.getRunSnapshot(input.run_id)).timeline;
     const candidates = timeline.filter((event) => event.sequence > after);
     const limited =
       input.limit === undefined ? candidates : candidates.slice(0, input.limit);
@@ -527,7 +530,7 @@ export class NewideBackendService {
    * 返回 `state='absent'` 而不是错误。行投影只含事实元数据，正文按 evidence ref 分页读。
    */
   async getRunDispatchJournal(input: GetRunDispatchJournalInput): Promise<RunDispatchJournalPage> {
-    this.assertRunExists(input.run_id);
+    await this.assertRunExists(input.run_id);
     return readRunDispatchJournalPage(this.runsRoot, input);
   }
 
@@ -540,13 +543,13 @@ export class NewideBackendService {
   async getRunDispatchEvidence(
     input: GetRunDispatchEvidenceInput,
   ): Promise<RunDispatchEvidencePage> {
-    this.assertRunExists(input.run_id);
+    await this.assertRunExists(input.run_id);
     return readRunDispatchEvidencePage(this.runsRoot, input);
   }
 
   /** 用既有快照投影判定 run 是否存在：未知 run 抛 `RunNotFoundError`（含已收尾、进程重启后的 run）。 */
-  private assertRunExists(runId: string): void {
-    this.getRunSnapshot(runId);
+  private async assertRunExists(runId: string): Promise<void> {
+    await this.getRunSnapshot(runId);
   }
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
@@ -1394,6 +1397,10 @@ export class NewideBackendService {
           }
         },
       });
+      // 这里的投影只用于 registry 的存活期视图；**派工事实不在这里补**——权威读取面
+      // （`getRunSnapshot`）与终态 writer 各自在读取边界补 Journal 事实。刻意不在终态状态
+      // 转换之前插入任何额外 await：`service.close()`/中断会观察 registry 的 running 状态，
+      // 把它拖长会把「已完成」误判成「仍需中断」。
       const projected = processor.getRunSnapshot(input.identity.run_id);
       if (!projected) throw new Error(`Run ${input.identity.run_id} has no persistent projection`);
       const executionState = processor.getRunExecutionState(input.identity.run_id);
@@ -1499,6 +1506,8 @@ export class NewideBackendService {
       } else {
         this.registry.fail(input.identity.run_id, 'TASK_LOOP_FAILED', normalized.message);
       }
+      // 失败路径同样只做事件投影：事实由读取面/终态 writer 在各自边界补，终态状态转换
+      // 之后也不再插入额外 await（同成功路径的时序约束）。
       const projected = processor.getRunSnapshot(input.identity.run_id);
       if (projected) this.registry.setProjectedSnapshot(input.identity.run_id, projected);
       await this.driverStreamAuditWriter.flush(input.identity.run_id).catch(() => undefined);
@@ -2012,11 +2021,27 @@ export class NewideBackendService {
     return this.registry.getSnapshot(runId);
   }
 
-  getRunSnapshot(runId: string): RunSnapshot {
+  /**
+   * 生产权威快照读取：RPC `run.getSnapshot` 与 CLI 的读取口都走这里。
+   *
+   * 阶段 4 修复 R4-01：持久事件可能缺 accepted/settled（事件写盘失败、或进程在事件落盘前
+   * 被杀），所以**读取边界**要自己补上 Journal 事实——`readRunDispatchFacts` 只读地折叠本
+   * Run Journal（peek：不取写锁、不建目录、不修坏尾、缺失/损坏一律退化 `undefined`），再把
+   * 结果交给 `TaskProcessor.getRunSnapshot`，与终态 writer / `persistTerminal` 共用同一份
+   * 事实和同一条幂等合并规则。读取不派工、不改终态；legacy Run 没有 Journal 时退回纯事件投影。
+   *
+   * 接口变化：本方法因此是**异步**的（peek 是异步文件读取），调用方需 `await`；
+   * `TaskProcessor.getRunSnapshot` 保持同步，事实由这里注入。
+   */
+  async getRunSnapshot(runId: string): Promise<RunSnapshot> {
     // 用量两条腿（proxy 事件、driver 占用累加器）都只在进程内，所以快照投影器
     // （纯函数）拿不到它们，必须在这个组装点补挂。没有该 run 时保持缺席，不编 0。
     const liveRun = this.registry.has(runId) ? this.registry.getSnapshot(runId) : undefined;
-    const persisted = this.taskProcessor?.getRunSnapshot(runId);
+    // 事实读取恒降级不抛错（见 readRunDispatchFacts）：补投影只该补出可见事实，
+    // 不该把一次 run.getSnapshot 打挂。run 不存在时它同样返回 undefined，随后由
+    // registry / 持久层给出既有的 RunNotFound 语义。
+    const dispatchJournalFacts = await readRunDispatchFacts(this.runsRoot, runId);
+    const persisted = this.taskProcessor?.getRunSnapshot(runId, dispatchJournalFacts);
     if (persisted) {
       const liveProjection = this.terminalRuns.has(runId) ? liveRun : undefined;
       if (

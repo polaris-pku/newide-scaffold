@@ -12,7 +12,7 @@
  * - `completed` 额外要求：无未决 `unknown` dispatch（后续显式 `retry_of` 且可信收束的可解）、
  *   无只读违规、未超预算/未被取消、`response_only` 与实际派工不冲突。
  * - 判定规则集中且唯一：unknown/retry 收束 reducer 与 engine/loop 共用
- *   {@link resolveUnresolvedDispatchIds}，本文件不再保留算法副本。
+ *   {@link resolveBlockingUnresolvedDispatchIds}，本文件不再保留算法副本。
  * - `persistRoleFinish` 是 finish 的**唯一生产落盘点**（loop 直接调用，测试也走同一入口）：
  *   统一 accepted_at、内容派生 entry_id、zero_dispatch 与错误映射（journal_write_failed）。
  *
@@ -34,7 +34,7 @@ import type {
   RoleJournalPort,
   RoleVerificationClaim,
 } from './role-autonomy-contract';
-import { resolveUnresolvedDispatchIds, RoleTerminationError } from './role-autonomy-contract';
+import { resolveBlockingUnresolvedDispatchIds, RoleTerminationError } from './role-autonomy-contract';
 
 // ─────────────────────────────────────────────────────────────
 // finish 校验器
@@ -104,12 +104,15 @@ async function validateRoleFinish(input: RoleFinishValidatorInput): Promise<Role
   // 6) completed 专属校验：未决 dispatch / 只读违规 / 显式验证陈述 / response_only 冲突。
   if (input.request.status === 'completed') {
     if (fold !== undefined) {
-      const unresolved = resolveUnresolvedDispatchIds(allRecords);
+      const unresolved = resolveBlockingUnresolvedDispatchIds(allRecords);
       if (unresolved.length > 0) {
         gaps.push(
           gap(
             'unresolved_dispatch',
-            'completed finish cannot be accepted while a dispatched execution is still unknown',
+            'completed finish cannot be accepted while a dispatched execution is still unknown; ' +
+              'recover each one with retry_of=<dispatch_id> and reconciliation_ref={path, sha256} ' +
+              'from that dispatch evidence_ref/evidence_sha256 (a verify timeout with a complete, ' +
+              'empty workspace delta is harmless)',
             { dispatch_ids: unresolved },
           ),
         );

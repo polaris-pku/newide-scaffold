@@ -224,7 +224,7 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
       );
       expect(processor.getRunSnapshot(runId)?.status).toBe('completed');
 
-      const live = serviceBefore.getRunSnapshot(runId);
+      const live = await serviceBefore.getRunSnapshot(runId);
       expect(live.status).toBe('completed');
       expect(live.usage?.billed?.by_source.proxy?.total_tokens).toBe(110);
 
@@ -247,7 +247,7 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
         reader: new LedgerRunUsageHistoryReader(store, runsRoot, () => 'T'),
       });
 
-      const restarted = serviceAfter.getRunSnapshot(runId);
+      const restarted = await serviceAfter.getRunSnapshot(runId);
 
       expect(restarted.status).toBe('completed');
       // ① 数字不许随后端重启而变：逐字段相同，而不是「也是 110」。
@@ -320,7 +320,7 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
       );
 
       // 一行 LLM 调用都没有 → 没有 proxy 腿 → 整个 `usage` 缺席，不是一个 0。
-      expect(service.getRunSnapshot(runId).usage).toBeUndefined();
+      expect((await service.getRunSnapshot(runId)).usage).toBeUndefined();
     } finally {
       resetAgentActivities();
       await service.close().catch(() => undefined);
@@ -402,12 +402,14 @@ describe('已收尾 run 的 usage 在进程重启后仍然可读', () => {
       });
 
       // 一条历史读都没发生过，答案必须由这一条读自己给出。
-      const snapshot = serviceAfter.getRunSnapshot(runId);
+      const snapshot = await serviceAfter.getRunSnapshot(runId);
       expect(snapshot.usage?.billed?.by_source.proxy?.total_tokens).toBe(110);
 
       // 顺序不能改变答案：触发一次历史读（会把整棵目录树回填进账本）之后必须同值。
       await serviceAfter.getRunUsage({ scope: 'task', scope_id: taskId, run_id: runId });
-      expect(serviceAfter.getRunSnapshot(runId).usage?.billed).toEqual(snapshot.usage?.billed);
+      expect((await serviceAfter.getRunSnapshot(runId)).usage?.billed).toEqual(
+        snapshot.usage?.billed,
+      );
     } finally {
       resetAgentActivities();
       await serviceBefore.close().catch(() => undefined);

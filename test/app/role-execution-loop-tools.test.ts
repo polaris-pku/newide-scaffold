@@ -248,7 +248,7 @@ const INTEGER_BOUNDARY_CASES: ReadonlyArray<{
     tool: 'dispatch_execution',
     path: ['properties', 'timeout_ms'],
     minimum: 1,
-    maximum: ROLE_BUDGET_DEFAULTS.dispatch_timeout_ms,
+    maximum: 3_600_000,
   },
   { tool: 'query_memory', path: ['properties', 'limit'], minimum: 1, maximum: 20 },
   { tool: 'read_evidence', path: ['properties', 'offset'], minimum: 0 },
@@ -288,13 +288,34 @@ describe('复审修复：模型 timeout 只能收紧', () => {
     expect(second.dispatch.calls[0]?.brief.timeout_ms).toBe(1_000);
   });
 
+  it('部署提高超时后允许长派工，模型仍不能超出冻结上限', async () => {
+    for (const requested of [1_800_000, 3_600_000]) {
+      const harness = makeToolsHarness({
+        policy: {
+          budget: {
+            ...FROZEN_BUDGET,
+            limits: { ...FROZEN_BUDGET.limits, dispatch_timeout_ms: 1_800_000 },
+          },
+        },
+      });
+      await harness.executor.execute(
+        toolCall('dispatch_execution', {
+          instruction: 'long development',
+          kind: 'execute',
+          timeout_ms: requested,
+        }),
+      );
+      expect(harness.dispatch.calls[0]?.brief.timeout_ms).toBe(1_800_000);
+    }
+  });
+
   it('timeout_ms 超过 schema 硬上限 → ROLE_INVALID_ARGUMENTS，不派工', async () => {
     const harness = makeToolsHarness();
     const result = await harness.executor.execute(
       toolCall('dispatch_execution', {
         instruction: 'run',
         kind: 'execute',
-        timeout_ms: 999_999,
+        timeout_ms: 3_600_001,
       }),
     );
     expect(result.ok).toBe(false);
@@ -481,6 +502,48 @@ describe('role-autonomy-tools: 生成 JSON Schema 同源与收敛', () => {
 // ─────────────────────────────────────────────────────────────
 
 describe('role-autonomy-tools: dispatch_execution', () => {
+  it('rejects NUL in verification argv before any dispatch', async () => {
+    const harness = makeToolsHarness();
+    for (const command of [
+      { executable: 'node\0', args: [] },
+      { executable: 'node', args: ['verify\0.mjs'] },
+    ]) {
+      const result = await harness.executor.execute(
+        toolCall('dispatch_execution', {
+          kind: 'verify',
+          instruction: 'check',
+          verification_command: command,
+        }),
+      );
+      expect(result.ok).toBe(false);
+    }
+    expect(harness.dispatch.calls).toHaveLength(0);
+  });
+  it('explicit verification argv stays in the hashed Brief; execute cannot use it', async () => {
+    const harness = makeToolsHarness();
+    const command = { executable: 'node', args: ['verify.mjs'] };
+    const result = await harness.executor.execute(
+      toolCall('dispatch_execution', {
+        kind: 'verify',
+        instruction: 'check',
+        verification_command: command,
+      }),
+    );
+    expect(result.ok).toBe(true);
+    expect(harness.dispatch.calls[0]?.brief.verification_command).toEqual(command);
+    expect(harness.dispatch.calls[0]?.brief_sha256).toBe(
+      hashExecutionBrief(harness.dispatch.calls[0]!.brief),
+    );
+    const rejected = await harness.executor.execute(
+      toolCall('dispatch_execution', {
+        kind: 'execute',
+        instruction: 'invalid command kind',
+        verification_command: command,
+      }),
+    );
+    expect(rejected.ok).toBe(false);
+    expect(harness.dispatch.calls).toHaveLength(1);
+  });
   it('宿主填身份/sequence/accepted_at/budget_before，实际 Brief instruction 传给 dispatch port', async () => {
     const harness = makeToolsHarness({ context: { frozen_driver_id: 'driver_alpha' } });
     const result = await harness.executor.execute(
@@ -513,6 +576,27 @@ describe('role-autonomy-tools: dispatch_execution', () => {
     } satisfies BudgetSnapshot);
     // frozen_driver_id 只作诊断/回显。
     expect(result.data).toMatchObject({ status: 'succeeded', frozen_driver_id: 'driver_alpha' });
+  });
+
+  it('NEWIDE_ROLE_TIME_BLIND=1 时回执不暴露剩余墙钟与 deadline，次数/token 仍保留', async () => {
+    const previous = process.env.NEWIDE_ROLE_TIME_BLIND;
+    process.env.NEWIDE_ROLE_TIME_BLIND = '1';
+    try {
+      const harness = makeToolsHarness();
+      const result = await harness.executor.execute(
+        toolCall('dispatch_execution', { kind: 'execute', instruction: 'blind dispatch' }),
+      );
+      expect(result.ok).toBe(true);
+      expect(result.data).toMatchObject({
+        status: 'succeeded',
+        budget_after: { dispatches_left: 11, role_tokens_left: 120_000 },
+      });
+      expect(result.data.budget_after).not.toHaveProperty('wall_clock_remaining_ms');
+      expect(result.data.budget_after).not.toHaveProperty('deadline_at');
+    } finally {
+      if (previous === undefined) delete process.env.NEWIDE_ROLE_TIME_BLIND;
+      else process.env.NEWIDE_ROLE_TIME_BLIND = previous;
+    }
   });
 
   it('retry_of / reconciliation_ref 透传到宿主构造的 Brief', async () => {

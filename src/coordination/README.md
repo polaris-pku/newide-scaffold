@@ -93,3 +93,32 @@ sees is a projection of it:
   `unknown`). Snapshot projection, `inherited.by_status`, the Journal RPC summary and the
   `driver-stream` report reconciliation all use it, and the RPC summary exposes optional
   `reconciled_dispatch_ids`.
+
+## Stage 5: the authoritative `run.getSnapshot` read also merges Journal facts
+
+R4-01 left one production gap: the terminal files were repaired, but the authoritative read path
+(`NewideBackendService.getRunSnapshot`, which backs RPC `run.getSnapshot` and the CLI) still
+projected from persisted events only. Stage 5 closes it at the read boundary:
+
+- `NewideBackendService.getRunSnapshot(runId)` is now **async**. Before projecting it calls
+  `readRunDispatchFacts(this.runsRoot, runId)` (`src/app/run-dispatch-read.ts`): a read-only
+  `RunDispatchJournal.peek` + fold that never takes the writer lock, creates no files, repairs no
+  tail, and degrades a missing/corrupt Journal to `undefined` (legacy runs keep the pure event
+  projection; it throws nothing that would break a snapshot read).
+- The folded records are passed as an optional `journalRecords` argument to
+  `TaskProcessor.getRunSnapshot(runId, journalRecords?)`. The processor stays **synchronous and
+  does no I/O**; the projector (`projectPersistedRunSnapshot`) reuses
+  `projectDispatchFacts(..., {journal_records})` — the same idempotent merge the terminal writer
+  uses. Saved `run.snapshot` still wins; the facts only fill a projection that has no saved
+  snapshot.
+- Consequences: RPC method names/params/result schemas and the wire protocol are unchanged (the
+  dispatcher already awaited handlers), but in-process callers now `await`
+  `service.getRunSnapshot` / `service.getRunEvents` (CLI included). `runAuthorityLoop` deliberately
+  does **not** await this read: it keeps the terminal transition timing so `close()`/interrupt does
+  not mistake a finished run for one that still needs interruption.
+- Read-only by construction: no dispatch, no terminal mutation, no second ledger. Regression:
+  `test/app/run-snapshot-journal-authority.test.ts` drives real disk SQLite + Journal +
+  `service.getRunSnapshot` + the terminal writer, and asserts the file summary, the public snapshot
+  and an empty-registry restart read agree without adding a driver call or a Journal line.
+
+Complex-task restart (2026-11-15): `run.restart` creates a new Task and Run. The role engine folds each ancestor Journal against that ancestor init.task_id, keeping the ancestor run_id and the selected role_id checks. Budgets, deadline and settled evidence remain inherited; no dispatch is replayed automatically.

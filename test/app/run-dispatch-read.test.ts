@@ -702,7 +702,7 @@ describe('NewideBackendService dispatch reads', () => {
     await journal.close();
 
     // 运行中的 run 仍可读快照（新读取口不改变既有 run.* 行为）。
-    expect(service.getRunSnapshot('run_live').status).toBe('running');
+    expect((await service.getRunSnapshot('run_live')).status).toBe('running');
 
     const page = await service.getRunDispatchJournal({ run_id: 'run_live' });
     expect(page.state).toBe('ok');

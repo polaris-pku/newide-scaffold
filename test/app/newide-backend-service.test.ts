@@ -135,7 +135,7 @@ describe('NewideBackendService', () => {
       snapshot: { run_id: 'run_1', task_id: 'task_1' },
       events: [{ sequence: 1 }, { sequence: 2 }, { sequence: 3, type: 'run.completed' }],
     });
-    expect(service.getRunSnapshot('run_1').market).toEqual({
+    expect((await service.getRunSnapshot('run_1')).market).toEqual({
       winner_agent_id: 'role_ts_engineer',
       winner_bid_id: 'bid_1',
       ledger_ref: 'file:///market/ledger.json',
@@ -451,7 +451,7 @@ describe('NewideBackendService', () => {
         status: 'cancelled',
         events: [{ type: 'run.started' }, { type: 'run.cancelled' }],
       });
-      expect(service.getRunSnapshot('run_cancelled')).toMatchObject({
+      expect(await service.getRunSnapshot('run_cancelled')).toMatchObject({
         status: 'cancelled',
         timeline: [{ type: 'run.started' }, { type: 'run.cancelled' }],
         agent_runs: [],
@@ -675,7 +675,7 @@ describe('NewideBackendService', () => {
       expect(types).not.toContain('gate.result');
       expect(types.filter((type) => type === 'run.completed')).toHaveLength(1);
 
-      const externalSnapshot = service.getRunSnapshot(created.run_id);
+      const externalSnapshot = await service.getRunSnapshot(created.run_id);
       expect(externalSnapshot).toMatchObject({
         mode: 'council',
         status: 'completed',
@@ -754,7 +754,7 @@ describe('NewideBackendService', () => {
       await service.waitForTerminal(created.run_id);
       await auditWriter.flush(created.run_id);
 
-      const snapshot = service.getRunSnapshot(created.run_id);
+      const snapshot = await service.getRunSnapshot(created.run_id);
       expect(snapshot.errors).toEqual([
         expect.objectContaining({
           code: 'GATE_DENIED',

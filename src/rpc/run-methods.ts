@@ -33,7 +33,14 @@ import type { JsonRpcDispatcher } from './json-rpc-dispatcher';
 
 export interface RunMethodsService {
   createRun(params: RunCreateParams): Promise<RunCreateResult>;
-  getRunSnapshot(runId: string): RunSnapshot;
+  /**
+   * 权威快照读取。
+   *
+   * 阶段 4 修复 R4-01 之后它是异步的：生产实现（`NewideBackendService.getRunSnapshot`）要先
+   * 只读折叠一次本 Run 的 Dispatch Journal，把缺失的 accepted/settled 事实补进投影。RPC 传输
+   * 本来就是异步的，所以对外契约（方法名、参数、结果 schema）不变，只有调用写法要 `await`。
+   */
+  getRunSnapshot(runId: string): Promise<RunSnapshot>;
   subscribe(
     runId: string,
     listener: (event: AppRunEvent) => void,
@@ -60,7 +67,7 @@ export interface RunMethodsService {
     run_id: string;
     after_sequence?: number;
     limit?: number;
-  }): RunEventsResult;
+  }): Promise<RunEventsResult>;
   /**
    * 面板用的用量查询：可选的当前 run 用量 + 按作用域的历史累计。
    *
@@ -195,9 +202,9 @@ export class RunRpcMethods {
       const parsed = parseParams(createParamsSchema, params);
       return this.service.createRun(compactCreateParams(parsed));
     });
-    dispatcher.register('run.getSnapshot', (params) => {
+    dispatcher.register('run.getSnapshot', async (params) => {
       const { run_id } = parseParams(runIdParamsSchema, params);
-      return this.callWithRunError(() => this.service.getRunSnapshot(run_id));
+      return this.callWithRunErrorAsync(() => this.service.getRunSnapshot(run_id));
     });
     dispatcher.register('run.subscribe', (params) => {
       const { run_id, after_sequence } = parseParams(subscribeParamsSchema, params);
@@ -232,9 +239,9 @@ export class RunRpcMethods {
       }
       return result;
     });
-    dispatcher.register('run.getEvents', (params) => {
+    dispatcher.register('run.getEvents', async (params) => {
       const { run_id, after_sequence, limit } = parseParams(eventsParamsSchema, params);
-      return this.callWithRunError(() =>
+      return this.callWithRunErrorAsync(() =>
         this.service.getRunEvents({
           run_id,
           ...(after_sequence !== undefined ? { after_sequence } : {}),
@@ -312,6 +319,25 @@ export class RunRpcMethods {
   private callWithRunError<T>(operation: () => T): T {
     try {
       return operation();
+    } catch (error) {
+      if (error instanceof RunNotFoundError) {
+        throw new JsonRpcMethodError(JSON_RPC_ERROR_CODES.RUN_NOT_FOUND, 'Run not found', {
+          run_id: error.runId,
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 异步口的 `RUN_NOT_FOUND` 映射。
+   *
+   * 与同步版映射同一组语义，只是必须 `await` 才能接住 rejection（try/catch 不会拦下
+   * 未等待的 Promise）。仅用于已经异步的读取口（`getRunSnapshot` / `getRunEvents`）。
+   */
+  private async callWithRunErrorAsync<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
     } catch (error) {
       if (error instanceof RunNotFoundError) {
         throw new JsonRpcMethodError(JSON_RPC_ERROR_CODES.RUN_NOT_FOUND, 'Run not found', {

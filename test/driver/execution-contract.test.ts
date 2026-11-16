@@ -516,3 +516,37 @@ describe('transport.result_received 与 transport.evidence 正交（审核修复
     ).toThrow(/requires an error/i);
   });
 });
+
+describe('EVD-05 response_excerpt 截断长度可配置', () => {
+  const observation: DriverAttemptObservation = {
+    transport: { evidence: 'execution_unconfirmed', result_received: true },
+    result: { status: 'succeeded', response: 'x'.repeat(5_000) },
+  };
+
+  it('默认保留 2,000 字符', () => {
+    delete process.env.NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS;
+    expect(makeEvidence(observation).response_excerpt).toHaveLength(2_000);
+  });
+
+  it('环境变量放大后保留完整报告，schema 接受更大的 excerpt', () => {
+    process.env.NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS = '12000';
+    try {
+      expect(makeEvidence(observation).response_excerpt).toHaveLength(5_000);
+    } finally {
+      delete process.env.NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS;
+    }
+  });
+
+  it('超过 schema 上限时封顶 20,000', () => {
+    process.env.NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS = '999999';
+    try {
+      const long = makeEvidence({
+        transport: { evidence: 'execution_unconfirmed', result_received: true },
+        result: { status: 'succeeded', response: 'x'.repeat(30_000) },
+      });
+      expect(long.response_excerpt).toHaveLength(20_000);
+    } finally {
+      delete process.env.NEWIDE_ROLE_RESPONSE_EXCERPT_CHARS;
+    }
+  });
+});

@@ -642,17 +642,29 @@ async function waitForTerminal(runId: string): Promise<RunSnapshot> {
   throw new Error(`Run ${runId} did not reach a terminal state`);
 }
 
+/**
+ * 校验真实外部 runner 模式产出的贪吃蛇文件。
+ *
+ * 阶段 5 修复：`RunSnapshot.artifacts` 的协议是 `z.array(recordSchema)`，快照投影只保证
+ * `{artifact_id}`（交付文件的路径不在里面），旧断言从 `artifacts[].source_path/metadata.path`
+ * 取路径，在外部 runner 模式下**永远**找不到文件——之前的情况不是 driver 没交付，而是断言读错
+ * 了字段。这里按交付事实的来源取路径：`delivery_report.files_written`（materialization 写入的
+ * 绝对路径）→ `final_output.files_written`（旧字段回退）→ `artifacts` 里若真带路径再用。
+ */
 async function validateSnakeArtifact(
   snapshot: RunSnapshot,
   expectedFilename: string,
 ): Promise<string> {
-  const sourceFile = snapshot.artifacts
-    .map((artifact) => artifact.source_path ?? artifact.metadata?.path)
-    .find(
-      (artifactPath): artifactPath is string =>
-        typeof artifactPath === 'string' && path.basename(artifactPath) === expectedFilename,
-    );
-  assert(sourceFile, `No selected artifact points to ${expectedFilename}`);
+  const candidates = [
+    ...snapshot.delivery_report.files_written,
+    ...snapshot.final_output.files_written,
+    ...snapshot.artifacts.map((artifact) => artifact.source_path ?? artifact.metadata?.path),
+  ];
+  const sourceFile = candidates.find(
+    (artifactPath): artifactPath is string =>
+      typeof artifactPath === 'string' && path.basename(artifactPath) === expectedFilename,
+  );
+  assert(sourceFile, `No delivered file points to ${expectedFilename}`);
   const html = await fs.readFile(sourceFile, 'utf8');
   const normalized = html.toLowerCase();
   assert(normalized.includes('<html'), `${expectedFilename} is not an HTML document`);

@@ -759,6 +759,21 @@ describe('runRoleExecutionLoop: 首轮上下文与限制', () => {
     });
   });
 
+  it('NEWIDE_ROLE_TIME_BLIND=1 时系统提示不写 deadline，其他冻结预算照常', async () => {
+    const previous = process.env.NEWIDE_ROLE_TIME_BLIND;
+    process.env.NEWIDE_ROLE_TIME_BLIND = '1';
+    try {
+      const harness = makeHarness({ script: [completion([finishCall('completed')])] });
+      await runRoleExecutionLoop(harness.options);
+      const systemPrompt = harness.llm.calls[0]?.messages[0]?.content ?? '';
+      expect(systemPrompt).toContain('max_dispatches=12');
+      expect(systemPrompt).not.toContain('deadline_at=');
+    } finally {
+      if (previous === undefined) delete process.env.NEWIDE_ROLE_TIME_BLIND;
+      else process.env.NEWIDE_ROLE_TIME_BLIND = previous;
+    }
+  });
+
   it('usage 缺失只标 missing，不填 0；有 usage 时累计 token', async () => {
     const harness = makeHarness({
       script: [

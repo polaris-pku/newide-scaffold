@@ -778,7 +778,7 @@ import { join } from 'node:path';
           winner_agent_id: 'role_ts_engineer',
         });
       }
-      const externalSnapshot = service.getRunSnapshot(created.run_id);
+      const externalSnapshot = await service.getRunSnapshot(created.run_id);
       expect(externalSnapshot.delivery_report).toMatchObject({
         outcome: 'completed_response',
         response: 'Fake ACP completed the request.',
@@ -834,7 +834,7 @@ import { join } from 'node:path';
       ).toBe(true);
       unsubscribe();
       expect(councilSnapshot.status).toBe('completed');
-      const externalCouncilSnapshot = service.getRunSnapshot(councilCreated.run_id);
+      const externalCouncilSnapshot = await service.getRunSnapshot(councilCreated.run_id);
       expect(externalCouncilSnapshot.council).toMatchObject({
         phase: 'completed',
         subject: 'Exercise production council composition.',
@@ -949,7 +949,7 @@ import { join } from 'node:path';
       // 审者交付不出 reviews.json 就等于这次没有评审。议会不再降级出一个没被评审过的
       // 结果（旧行为会伪造 needs_revision 并照常完成），而是让这次 run 直接失败，
       // 并把原因写进终止错误里。
-      const failedRunSnapshot = service.getRunSnapshot(failedCouncilCreated.run_id);
+      const failedRunSnapshot = await service.getRunSnapshot(failedCouncilCreated.run_id);
       expect(failedRunSnapshot.status).toBe('failed');
       expect(failedRunSnapshot.errors.map((error) => error.message).join('\n')).toContain(
         'produced no reviews.json at the workspace root',

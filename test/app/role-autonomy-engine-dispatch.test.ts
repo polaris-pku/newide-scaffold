@@ -47,10 +47,7 @@ import {
 import { reconcileLateDriverResult, RoleAutonomyEngine } from '../../src/app/role-autonomy-engine';
 import { runRoleExecutionLoop } from '../../src/app/role-execution-loop';
 import { createRoleFinishValidator } from '../../src/app/role-autonomy-finish';
-import {
-  ROLE_DISPATCH_EVENT,
-  type RoleLifecycleEvent,
-} from '../../src/app/run-dispatch-events';
+import { ROLE_DISPATCH_EVENT, type RoleLifecycleEvent } from '../../src/app/run-dispatch-events';
 import { projectDispatchFacts } from '../../src/app/run-dispatch-projection';
 
 const temporaryDirectories: string[] = [];
@@ -517,6 +514,165 @@ async function waitForCondition(condition: () => boolean, timeoutMs: number): Pr
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
 }
+
+describe('explicit verification command (real child + Journal + Role loop)', () => {
+  it.each([true, false])('local checks obey read_only=%s', async (readOnly) => {
+    const fixture = await makeFixture();
+    const harness = makeHarness({
+      ...fixture,
+      finishValidator: createRoleFinishValidator,
+      loop: scriptedRoleLoop(({ round, messages }) => {
+        if (round === 1)
+          return toolCallCompletion('check', 'dispatch_execution', {
+            kind: 'verify',
+            read_only: readOnly,
+            instruction: 'generate and check output',
+            verification_command: {
+              executable: 'node',
+              args: ['-e', 'require("node:fs").writeFileSync("generated.txt", "checked")'],
+            },
+          });
+        return finishCompletion('finish', {
+          status: readOnly ? 'blocked' : 'completed',
+          summary: 'check result',
+          verification: [
+            {
+              requirement: 'generated check',
+              outcome: readOnly ? 'failed' : 'passed',
+              dispatch_ids: [lastDispatchId(messages)!],
+            },
+          ],
+        });
+      }),
+    });
+    const pending = harness.engine.run({
+      ...IDENTITY,
+      run_id: fixture.runId,
+      instruction: 'generate and check output',
+      workspace_path: fixture.workspace,
+    });
+    if (readOnly)
+      await expect(pending).rejects.toMatchObject({ termination: { code: 'role_blocked' } });
+    else await expect(pending).resolves.toMatchObject({ status: 'completed' });
+    expect(harness.driverCalls()).toBe(0);
+    const fold = await readFold(fixture.runsRoot, fixture.runId);
+    expect(fold.records[0]?.violations).toEqual(readOnly ? ['read_only_changed'] : []);
+    expect(fold.records[0]?.status).toBe(readOnly ? 'failed' : 'succeeded');
+  });
+
+  it.each(['settings.local.json', 'settings.json'])(
+    'ordinary read-only dispatch writing %s is classified precisely',
+    async (file) => {
+      const fixture = await makeFixture();
+      const harness = makeHarness({
+        ...fixture,
+        sendPrompt: async () => {
+          await fs.mkdir(path.join(fixture.workspace, '.claude'), { recursive: true });
+          await fs.writeFile(path.join(fixture.workspace, '.claude', file), '{}');
+          return driverResult('succeeded', 'analysis complete');
+        },
+        finishValidator: createRoleFinishValidator,
+        loop: scriptedRoleLoop(({ round, messages }) => {
+          if (round === 1)
+            return toolCallCompletion('read', 'dispatch_execution', {
+              kind: 'investigate',
+              instruction: 'analyze without changing project files',
+            });
+          return finishCompletion('finish', {
+            status: file === 'settings.local.json' ? 'completed' : 'blocked',
+            summary: 'analysis',
+            verification: [
+              {
+                requirement: 'read only',
+                outcome: 'not_run',
+                dispatch_ids: [lastDispatchId(messages)!],
+              },
+            ],
+          });
+        }),
+      });
+      const pending = harness.engine.run({
+        ...IDENTITY,
+        run_id: fixture.runId,
+        instruction: 'analyze the project',
+        workspace_path: fixture.workspace,
+      });
+      if (file === 'settings.local.json')
+        await expect(pending).resolves.toMatchObject({ status: 'completed' });
+      else await expect(pending).rejects.toMatchObject({ termination: { code: 'role_blocked' } });
+      const fold = await readFold(fixture.runsRoot, fixture.runId);
+      expect(fold.records[0]?.violations).toEqual(
+        file === 'settings.local.json' ? [] : ['read_only_changed'],
+      );
+      expect((await fs.lstat(path.join(fixture.workspace, '.claude'))).isDirectory()).toBe(true);
+      expect((await fs.lstat(path.join(fixture.workspace, '.claude'))).isSymbolicLink()).toBe(
+        false,
+      );
+    },
+  );
+  it.each([0, 7])('runs the check once and finishes with observed exit %i', async (exitCode) => {
+    const fixture = await makeFixture();
+    await fs.writeFile(
+      path.join(fixture.workspace, 'verify.mjs'),
+      `import fs from 'node:fs'; console.log('CHECK_OUTPUT');
+       if (fs.readFileSync('file.txt', 'utf8') !== 'fixed') process.exit(9);
+       process.exit(${exitCode});`,
+    );
+    let observedChecks: unknown;
+    const harness = makeHarness({
+      ...fixture,
+      sendPrompt: async () => {
+        await fs.writeFile(path.join(fixture.workspace, 'file.txt'), 'fixed');
+        return driverResult('succeeded', 'fixed; no command observation support');
+      },
+      finishValidator: createRoleFinishValidator,
+      loop: scriptedRoleLoop(({ round, messages }) => {
+        if (round === 1) return dispatchCompletion('fix');
+        if (round === 2)
+          return toolCallCompletion('check', 'dispatch_execution', {
+            kind: 'verify',
+            instruction: 'run the project check',
+            verification_command: { executable: 'node', args: ['verify.mjs'] },
+          });
+        const last = messages.filter((message) => message.role === 'tool').at(-1);
+        observedChecks = JSON.parse(String(last?.content)).data.checks;
+        return finishCompletion('finish', {
+          status: exitCode === 0 ? 'completed' : 'failed',
+          summary: `check exited ${exitCode}`,
+          verification: [
+            {
+              requirement: 'project check',
+              outcome: exitCode === 0 ? 'passed' : 'failed',
+              dispatch_ids: [lastDispatchId(messages)!],
+            },
+          ],
+        });
+      }),
+    });
+    const pending = harness.engine.run({
+      ...IDENTITY,
+      run_id: fixture.runId,
+      instruction: 'fix the bug and run the project check',
+      workspace_path: fixture.workspace,
+    });
+    if (exitCode === 0) await expect(pending).resolves.toMatchObject({ status: 'completed' });
+    else await expect(pending).rejects.toMatchObject({ termination: { code: 'role_failed' } });
+    expect(harness.driverCalls()).toBe(1);
+    expect(observedChecks).toMatchObject([
+      { exit_code: exitCode, provenance: 'host_observed', observation: 'complete' },
+    ]);
+    const fold = await readFold(fixture.runsRoot, fixture.runId);
+    expect(fold.records).toHaveLength(2);
+    expect(fold.finish?.status).toBe(exitCode === 0 ? 'completed' : 'failed');
+    const check = fold.records[1]?.evidence?.checks[0];
+    expect(check?.workspace_sha256).toBe(await workspaceContentSha(fixture.workspace));
+    const reader = await RunDispatchJournal.peek({
+      runDir: path.join(fixture.runsRoot, fixture.runId),
+      identity: { run_id: fixture.runId, ...IDENTITY },
+    });
+    expect((await reader.readEvidence(check!.stdout_ref!)).text).toContain('CHECK_OUTPUT');
+  });
+});
 
 describe('role 引擎派工链路（真实 journal + fake driver）', () => {
   it('成功派工：一次 attempt、accepted→dispatched→settled 完整，fold 为 succeeded', async () => {

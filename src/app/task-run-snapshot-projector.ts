@@ -17,17 +17,29 @@ import { nodeCodeForCursor, stageForCursor } from './run-stage-mapping';
 import { projectDispatchFacts } from './run-dispatch-projection';
 
 /**
+ * 只读 Journal 折叠记录的类型别名。
+ *
+ * 投影器本身就要用 `DispatchRecord`（来自 driver 模块），但调用方
+ * `src/coordination/task-processor.ts` 不该为此新增一条「协调层 → driver」的依赖边：
+ * 它从本项目已有的协调层 → app 投影器依赖里拿这个别名，参数类型仍然逐位相同。
+ */
+export type RunDispatchFacts = readonly DispatchRecord[];
+
+/**
  * 从协调库持久事件投影 Run 快照（重启后的 `run.getSnapshot` 回读路径）。
  *
  * `journalRecords` 是只读 Journal 事实（阶段 4 修复 R4-01）：持久事件里缺 accepted/settled
  * 时用它补齐派工摘要/进度，与存活期投影器共用同一条合并/有效状态规则。不传则保持纯事件
  * 投影（legacy Run 语义不变）。
+ *
+ * **生产调用者是 `NewideBackendService.getRunSnapshot`**：它先 `readRunDispatchFacts`
+ * 读本 Run Journal，再把结果传到这里；终态 writer 走同一份事实。两者都不在这里做 I/O。
  */
 export function projectPersistedRunSnapshot(
   aggregate: PersistedTaskAggregate,
   runId: string,
   runsRoot = '.newide/runs',
-  journalRecords?: readonly DispatchRecord[],
+  journalRecords?: RunDispatchFacts,
 ): RunSnapshot {
   const run = aggregate.runs.find((candidate) => candidate.run_id === runId);
   if (!run) throw new Error(`Run ${runId} does not belong to Task ${aggregate.task.task_id}`);
