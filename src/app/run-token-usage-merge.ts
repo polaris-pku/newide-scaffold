@@ -17,12 +17,20 @@
 import { promises as fs } from 'node:fs';
 import {
   collectClaudeSessionUsage,
+  collectCodexSessionUsage,
   isPopulatedRunTokenUsage,
   mergeTokenUsageSummaries,
+  type CollectCodexSessionUsage,
   type RunTokenUsageSummary,
 } from '../telemetry';
 
 export type CollectClaudeSessionUsage = typeof collectClaudeSessionUsage;
+
+/** 已经并过的 driver 计费腿；任一存在即视为本 run 的 driver 计费已入账。 */
+const DRIVER_BILLED_SOURCES = ['claude_session_jsonl', 'codex_jsonl'] as const;
+
+/** `driver_billed_usage.source` 的兜底名（两条腿都没数据时仍按历史名报）。 */
+const FALLBACK_DRIVER_SOURCE = 'claude_session_jsonl';
 
 export type BilledTokenUsageMergeStatus =
   /** 合并后的数字更大，已写回。 */
@@ -64,6 +72,7 @@ export interface BilledTokenUsageMergeResult {
 export async function mergeBilledTokenUsage(
   summaryPath: string,
   collect: CollectClaudeSessionUsage = collectClaudeSessionUsage,
+  collectCodex: CollectCodexSessionUsage = collectCodexSessionUsage,
 ): Promise<BilledTokenUsageMergeResult> {
   let raw: Record<string, unknown>;
   try {
@@ -76,7 +85,7 @@ export async function mergeBilledTokenUsage(
 
   const existing = isPopulatedRunTokenUsage(raw.token_usage) ? raw.token_usage : undefined;
   const before = existing?.total_tokens ?? 0;
-  const outcome = await resolveBilledMerge({ raw, existing, before, collect });
+  const outcome = await resolveBilledMerge({ raw, existing, before, collect, collectCodex });
   // 状态与 token 数字**同一次写入**：分两次写会出现「数字更新了但状态还是旧的」那种半更新。
   raw.driver_billed_merge = outcome.result;
   if (outcome.merged) {
@@ -99,8 +108,9 @@ async function resolveBilledMerge(input: {
   existing: RunTokenUsageSummary | undefined;
   before: number;
   collect: CollectClaudeSessionUsage;
+  collectCodex: CollectCodexSessionUsage;
 }): Promise<{ result: BilledTokenUsageMergeResult; merged?: RunTokenUsageSummary }> {
-  const { raw, existing, before, collect } = input;
+  const { raw, existing, before, collect, collectCodex } = input;
   const noChange = (status: BilledTokenUsageMergeStatus): BilledTokenUsageMergeResult => ({
     status,
     total_tokens_before: before,
@@ -108,8 +118,8 @@ async function resolveBilledMerge(input: {
   });
 
   // 幂等：driver 那一腿并过就不再并。`mergeTokenUsageSummaries` 是求和，收尾路径若重入，
-  // 同一批 token 会被数两遍。
-  if (existing?.sources.includes('claude_session_jsonl')) {
+  // 同一批 token 会被数两遍。两条 driver 腿（Claude / Codex）任一存在都算已并过。
+  if (existing !== undefined && DRIVER_BILLED_SOURCES.some((name) => existing.sources.includes(name))) {
     return { result: noChange('already_merged') };
   }
   const worktreePath = nonEmptyString(raw.worktree_path);
@@ -117,18 +127,27 @@ async function resolveBilledMerge(input: {
 
   const sessionId = nonEmptyString(raw.session_id);
   const sessionIds = collectDriverSessionIds(raw, sessionId);
-  let scraped: RunTokenUsageSummary;
-  try {
-    scraped = await collect({
-      worktreePath,
-      ...(sessionId ? { sessionId } : {}),
-      ...(sessionIds.length > 0 ? { sessionIds } : {}),
-    });
-  } catch {
-    return { result: noChange('scrape_failed') };
+  const scrapeInput = {
+    worktreePath,
+    ...(sessionId ? { sessionId } : {}),
+    ...(sessionIds.length > 0 ? { sessionIds } : {}),
+  };
+  // 哪个 driver 写的会话由档案决定；这里对两条腿都尝试，只有匹配到的会话才会出数，
+  // 所以 Claude run 不会被 Codex 的会话污染，反之亦然。单条腿抛错不拖累另一条。
+  let scrapeFailed = false;
+  const parts: RunTokenUsageSummary[] = [];
+  for (const collector of [collect, collectCodex]) {
+    try {
+      parts.push(await collector(scrapeInput));
+    } catch {
+      scrapeFailed = true;
+    }
   }
+  const scraped = mergeTokenUsageSummaries(parts);
   const usable = scraped.call_count > 0 || scraped.total_tokens > 0;
-  if (!usable) return { result: noChange('skipped_no_session_usage') };
+  if (!usable) {
+    return { result: noChange(scrapeFailed ? 'scrape_failed' : 'skipped_no_session_usage') };
+  }
 
   const merged = mergeTokenUsageSummaries(existing ? [existing, scraped] : [scraped]);
   if (merged.total_tokens <= before) return { result: noChange('unchanged') };
@@ -159,7 +178,12 @@ function buildDriverBilledUsage(
   );
   if (sessions.length === 0) return undefined;
   const contextBySession = readContextSessionsBySessionId(raw);
-  const leg = merged.by_source.claude_session_jsonl;
+  // 计费腿的名字由 driver 档案决定：Claude 会话是 claude_session_jsonl，
+  // Codex 是 codex_jsonl。取实际存在的那条，不要写死历史名。
+  const legName =
+    DRIVER_BILLED_SOURCES.find((name) => merged.by_source[name] !== undefined) ??
+    FALLBACK_DRIVER_SOURCE;
+  const leg = merged.by_source[legName];
   const totals = leg ??
     sessions.reduce(
       (sum, session) => ({
@@ -183,7 +207,7 @@ function buildDriverBilledUsage(
       },
     );
   return {
-    source: 'claude_session_jsonl',
+    source: legName,
     metric: 'billed_tokens',
     input_tokens: totals.input_tokens,
     output_tokens: totals.output_tokens,
