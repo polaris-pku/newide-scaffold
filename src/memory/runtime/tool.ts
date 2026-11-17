@@ -73,6 +73,12 @@ export interface ToolCallResult {
    * role token 预算依赖它可观测；缺失时省略字段，由消费方标记 missing。
    */
   usage?: ToolCallUsage;
+  /**
+   * provider 的结束原因（`stop` / `length` / `tool-calls` …；加法扩展，旧调用方可忽略）。
+   * `length` 表示输出被 maxTokens 截断；消费方据此区分「正常回合」与「被截断的回合」，
+   * 缺失时省略字段（不猜测）。
+   */
+  finish_reason?: string;
 }
 
 /**

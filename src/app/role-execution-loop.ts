@@ -9,6 +9,9 @@
  *   **纯文本（含“完成/done”）不结束循环**；零派工也必须显式 `finish_task`。
  * - 工具执行全部委托给隔离工具表（role-autonomy-tools）；同一回复多个 dispatch 串行执行；
  *   finish 接受后剩余工具由工具表以 `ROLE_ALREADY_FINISHED` 拒绝。
+ * - 输出被输出上限截断且没有产生任何动作（`finish_reason=length`、无正文、无 tool_call）时，
+ *   不把这条空 assistant 写进历史（重放它会触发思考模式的 reasoning_content 协议错误），
+ *   改为追加一条不含任务特性的提醒并重试一次；连续截断以 `output_truncated` 终止。
  * - finish 接受后由本 loop 调用 `role-autonomy-finish` 的唯一生产落盘点 `persistRoleFinish`
  *   （actor=role，带 summary/unresolved/role_reflection/response_only/verification/zero_dispatch）；
  *   写失败抛 `RoleTerminationError({code:'journal_write_failed',actor:'host'})`，然后返回
@@ -44,6 +47,14 @@ const DEFAULT_TOOL_RESULT_CHARS = 8_000;
 /** 保留完整内容的最近 dispatch 工具结果条数；更早的压缩成占位符。 */
 const DEFAULT_DISPATCH_HISTORY = 12;
 const TRUNCATION_MARKER = '…[truncated]';
+
+/**
+ * 被输出上限截断且没有产生任何动作时，重试一次所追加的提醒。
+ * 只陈述「上次没有动作、现在直接给一个工具调用」，不含任何任务特性。
+ */
+const TRUNCATED_TURN_NUDGE =
+  'Your previous response hit the output token limit before producing any action. ' +
+  'Respond now with a single tool call, and keep reasoning brief.';
 
 interface ResolvedLimits {
   history_messages: number;
@@ -90,6 +101,8 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
   let inputTokens = 0;
   let outputTokens = 0;
   let usageMissing = options.consumed.tokens_missing;
+  /** 截断空回合的重试预算：只允许连续重试一次，成功后复位。 */
+  let truncatedTurnRetried = false;
 
   for (;;) {
     throwIfCancelled(options.signal);
@@ -139,6 +152,27 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
       countedToolCalls,
     );
     options.budget.assertTokenBudget(now());
+
+    // 输出截断且没有产生任何动作：这条空 assistant 不能写进历史——重放它会让
+    // 思考模式的下一次请求因缺少 reasoning 而 400；改为追加一条极简提醒重试一次。
+    const truncatedEmptyTurn =
+      completion.finish_reason === 'length' &&
+      (completion.content ?? '').trim().length === 0 &&
+      (completion.tool_calls?.length ?? 0) === 0;
+    if (truncatedEmptyTurn) {
+      if (truncatedTurnRetried) {
+        throw new RoleTerminationError({
+          code: 'output_truncated',
+          actor: 'host',
+          message: 'role output hit the output-token limit twice without producing an action',
+          details: { round },
+        });
+      }
+      truncatedTurnRetried = true;
+      messages.push({ role: 'user', content: TRUNCATED_TURN_NUDGE });
+      continue;
+    }
+    truncatedTurnRetried = false;
 
     messages.push(assistantMessage(completion));
 

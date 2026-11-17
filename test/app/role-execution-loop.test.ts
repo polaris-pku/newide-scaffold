@@ -219,11 +219,13 @@ function completion(
   toolCalls: ToolCall[],
   content: string | null = null,
   usage?: RoleLlmUsage,
+  finishReason?: string,
 ): RoleLlmCompletion {
   return {
     content,
     tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
     ...(usage !== undefined ? { usage } : {}),
+    ...(finishReason !== undefined ? { finish_reason: finishReason } : {}),
   };
 }
 
@@ -925,5 +927,74 @@ describe('复审修复：最终答复 / 在途取消与墙钟 / 恢复真实工�
       actor: 'user',
     });
     expect(harness.llm.calls).toHaveLength(0);
+  });
+});
+
+describe('runRoleExecutionLoop: 输出被截断', () => {
+  it('截断且无动作：不写空 assistant、追加提醒并重试一次后继续', async () => {
+    const harness = makeHarness({
+      script: [
+        completion([], null, { input_tokens: 100, output_tokens: 8000 }, 'length'),
+        completion([finishCall('completed', 'finished after retry')]),
+      ],
+    });
+
+    const outcome = await runRoleExecutionLoop(harness.options);
+
+    expect(outcome.status).toBe('completed');
+    expect(harness.llm.calls).toHaveLength(2);
+    const retriedMessages = harness.llm.calls[1]?.messages ?? [];
+    // 空 assistant 不进入历史：重放它会让思考模式的下一次请求缺 reasoning 而失败。
+    expect(
+      retriedMessages.some(
+        (message) => message.role === 'assistant' && (message.content ?? '').trim() === '',
+      ),
+    ).toBe(false);
+    // 重试以一条不含任务特性的 user 提醒表达。
+    expect(
+      retriedMessages.some(
+        (message) =>
+          message.role === 'user' && (message.content ?? '').includes('output token limit'),
+      ),
+    ).toBe(true);
+    // 被截断回合的用量仍然记账（token 已经花掉）。
+    expect(harness.budget.rounds[0]?.usage?.output_tokens).toBe(8000);
+  });
+
+  it('连续两次截断：以 output_truncated 终止，不再重放空 assistant', async () => {
+    const harness = makeHarness({
+      script: [
+        completion([], null, { input_tokens: 10, output_tokens: 8000 }, 'length'),
+        completion([], null, { input_tokens: 20, output_tokens: 8000 }, 'length'),
+      ],
+    });
+
+    const error = await runRoleExecutionLoop(harness.options).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(RoleTerminationError);
+    expect((error as RoleTerminationError).termination).toMatchObject({
+      code: 'output_truncated',
+      actor: 'host',
+    });
+    expect(harness.llm.calls).toHaveLength(2);
+  });
+
+  it('finish_reason 缺失时不按截断处理：正常执行工具', async () => {
+    const harness = makeHarness({
+      statuses: ['succeeded'],
+      script: [
+        completion([dispatchCall('investigate', 'look around')]),
+        completion([finishCall('completed', 'done')]),
+      ],
+    });
+
+    const outcome = await runRoleExecutionLoop(harness.options);
+
+    expect(outcome.status).toBe('completed');
+    expect(harness.dispatch.calls).toHaveLength(1);
+    expect(harness.llm.calls).toHaveLength(2);
   });
 });

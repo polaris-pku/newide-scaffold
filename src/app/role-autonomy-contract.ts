@@ -249,6 +249,7 @@ export const ROLE_TERMINATION_CODES = [
   'budget_tokens',
   'budget_wall_clock',
   'budget_tool_calls',
+  'output_truncated',
   'host_failed',
   'host_cancelled',
   'dispatch_unknown_unresolved',
@@ -648,6 +649,11 @@ export interface RoleLlmCompletion {
   tool_calls: ToolCallResult['tool_calls'];
   /** 缺失即不填（不填 0）；loop 据此标记 tokens_missing。 */
   usage?: RoleLlmUsage;
+  /**
+   * provider 结束原因；`length` 表示输出被 maxTokens 截断。缺失时不猜测。
+   * loop 用它与「无正文、无 tool_call」一起识别被截断的空回合。
+   */
+  finish_reason?: string;
 }
 
 export interface RoleLlmPort {

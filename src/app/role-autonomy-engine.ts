@@ -1208,6 +1208,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
           content: result.content,
           tool_calls: result.tool_calls,
           ...(usage !== undefined ? { usage } : {}),
+          ...(result.finish_reason !== undefined
+            ? { finish_reason: result.finish_reason }
+            : {}),
         };
       },
     };

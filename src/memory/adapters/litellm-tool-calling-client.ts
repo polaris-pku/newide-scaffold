@@ -390,6 +390,10 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
           ? toToolCalls(result.toolCalls as unknown[])
           : undefined,
       ...(usage !== undefined ? { usage } : {}),
+      // `length` 表示输出被 maxTokens 截断；上层据此识别「被截断的回合」。
+      ...(result.finishReason !== undefined
+        ? { finish_reason: String(result.finishReason) }
+        : {}),
     };
   }
 }
