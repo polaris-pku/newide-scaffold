@@ -218,6 +218,8 @@ export class FakeDispatchPort implements RoleDispatchPort {
     this.active += 1;
     this.maxActive = Math.max(this.maxActive, this.active);
     try {
+      // accepted/dispatched 已 durable、Driver 尚未开始：阶段 1 的准入释放点。
+      input.on_dispatched?.();
       // 让「并行执行」在这里暴露：串行时 maxActive 恒为 1。
       await Promise.resolve();
       const barrierStage = this.barrierStages.shift();

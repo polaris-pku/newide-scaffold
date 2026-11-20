@@ -116,6 +116,37 @@ describe('buildRoleAutonomySelectionConfig', () => {
     ).toThrow('NEWIDE_ROLE_MAX_DISPATCHES');
   });
 
+  it('parses stage 1 parallel read-only config and rejects invalid caps at startup', () => {
+    expect(
+      buildRoleAutonomySelectionConfig(
+        {
+          NEWIDE_ROLE_AUTONOMY: '1',
+          NEWIDE_ROLE_PARALLEL_READ_ONLY: '1',
+          NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES: '3',
+        },
+        { wired: true },
+      ),
+    ).toMatchObject({ parallel_read_only: true, max_parallel_dispatches: 3 });
+    // 未声明时保持旧对象形状（字段不出现 = 关闭 + 上限 1）。
+    expect(buildRoleAutonomySelectionConfig({}, { wired: true })).not.toHaveProperty(
+      'parallel_read_only',
+    );
+    for (const invalid of ['0', '9', '2.5', 'many']) {
+      expect(() =>
+        buildRoleAutonomySelectionConfig(
+          { NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES: invalid },
+          { wired: true },
+        ),
+      ).toThrow('NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES');
+    }
+    expect(() =>
+      buildRoleAutonomySelectionConfig(
+        { NEWIDE_ROLE_PARALLEL_READ_ONLY: 'maybe' },
+        { wired: true },
+      ),
+    ).toThrow('NEWIDE_ROLE_PARALLEL_READ_ONLY');
+  });
+
   it('parses stage 3 switches and rejects illegal combinations at startup', () => {
     expect(
       buildRoleAutonomySelectionConfig(

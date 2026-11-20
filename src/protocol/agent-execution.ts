@@ -102,6 +102,9 @@ export interface RoleFreezePlanInput {
   /** 阶段 3 开关（默认关闭；与预算一起在 Journal init 行冻结）。 */
   evidence_only?: boolean;
   buffer_v2?: boolean;
+  /** 阶段 1 同回复只读并发开关/上限（默认关闭、上限 1；与预算一起冻结）。 */
+  parallel_read_only?: boolean;
+  max_parallel_dispatches?: number;
 }
 
 export interface AgentExecutionOptions {

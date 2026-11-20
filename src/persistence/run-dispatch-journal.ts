@@ -417,6 +417,12 @@ export interface JournalInitAppendInput {
   dispatch_timeout_ms?: number;
   /** TaskBudget.max_tool_calls 映射后的任务级工具调用上限。 */
   max_tool_calls?: number;
+  /**
+   * 阶段 1 同回复只读并发开关/上限（旧记录可缺省 → 关闭、上限 1）。
+   * 必须随 init 一起 durable，否则 restart 读回时会静默退回串行。
+   */
+  parallel_read_only?: boolean;
+  max_parallel_dispatches?: number;
   entry_id?: string;
   at?: string;
 }
@@ -1623,6 +1629,12 @@ export class RunDispatchJournal implements DispatchJournalPort {
         ? { dispatch_timeout_ms: input.dispatch_timeout_ms }
         : {}),
       ...(input.max_tool_calls !== undefined ? { max_tool_calls: input.max_tool_calls } : {}),
+      ...(input.parallel_read_only !== undefined
+        ? { parallel_read_only: input.parallel_read_only }
+        : {}),
+      ...(input.max_parallel_dispatches !== undefined
+        ? { max_parallel_dispatches: input.max_parallel_dispatches }
+        : {}),
     });
     if (dedupeByEntryId(snapshot, line)) return;
     const existing = snapshot.lines.find((entry) => entry.event === 'init');

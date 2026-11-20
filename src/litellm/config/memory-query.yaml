@@ -10,5 +10,8 @@ tasks:
     temperature: 0.1
     # 经验提取的 JSON 响应实测需 616~3491 completion token（该模型带 reasoning，
     # 长度方差大），4000 余量不足会截断在字符串中间 → 提取静默降级到规则版。
-    # 8000 对齐 profiles.yaml 的 coding 档。
-    maxTokens: 8000
+    # 思考模型的推理与正文共享这一输出预算：role 决策层复用本 profile 时，
+    # 8,000 会在「读完长回执再决策」的回合把推理截断（实测 dask 任务两次撞顶，
+    # 空正文、无 tool_call）。32,768 只是天花板，不预分配成本；实测该端点接受
+    # 16k/32k/64k 的 max_tokens。
+    maxTokens: 32768

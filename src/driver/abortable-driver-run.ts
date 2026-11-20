@@ -31,12 +31,20 @@ export async function runDriverPromptWithSignal(
   if (signal?.aborted) {
     const reason = abortReason(signal);
     // 宿主侧超时必须独立收束：interrupt 只是尽力通知，不能等待它返回（它可能永远挂起）。
-    requestInterrupt(driver, reason.message, input.run_id);
+    requestInterrupt(driver, reason.message, activeKeyOf(input));
     throw reason;
   }
 
   const unsubscribe = onDriverEvent
     ? driver.subscribeToEvents?.((event) => {
+        // 阶段 1：同 Run 并发只读调查共享 driver/transport。事件带 dispatch_id 时按派工隔离；
+        // 不带（legacy 订阅方/不标注的 transport）时保持按 run_id 过滤——此时并发隔离取决于
+        // transport 是否标注，CommandDriverTransport 已标注。
+        if (input.dispatch_id !== undefined && event.dispatch_id !== undefined) {
+          if (event.dispatch_id !== input.dispatch_id) return;
+        } else if (event.run_id && event.run_id !== input.run_id) {
+          return;
+        }
         if (event.run_id && event.run_id !== input.run_id) return;
         if (event.task_id && event.task_id !== input.task_id) return;
         onDriverEvent(event);
@@ -57,7 +65,7 @@ export async function runDriverPromptWithSignal(
       const reason = abortReason(signal);
       // 同步 reject：不能等 driver.interrupt 返回（复审复现：prompt/interrupt 都不合作时
       // 单派工超时必须仍及时收束）。interrupt 的失败/迟到结算只吞掉，不影响终止。
-      requestInterrupt(driver, reason.message, input.run_id);
+      requestInterrupt(driver, reason.message, activeKeyOf(input));
       reject(reason);
     };
     signal.addEventListener('abort', onAbort, { once: true });
@@ -112,4 +120,9 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
     : new Error(String(signal.reason ?? 'Run cancelled'));
+}
+
+/** transport 的活动键：派工并发时用 dispatch_id，legacy 调用回退 run_id。 */
+function activeKeyOf(input: DriverPrompt): string {
+  return input.dispatch_id ?? input.run_id;
 }

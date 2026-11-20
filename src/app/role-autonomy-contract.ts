@@ -109,6 +109,21 @@ export const ROLE_BUDGET_DEFAULTS = {
  */
 export const ROLE_DEFAULT_MAX_TOOL_CALLS = 64;
 
+/**
+ * 阶段 1 同回复只读并发的上限边界。
+ *
+ * `1` 表示串行（默认、旧行为）；大于 1 时只有显式 `kind=investigate && read_only=true`
+ * 且没有 `verification_command` 的派工可以重叠。上限刻意封顶 8：并发提升的是单位墙钟
+ * 覆盖率，不是无限扇出，超过这个数只会在共享 workspace/Session 上放大争用。
+ */
+export const ROLE_MAX_PARALLEL_DISPATCHES_LIMIT = 8;
+
+/** 把冻结/配置里的并发上限收敛到合法区间；缺失或非法一律按 1（串行）解释。 */
+export function normalizeMaxParallelDispatches(value: number | undefined): number {
+  if (value === undefined || !Number.isInteger(value) || value < 1) return 1;
+  return Math.min(value, ROLE_MAX_PARALLEL_DISPATCHES_LIMIT);
+}
+
 export type RoleBudgetLimits = {
   max_dispatches: number;
   max_role_rounds: number;
@@ -703,6 +718,14 @@ export interface RoleDispatchInput {
   brief: ExecutionBrief;
   brief_sha256: string;
   budget_before: BudgetSnapshot;
+  /**
+   * accepted 与 dispatched 两行都 durable 之后、Driver 真正开始之前的唯一回调。
+   *
+   * 阶段 1 用它把「派工准入」与「Driver 执行等待」拆开：工具表在同一回复内并发启动多个
+   * 只读调查时，凭这个回调在准入完成后立即释放序号/预算预留锁，而不是等 Driver 结束。
+   * 回调在本 Run 的派工路径上最多调用一次；实现未提供时调用方必须按「串行」退化。
+   */
+  on_dispatched?: () => void;
 }
 
 export type RoleDispatchObservation = {
@@ -815,6 +838,13 @@ export interface RoleFrozenPolicy {
   tool_allowlist: RoleToolName[];
   evidence_only: boolean;
   buffer_v2: boolean;
+  /**
+   * 阶段 1 同回复只读并发开关（冻结值，默认关闭）。旧冻结记录没有该字段时按关闭解释，
+   * 因此恢复不会因为部署后来打开并行而切换同一 Run 的执行策略。
+   */
+  parallel_read_only?: boolean;
+  /** 同时运行的安全只读调查上限（1..8）；缺省 1 = 串行。 */
+  max_parallel_dispatches?: number;
   budget: RoleFrozenBudget;
   routing: RoleFrozenRouting;
 }
@@ -835,6 +865,9 @@ export interface RoleFrozenPolicyPlan {
   /** 首次进入 execute_agent 时冻结的 stage 3 开关（恢复时从 init 行读回，不随部署变化）。 */
   evidence_only: boolean;
   buffer_v2: boolean;
+  /** 阶段 1 同回复只读并发开关/上限（与预算一起冻结；缺省关闭、上限 1）。 */
+  parallel_read_only?: boolean;
+  max_parallel_dispatches?: number;
 }
 
 /** 由选路模块构造、交给 journal.appendInit 的完整冻结参数（身份字段由宿主填）。 */
@@ -853,6 +886,9 @@ export interface RoleFreezeInitInput {
   dispatch_timeout_ms: number;
   /** TaskBudget.max_tool_calls 映射后的任务级工具调用上限（旧冻结记录可缺省）。 */
   max_tool_calls?: number;
+  /** 阶段 1 同回复只读并发开关/上限（旧冻结记录可缺省 → 关闭、上限 1）。 */
+  parallel_read_only?: boolean;
+  max_parallel_dispatches?: number;
 }
 
 export function buildRoleFreezeInitInput(input: {
@@ -862,6 +898,8 @@ export function buildRoleFreezeInitInput(input: {
   routing?: RoleFrozenRouting;
   evidence_only?: boolean;
   buffer_v2?: boolean;
+  parallel_read_only?: boolean;
+  max_parallel_dispatches?: number;
   now?: string;
 }): RoleFreezeInitInput {
   return {
@@ -878,6 +916,12 @@ export function buildRoleFreezeInitInput(input: {
     routing: input.routing ?? {},
     dispatch_timeout_ms: input.limits.dispatch_timeout_ms,
     ...(input.max_tool_calls !== undefined ? { max_tool_calls: input.max_tool_calls } : {}),
+    ...(input.parallel_read_only !== undefined
+      ? { parallel_read_only: input.parallel_read_only }
+      : {}),
+    ...(input.max_parallel_dispatches !== undefined
+      ? { max_parallel_dispatches: input.max_parallel_dispatches }
+      : {}),
   };
 }
 
@@ -922,6 +966,9 @@ export function roleFrozenPolicyFromJournalInit(
     // 阶段 3：开关从冻结记录读回，恢复不随部署默认值切换（同一 Run 内数据格式解释不变）。
     evidence_only: init.evidence_only,
     buffer_v2: init.buffer_v2,
+    // 阶段 1：旧冻结记录没有并发字段 → 关闭 + 上限 1（保持原串行行为）。
+    parallel_read_only: init.parallel_read_only === true,
+    max_parallel_dispatches: normalizeMaxParallelDispatches(init.max_parallel_dispatches),
     budget: {
       limits,
       deadline_at: init.deadline_at,
@@ -994,8 +1041,17 @@ export interface RoleLoopOptions {
   consumed: RoleBudgetConsumption;
   clock?: () => Date;
   signal?: AbortSignal;
-  /** 单回合普通文本上限/工具结果上限（防止上下文无限增长）。 */
-  limits?: { history_messages?: number; tool_result_chars?: number; dispatch_history?: number };
+  /**
+   * 单回合普通文本上限/工具结果上限（防止上下文无限增长）。
+   * `max_parallel_dispatches` 只对“显式只读的调查派工”生效：>1 时同一条回复里相互独立的
+   * `kind=investigate && read_only=true` 派工并发执行；写/验证派工永远串行。默认 1（现行为）。
+   */
+  limits?: {
+    history_messages?: number;
+    tool_result_chars?: number;
+    dispatch_history?: number;
+    max_parallel_dispatches?: number;
+  };
   /**
    * 阶段 4 生命周期观察（只作投影信号，不参与决策/验收）：
    * role 计划更新。缺失时不发事件，loop 语义与从前逐位一致。

@@ -24,6 +24,7 @@ import {
   buildRoleFreezeInitInput,
   DEFAULT_ROLE_AUTONOMY_SWITCHES,
   isRoleAutonomySwitchCombinationValid,
+  normalizeMaxParallelDispatches,
   ROLE_AUTONOMY_ENGINE,
   resolveRolePolicyBudget,
   roleFrozenPolicyFromJournalInit,
@@ -52,6 +53,13 @@ export interface RoleAutonomySelectionConfig {
   task_budget?: TaskBudget;
   /** 冻结的 routing 引用（只记录，不迁移 Session/记忆）。 */
   routing?: RoleFrozenRouting;
+  /**
+   * 阶段 1 同回复只读并发开关（`NEWIDE_ROLE_PARALLEL_READ_ONLY`），默认关闭。
+   * 只有开关打开且上限 > 1 时才真正并行；缺省值保持旧串行行为。
+   */
+  parallel_read_only?: boolean;
+  /** 同时运行的安全只读调查上限（`NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES`，1..8）。 */
+  max_parallel_dispatches?: number;
 }
 
 export interface RoleEngineSelectionInput {
@@ -263,6 +271,13 @@ export async function selectRoleExecutionEngine(
     now.getTime() + resolved.limits.wall_clock_seconds * 1_000,
   ).toISOString();
   const routing = config.routing ?? {};
+  // 阶段 1：并发上限与开关同源冻结。开关关着时冻结值为 1（串行），部署后来打开也不会
+  // 改写已开始 Run 的执行策略。上限在冻结前收敛到 1..8。
+  const maxParallelDispatches =
+    config.parallel_read_only === true
+      ? normalizeMaxParallelDispatches(config.max_parallel_dispatches)
+      : 1;
+  const parallelReadOnly = config.parallel_read_only === true && maxParallelDispatches > 1;
   const freezePlan: RoleFrozenPolicyPlan = {
     limits: resolved.limits,
     deadline_at: deadlineAt,
@@ -271,6 +286,8 @@ export async function selectRoleExecutionEngine(
     routing,
     evidence_only: switches.evidence_only,
     buffer_v2: switches.buffer_v2,
+    parallel_read_only: parallelReadOnly,
+    max_parallel_dispatches: maxParallelDispatches,
   };
   const freezeInput = buildRoleFreezeInitInput({
     limits: freezePlan.limits,
@@ -279,6 +296,8 @@ export async function selectRoleExecutionEngine(
     routing: freezePlan.routing,
     evidence_only: freezePlan.evidence_only,
     buffer_v2: freezePlan.buffer_v2,
+    parallel_read_only: parallelReadOnly,
+    max_parallel_dispatches: maxParallelDispatches,
   });
   return {
     engine: ROLE_AUTONOMY_ENGINE,
@@ -289,6 +308,8 @@ export async function selectRoleExecutionEngine(
       tool_allowlist: freezeInput.tool_allowlist,
       evidence_only: switches.evidence_only,
       buffer_v2: switches.buffer_v2,
+      parallel_read_only: parallelReadOnly,
+      max_parallel_dispatches: maxParallelDispatches,
       budget: {
         limits: freezePlan.limits,
         deadline_at: freezePlan.deadline_at,

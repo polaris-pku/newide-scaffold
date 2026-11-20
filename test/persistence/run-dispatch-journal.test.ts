@@ -757,6 +757,37 @@ describe('RunDispatchJournal: 正常写序与折叠', () => {
     await journal.close();
   });
 
+  it('init 行保留阶段 1 并发冻结字段（真实 Journal 往返）', async () => {
+    const runDir = await makeRunDir();
+    const journal = await openJournal(runDir);
+    await journal.appendInit({
+      autonomy: true,
+      evidence_only: false,
+      buffer_v2: false,
+      max_dispatches: 4,
+      max_role_rounds: 8,
+      role_token_budget: 120_000,
+      deadline_at: '2026-11-13T15:00:00.000Z',
+      parallel_read_only: true,
+      max_parallel_dispatches: 2,
+    });
+    const fold = await journal.fold();
+    expect(fold.init).toMatchObject({
+      parallel_read_only: true,
+      max_parallel_dispatches: 2,
+    });
+    await journal.close();
+
+    // 恢复路径重新打开后仍能读回冻结值（不是只在内存对象上存在）。
+    const reopened = await openJournal(runDir);
+    const recovered = await reopened.fold();
+    expect(recovered.init).toMatchObject({
+      parallel_read_only: true,
+      max_parallel_dispatches: 2,
+    });
+    await reopened.close();
+  });
+
   it('init/finish/repair 控制行不伪造 dispatch', async () => {
     const runDir = await makeRunDir();
     const journal = await openJournal(runDir);

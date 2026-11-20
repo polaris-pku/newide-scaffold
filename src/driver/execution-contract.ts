@@ -1366,6 +1366,12 @@ export const JournalInitEntrySchema = z
     dispatch_timeout_ms: z.number().int().positive().optional(),
     /** TaskBudget.max_tool_calls 映射后的任务级工具调用上限（旧行可缺省）。 */
     max_tool_calls: z.number().int().positive().optional(),
+    /**
+     * 阶段 1 同回复只读并发开关/上限（旧行可缺省 → 关闭、上限 1）。
+     * 两者与其它冻结字段同源写入，恢复时原样读回，不随部署变量变化。
+     */
+    parallel_read_only: z.boolean().optional(),
+    max_parallel_dispatches: z.number().int().min(1).max(8).optional(),
   })
   .strict();
 

@@ -23,7 +23,7 @@
  * 边界：本文件不直接调用 driver/persistence 运行时（只依赖共享契约端口），不写 Task/Run 终态；
  * Gate/Deliver 与 C 层游标仍由既有提交路径负责（RD-FIN-01 / RD-TRM-01）。
  */
-import type { ToolCallMessage } from '../memory';
+import type { ToolCall, ToolCallMessage } from '../memory';
 import type {
   RoleFrozenPolicy,
   RoleLlmCompletion,
@@ -32,12 +32,13 @@ import type {
 } from './role-autonomy-contract';
 import {
   isRoleAutonomySwitchCombinationValid,
+  normalizeMaxParallelDispatches,
   resolveUnresolvedDispatchIds,
   ROLE_TOOL_NAMES,
   RoleTerminationError,
 } from './role-autonomy-contract';
 import { persistRoleFinish } from './role-autonomy-finish';
-import { createRoleToolExecutor } from './role-autonomy-tools';
+import { createRoleToolExecutor, isParallelSafeDispatchCall } from './role-autonomy-tools';
 import { armAbortDeadline } from './role-deadline';
 
 /** 历史消息上限（含 system/assistant/tool；超限从最旧的对话消息开始丢）。 */
@@ -46,6 +47,8 @@ const DEFAULT_HISTORY_MESSAGES = 80;
 const DEFAULT_TOOL_RESULT_CHARS = 8_000;
 /** 保留完整内容的最近 dispatch 工具结果条数；更早的压缩成占位符。 */
 const DEFAULT_DISPATCH_HISTORY = 12;
+/** 同回复只读并发上限的默认值（1 = 串行，旧行为）；上限绝对值由契约统一收敛到 1..8。 */
+const DEFAULT_MAX_PARALLEL_DISPATCHES = 1;
 const TRUNCATION_MARKER = '…[truncated]';
 
 /**
@@ -60,6 +63,7 @@ interface ResolvedLimits {
   history_messages: number;
   tool_result_chars: number;
   dispatch_history: number;
+  max_parallel_dispatches: number;
 }
 
 /**
@@ -81,7 +85,7 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
 
   const recallText = await recallMemory(options, now);
   const messages: ToolCallMessage[] = [
-    { role: 'system', content: buildSystemPrompt(options, recallText) },
+    { role: 'system', content: buildSystemPrompt(options, recallText, limits) },
     { role: 'user', content: options.context.instruction },
   ];
   const executor = createRoleToolExecutor({
@@ -93,6 +97,7 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
     policy: options.policy,
     context: options.context,
     now,
+    parallel_read_only: limits.max_parallel_dispatches > 1,
     ...(options.signal !== undefined ? { signal: options.signal } : {}),
     ...(options.on_plan_updated !== undefined ? { on_plan_updated: options.on_plan_updated } : {}),
   });
@@ -176,17 +181,9 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
 
     messages.push(assistantMessage(completion));
 
-    // 同一回复多个 tool_call：串行执行；finish 接受后剩余工具由工具表拒绝（不产生副作用）。
-    for (const call of completion.tool_calls ?? []) {
-      throwIfCancelled(options.signal);
-      // 工具执行同样受总墙钟/取消约束：底层不响应时上层停止等待并封锁后续副作用。
-      const result = await runGuarded(options, now, () => executor.execute(call));
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        content: truncateToolContent(JSON.stringify(result), limits.tool_result_chars),
-      });
-    }
+    // 同一回复多个 tool_call：阶段 1 两阶段调度——开头的显式只读调查可并发，其余
+    // （写/verify/其它工具）严格按原顺序串行；结果消息始终按输入顺序回填。
+    await executeToolCalls(options, now, executor, completion.tool_calls ?? [], messages, limits);
 
     const finishRecord = executor.finishRecord;
     if (finishRecord !== undefined) {
@@ -235,6 +232,102 @@ export async function runRoleExecutionLoop(options: RoleLoopOptions): Promise<Ro
     trimHistory(messages, limits.history_messages);
     compressOldDispatchResults(messages, limits.dispatch_history);
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 同回复工具调度（阶段 1：开头只读调查并发，其余串行）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 执行一条回复里的全部 tool_calls，并按**输入顺序**把结果写回历史。
+ *
+ * 调度规则（阶段 1）：
+ * - 只有开头连续的「显式只读调查」可以并发（`isParallelSafeDispatchCall`，上限
+ *   `max_parallel_dispatches`）；上限 1 时退化为逐条串行，与旧行为一致。
+ * - 第一条写/verify/其它工具出现后，必须先等在途只读调查全部收束，之后所有调用
+ *   （包括后续的只读调查）严格按原顺序串行——写不得与调查重叠，verify 期间不启动
+ *   任何其它 Driver。
+ * - 工具结果是 Promise 完成顺序无关的：先收集到原索引，再按原顺序追加消息。
+ * - 任一调用抛出 typed termination 时停止启动新调用，等待已在途的调用收束后抛出，
+ *   不留下未处理 rejection。
+ */
+async function executeToolCalls(
+  options: RoleLoopOptions,
+  now: () => Date,
+  executor: ReturnType<typeof createRoleToolExecutor>,
+  calls: readonly ToolCall[],
+  messages: ToolCallMessage[],
+  limits: ResolvedLimits,
+): Promise<void> {
+  if (calls.length === 0) return;
+  const runOne = async (call: ToolCall): Promise<string> => {
+    throwIfCancelled(options.signal);
+    // 工具执行同样受总墙钟/取消约束：底层不响应时上层停止等待并封锁后续副作用。
+    const result = await runGuarded(options, now, () => executor.execute(call));
+    return truncateToolContent(JSON.stringify(result), limits.tool_result_chars);
+  };
+  const contents: string[] = new Array<string>(calls.length);
+
+  // 串行回退：并行关闭（上限 1）或本回复只有一个调用时，保持与旧实现逐条一致。
+  if (limits.max_parallel_dispatches <= 1 || calls.length === 1) {
+    for (let index = 0; index < calls.length; index += 1) {
+      contents[index] = await runOne(calls[index]!);
+    }
+  } else {
+    const firstUnsafe = calls.findIndex((call) => !isParallelSafeDispatchCall(call));
+    const parallelCount = firstUnsafe === -1 ? calls.length : firstUnsafe;
+    if (parallelCount > 0) {
+      await runParallelReadOnly(
+        calls.slice(0, parallelCount),
+        limits.max_parallel_dispatches,
+        runOne,
+        (index, content) => {
+          contents[index] = content;
+        },
+      );
+    }
+    for (let index = parallelCount; index < calls.length; index += 1) {
+      contents[index] = await runOne(calls[index]!);
+    }
+  }
+
+  for (let index = 0; index < calls.length; index += 1) {
+    const call = calls[index]!;
+    messages.push({
+      role: 'tool',
+      tool_call_id: call.id,
+      content: contents[index]!,
+    });
+  }
+}
+
+/** 固定上限的 worker 池：按输入索引取任务，完成顺序不影响结果回填位置。 */
+async function runParallelReadOnly(
+  calls: readonly ToolCall[],
+  cap: number,
+  runOne: (call: ToolCall) => Promise<string>,
+  store: (index: number, content: string) => void,
+): Promise<void> {
+  let nextIndex = 0;
+  let firstError: unknown;
+  const workerCount = Math.min(cap, calls.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    for (;;) {
+      if (firstError !== undefined) return;
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= calls.length) return;
+      try {
+        store(index, await runOne(calls[index]!));
+      } catch (error) {
+        if (firstError === undefined) firstError = error;
+        return;
+      }
+    }
+  });
+  // 先等所有已在途调用收束（不再启动新调用），再抛第一个错误：不留下游离副作用。
+  await Promise.all(workers);
+  if (firstError !== undefined) throw firstError;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -288,7 +381,11 @@ function roleTimeBlind(): boolean {
   return process.env.NEWIDE_ROLE_TIME_BLIND === '1';
 }
 
-function buildSystemPrompt(options: RoleLoopOptions, recallText: string): string {
+function buildSystemPrompt(
+  options: RoleLoopOptions,
+  recallText: string,
+  loopLimits: ResolvedLimits,
+): string {
   const { policy, context } = options;
   const limits = policy.budget.limits;
   const lines = [
@@ -301,8 +398,12 @@ function buildSystemPrompt(options: RoleLoopOptions, recallText: string): string
       `role_token_budget=${limits.role_token_budget}，dispatch_timeout_ms=${limits.dispatch_timeout_ms}` +
       (roleTimeBlind() ? '。' : `，deadline_at=${policy.budget.deadline_at}。`),
     `允许工具（仅这些）：${policy.tool_allowlist.join('、')}。`,
-    '同一回复里的多个 dispatch_execution 会按顺序串行执行；driver 的 succeeded 只代表本次派工' +
-      '返回成功，不代表任务完成。',
+    loopLimits.max_parallel_dispatches > 1
+      ? `同一条回复里最多 ${loopLimits.max_parallel_dispatches} 个相互独立的显式只读调查` +
+          '（kind="investigate" 且 read_only=true）会并发执行；写、验证及其它派工会等待在途调查' +
+          '收束后按顺序串行执行。driver 的 succeeded 只代表本次派工返回成功，不代表任务完成。'
+      : '同一回复里的多个 dispatch_execution 会按顺序串行执行；driver 的 succeeded 只代表本次派工' +
+          '返回成功，不代表任务完成。',
     '纯文本（包括“完成/done/已完成”等）不会结束任务；必须调用 finish_task 显式结束。',
     '需要运行测试或其他明确验证命令时，优先 dispatch_execution(kind="verify", ' +
       'session={mode:"fresh"}, verification_command={executable:"node",args:["verify.mjs"]})；' +
@@ -501,6 +602,9 @@ function resolveLimits(limits: RoleLoopOptions['limits']): ResolvedLimits {
     history_messages: Math.max(2, limits?.history_messages ?? DEFAULT_HISTORY_MESSAGES),
     tool_result_chars: Math.max(256, limits?.tool_result_chars ?? DEFAULT_TOOL_RESULT_CHARS),
     dispatch_history: Math.max(1, limits?.dispatch_history ?? DEFAULT_DISPATCH_HISTORY),
+    max_parallel_dispatches: normalizeMaxParallelDispatches(
+      limits?.max_parallel_dispatches ?? DEFAULT_MAX_PARALLEL_DISPATCHES,
+    ),
   };
 }
 

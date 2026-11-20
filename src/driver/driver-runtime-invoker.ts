@@ -24,6 +24,8 @@ export interface DriverRuntimeInvokerInput {
   resume_session?: boolean;
   call_id: string;
   source_driver: string;
+  /** 阶段 1：Run 内派工身份（role dispatch_id）；并发只读调查靠它隔离 transport 与事件流。 */
+  dispatch_id?: string;
   /**
    * 报告模式：
    * - `six_field`（默认，legacy/Council 路径）：prompt 追加六字段报告指令，结果经
@@ -113,6 +115,7 @@ export function createDriverRuntimeInvoker(
         {
           task_id: input.task_id,
           run_id: runId,
+          ...(input.dispatch_id !== undefined ? { dispatch_id: input.dispatch_id } : {}),
           ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
           ...(input.session_id ? { session_id: input.session_id } : {}),
           prompt: buildDriverPrompt(input, evidenceOnly),
@@ -129,6 +132,9 @@ export function createDriverRuntimeInvoker(
                   event_type: 'driver.prompt_dispatching',
                   task_id: input.task_id,
                   run_id: runId,
+                  ...(input.dispatch_id !== undefined
+                    ? { dispatch_id: input.dispatch_id }
+                    : {}),
                   ...(input.session_id ? { session_id: input.session_id } : {}),
                   created_at: nowTimestamp(),
                 });

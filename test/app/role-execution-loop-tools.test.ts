@@ -740,6 +740,31 @@ describe('role-autonomy-tools: dispatch_execution', () => {
     expect(harness.dispatch.calls.map((call) => call.brief.sequence)).toEqual([1, 2]);
     expect(harness.dispatch.maxActive).toBe(1);
   });
+
+  it('并发准入下 sequence 仍连续、不重复，且每个派工只计一次预算', async () => {
+    const harness = makeToolsHarness();
+    const [first, second] = await Promise.all([
+      harness.executor.execute(
+        toolCall('dispatch_execution', {
+          kind: 'investigate',
+          read_only: true,
+          instruction: 'parallel first',
+        }),
+      ),
+      harness.executor.execute(
+        toolCall('dispatch_execution', {
+          kind: 'investigate',
+          read_only: true,
+          instruction: 'parallel second',
+        }),
+      ),
+    ]);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(harness.dispatch.calls.map((call) => call.brief.sequence)).toEqual([1, 2]);
+    expect(harness.budget.consumed.dispatches).toBe(2);
+    expect(harness.executor.dispatches).toHaveLength(2);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────

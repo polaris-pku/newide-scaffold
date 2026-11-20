@@ -20,6 +20,15 @@ export interface DriverCapabilities {
 export interface DriverPrompt {
   task_id: TaskId;
   run_id: RunId;
+  /**
+   * 阶段 1：Run 内的派工身份（role 自主循环的 dispatch_id）。
+   *
+   * 同一 Run 可能同时有多个只读调查在途，而 transport/handle 按 driver 共享。提供该字段时：
+   * - transport 用它区分活动子进程（而不是把同 Run 的第二次调用当成重复运行）；
+   * - 该次调用产生的事件带上同一个 dispatch_id，订阅侧据此隔离并发事件流。
+   * legacy/Council 不提供（缺省回退 run_id，行为不变）。
+   */
+  dispatch_id?: string;
   prompt: string;
   workspace_path?: string;
   session_id?: DriverSessionId;

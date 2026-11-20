@@ -1367,6 +1367,39 @@ export function readBufferV2Enabled(value: string | undefined): boolean {
   throw new Error(`Invalid NEWIDE_BUFFER_V2: ${value}. Expected 0/1/true/false.`);
 }
 
+/**
+ * NEWIDE_ROLE_PARALLEL_READ_ONLY：阶段 1 同回复只读并发开关，默认关闭。
+ * 只有显式打开、且 `NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES > 1` 时才真正重叠。
+ */
+export function readRoleParallelReadOnlyEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return false;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_ROLE_PARALLEL_READ_ONLY: ${value}. Expected 0/1/true/false.`);
+}
+
+/**
+ * NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES：同时运行的安全只读调查上限，默认 1（串行）。
+ * 只接受 1..8 的整数；非法值在启动期拒绝，不在 Run 内静默降级。
+ */
+export function readRoleMaxParallelDispatches(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw) return 1;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `Invalid NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES: ${raw}. Expected an integer between 1 and 8.`,
+    );
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 8) {
+    throw new Error(
+      `Invalid NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES: ${raw}. Expected an integer between 1 and 8.`,
+    );
+  }
+  return parsed;
+}
+
 const ROLE_BUDGET_ENV_KEYS = {
   max_dispatches: 'NEWIDE_ROLE_MAX_DISPATCHES',
   max_role_rounds: 'NEWIDE_ROLE_MAX_ROUNDS',
@@ -1392,6 +1425,15 @@ export function buildRoleAutonomySelectionConfig(
     evidence_only: readDriverEvidenceOnlyEnabled(env.NEWIDE_DRIVER_EVIDENCE_ONLY),
     buffer_v2: readBufferV2Enabled(env.NEWIDE_BUFFER_V2),
   };
+  // 阶段 1：只有部署显式声明时才写进配置对象；未声明 = 关闭 + 上限 1（旧行为）。
+  const parallelReadOnly =
+    env.NEWIDE_ROLE_PARALLEL_READ_ONLY !== undefined
+      ? readRoleParallelReadOnlyEnabled(env.NEWIDE_ROLE_PARALLEL_READ_ONLY)
+      : undefined;
+  const maxParallelDispatches =
+    env.NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES !== undefined
+      ? readRoleMaxParallelDispatches(env.NEWIDE_ROLE_MAX_PARALLEL_DISPATCHES)
+      : undefined;
   if ((switches.evidence_only || switches.buffer_v2) && !enabled) {
     throw new Error(
       'NEWIDE_DRIVER_EVIDENCE_ONLY / NEWIDE_BUFFER_V2 require NEWIDE_ROLE_AUTONOMY=1.',
@@ -1405,6 +1447,10 @@ export function buildRoleAutonomySelectionConfig(
     wired: options.wired,
     switches,
     ...(budgetOverrides !== undefined ? { budget_overrides: budgetOverrides } : {}),
+    ...(parallelReadOnly !== undefined ? { parallel_read_only: parallelReadOnly } : {}),
+    ...(maxParallelDispatches !== undefined
+      ? { max_parallel_dispatches: maxParallelDispatches }
+      : {}),
   };
 }
 

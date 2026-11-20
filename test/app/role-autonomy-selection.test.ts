@@ -139,6 +139,67 @@ describe('role-autonomy 引擎选路', () => {
     expect(selection.freeze_input.dispatch_timeout_ms).toBe(600_000);
   });
 
+  it('阶段 1 并发开关/上限随冻结计划与 init 冻结；默认关闭且上限 1', async () => {
+    const defaults = await selectRoleExecutionEngine(baseInput(await makeFixture('run_default')));
+    expect(defaults.engine).toBe('role_autonomy');
+    if (defaults.engine !== 'role_autonomy' || defaults.reason !== 'fresh_role_autonomy') return;
+    expect(defaults.frozen.parallel_read_only).toBe(false);
+    expect(defaults.frozen.max_parallel_dispatches).toBe(1);
+    expect(defaults.freeze_plan.parallel_read_only).toBe(false);
+    expect(defaults.freeze_plan.max_parallel_dispatches).toBe(1);
+    expect(defaults.freeze_input.parallel_read_only).toBe(false);
+    expect(defaults.freeze_input.max_parallel_dispatches).toBe(1);
+
+    const enabled = await selectRoleExecutionEngine(
+      baseInput(await makeFixture('run_parallel'), {
+        config: {
+          enabled: true,
+          wired: true,
+          parallel_read_only: true,
+          max_parallel_dispatches: 3,
+        },
+      }),
+    );
+    expect(enabled.engine).toBe('role_autonomy');
+    if (enabled.engine !== 'role_autonomy' || enabled.reason !== 'fresh_role_autonomy') return;
+    expect(enabled.frozen.parallel_read_only).toBe(true);
+    expect(enabled.frozen.max_parallel_dispatches).toBe(3);
+    expect(enabled.freeze_input).toMatchObject({
+      parallel_read_only: true,
+      max_parallel_dispatches: 3,
+    });
+
+    // 开关打开但上限 1 → 仍是串行（不伪造并行）；上限收敛到 8。
+    const serial = await selectRoleExecutionEngine(
+      baseInput(await makeFixture('run_serial'), {
+        config: {
+          enabled: true,
+          wired: true,
+          parallel_read_only: true,
+          max_parallel_dispatches: 1,
+        },
+      }),
+    );
+    expect(serial.engine).toBe('role_autonomy');
+    if (serial.engine !== 'role_autonomy' || serial.reason !== 'fresh_role_autonomy') return;
+    expect(serial.frozen.parallel_read_only).toBe(false);
+    expect(serial.frozen.max_parallel_dispatches).toBe(1);
+
+    const capped = await selectRoleExecutionEngine(
+      baseInput(await makeFixture('run_capped'), {
+        config: {
+          enabled: true,
+          wired: true,
+          parallel_read_only: true,
+          max_parallel_dispatches: 99,
+        },
+      }),
+    );
+    expect(capped.engine).toBe('role_autonomy');
+    if (capped.engine !== 'role_autonomy' || capped.reason !== 'fresh_role_autonomy') return;
+    expect(capped.frozen.max_parallel_dispatches).toBe(8);
+  });
+
   it('部署上限可提高或降低，非法值被显式拒绝', async () => {
     const fixture = await makeFixture();
     const tightened = await selectRoleExecutionEngine({
@@ -333,6 +394,9 @@ describe('role-autonomy 引擎选路', () => {
     expect(selection.frozen.budget.limits.wall_clock_seconds).toBe(60);
     expect(selection.frozen.budget.limits.role_token_budget).toBe(1_000);
     expect(selection.frozen.budget.limits.dispatch_timeout_ms).toBe(2_000);
+    // 旧 init 行没有并发字段：按关闭 + 上限 1 解释，不补出并行。
+    expect(selection.frozen.parallel_read_only).toBe(false);
+    expect(selection.frozen.max_parallel_dispatches).toBe(1);
   });
 
   it('冻结为 legacy 的 Run：即使部署开关后来打开也保持 legacy', async () => {

@@ -149,6 +149,19 @@ role/driver 职责完善：让每次派工有身份、有证据、有可对账�
 `report` 缺席只可能来自 evidence-only；legacy 消费者（facade `invoke_driver`、ADP endpoint）
 在缺席时显式失败，不会拿空壳当报告。测试：`test/driver/driver-runtime-invoker-evidence-only.test.ts`。
 
+## 阶段 1：Run 内并发派工标识（默认关闭）
+
+同一 Run 的多个只读调查可以并发，而 driver handle/transport 按 driver 共享，所以：
+
+- `DriverPrompt.dispatch_id`（可选）是该次派工的并发身份。`CommandDriverTransport` 用它
+  （缺省回退 `run_id`）区分活动子进程；同一 `run_id` 的第二个 legacy 调用仍会被拒绝。
+- transport 发出的事件带 `dispatch_id`；`runDriverPromptWithSignal` 在事件自带
+  `dispatch_id` 时按派工隔离订阅流，未标注的事件继续按 `run_id` 过滤（并发隔离取决于
+  transport 是否标注，命令 transport 已标注）。
+- 事件信封的 `run_id` 仍是真实 Run，`dispatch_id` 只是可选的附加字段；legacy/Council 不提供。
+- 并发开关/上限在 role 选路时冻结进 Journal `init`，见 `.env.example` 与
+  `docs/contracts/role-driver-autonomy.md` 的阶段 1 记录。
+
 ## 阶段 5：明确命令的 verify 派工
 
 `dispatch_execution` 可在 `kind=verify`、`session.mode=fresh` 时携带

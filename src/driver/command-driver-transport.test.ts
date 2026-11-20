@@ -359,6 +359,67 @@ describe('CommandDriverTransport', () => {
     expect(activeChildren().size).toBe(0);
   });
 
+  it('runs concurrent dispatches of one run when dispatch_id differs, tagging their events', async () => {
+    const transport = new CommandDriverTransport(
+      nodeCommand(`
+        readInput((raw) => {
+          const prompt = JSON.parse(raw);
+          const PREFIX = ${JSON.stringify(DRIVER_EVENT_PREFIX)};
+          process.stderr.write(PREFIX + JSON.stringify({
+            schema_version: 'driver-event.v1',
+            event_type: 'driver.turn_started',
+            payload: {},
+            task_id: prompt.task_id,
+            run_id: prompt.run_id,
+            sequence: 1,
+            created_at: new Date().toISOString(),
+          }) + '\\n');
+          setTimeout(() => {
+            process.stdout.write(JSON.stringify(driverRunResult(prompt.task_id)));
+          }, 40);
+        });
+      `),
+    );
+    const events: DriverStreamEvent[] = [];
+    transport.subscribeToEvents((event) => events.push(event));
+    const activeChildren = () =>
+      (transport as unknown as { activeChildren: Map<string, unknown> }).activeChildren;
+
+    // 同一个 Run 的两个只读调查：旧的 run_id 键会把第二个当成「已在运行」拒绝。
+    const first = transport.run({ ...PROMPT, dispatch_id: 'dsp_first' });
+    const second = transport.run({ ...PROMPT, dispatch_id: 'dsp_second' });
+    await vi.waitFor(() => expect(activeChildren().size).toBe(2));
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(
+      events
+        .filter((event) => event.event_type === 'driver.turn_started')
+        .map((event) => event.dispatch_id)
+        .sort(),
+    ).toEqual(['dsp_first', 'dsp_second']);
+  });
+
+  it('still rejects a second legacy invocation with the same run_id and no dispatch_id', async () => {
+    const transport = new CommandDriverTransport(
+      nodeCommand(`
+        readInput(() => {
+          setInterval(() => {}, 60000);
+        });
+      `),
+    );
+    const first = transport.run({ ...PROMPT, run_id: 'run_duplicate' });
+    const activeChildren = () =>
+      (transport as unknown as { activeChildren: Map<string, unknown> }).activeChildren;
+    await vi.waitFor(() => expect(activeChildren().size).toBe(1));
+
+    await expect(
+      transport.run({ ...PROMPT, run_id: 'run_duplicate' }),
+    ).rejects.toThrow('already active');
+
+    await transport.interrupt('test cleanup', 'run_duplicate');
+    await expect(first).rejects.toThrow(TERMINATED);
+  });
+
   it('throws a clear error with stderr context when the command exits non-zero', async () => {
     const transport = new CommandDriverTransport(
       nodeCommand(`

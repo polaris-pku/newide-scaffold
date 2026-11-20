@@ -31,6 +31,16 @@ export interface CommandDriverTransportOptions {
   onEvent?: DriverStreamEventListener;
 }
 
+/**
+ * 一个活动子进程：`activeKey`（dispatch_id 或 run_id）→ 子进程 + 真实 Run 身份。
+ * 事件信封的 `run_id` 仍写真实 Run；`dispatch_id` 只在派工并发路径出现。
+ */
+interface ActiveChild {
+  child: ChildProcess;
+  run_id: string;
+  dispatch_id?: string;
+}
+
 export class CommandDriverTransport implements ExternalDriverTransport {
   private readonly command: string;
   private readonly args: readonly string[];
@@ -39,7 +49,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   private readonly unsetEnv: readonly string[];
   private readonly timeoutMs: number | undefined;
   private readonly inactivityTimeoutMs: number | undefined;
-  private readonly activeChildren = new Map<string, ChildProcess>();
+  private readonly activeChildren = new Map<string, ActiveChild>();
   private readonly eventListeners = new Set<DriverStreamEventListener>();
   private readonly requestedInterrupts = new Set<string>();
   private stderr = '';
@@ -79,17 +89,20 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   }
 
   async interrupt(reason: string, runId?: string): Promise<void> {
-    const children = runId
+    const entries = runId
       ? [...(this.activeChildren.get(runId) ? [this.activeChildren.get(runId)!] : [])]
       : [...this.activeChildren.values()];
+    const children = entries.map((entry) => entry.child);
     const ids = runId ? [runId] : [...this.activeChildren.keys()];
     for (const id of ids) this.requestedInterrupts.add(id);
     for (const id of ids) {
+      const entry = this.activeChildren.get(id);
       this.emitEvent({
         schema_version: 'driver-event.v1',
         event_type: 'driver.interrupt_requested',
         payload: { reason },
-        run_id: id,
+        run_id: entry?.run_id ?? id,
+        ...(entry?.dispatch_id !== undefined ? { dispatch_id: entry.dispatch_id } : {}),
         sequence: 0,
         created_at: nowTimestamp(),
       });
@@ -113,12 +126,15 @@ export class CommandDriverTransport implements ExternalDriverTransport {
   }
 
   private execute(input: DriverPrompt): Promise<string> {
+    // 阶段 1：同一 Run 可以同时有多个派工。活动子进程按 dispatch_id（缺省回退 run_id）
+    // 区分，否则同 Run 的第二个并发调用会被误判成「已在运行」而拒绝。
+    const activeKey = input.dispatch_id ?? input.run_id;
     return new Promise((resolve, reject) => {
-      if (this.activeChildren.has(input.run_id)) {
+      if (this.activeChildren.has(activeKey)) {
         // 本次 prompt 从未交付给任何进程 → 明确证据「未执行」（A1 证据模型）。
         reject(
           new DriverTransportError(
-            `Command driver run ${input.run_id} is already active`,
+            `Command driver ${input.dispatch_id !== undefined ? `dispatch ${input.dispatch_id} of run` : 'run'} ${input.run_id} is already active`,
             'not_executed',
           ),
         );
@@ -233,6 +249,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           payload: { code, signal },
           task_id: input.task_id,
           run_id: input.run_id,
+          ...(input.dispatch_id !== undefined ? { dispatch_id: input.dispatch_id } : {}),
           sequence: ++eventSequence,
           created_at: nowTimestamp(),
         });
@@ -248,12 +265,16 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       openPhase(driverMilestoneSpan('driver.first_output'));
       openPhase(driverMilestoneSpan('driver.event_channel'));
       const child = spawn(this.command, this.args, this.spawnOptions());
-      this.activeChildren.set(input.run_id, child);
+      this.activeChildren.set(activeKey, {
+        child,
+        run_id: input.run_id,
+        ...(input.dispatch_id !== undefined ? { dispatch_id: input.dispatch_id } : {}),
+      });
       child.once('spawn', () => closePhase(driverMilestoneSpan('driver.spawn')));
 
       const releaseChild = (): void => {
-        if (this.activeChildren.get(input.run_id) === child) {
-          this.activeChildren.delete(input.run_id);
+        if (this.activeChildren.get(activeKey)?.child === child) {
+          this.activeChildren.delete(activeKey);
         }
       };
 
@@ -375,7 +396,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         const stdout = Buffer.concat(stdoutChunks).toString('utf8');
         const stderrSummary = summarizeText(this.stderr);
 
-        if (timedOut && !this.requestedInterrupts.has(input.run_id)) {
+        if (timedOut && !this.requestedInterrupts.has(activeKey)) {
           // prompt 已交付、进程已跑过 → 断连/超时期间是否执行、副作用状态均不明。
           reject(
             new DriverTransportError(
@@ -386,7 +407,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
           return;
         }
 
-        if (inactive && !this.requestedInterrupts.has(input.run_id)) {
+        if (inactive && !this.requestedInterrupts.has(activeKey)) {
           reject(
             new DriverTransportError(
               `Command driver produced no output for ${String(this.inactivityTimeoutMs)}ms: ${this.commandLabel()}. stderr: ${stderrSummary}`,
@@ -464,6 +485,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         payload: text,
         task_id: input.task_id,
         run_id: input.run_id,
+        ...(input.dispatch_id !== undefined ? { dispatch_id: input.dispatch_id } : {}),
         sequence: nextSequence(),
         created_at: nowTimestamp(),
       });
@@ -486,6 +508,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         ...(parsed.payload !== undefined ? { payload: parsed.payload } : {}),
         task_id: typeof parsed.task_id === 'string' ? parsed.task_id : input.task_id,
         run_id: typeof parsed.run_id === 'string' ? parsed.run_id : input.run_id,
+        ...(input.dispatch_id !== undefined ? { dispatch_id: input.dispatch_id } : {}),
         ...(typeof parsed.role_id === 'string' ? { role_id: parsed.role_id } : {}),
         ...(typeof parsed.session_id === 'string' ? { session_id: parsed.session_id } : {}),
         sequence: typeof parsed.sequence === 'number' ? parsed.sequence : nextSequence(),
@@ -501,6 +524,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
         payload: text,
         task_id: input.task_id,
         run_id: input.run_id,
+        ...(input.dispatch_id !== undefined ? { dispatch_id: input.dispatch_id } : {}),
         sequence: nextSequence(),
         created_at: nowTimestamp(),
       });

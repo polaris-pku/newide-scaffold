@@ -143,13 +143,46 @@ export const ROLE_AUTONOMY_TOOL_DEFINITIONS: readonly ToolDefinition[] = ROLE_TO
   }),
 );
 
-/** 按冻结策略的工具授权过滤；未在 allowlist 的工具不会出现在 LLM 工具表里。 */
+/** 并行只读开启时追加在 dispatch_execution 描述后的通用提示（不含任务特性）。 */
+const PARALLEL_READ_ONLY_HINT =
+  '同一条回复里可以放多个相互独立的只读调查（kind="investigate" 且 read_only=true），' +
+  '宿主会并发执行；实现与验证派工仍按顺序串行。';
+
+/**
+ * 按冻结策略的工具授权过滤；未在 allowlist 的工具不会出现在 LLM 工具表里。
+ * `parallel_read_only` 只追加工具描述，不改变工具表内容。
+ */
 export function roleToolDefinitionsForAllowlist(
   allowlist: readonly RoleToolName[],
+  options: { parallel_read_only?: boolean } = {},
 ): ToolDefinition[] {
   const allowed = new Set(allowlist);
-  return ROLE_AUTONOMY_TOOL_DEFINITIONS.filter((definition) =>
-    allowed.has(definition.function.name as RoleToolName),
+  return ROLE_AUTONOMY_TOOL_DEFINITIONS.map((definition) =>
+    definition.function.name === 'dispatch_execution' && options.parallel_read_only === true
+      ? {
+          ...definition,
+          function: {
+            ...definition.function,
+            description: `${definition.function.description}${PARALLEL_READ_ONLY_HINT}`,
+          },
+        }
+      : definition,
+  ).filter((definition) => allowed.has(definition.function.name as RoleToolName));
+}
+
+/**
+ * 并行安全判据：只有**显式**声明只读的调查派工可以与其他只读派工并发。
+ * `read_only` 缺省视为不安全（宿主按有副作用处理）；带验证命令的调查也不并发。
+ */
+export function isParallelSafeDispatchCall(call: ToolCall): boolean {
+  if (call.function.name !== 'dispatch_execution') return false;
+  const parsed = parseRoleToolCallArguments('dispatch_execution', call.function.arguments);
+  if (!parsed.ok) return false;
+  const args = parsed.parsed.args as RoleDispatchExecutionArgs;
+  return (
+    args.kind === 'investigate' &&
+    args.read_only === true &&
+    args.verification_command === undefined
   );
 }
 // ─────────────────────────────────────────────────────────────
@@ -217,6 +250,11 @@ export interface RoleToolExecutorOptions {
   signal?: AbortSignal;
   /** 阶段 4：计划更新的投影观察（不改变工具语义；缺失时不发事件）。 */
   on_plan_updated?: (plan: string) => void;
+  /**
+   * 第一档并行只读：开启时 dispatch_execution 的工具描述会说明“独立的只读调查可以并发”。
+   * 执行顺序由 loop 决定；本开关只影响模型可见的描述。
+   */
+  parallel_read_only?: boolean;
 }
 
 /**
@@ -235,11 +273,66 @@ export interface RoleToolExecutor {
 export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleToolExecutor {
   const now = options.now ?? (() => new Date());
   const allowlist = new Set<RoleToolName>(options.policy.tool_allowlist);
-  const definitions = roleToolDefinitionsForAllowlist(options.policy.tool_allowlist);
-  const dispatches: RoleDispatchObservation[] = [];
+  const definitions = roleToolDefinitionsForAllowlist(options.policy.tool_allowlist, {
+    parallel_read_only: options.parallel_read_only === true,
+  });
+  /**
+   * 阶段 1 并发状态：
+   * - `dispatchesBySequence` 按宿主分配的 sequence 保存观察，读取时按序返回（完成顺序
+   *   不决定 outcome 顺序）；
+   * - `nextDispatchSequence` 在准入锁内递增：Journal 的 accepted 行要求 sequence 连续，
+   *   先 fold 再分配会在并发下重复；这里把「分配 + accepted/dispatched durable」放在
+   *   同一把准入锁里，Driver 执行在锁外，因此可重叠；
+   * - `reservedDispatches` 把「已准入但未 settle」的派工计入预算：仅看
+   *   `consumed.dispatches`（只在 settle 后 +1）会让并发派工一起越过上限。
+   */
+  const dispatchesBySequence = new Map<number, RoleDispatchObservation>();
+  let nextDispatchSequence: number | undefined;
+  let reservedDispatches = 0;
+  let admissionTail: Promise<void> = Promise.resolve();
   let plan: string | undefined;
   let finished = false;
   let finishRecord: RoleFinishRecord | undefined;
+
+  const dispatchList = (): RoleDispatchObservation[] =>
+    [...dispatchesBySequence.entries()]
+      .sort((left, right) => left[0] - right[0])
+      .map(([, observation]) => observation);
+
+  /** 串行准入锁：保证并发派工按调用顺序拿到连续 sequence，且 accepted 不会交错。 */
+  const acquireAdmission = (): Promise<() => void> => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = admissionTail;
+    admissionTail = admissionTail.then(() => gate);
+    return ready.then(() => release);
+  };
+
+  const releaseOnce = (release: () => void): (() => void) => {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+  };
+
+  const reserveDispatchSlot = (): void => {
+    const snapshot = options.budget.snapshot(now());
+    const max = snapshot.frozen.limits.max_dispatches;
+    const used = snapshot.consumed.dispatches + reservedDispatches;
+    if (used >= max) {
+      throw new RoleTerminationError({
+        code: 'budget_dispatches',
+        actor: 'host',
+        message: `dispatch budget exhausted (${used}/${max})`,
+        details: { dispatches: used, max_dispatches: max, reserved: reservedDispatches },
+      });
+    }
+    reservedDispatches += 1;
+  };
 
   const cancelled = (): boolean => options.signal?.aborted ?? false;
 
@@ -254,217 +347,252 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
   };
 
   const executeDispatch = async (args: RoleDispatchExecutionArgs): Promise<RoleToolResult> => {
-    ensureNotCancelled();
-    options.budget.assertDispatchAllowed(now());
-
-    // 身份/sequence/accepted_at 由宿主填：sequence 取 Journal 已有记录数 + 1（RD-DIS-02）。
-    const fold = await options.journal.fold();
-    const identity: ExecutionBriefHostIdentity = {
-      dispatch_id: createId('dsp'),
-      task_id: options.context.task_id,
-      run_id: options.context.run_id,
-      role_id: options.context.role_id,
-      sequence: fold.records.length + 1,
-      accepted_at: now().toISOString(),
-    };
-    // 单 dispatch 超时的唯一有效值：min(模型请求, 冻结上限)。模型只能收紧、不能突破；
-    // Brief/Journal/实际执行使用同一个有效值，恢复也不扩大上限。
-    const frozenDispatchTimeoutMs = options.policy.budget.limits.dispatch_timeout_ms;
-    const effectiveTimeoutMs =
-      args.timeout_ms === undefined
-        ? frozenDispatchTimeoutMs
-        : Math.min(args.timeout_ms, frozenDispatchTimeoutMs);
-    const request: Record<string, unknown> = {
-      kind: args.kind,
-      instruction: args.instruction,
-      acceptance: args.acceptance,
-      constraints: args.constraints,
-      expected_artifacts: args.expected_artifacts,
-      session: args.session,
-      timeout_ms: effectiveTimeoutMs,
-    };
-    if (args.read_only !== undefined) request.read_only = args.read_only;
-    if (args.verification_command !== undefined) {
-      request.verification_command = args.verification_command;
-    }
-    if (args.retry_of !== undefined) request.retry_of = args.retry_of;
-    if (args.reconciliation_ref !== undefined) {
-      request.reconciliation_ref = args.reconciliation_ref;
-    }
-
-    // Session 已由宿主冻结：reuse 只允许本 role/run 已确认的那一个 Session；
-    // 不一致时**不派工**，也不悄悄改成 fresh 或复用别的 Session。
-    if (args.session.mode === 'reuse') {
-      const confirmedSessionId = options.context.confirmed_session_id;
-      if (
-        confirmedSessionId === undefined ||
-        confirmedSessionId.length === 0 ||
-        args.session.session_id !== confirmedSessionId
-      ) {
-        return toolError(
-          'ROLE_INVALID_ARGUMENTS',
-          'reuse session is not the confirmed session of this role/run',
-          { reason: 'session_reuse_unconfirmed' },
-        );
+    // 准入锁覆盖「预算预留 + sequence 分配 + accepted/dispatched durable」，Driver 执行
+    // 在锁外（on_dispatched 释放），所以同回复的只读调查可以真正重叠而 sequence 不重复。
+    const releaseAdmission = releaseOnce(await acquireAdmission());
+    let reservedSlots = false;
+    let sequenceValue: number | undefined;
+    let dispatchedDurable = false;
+    const markDispatchedDurable = (): void => {
+      if (dispatchedDurable) return;
+      dispatchedDurable = true;
+      if (sequenceValue !== undefined) {
+        nextDispatchSequence = Math.max(nextDispatchSequence ?? sequenceValue, sequenceValue + 1);
       }
-    }
-    const confirmedSessions =
-      options.context.confirmed_session_id !== undefined
-        ? [
-            {
-              session_id: options.context.confirmed_session_id,
-              run_id: options.context.run_id,
-              role_id: options.context.role_id,
-              ...(options.context.frozen_driver_id !== undefined
-                ? { driver_id: options.context.frozen_driver_id }
-                : {}),
-            },
-          ]
-        : [];
-
-    let built;
-    try {
-      built = buildExecutionBrief({ identity, request, confirmed_sessions: confirmedSessions });
-    } catch (error) {
-      if (error instanceof ExecutionContractViolation) {
-        return toolError(
-          'ROLE_INVALID_ARGUMENTS',
-          `dispatch_execution request rejected: ${error.code}`,
-          { contract_code: error.code },
-        );
-      }
-      throw error;
-    }
-
-    const budgetSnapshot = options.budget.snapshot(now());
-    const budgetBefore: BudgetSnapshot = {
-      dispatches_left: Math.max(
-        0,
-        budgetSnapshot.frozen.limits.max_dispatches - budgetSnapshot.consumed.dispatches,
-      ),
-      role_tokens_left: Math.max(
-        0,
-        budgetSnapshot.frozen.limits.role_token_budget - budgetSnapshot.consumed.tokens,
-      ),
-      deadline_at: budgetSnapshot.frozen.deadline_at,
+      releaseAdmission();
     };
-
-    let observation: RoleDispatchObservation;
     try {
-      observation = await options.dispatch.run({
-        brief: built.brief,
-        brief_sha256: built.brief_sha256,
-        budget_before: budgetBefore,
-      });
-    } catch (error) {
-      if (error instanceof DispatchJournalBarrierErrorClass) {
-        // retry_of/reconciliation_ref 写错是**可纠正的参数错误**，不是宿主写盘失败：
-        // 把 journal 的原始错误码交还 Role，让它按 recovery_hint 补字段重派，而不是终止 Run。
-        const cause = (error as { original_error?: { code?: unknown; message?: unknown } })
-          .original_error;
-        const causeCode = typeof cause?.code === 'string' ? cause.code : undefined;
+      ensureNotCancelled();
+      options.budget.assertDispatchAllowed(now());
+      reserveDispatchSlot();
+      reservedSlots = true;
+
+      // 身份/sequence/accepted_at 由宿主填：首个派工从 Journal 已有记录数续号，之后在准入
+      // 锁内递增。不能每次现 fold：并发时另一个派工可能已 accepted 但还未进入折叠。
+      if (nextDispatchSequence === undefined) {
+        const fold = await options.journal.fold();
+        nextDispatchSequence = fold.records.length + 1;
+      }
+      sequenceValue = nextDispatchSequence;
+      const identity: ExecutionBriefHostIdentity = {
+        dispatch_id: createId('dsp'),
+        task_id: options.context.task_id,
+        run_id: options.context.run_id,
+        role_id: options.context.role_id,
+        sequence: sequenceValue,
+        accepted_at: now().toISOString(),
+      };
+      // 单 dispatch 超时的唯一有效值：min(模型请求, 冻结上限)。模型只能收紧、不能突破；
+      // Brief/Journal/实际执行使用同一个有效值，恢复也不扩大上限。
+      const frozenDispatchTimeoutMs = options.policy.budget.limits.dispatch_timeout_ms;
+      const effectiveTimeoutMs =
+        args.timeout_ms === undefined
+          ? frozenDispatchTimeoutMs
+          : Math.min(args.timeout_ms, frozenDispatchTimeoutMs);
+      const request: Record<string, unknown> = {
+        kind: args.kind,
+        instruction: args.instruction,
+        acceptance: args.acceptance,
+        constraints: args.constraints,
+        expected_artifacts: args.expected_artifacts,
+        session: args.session,
+        timeout_ms: effectiveTimeoutMs,
+      };
+      if (args.read_only !== undefined) request.read_only = args.read_only;
+      if (args.verification_command !== undefined) {
+        request.verification_command = args.verification_command;
+      }
+      if (args.retry_of !== undefined) request.retry_of = args.retry_of;
+      if (args.reconciliation_ref !== undefined) {
+        request.reconciliation_ref = args.reconciliation_ref;
+      }
+
+      // Session 已由宿主冻结：reuse 只允许本 role/run 已确认的那一个 Session；
+      // 不一致时**不派工**，也不悄悄改成 fresh 或复用别的 Session。
+      if (args.session.mode === 'reuse') {
+        const confirmedSessionId = options.context.confirmed_session_id;
         if (
-          causeCode === 'journal_retry_not_allowed' ||
-          causeCode === 'journal_retry_without_evidence' ||
-          causeCode === 'journal_unknown_dispatch'
+          confirmedSessionId === undefined ||
+          confirmedSessionId.length === 0 ||
+          args.session.session_id !== confirmedSessionId
         ) {
           return toolError(
             'ROLE_INVALID_ARGUMENTS',
-            `dispatch retry rejected: ${String(cause?.message ?? causeCode)}`,
-            {
-              contract_code: causeCode,
-              recovery_hint:
-                'Recovering an unknown dispatch requires retry_of=<dispatch_id> AND ' +
-                'reconciliation_ref={path, sha256} copied from that dispatch evidence_ref/evidence_sha256.',
-            },
+            'reuse session is not the confirmed session of this role/run',
+            { reason: 'session_reuse_unconfirmed' },
           );
         }
-        throw roleTerminationFromDispatchBarrier(error);
       }
-      if (error instanceof ExecutionContractViolation) {
-        return toolError(
-          'ROLE_INVALID_ARGUMENTS',
-          `dispatch_execution rejected by contract: ${error.code}`,
-          { contract_code: error.code },
+      const confirmedSessions =
+        options.context.confirmed_session_id !== undefined
+          ? [
+              {
+                session_id: options.context.confirmed_session_id,
+                run_id: options.context.run_id,
+                role_id: options.context.role_id,
+                ...(options.context.frozen_driver_id !== undefined
+                  ? { driver_id: options.context.frozen_driver_id }
+                  : {}),
+              },
+            ]
+          : [];
+
+      let built;
+      try {
+        built = buildExecutionBrief({ identity, request, confirmed_sessions: confirmedSessions });
+      } catch (error) {
+        if (error instanceof ExecutionContractViolation) {
+          return toolError(
+            'ROLE_INVALID_ARGUMENTS',
+            `dispatch_execution request rejected: ${error.code}`,
+            { contract_code: error.code },
+          );
+        }
+        throw error;
+      }
+
+      const budgetSnapshot = options.budget.snapshot(now());
+      const budgetBefore: BudgetSnapshot = {
+        dispatches_left: Math.max(
+          0,
+          budgetSnapshot.frozen.limits.max_dispatches - budgetSnapshot.consumed.dispatches,
+        ),
+        role_tokens_left: Math.max(
+          0,
+          budgetSnapshot.frozen.limits.role_token_budget - budgetSnapshot.consumed.tokens,
+        ),
+        deadline_at: budgetSnapshot.frozen.deadline_at,
+      };
+
+      let observation: RoleDispatchObservation;
+      try {
+        observation = await options.dispatch.run({
+          brief: built.brief,
+          brief_sha256: built.brief_sha256,
+          budget_before: budgetBefore,
+          on_dispatched: markDispatchedDurable,
+        });
+        // 兼容不实现 on_dispatched 的旧端口：成功返回后仍要推进 sequence 并释放准入锁。
+        markDispatchedDurable();
+      } catch (error) {
+        if (error instanceof DispatchJournalBarrierErrorClass) {
+          // retry_of/reconciliation_ref 写错是**可纠正的参数错误**，不是宿主写盘失败：
+          // 把 journal 的原始错误码交还 Role，让它按 recovery_hint 补字段重派，而不是终止 Run。
+          const cause = (error as { original_error?: { code?: unknown; message?: unknown } })
+            .original_error;
+          const causeCode = typeof cause?.code === 'string' ? cause.code : undefined;
+          if (
+            causeCode === 'journal_retry_not_allowed' ||
+            causeCode === 'journal_retry_without_evidence' ||
+            causeCode === 'journal_unknown_dispatch'
+          ) {
+            return toolError(
+              'ROLE_INVALID_ARGUMENTS',
+              `dispatch retry rejected: ${String(cause?.message ?? causeCode)}`,
+              {
+                contract_code: causeCode,
+                recovery_hint:
+                  'Recovering an unknown dispatch requires retry_of=<dispatch_id> AND ' +
+                  'reconciliation_ref={path, sha256} copied from that dispatch evidence_ref/evidence_sha256.',
+              },
+            );
+          }
+          throw roleTerminationFromDispatchBarrier(error);
+        }
+        if (error instanceof ExecutionContractViolation) {
+          return toolError(
+            'ROLE_INVALID_ARGUMENTS',
+            `dispatch_execution rejected by contract: ${error.code}`,
+            { contract_code: error.code },
+          );
+        }
+        if (error instanceof RoleTerminationError) throw error;
+        throw new RoleTerminationError(
+          {
+            code: 'host_failed',
+            actor: 'host',
+            message: 'role dispatch failed unexpectedly',
+            details: { dispatch_id: built.brief.dispatch_id },
+          },
+          error,
         );
       }
-      if (error instanceof RoleTerminationError) throw error;
-      throw new RoleTerminationError(
-        {
-          code: 'host_failed',
-          actor: 'host',
-          message: 'role dispatch failed unexpectedly',
-          details: { dispatch_id: built.brief.dispatch_id },
-        },
-        error,
+
+      // 派工已 settled：预算预留转为真实消费，观察按宿主 sequence 归档（完成顺序不影响顺序）。
+      if (reservedSlots) {
+        reservedDispatches -= 1;
+        reservedSlots = false;
+      }
+      options.budget.recordDispatch();
+      dispatchesBySequence.set(sequenceValue!, observation);
+
+      const data: Record<string, unknown> = {
+        dispatch_id: observation.dispatch_id,
+        status: observation.status,
+        evidence_ref: observation.evidence_ref,
+        evidence_sha256: observation.evidence_sha256,
+        violations: observation.violations,
+        attempts: observation.attempts,
+        sequence: identity.sequence,
+        checks: observation.evidence.checks,
+      };
+      // 让 Role 每轮都看到剩余墙钟，而不是只在启动时拿到一个绝对 deadline；
+      // 否则长任务会按“还有几十次派工”的惯性排期，无法为最终验证留窗口。
+      const budgetAfter = options.budget.snapshot(now());
+      const dispatchesLeft = Math.max(
+        0,
+        budgetAfter.frozen.limits.max_dispatches - budgetAfter.consumed.dispatches,
       );
+      const roleTokensLeft = Math.max(
+        0,
+        budgetAfter.frozen.limits.role_token_budget - budgetAfter.consumed.tokens,
+      );
+      data.budget_after =
+        process.env.NEWIDE_ROLE_TIME_BLIND === '1'
+          ? { dispatches_left: dispatchesLeft, role_tokens_left: roleTokensLeft }
+          : {
+              wall_clock_remaining_ms: budgetAfter.wall_clock_remaining_ms,
+              deadline_at: budgetAfter.frozen.deadline_at,
+              dispatches_left: dispatchesLeft,
+              role_tokens_left: roleTokensLeft,
+            };
+      if (
+        built.brief.kind === 'verify' &&
+        !observation.evidence.checks.some((check) => check.provenance === 'host_observed')
+      ) {
+        data.verification_gap =
+          '本次派工没有宿主检查证据；如需验证命令，请用 verify + fresh + verification_command ' +
+          '给出 executable/args。不要重复同样的自然语言派工取证；无法验证时如实 finish(blocked)。';
+      }
+      if (observation.evidence.response_excerpt !== undefined) {
+        data.response_excerpt = observation.evidence.response_excerpt;
+      }
+      if (observation.status === 'unknown') {
+        // unknown 不会被宿主自动当作成功或失败；Role 若接续这项工作，必须显式建立
+        // retry 链，否则 finish(completed) 会被“未收束 unknown”拒绝。unknown 目标还要求
+        // reconciliation_ref 取证，所以把现成的 ref 直接写进提示，避免 Role 只写 retry_of
+        // 后被 journal 拒绝、再被误报成宿主写失败。
+        const reconciliation = JSON.stringify({
+          path: observation.evidence_ref.path,
+          sha256: observation.evidence_sha256,
+        });
+        data.recovery_hint =
+          `Dispatch ${observation.dispatch_id} is unresolved (status=unknown). ` +
+          `To recover its work, send a dispatch with retry_of="${observation.dispatch_id}" ` +
+          `AND reconciliation_ref=${reconciliation}; ` +
+          'without both fields the retry is rejected and the run cannot finish as completed. ' +
+          'A verify dispatch that changed no workspace files is treated as harmless.';
+      }
+      if (options.context.frozen_driver_id !== undefined) {
+        data.frozen_driver_id = options.context.frozen_driver_id;
+      }
+      return { ok: true, data };
+    } finally {
+      // 任何提前返回（参数/契约拒绝、取消、写屏障失败）都不能占着准入锁或预算预留：
+      // 已 settle 的派工在成功路径里已自行释放，这里只兜底未完成的路径。
+      releaseAdmission();
+      if (reservedSlots) reservedDispatches -= 1;
     }
-
-    // 派工已 settled：只计数，不再检查（预算在派工前已检查）。
-    options.budget.recordDispatch();
-    dispatches.push(observation);
-
-    const data: Record<string, unknown> = {
-      dispatch_id: observation.dispatch_id,
-      status: observation.status,
-      evidence_ref: observation.evidence_ref,
-      evidence_sha256: observation.evidence_sha256,
-      violations: observation.violations,
-      attempts: observation.attempts,
-      sequence: identity.sequence,
-      checks: observation.evidence.checks,
-    };
-    // 让 Role 每轮都看到剩余墙钟，而不是只在启动时拿到一个绝对 deadline；
-    // 否则长任务会按“还有几十次派工”的惯性排期，无法为最终验证留窗口。
-    const budgetAfter = options.budget.snapshot(now());
-    const dispatchesLeft = Math.max(
-      0,
-      budgetAfter.frozen.limits.max_dispatches - budgetAfter.consumed.dispatches,
-    );
-    const roleTokensLeft = Math.max(
-      0,
-      budgetAfter.frozen.limits.role_token_budget - budgetAfter.consumed.tokens,
-    );
-    data.budget_after =
-      process.env.NEWIDE_ROLE_TIME_BLIND === '1'
-        ? { dispatches_left: dispatchesLeft, role_tokens_left: roleTokensLeft }
-        : {
-            wall_clock_remaining_ms: budgetAfter.wall_clock_remaining_ms,
-            deadline_at: budgetAfter.frozen.deadline_at,
-            dispatches_left: dispatchesLeft,
-            role_tokens_left: roleTokensLeft,
-          };
-    if (
-      built.brief.kind === 'verify' &&
-      !observation.evidence.checks.some((check) => check.provenance === 'host_observed')
-    ) {
-      data.verification_gap =
-        '本次派工没有宿主检查证据；如需验证命令，请用 verify + fresh + verification_command ' +
-        '给出 executable/args。不要重复同样的自然语言派工取证；无法验证时如实 finish(blocked)。';
-    }
-    if (observation.evidence.response_excerpt !== undefined) {
-      data.response_excerpt = observation.evidence.response_excerpt;
-    }
-    if (observation.status === 'unknown') {
-      // unknown 不会被宿主自动当作成功或失败；Role 若接续这项工作，必须显式建立
-      // retry 链，否则 finish(completed) 会被“未收束 unknown”拒绝。unknown 目标还要求
-      // reconciliation_ref 取证，所以把现成的 ref 直接写进提示，避免 Role 只写 retry_of
-      // 后被 journal 拒绝、再被误报成宿主写失败。
-      const reconciliation = JSON.stringify({
-        path: observation.evidence_ref.path,
-        sha256: observation.evidence_sha256,
-      });
-      data.recovery_hint =
-        `Dispatch ${observation.dispatch_id} is unresolved (status=unknown). ` +
-        `To recover its work, send a dispatch with retry_of="${observation.dispatch_id}" ` +
-        `AND reconciliation_ref=${reconciliation}; ` +
-        'without both fields the retry is rejected and the run cannot finish as completed. ' +
-        'A verify dispatch that changed no workspace files is treated as harmless.';
-    }
-    if (options.context.frozen_driver_id !== undefined) {
-      data.frozen_driver_id = options.context.frozen_driver_id;
-    }
-    return { ok: true, data };
   };
 
   const executeQueryMemory = async (args: RoleQueryMemoryArgs): Promise<RoleToolResult> => {
@@ -525,7 +653,7 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
       journal: options.journal,
       context: options.context,
       budget: options.budget,
-      dispatches: [...dispatches],
+      dispatches: dispatchList(),
       cancelled: cancelled(),
       ...(workspaceState?.sha256 !== undefined
         ? { current_workspace_sha256: workspaceState.sha256 }
@@ -560,7 +688,7 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
         evidence_refs: decision.record.evidence_refs,
         unresolved: decision.record.unresolved,
         response_only: decision.record.response_only,
-        zero_dispatch: dispatches.length === 0,
+        zero_dispatch: dispatchList().length === 0,
       },
     };
   };
@@ -568,7 +696,7 @@ export function createRoleToolExecutor(options: RoleToolExecutorOptions): RoleTo
   const executor: RoleToolExecutor = {
     definitions,
     get dispatches(): readonly RoleDispatchObservation[] {
-      return dispatches;
+      return dispatchList();
     },
     get plan(): string | undefined {
       return plan;

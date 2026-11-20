@@ -99,6 +99,7 @@ import {
   buildRoleFreezeInitInput,
   effectiveDispatchRecordStatus,
   isRoleAutonomySwitchCombinationValid,
+  normalizeMaxParallelDispatches,
   resolveBlockingUnresolvedDispatchIds,
   resolveRolePolicyBudget,
   resolveUnresolvedDispatchIds,
@@ -559,7 +560,16 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       consumed,
       ...(this.deps.clock ? { clock: this.deps.clock } : {}),
       ...(input.signal ? { signal: input.signal } : {}),
-      limits: { history_messages: 60, tool_result_chars: 12_000, dispatch_history: 24 },
+      limits: {
+        history_messages: 60,
+        tool_result_chars: 12_000,
+        dispatch_history: 24,
+        // 阶段 1：冻结值决定同回复只读并发；关闭或上限 1 时与旧串行行为逐位一致。
+        max_parallel_dispatches:
+          policy.parallel_read_only === true
+            ? normalizeMaxParallelDispatches(policy.max_parallel_dispatches)
+            : 1,
+      },
       on_plan_updated: (plan: string) => {
         this.emitLifecycle(input, {
           type: ROLE_DISPATCH_EVENT.plan_updated,
@@ -772,6 +782,14 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
     // 阶段 3 开关与预算同源冻结：新 Run 取选路计划，继承链取祖先冻结值（恢复不切换）。
     const evidenceOnly = inherited?.evidence_only ?? plan!.evidence_only;
     const bufferV2 = inherited?.buffer_v2 ?? plan!.buffer_v2;
+    // 阶段 1：同回复只读并发与预算同源冻结；旧冻结记录/旧计划缺字段 → 关闭 + 上限 1。
+    const parallelReadOnly = inherited?.parallel_read_only ?? plan!.parallel_read_only ?? false;
+    const frozenMaxParallel =
+      inherited?.max_parallel_dispatches ?? plan!.max_parallel_dispatches;
+    const maxParallelDispatches = normalizeMaxParallelDispatches(
+      parallelReadOnly ? frozenMaxParallel : 1,
+    );
+    const effectiveParallelReadOnly = parallelReadOnly && maxParallelDispatches > 1;
     if (
       !isRoleAutonomySwitchCombinationValid({ evidence_only: evidenceOnly, buffer_v2: bufferV2 })
     ) {
@@ -792,6 +810,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       routing,
       evidence_only: evidenceOnly,
       buffer_v2: bufferV2,
+      parallel_read_only: effectiveParallelReadOnly,
+      max_parallel_dispatches: maxParallelDispatches,
       ...(maxToolCalls !== undefined ? { max_tool_calls: maxToolCalls } : {}),
     });
     try {
@@ -817,6 +837,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       tool_allowlist: freezeInput.tool_allowlist,
       evidence_only: evidenceOnly,
       buffer_v2: bufferV2,
+      parallel_read_only: effectiveParallelReadOnly,
+      max_parallel_dispatches: maxParallelDispatches,
       budget: {
         limits,
         deadline_at: deadlineAt,
@@ -837,6 +859,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
         ...input.freeze_plan,
         evidence_only: input.freeze_plan.evidence_only ?? false,
         buffer_v2: input.freeze_plan.buffer_v2 ?? false,
+        parallel_read_only: input.freeze_plan.parallel_read_only ?? false,
+        max_parallel_dispatches: input.freeze_plan.max_parallel_dispatches ?? 1,
       };
     }
     const resolved = resolveRolePolicyBudget({
@@ -857,6 +881,8 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
       // 直接调用 engine（无选路计划）的调用者拿不到部署开关：默认关闭，不猜。
       evidence_only: false,
       buffer_v2: false,
+      parallel_read_only: false,
+      max_parallel_dispatches: 1,
     };
   }
 
@@ -1291,7 +1317,12 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
   private async runDispatch(
     input: RoleAutonomyEngineRequest,
     journal: RunDispatchJournal,
-    dispatchInput: { brief: ExecutionBrief; brief_sha256: string; budget_before: BudgetSnapshot },
+    dispatchInput: {
+      brief: ExecutionBrief;
+      brief_sha256: string;
+      budget_before: BudgetSnapshot;
+      on_dispatched?: () => void;
+    },
     policy: RoleFrozenPolicy,
     artifacts: ArtifactRef[],
     runDir: string,
@@ -1324,6 +1355,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
         brief_sha256: dispatchInput.brief_sha256,
         budget_before: dispatchInput.budget_before,
         execute: async () => {
+          // 阶段 1：accepted/dispatched 已 durable，Driver 尚未开始——释放工具表的准入锁，
+          // 让同一回复里其它安全只读调查可以真正重叠（写/验证仍由 loop 串行）。
+          dispatchInput.on_dispatched?.();
           // Journal 的 accepted/dispatched 两行已经 durable，这里才是真正开始 driver 调用。
           this.emitLifecycle(input, {
             type: ROLE_DISPATCH_EVENT.started,
@@ -1566,6 +1600,9 @@ export class RoleAutonomyEngine implements RoleAutonomyEnginePort {
             : {}),
           call_id: createId('call'),
           source_driver: driver.driver_id,
+          // 阶段 1：Run 内并发标识。共享 transport 以 dispatch_id（缺省回退 run_id）区分
+          // 活动子进程并隔离事件流；event 的 run_id 仍是真实 Run，不改变外部语义。
+          dispatch_id: brief.dispatch_id,
           // 阶段 3：evidence-only 分支不要求六字段报告/报告文件；legacy/Council 冻结在
           // evidence_only=false 时仍走原 converter（既有路径行为不变）。
           report_mode: policy.evidence_only ? 'evidence_only' : 'six_field',
